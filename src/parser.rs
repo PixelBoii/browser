@@ -1,5 +1,7 @@
 use anyhow::Context;
+use deno_core::{ToV8, v8};
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 
 const SELF_CLOSING_TAGS: [&str; 6] = ["br", "input", "meta", "link", "img", "hr"];
 
@@ -13,7 +15,7 @@ pub struct Element {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextElement {
     pub text: String,
-    parent: Option<usize>,
+    pub parent: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +29,75 @@ impl Node {
         match self {
             Node::Element(element) => element.parent,
             Node::Text(element) => element.parent,
+        }
+    }
+}
+
+fn set_object_prop<'a, 'i, T>(
+    scope: &mut v8::PinScope<'a, 'i>,
+    object: v8::Local<'a, v8::Object>,
+    key: &str,
+    value: T,
+) where
+    T: ToV8<'a, Error = Infallible>,
+{
+    let key = v8::String::new(scope, key).unwrap();
+    let value = value.to_v8(scope).unwrap();
+    object.set(scope, key.into(), value).unwrap();
+}
+
+impl<'a> ToV8<'a> for Element {
+    type Error = Infallible;
+
+    fn to_v8<'i>(
+        self,
+        scope: &mut v8::PinScope<'a, 'i>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        let object = v8::Object::new(scope);
+        let attributes = v8::Object::new(scope);
+
+        set_object_prop(scope, object, "kind", "element");
+        set_object_prop(scope, object, "tag", self.tag);
+        set_object_prop(scope, object, "parent", self.parent);
+
+        for (key, value) in self.attributes {
+            set_object_prop(scope, attributes, &key, value);
+        }
+
+        let attrs_key = v8::String::new(scope, "attributes").unwrap();
+        object.set(scope, attrs_key.into(), attributes.into()).unwrap();
+
+        Ok(object.into())
+    }
+}
+
+impl<'a> ToV8<'a> for TextElement {
+    type Error = Infallible;
+
+    fn to_v8<'i>(
+        self,
+        scope: &mut v8::PinScope<'a, 'i>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        let object = v8::Object::new(scope);
+
+        set_object_prop(scope, object, "kind", "text");
+        set_object_prop(scope, object, "text", self.text);
+        set_object_prop(scope, object, "parent", self.parent);
+
+        Ok(object.into())
+    }
+}
+
+impl<'a> ToV8<'a> for Node {
+    type Error = Infallible;
+
+    fn to_v8<'i>(
+        self,
+        scope: &mut v8::PinScope<'a, 'i>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        match self {
+            Node::Element(element) => element.to_v8(scope),
+            Node::Text(element) => element.to_v8(scope),
         }
     }
 }
@@ -267,7 +338,7 @@ impl<'a> HtmlParser<'a> {
                     }
                     _ => {}
                 },
-                ' ' => match self.stage {
+                ' ' | '\n' => match self.stage {
                     BuildPhase::Tag => {
                         self.create_node_from_state()?;
 
@@ -279,6 +350,10 @@ impl<'a> HtmlParser<'a> {
                     }
                     BuildPhase::AttributeValueInside => {
                         self.value.push(char);
+                    }
+                    BuildPhase::AttributeName => {
+                        self.close_attribute()?;
+                        self.stage = BuildPhase::TagDone;
                     }
                     _ => {}
                 },
@@ -319,6 +394,10 @@ impl<'a> HtmlParser<'a> {
                     _ => {}
                 },
             }
+        }
+        // If we're out of chars, and in the text phase, consider it done
+        if self.stage == BuildPhase::Text {
+            self.create_node_from_state()?;
         }
         Ok(())
     }
