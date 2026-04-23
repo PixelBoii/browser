@@ -301,11 +301,13 @@ dependencies = [
 name = "browser"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "bytes",
  "deno_core",
  "deno_web",
  "deno_webidl",
+ "percent-encoding",
  "raw-window-handle",
  "reqwest",
  "resvg",

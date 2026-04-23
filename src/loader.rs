@@ -1,9 +1,9 @@
-use deno_core::error::{ModuleLoaderError};
+use deno_core::error::ModuleLoaderError;
 use deno_core::futures::FutureExt;
 use deno_core::{
-    resolve_import, ModuleLoadOptions, ModuleLoadReferrer,
-    ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier,
-    ModuleType, RequestedModuleType, ResolutionKind,
+    ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader, ModuleSource,
+    ModuleSourceCode, ModuleSpecifier, ModuleType, RequestedModuleType, ResolutionKind,
+    resolve_import,
 };
 
 pub struct HttpModuleLoader {
@@ -109,9 +109,7 @@ impl ModuleLoader for HttpModuleLoader {
             );
 
             // Mirror deno_core's JSON behavior: JSON imports should be explicit.
-            if module_type == ModuleType::Json
-                && requested != RequestedModuleType::Json
-            {
+            if module_type == ModuleType::Json && requested != RequestedModuleType::Json {
                 return Err(ModuleLoaderError::type_error(
                     "Attempted to load JSON module without `with { type: \"json\" }`.",
                 ));

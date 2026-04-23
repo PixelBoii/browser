@@ -60,9 +60,15 @@ function setIntervalImpl(callback, delay = 0, ...args) {
     return createTimer(callback, delay, args, true)
 }
 
-const ELEMENT_ATTRIBUTES = ["src", "style", "id", "class"]
+const ELEMENT_ATTRIBUTES = ['src', 'style', 'id', 'class']
 
 globalThis.__EVENT_LISTENERS = {}
+
+class TextNode {
+    constructor(text) {
+        this.text = text
+    }
+}
 
 class HtmlElement {
     constructor(tag) {
@@ -70,7 +76,6 @@ class HtmlElement {
     }
 
     addEventListener(event, cb) {
-        console.log('addEventListener', event, cb)
         const key = `${this.__node_idx}:${event}`
         if (!(key in globalThis.__EVENT_LISTENERS)) {
             globalThis.__EVENT_LISTENERS[key] = []
@@ -83,20 +88,51 @@ class HtmlElement {
             throw new TypeError("Element is not an object")
         }
 
-        let attributes = {}
-
-        for (const attr in ELEMENT_ATTRIBUTES) {
-            if (this[attr] !== null && this[attr] !== undefined) {
-                attributes[attr] = this[attr]
-            }
+        if (!this.__node_idx) {
+            throw new Error("Item has not been registered on rust backend yet")
         }
-        attributes = Object.fromEntries(Object.entries(attributes).filter(([k, v]) => v))
 
-        core.ops.op_append_child(this.__node_idx, element.tag, attributes, element.innerHTML || element.textContent)
+        if (element instanceof TextNode) {
+            core.ops.op_append_text_child(this.__node_idx, element.text)
+        } else {
+            let attributes = {}
+
+            for (const attr in ELEMENT_ATTRIBUTES) {
+                if (element[attr] !== null && element[attr] !== undefined) {
+                    attributes[attr] = element[attr]
+                }
+            }
+            attributes = Object.fromEntries(Object.entries(attributes).filter(([k, v]) => v))
+
+            core.ops.op_append_child(this.__node_idx, element.tag, attributes, element.innerHTML || element.textContent)
+        }
+    }
+
+    hasChildNodes() {
+        return core.ops.op_has_child_nodes(this.__node_idx)
+    }
+
+    removeChild(element) {
+        if (!element) {
+            throw new TypeError("Element is not an object")
+        }
+
+        if (element.__node_idx) {
+            core.ops.op_remove_child(element.__node_idx)
+        }
+    }
+
+    getAttribute(attr) {
+        return this[attr]
     }
 
     setAttribute(attr, value) {
         this[attr] = value
+    }
+
+    // TODO: Implement this
+    getComputedStyle() {
+        return {}
     }
 
     get innerHTML() {
@@ -121,6 +157,57 @@ class HtmlElement {
             core.ops.op_set_inner_html(this.__node_idx, value);
         }
     }
+
+    get classList() {
+        return new ClassList(this.class, this)
+    }
+
+    // TODO: Handle deep updates and sync with rust backend
+    get style() {
+        return this.__style ?? {}
+    }
+
+    set style(value) {
+        this.__style = value
+    }
+}
+
+class SVGElement extends HtmlElement {
+    //
+}
+
+class ClassList {
+    constructor(str, element) {
+        this.list = new Set((str || "").split(" "))
+        this.element = element
+    }
+
+    // TODO: Hook this up to the rust backend
+    sync() {
+        this.element.class = Array.from(this.list).join(" ")
+    }
+
+    add(str) {
+        this.list.add(str)
+        this.sync()
+    }
+
+    toggle(str) {
+        if (this.list.has(str)) {
+            this.list.delete(str)
+        } else {
+            this.list.add(str)
+        }
+        this.sync()
+    }
+
+    get length() {
+        return this.list.length
+    }
+
+    [Symbol.iterator]() {
+        return this.list[Symbol.iterator]();
+    }
 }
 
 function nodeToElement(pair) {
@@ -134,9 +221,26 @@ function nodeToElement(pair) {
     return element
 }
 
+Object.defineProperty(globalThis, "HTMLElement", {
+    value: SVGElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+Object.defineProperty(globalThis, "SVGElement", {
+    value: SVGElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 globalThis.document = {
-    createElement(...args) {
-        return new HtmlElement(...args)
+    referrer: "",
+    createElement(tag, ...args) {
+        const element = tag === "svg" ? new SVGElement(tag, ...args) : new HtmlElement(tag, ...args)
+        const node_idx = core.ops.op_create_element(element.tag)
+        element.__node_idx = node_idx
+        return element
     },
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(id)
@@ -154,6 +258,12 @@ globalThis.document = {
         const nodes = core.ops.op_query_selector_all(selector)
         return nodes.map(nodeToElement)
     },
+    addEventListener(event, cb) {
+        // TODO: Implement this
+    },
+    createTextNode(text) {
+        return new TextNode(text)
+    }
 };
 
 Object.defineProperty(globalThis, "setTimeout", {
@@ -184,8 +294,21 @@ Object.defineProperty(globalThis, "clearInterval", {
   writable: true,
 });
 
-Object.defineProperty(globalThis, "location", {
-    value: location.locationDescriptor,
+Object.defineProperty(globalThis, "__init_location", {
+    value: location.setLocationHref,
+    enumerable: true,
+    configurable: true,
+    writable: true
+})
+Object.defineProperty(globalThis, "location", location.locationDescriptor)
+
+// TODO: Implement this
+function getComputedStyle() {
+    return {}
+}
+
+Object.defineProperty(globalThis, "getComputedStyle", {
+    value: getComputedStyle,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -196,6 +319,99 @@ Object.defineProperties(globalThis, {
     URLSearchParams: { value: url.URLSearchParams, configurable: true, writable: true },
     URLPattern: { value: urlPattern.URLPattern, configurable: true, writable: true },
 });
+
+// Poor mans storage
+// TODO: Sync this with file storage somewhere
+class Storage {
+    __STORE = {}
+
+    getItem(key) {
+        return this.__STORE[key]
+    }
+
+    setItem(key, value) {
+        this.__STORE[key] = value
+    }
+}
+
+Object.defineProperty(globalThis, "Storage", {
+    value: Storage,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "localStorage", {
+    value: new Storage(),
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "sessionStorage", {
+    value: new Storage(),
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+function matchMedia(selector) {
+    const matches = core.ops.op_media_query_matches(selector)
+    return {
+        media: selector,
+        matches,
+        onchange: null,
+    }
+}
+
+Object.defineProperty(globalThis, "matchMedia", {
+    value: matchMedia,
+    enumerable: true,
+    configurable: true,
+    writable: true
+})
+
+const navigator = {
+    // TODO: Don't hardcode this
+    platform: "Linux x86_64"
+}
+
+Object.defineProperty(globalThis, "navigator", {
+    value: navigator,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+// TODO: Implement this
+function addEventListener(event, cb) {
+
+}
+
+Object.defineProperty(globalThis, "addEventListener", {
+    value: addEventListener,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+// TODO: Implement this
+class History {
+    constructor() {
+        this.state = null
+    }
+
+    replaceState() {
+        this.state = null
+    }
+}
+
+Object.defineProperty(globalThis, "history", {
+    value: new History(),
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 globalThis.window = globalThis
 globalThis.self = globalThis

@@ -65,7 +65,9 @@ impl<'a> ToV8<'a> for Element {
         }
 
         let attrs_key = v8::String::new(scope, "attributes").unwrap();
-        object.set(scope, attrs_key.into(), attributes.into()).unwrap();
+        object
+            .set(scope, attrs_key.into(), attributes.into())
+            .unwrap();
 
         Ok(object.into())
     }
@@ -113,11 +115,12 @@ pub enum BuildPhase {
     Text,
     TagClosing,
     ScriptOpen,
+    CommentOpen,
 }
 
 #[derive(Debug)]
-pub struct HtmlParser<'a> {
-    input: &'a str,
+pub struct HtmlParser {
+    input: String,
     pub stage: BuildPhase,
     pub tag: String,
     value: String,
@@ -136,8 +139,8 @@ pub struct TraceItem {
 
 const UNIQUE_TAGS: [&str; 2] = ["script", "style"];
 
-impl<'a> HtmlParser<'a> {
-    pub fn new(input: &'a str) -> Self {
+impl HtmlParser {
+    pub fn new(input: String) -> Self {
         Self {
             input,
             tag: "".to_string(),
@@ -182,12 +185,10 @@ impl<'a> HtmlParser<'a> {
 
     fn create_node_from_state(&mut self) -> anyhow::Result<bool> {
         let node = match self.stage {
-            BuildPhase::Text => {
-                Node::Text(TextElement {
-                    text: self.tag.clone(),
-                    parent: self.node.clone(),
-                })
-            },
+            BuildPhase::Text => Node::Text(TextElement {
+                text: self.tag.clone(),
+                parent: self.node.clone(),
+            }),
             _ => Node::Element(Element {
                 tag: self.tag.clone(),
                 attributes: HashMap::new(),
@@ -228,12 +229,13 @@ impl<'a> HtmlParser<'a> {
     }
 
     pub fn parse(&mut self) -> anyhow::Result<()> {
-        let chars = self.input.chars();
+        let input = self.input.clone();
+        let chars = input.chars();
         for char in chars {
-            if self.traces.len() >= 1000 {
-                self.traces.pop_front();
+            if self.traces.len() >= 200 {
+                self.traces.pop_back();
             }
-            self.traces.push_back(TraceItem {
+            self.traces.push_front(TraceItem {
                 char,
                 tag: self.tag.clone(),
                 stage: self.stage.clone(),
@@ -288,6 +290,9 @@ impl<'a> HtmlParser<'a> {
                     BuildPhase::AttributeValueInside => {
                         self.value.push(char);
                     }
+                    BuildPhase::Text => {
+                        self.tag.push(char);
+                    }
                     _ => {}
                 },
                 '>' => match self.stage {
@@ -316,7 +321,7 @@ impl<'a> HtmlParser<'a> {
                         self.stage = BuildPhase::Start;
                         self.tag = "".to_string();
                     }
-                    BuildPhase::AttributeValue => {
+                    BuildPhase::AttributeName | BuildPhase::AttributeValue => {
                         self.close_attribute()?;
                         self.self_close_if_appropiate();
                         if self.curr_is_script() {
@@ -327,6 +332,12 @@ impl<'a> HtmlParser<'a> {
                         self.tag = "".to_string();
                         self.value = "".to_string();
                     }
+                    BuildPhase::CommentOpen => {
+                        // Comment is done, so go back to parsing
+                        // We don't really care about comments, so don't save it
+                        self.stage = BuildPhase::Start;
+                        self.tag.clear();
+                    },
                     _ => {}
                 },
                 '=' => match self.stage {
@@ -367,7 +378,13 @@ impl<'a> HtmlParser<'a> {
                         self.tag.push(char);
                     }
                     BuildPhase::Tag => {
-                        self.tag.push(char);
+                        // If this is the first char after entering the tag, and it's a !
+                        // that means this is actually a doctype/comment, so go into a separate stage
+                        if self.tag.is_empty() && char == '!' {
+                            self.stage = BuildPhase::CommentOpen;
+                        } else {
+                            self.tag.push(char);
+                        }
                     }
                     BuildPhase::TagDone | BuildPhase::AttributeName => {
                         self.stage = BuildPhase::AttributeName;
@@ -388,7 +405,7 @@ impl<'a> HtmlParser<'a> {
                             self.value.push(char);
                         }
                     }
-                    BuildPhase::Text => {
+                    BuildPhase::Text | BuildPhase::CommentOpen => {
                         self.tag.push(char);
                     }
                     _ => {}

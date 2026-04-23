@@ -81,19 +81,42 @@ pub struct CssParser<'a> {
 
 pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
     let parts = selector.split(" ");
-    parts.filter_map(|p| -> Option<ClassNamePart> {
-        if p.is_empty() {
-            return None;
-        }
-        let mut chars = p.chars();
-        match chars.nth(0).unwrap() {
-            '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
-            '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
-            ':' => Some(ClassNamePart::PseudoClass(chars.as_str().to_string())),
-            // This isn't entirely correct, there are ID matchers among other things, but we don't support those yet
-            _ => Some(ClassNamePart::Tag(p.to_string()))
-        }
-    }).collect()
+    parts
+        .filter_map(|p| -> Option<ClassNamePart> {
+            if p.is_empty() {
+                return None;
+            }
+            let mut chars = p.chars();
+            match chars.nth(0).unwrap() {
+                '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
+                '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
+                ':' => Some(ClassNamePart::PseudoClass(chars.as_str().to_string())),
+                // This isn't entirely correct, there are ID matchers among other things, but we don't support those yet
+                _ => Some(ClassNamePart::Tag(p.to_string())),
+            }
+        })
+        .collect()
+}
+
+pub fn parse_media_query_parts(mut name: &str) -> Vec<MediaQueryCriteria> {
+    name = name.strip_prefix("(").unwrap_or(&name);
+    name = name.strip_suffix(")").unwrap_or(&name);
+    let criterias: Vec<MediaQueryCriteria> = name
+        .split(",")
+        .map(|l| {
+            let trimmed = l.trim().to_string();
+            let parts: Vec<&str> = trimmed.split(":").collect();
+            if parts.len() == 2 {
+                MediaQueryCriteria {
+                    property: parts[0].trim().to_string(),
+                    value: parts[1].trim().to_string(),
+                }
+            } else {
+                panic!();
+            }
+        })
+        .collect();
+    criterias
 }
 
 impl<'a> CssParser<'a> {
@@ -118,25 +141,14 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_media_query_from_state(&mut self) {
-        let mut name = self.label.trim().strip_prefix("media").unwrap_or(&self.label).trim();
-        name = name.strip_prefix("(").unwrap_or(&name);
-        name = name.strip_suffix(")").unwrap_or(&name);
+        let name = self
+            .label
+            .trim()
+            .strip_prefix("media")
+            .unwrap_or(&self.label)
+            .trim();
 
-        let criterias: Vec<MediaQueryCriteria> = name
-            .split(",")
-            .map(|l| {
-                let trimmed = l.trim().to_string();
-                let parts: Vec<&str> = trimmed.split(":").collect();
-                if parts.len() == 2 {
-                    MediaQueryCriteria {
-                        property: parts[0].trim().to_string(),
-                        value: parts[1].trim().to_string(),
-                    }
-                } else {
-                    panic!();
-                }
-            })
-            .collect();
+        let criterias = parse_media_query_parts(name);
 
         self.nodes.push(Node::MediaQuery(MediaQuery {
             criterias,
@@ -153,7 +165,8 @@ impl<'a> CssParser<'a> {
             .map(|l| l.trim().to_string())
             .collect();
 
-        let name_parts: Vec<Vec<ClassNamePart>> = name.iter().map(|n| selector_to_parts(n)).collect();
+        let name_parts: Vec<Vec<ClassNamePart>> =
+            name.iter().map(|n| selector_to_parts(n)).collect();
 
         self.nodes.push(Node::ClassName(ClassName {
             name,
@@ -216,14 +229,12 @@ impl<'a> CssParser<'a> {
         let chars = self.input.trim().chars();
         for char in chars {
             match char {
-                '@' => {
-                    match self.stage {
-                        CssBuildPhase::Start | CssBuildPhase::Specifier => {
-                            self.stage = CssBuildPhase::MediaQuery;
-                        }
-                        _ => {
-                            panic!("Got @ at unexpected stage: {:?}", self.stage);
-                        }
+                '@' => match self.stage {
+                    CssBuildPhase::Start | CssBuildPhase::Specifier => {
+                        self.stage = CssBuildPhase::MediaQuery;
+                    }
+                    _ => {
+                        panic!("Got @ at unexpected stage: {:?}", self.stage);
                     }
                 },
                 '.' | '#' => {
