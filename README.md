@@ -1,2 +1,5 @@
-# HTML and CSS engine written in Rust, capable of rendering complete websites that do not rely on JS.
-# WIP
+# [WIP] Browser written in Rust
+- Handwritten HTML and CSS engine
+- Deno as JS runtime
+- resvg for SVG rendering
+- ab_glyph for font rendering (Only Inter supported for now)
