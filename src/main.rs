@@ -623,7 +623,8 @@ fn op_create_element(state: &mut OpState, #[number] #[string] tag: String) -> Re
 
 #[op2]
 #[serde]
-fn op_append_child(state: &mut OpState, #[number] node_idx: usize, #[string] tag: String, #[serde] attrs: HashMap<String, String>, #[string] inner_html: Option<String>) -> Result<(), JsError> {
+// TODO: Implement before_reference_idx
+fn op_append_child(state: &mut OpState, #[number] node_idx: usize, #[string] tag: String, #[serde] attrs: HashMap<String, String>, #[string] inner_html: Option<String>, #[number] before_reference_idx: Option<usize>) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     host.renderer.borrow_mut().append_element_child(node_idx, tag, attrs, inner_html)?;
     host.proxy.send_event(UserEvent::DomUpdated).unwrap();
@@ -715,11 +716,27 @@ fn op_media_query_matches(state: &mut OpState, #[string] query: String) -> Resul
     Ok(matches)
 }
 
-#[op2(fast)]
-fn op_has_child_nodes(state: &mut OpState, #[number] node_idx: usize) -> Result<bool, JsError> {
+#[op2]
+fn op_get_child_nodes(state: &mut OpState, #[number] node_idx: usize) -> Result<Vec<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
-    Ok(renderer.children_index.get(&node_idx).unwrap().len() > 0)
+    let children: Vec<(usize, Node)> = renderer
+        .children_index
+        .get(&node_idx)
+        .unwrap()
+        .iter()
+        .map(|idx| (*idx, renderer.nodes.get(idx).unwrap().clone()))
+        .collect();
+    Ok(children)
+}
+
+#[op2]
+fn op_get_parent_node(state: &mut OpState, #[number] node_idx: usize) -> Result<(usize, Node), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow_mut();
+    let parent_idx = renderer.nodes.get(&node_idx).unwrap().get_parent().unwrap();
+    let parent = (parent_idx, renderer.nodes.get(&parent_idx).unwrap().clone());
+    Ok(parent)
 }
 
 // This should walk the tree to be fully correct I think
@@ -750,7 +767,8 @@ extension!(
     op_create_element,
     op_append_child,
     op_remove_child,
-    op_has_child_nodes,
+    op_get_child_nodes,
+    op_get_parent_node,
     op_append_text_child,
     op_get_element_by_id,
     op_get_elements_by_tag_name,
@@ -1579,7 +1597,7 @@ impl Renderer {
     fn layout_flex(
         &mut self,
         node_idx: usize,
-        mut cursor: Position,
+        cursor: Position,
         style: &Style,
         available_size: Size,
         forced_size: OptionalSize,
@@ -1590,11 +1608,11 @@ impl Renderer {
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
             self.get_paddings(node_idx, style, available_size);
 
-        let original_cursor = cursor.clone();
-        let content_position = Position {
+        let mut content_position = Position {
             x: cursor.x + padding_left_size as i32,
             y: cursor.y + padding_top_size as i32,
         };
+        let original_content_cursor = content_position.clone();
         let mut base_items = Vec::new();
         let mut children = Vec::new();
 
@@ -1733,19 +1751,19 @@ impl Renderer {
         let (width, mut height) = match style.flex_direction {
             StyleFlexDirection::Row => {
                 let mut max_child_height = 0u32;
-                cursor.x = content_position.x + main_start_offset as i32;
+                content_position.x = original_content_cursor.x + main_start_offset as i32;
 
                 let mut children_rows = MarginRows::new();
 
                 for (item_idx, item) in base_items.iter().enumerate() {
                     let cross_offset = self.calculate_cross_offset(&item, &style, has_definite_height, allow_fill, &container_sizes);
                     // Re-compute cursor for each child so that align-self works
-                    cursor.y = original_cursor.y + cross_offset as i32;
+                    content_position.y = original_content_cursor.y + cross_offset as i32;
 
                     let last = item_idx == base_items.len() - 1;
                     if let Some(child) = self.layout_node(
                         item.node_idx,
-                        cursor,
+                        content_position,
                         Size {
                             width: item.target_size as u32,
                             height: container_sizes.inner_height,
@@ -1761,11 +1779,11 @@ impl Renderer {
                         let child_box = self.layout_table.get(&child).unwrap();
                         let child_style = &self.node_styles.get(&item.node_idx).unwrap();
                         if !child_style.position.is_free() {
-                            cursor.x += child_box.rect.width as i32 + child_box.rect.margin_right;
+                            content_position.x += child_box.rect.width as i32 + child_box.rect.margin_right;
                             children_rows.last_row(child, cross_offset as i32);
                             // Don't add gap for last item
                             if !last {
-                                cursor.x += main_gap as i32;
+                                content_position.x += main_gap as i32;
                             }
                             max_child_height = max_child_height.max(child_box.rect.height);
                         }
@@ -1783,7 +1801,7 @@ impl Renderer {
 
                 // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
                 let wants_to_fill = style.display != StyleDisplay::InlineFlex;
-                let width = if allow_fill && wants_to_fill { container_sizes.container_width } else { container_sizes.compute_actual_container_width((cursor.x - content_position.x) as u32) };
+                let width = if allow_fill && wants_to_fill { container_sizes.container_width } else { container_sizes.compute_actual_container_width((content_position.x - original_content_cursor.x) as u32) };
 
                 // Margin: auto
                 let free_space_y = (container_sizes.inner_height as i32 - max_child_height as i32).max(0) as u32;
@@ -1792,19 +1810,19 @@ impl Renderer {
                 (width, height)
             }
             StyleFlexDirection::Column => {
-                cursor.y = content_position.y + main_start_offset as i32;
+                content_position.y = original_content_cursor.y + main_start_offset as i32;
 
                 let mut max_affecting_child_width = 0;
                 let mut children_rows = MarginRows::new();
 
                 for (item_idx, item) in base_items.iter().enumerate() {
                     let cross_offset = self.calculate_cross_offset(&item, &style, has_definite_height, allow_fill, &container_sizes);
-                    cursor.x = original_cursor.x + cross_offset as i32;
+                    content_position.x = original_content_cursor.x + cross_offset as i32;
 
                     let last = item_idx == base_items.len() - 1;
                     if let Some(child) = self.layout_node(
                         item.node_idx,
-                        cursor,
+                        content_position,
                         Size {
                             width: container_sizes.inner_width,
                             height: item.target_size as u32,
@@ -1821,18 +1839,18 @@ impl Renderer {
                         let child_style = &self.node_styles.get(&item.node_idx).unwrap();
                         if !child_style.position.is_free() {
                             max_affecting_child_width = max_affecting_child_width.max(child_box.rect.width);
-                            cursor.y += child_box.rect.height as i32 + child_box.rect.margin_bottom;
+                            content_position.y += child_box.rect.height as i32 + child_box.rect.margin_bottom;
                             children_rows.new_row(child, cross_offset as i32);
                             // Don't add gap for last item
                             if !last {
-                                cursor.y += main_gap as i32;
+                                content_position.y += main_gap as i32;
                             }
                         }
                         children.push(child);
                     }
                 }
 
-                let content_height = (cursor.y - content_position.y).max(0);
+                let content_height = (content_position.y - original_content_cursor.y).max(0);
                 let height = specified_height.unwrap_or_else(|| {
                     if children.is_empty() {
                         (padding_top_size + padding_bottom_size) as u32
@@ -2543,7 +2561,8 @@ impl Browser {
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("http://localhost:5173".to_string());
+    let mut browser = Browser::new("https://vite.dev".to_string());
+    // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {

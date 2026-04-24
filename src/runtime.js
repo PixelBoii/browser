@@ -73,6 +73,7 @@ class TextNode {
 class HtmlElement {
     constructor(tag) {
         this.tag = tag
+        this.namespaceURI = "http://www.w3.org/1999/xhtml"
     }
 
     addEventListener(event, cb) {
@@ -94,22 +95,28 @@ class HtmlElement {
 
         if (element instanceof TextNode) {
             core.ops.op_append_text_child(this.__node_idx, element.text)
+        } else if (element instanceof CommentNode) {
+            return
         } else {
-            let attributes = {}
-
-            for (const attr in ELEMENT_ATTRIBUTES) {
-                if (element[attr] !== null && element[attr] !== undefined) {
-                    attributes[attr] = element[attr]
-                }
-            }
-            attributes = Object.fromEntries(Object.entries(attributes).filter(([k, v]) => v))
-
-            core.ops.op_append_child(this.__node_idx, element.tag, attributes, element.innerHTML || element.textContent)
+            core.ops.op_append_child(this.__node_idx, element.tag, element.getPassableAttributes(), element.innerHTML || element.textContent, null)
         }
     }
 
+    getPassableAttributes() {
+        let attributes = {}
+
+        for (const attr in ELEMENT_ATTRIBUTES) {
+            if (this[attr] !== null && this[attr] !== undefined) {
+                attributes[attr] = this[attr]
+            }
+        }
+        attributes = Object.fromEntries(Object.entries(attributes).filter(([k, v]) => v))
+
+        return attributes
+    }
+
     hasChildNodes() {
-        return core.ops.op_has_child_nodes(this.__node_idx)
+        return core.ops.op_get_child_nodes(this.__node_idx).length > 0
     }
 
     removeChild(element) {
@@ -122,6 +129,20 @@ class HtmlElement {
         }
     }
 
+    insertBefore(newNode, referenceNode) {
+        if (!newNode) {
+            throw new TypeError("insertBefore called without newNode")
+        }
+        if (newNode instanceof TextNode) {
+            // TODO: Pass along referenceNode here
+            core.ops.op_append_text_child(this.__node_idx, newNode.text)
+        } else if (newNode instanceof CommentNode) {
+            return
+        } else {
+            core.ops.op_append_child(this.__node_idx, newNode.tag, newNode.getPassableAttributes(), newNode.innerHTML || newNode.textContent, referenceNode?.__node_idx)
+        }
+    }
+
     getAttribute(attr) {
         return this[attr]
     }
@@ -130,13 +151,39 @@ class HtmlElement {
         this[attr] = value
     }
 
+    removeAttribute(attr) {
+        this[attr] = undefined
+    }
+
+    hasAttribute(attr) {
+        return !!this[attr]
+    }
+
     // TODO: Implement this
     getComputedStyle() {
         return {}
     }
 
+    get tagName() {
+        return this.tag.toUpperCase()
+    }
+
     get innerHTML() {
         return this._innerHTML
+    }
+
+    get parentNode() {
+        const parent = core.ops.op_get_parent_node(this.__node_idx)
+        return nodeToElement(parent)
+    }
+
+    get firstChild() {
+        const children = core.ops.op_get_child_nodes(this.__node_idx)
+        return children.length > 0 ? nodeToElement(children[0]) : null
+    }
+
+    get nodeType() {
+        return 1
     }
 
     set innerHTML(value) {
@@ -173,7 +220,24 @@ class HtmlElement {
 }
 
 class SVGElement extends HtmlElement {
-    //
+    constructor(tag) {
+        super(tag)
+
+        this.namespaceURI = "http://www.w3.org/2000/svg"
+    }
+}
+
+class TemplateElement extends HtmlElement {
+    // TODO: Actually return a fragment of children here
+    get content() {
+        return this
+    }
+}
+
+class CommentNode {
+    constructor(data) {
+        this.data = data
+    }
 }
 
 class ClassList {
@@ -236,11 +300,19 @@ Object.defineProperty(globalThis, "SVGElement", {
 
 globalThis.document = {
     referrer: "",
+    createElementNS(ns, tag) {
+        const element = this.createElement(tag)
+        element.namespaceURI = ns
+        return element
+    },
     createElement(tag, ...args) {
-        const element = tag === "svg" ? new SVGElement(tag, ...args) : new HtmlElement(tag, ...args)
+        const element = tag === "svg" ? new SVGElement(tag, ...args) : tag === "template" ? new TemplateElement(tag, ...args) : new HtmlElement(tag, ...args)
         const node_idx = core.ops.op_create_element(element.tag)
         element.__node_idx = node_idx
         return element
+    },
+    createComment(data) {
+        return new CommentNode(data)
     },
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(id)
