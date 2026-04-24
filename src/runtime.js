@@ -98,7 +98,7 @@ class HtmlElement {
         } else if (element instanceof CommentNode) {
             return
         } else {
-            core.ops.op_append_child(this.__node_idx, element.tag, element.getPassableAttributes(), element.innerHTML || element.textContent, null)
+            core.ops.op_append_child(this.__node_idx, element.__node_idx)
         }
     }
 
@@ -139,7 +139,7 @@ class HtmlElement {
         } else if (newNode instanceof CommentNode) {
             return
         } else {
-            core.ops.op_append_child(this.__node_idx, newNode.tag, newNode.getPassableAttributes(), newNode.innerHTML || newNode.textContent, referenceNode?.__node_idx)
+            core.ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
         }
     }
 

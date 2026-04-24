@@ -31,6 +31,13 @@ impl Node {
             Node::Text(element) => element.parent,
         }
     }
+
+    pub fn set_parent(&mut self, parent: Option<usize>) {
+        match self {
+            Node::Element(element) => element.parent = parent,
+            Node::Text(element) => element.parent = parent,
+        }
+    }
 }
 
 fn set_object_prop<'a, 'i, T>(

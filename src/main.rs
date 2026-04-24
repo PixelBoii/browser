@@ -624,9 +624,10 @@ fn op_create_element(state: &mut OpState, #[number] #[string] tag: String) -> Re
 #[op2]
 #[serde]
 // TODO: Implement before_reference_idx
-fn op_append_child(state: &mut OpState, #[number] node_idx: usize, #[string] tag: String, #[serde] attrs: HashMap<String, String>, #[string] inner_html: Option<String>, #[number] before_reference_idx: Option<usize>) -> Result<(), JsError> {
+fn op_append_child(state: &mut OpState, #[number] parent_idx: usize, #[number] node_idx: usize, #[number] before_reference_idx: Option<usize>) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
-    host.renderer.borrow_mut().append_element_child(node_idx, tag, attrs, inner_html)?;
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.nodes.get_mut(&node_idx).unwrap().set_parent(Some(parent_idx));
     host.proxy.send_event(UserEvent::DomUpdated).unwrap();
     Ok(())
 }
@@ -1107,7 +1108,7 @@ impl Renderer {
 
         match self.nodes.get(&node_idx).unwrap().clone() {
             Node::Text(text) => {
-                let text = collapse_whitespace(&text.text).unwrap();
+                let text = collapse_whitespace(&text.text).unwrap_or("".to_string());
                 let renderable_text = self.font_handler
                     .get_renderable_text(text.clone(), resolved_font_size)
                     .inspect_err(|err| println!("Failed to get renderable text for {} {:?}", text, err))
@@ -2077,14 +2078,6 @@ impl Renderer {
                 None
             }
         }
-    }
-
-    pub fn append_element_child(&mut self, node_idx: usize, tag: String, attributes: HashMap<String, String>, inner_html: Option<String>) -> Result<(), JsError> {
-        self.push_node(Node::Element(Element { tag, attributes, parent: Some(node_idx) }));
-        if let Some(html) = inner_html {
-            self.create_children_from_html(self.node_idx_cursor, html);
-        }
-        Ok(())
     }
 
     pub fn append_text_child(&mut self, node_idx: usize, text: String) {
