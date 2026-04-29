@@ -28,6 +28,8 @@ pub enum StyleSize {
     Em(f32),
     Rem(f32),
     Percent(f32),
+    Vh(i32),
+    Svh(i32),
     Calc(Vec<CalcExpression>),
 }
 
@@ -427,8 +429,21 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .trim();
         return Ok(StyleSize::Percent(parse_size_number(percentage)? as f32));
     }
-    // TODO: Better handle commas later
-    if value.ends_with("px") && !value.contains(",") {
+    if value.ends_with("svh") {
+        let svh = value
+            .strip_suffix("svh")
+            .with_context(|| "Failed to strip svh")?
+            .trim();
+        return Ok(StyleSize::Svh(parse_size_number(svh)? as i32));
+    }
+    if value.ends_with("vh") {
+        let vh = value
+            .strip_suffix("vh")
+            .with_context(|| "Failed to strip vh")?
+            .trim();
+        return Ok(StyleSize::Vh(parse_size_number(vh)? as i32));
+    }
+    if value.ends_with("px") {
         let px = value
             .strip_suffix("px")
             .with_context(|| "Failed to strip px")?
@@ -558,7 +573,7 @@ pub fn class_part_matches_element(
             parts.iter().all(|p| class_part_matches_element(element, element_classes, p))
         },
         // TODO: Implement this completely
-        ClassNamePart::ArrowRight => true,
+        ClassNamePart::ArrowRight | ClassNamePart::Ampersand => true,
     }
 }
 

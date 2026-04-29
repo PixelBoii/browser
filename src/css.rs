@@ -19,6 +19,7 @@ pub enum ClassNamePart {
     Tag(String),
     Combined(Vec<ClassNamePart>),
     ArrowRight,
+    Ampersand,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +236,7 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                     ':' => Some(ClassNamePart::PseudoClass(chars.as_str().to_string())),
                     '[' => parse_selector_with_attributes(chars.as_str()),
                     '>' => Some(ClassNamePart::ArrowRight),
+                    '&' => Some(ClassNamePart::Ampersand),
                     _ => Some(ClassNamePart::Tag(cond.clone())),
                 };
                 match parsed {

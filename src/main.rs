@@ -47,10 +47,10 @@ struct RectBorderSide {
 }
 
 impl RectBorderSide {
-    pub fn parse_from_style(style: &StyleSizeAndColor, font_size: u32, available_size: &Size) -> Option<RectBorderSide> {
+    pub fn parse_from_style(style: &StyleSizeAndColor, font_size: u32, available_size: &Size, window_size: &PhysicalSize<u32>) -> Option<RectBorderSide> {
         match style.style {
             StyleBorderStyle::Solid => Some(Self {
-                size: get_specified_size(font_size, &style.size, Some(available_size.width), None)? as u32,
+                size: get_specified_size(font_size, &style.size, Some(available_size.width), None, window_size)? as u32,
                 color: match style.color {
                     StyleBackground::Hex(hex) => hex,
                     StyleBackground::Transparent => 0xFF_FF_FF_00,
@@ -232,15 +232,15 @@ impl ContainingNode {
             let style = renderer.node_styles.get(&waiter.node_idx).unwrap().clone();
             let mut forced_size = OptionalSize { height: None, width: None };
             let resolved_parent_font_size = renderer.get_parent_font_size(waiter.node_idx);
-            let font_size = get_specified_size(resolved_parent_font_size, &style.font_size, Some(resolved_parent_font_size), None).with_context(|| "Failed to get specific size")? as u32;
+            let font_size = get_specified_size(resolved_parent_font_size, &style.font_size, Some(resolved_parent_font_size), None, &renderer.window_size).with_context(|| "Failed to get specific size")? as u32;
             renderer.resolved_font_sizes.insert(waiter.node_idx, font_size as u32);
-            let top = get_specified_size(font_size, &style.top, Some(waiter.available_size.height), None);
-            let right = get_specified_size(font_size, &style.right, Some(waiter.available_size.width), None);
-            let bottom = get_specified_size(font_size, &style.bottom, Some(waiter.available_size.height), None);
-            let left = get_specified_size(font_size, &style.left, Some(waiter.available_size.width), None);
+            let top = get_specified_size(font_size, &style.top, Some(waiter.available_size.height), None, &renderer.window_size);
+            let right = get_specified_size(font_size, &style.right, Some(waiter.available_size.width), None, &renderer.window_size);
+            let bottom = get_specified_size(font_size, &style.bottom, Some(waiter.available_size.height), None, &renderer.window_size);
+            let left = get_specified_size(font_size, &style.left, Some(waiter.available_size.width), None, &renderer.window_size);
 
-            let margin_right = get_specified_size(font_size, &style.margin_right, Some(waiter.available_size.width), None);
-            let margin_left = get_specified_size(font_size, &style.margin_left, Some(waiter.available_size.width), None);
+            let margin_right = get_specified_size(font_size, &style.margin_right, Some(waiter.available_size.width), None, &renderer.window_size);
+            let margin_left = get_specified_size(font_size, &style.margin_left, Some(waiter.available_size.width), None, &renderer.window_size);
 
             if style.position == StylePosition::Absolute && style.width == StyleSize::Auto && left.is_some() && right.is_some() {
                 forced_size.width = Some((width as i32 - left.unwrap() - right.unwrap()) as u32);
@@ -269,6 +269,9 @@ impl ContainingNode {
                         renderer.move_entire_box(layout_idx, move_by, 0);
                     } else if left.is_some() {
                         renderer.move_entire_box(layout_idx, left.unwrap() - margin_left.unwrap_or(0), 0);
+                    } else if style.margin_left == StyleSize::Auto && style.margin_right == StyleSize::Auto {
+                        let free_space = width.saturating_sub(waiter_layout_box.rect.width);
+                        renderer.move_entire_box(layout_idx, (free_space / 2) as i32, 0);
                     }
 
                     if top.is_some() && bottom.is_some() {
@@ -301,6 +304,7 @@ fn get_specified_size(
     value: &StyleSize,
     available_size: Option<u32>,
     auto_size: Option<i32>,
+    window_size: &PhysicalSize<u32>
 ) -> Option<i32> {
     match value {
         StyleSize::Auto => auto_size,
@@ -313,10 +317,12 @@ fn get_specified_size(
             }
         }
         StyleSize::Px(px) => Some(*px),
+        StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
+        StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         // TODO: Make this handle order of operations
         StyleSize::Calc(calc) => {
             let mut value = match &calc[0] {
-                CalcExpression::Size(size) => get_specified_size(font_size, &size, available_size, auto_size)?,
+                CalcExpression::Size(size) => get_specified_size(font_size, &size, available_size, auto_size, window_size)?,
                 _ => panic!("Expected first calc expression to be value"),
             };
             let mut exp_idx = 1;
@@ -326,7 +332,7 @@ fn get_specified_size(
                     _ => panic!("Expected calc expression to be operator"),
                 };
                 let loop_value = match &calc[exp_idx + 1] {
-                    CalcExpression::Size(size) => get_specified_size(font_size, &size, available_size, auto_size)?,
+                    CalcExpression::Size(size) => get_specified_size(font_size, &size, available_size, auto_size, window_size)?,
                     _ => panic!("Expected calc expression to be size"),
                 };
                 value = match loop_operator {
@@ -568,6 +574,7 @@ fn compute_node_style(
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
+    window_size: &PhysicalSize<u32>,
 ) {
     let mut variables = parent_variables.clone();
     let style = match &nodes.get(&node_idx).unwrap() {
@@ -575,7 +582,7 @@ fn compute_node_style(
         node => get_base_style(node, parent_style),
     };
 
-    let resolved_font_size = get_specified_size(parent_font_size.unwrap_or(16), &style.font_size, Some(parent_font_size.unwrap_or(16)), None).unwrap_or_else(|| {
+    let resolved_font_size = get_specified_size(parent_font_size.unwrap_or(16), &style.font_size, Some(parent_font_size.unwrap_or(16)), None, window_size).unwrap_or_else(|| {
         println!("Failed to get font size for node idx {}", node_idx);
         16
     });
@@ -596,6 +603,7 @@ fn compute_node_style(
             Some(resolved_font_size as u32),
             collected_class_nodes,
             css_children_index,
+            window_size,
         );
     }
 }
@@ -610,19 +618,20 @@ fn parse_css_nodes(css_nodes: &Vec<String>) -> Result<Vec<CssNode>> {
 
 fn move_up_ancestor_chain(
     element: usize,
-    html_nodes: &HashMap<usize, Node>,
+    html_nodes: &HashMap<usize, &Node>,
     css_nodes: &Vec<(usize, &CssNode)>,
     class_elements: &HashMap<String, HashSet<usize>>, 
     css_node: &CssNode,
     window_size: &PhysicalSize<u32>,
     require_immediate_match: bool,
+    walk_up_parent: bool,
 ) -> bool {
     let parent = css_node.get_parent();
     if let Some(parent) = parent {
         let parent_node = css_nodes[parent].1;
         // Media queries should not cause a walk up a HTML parent
         // I think this happens at the right time, but might be worth double-checking later
-        let walk_up_html_parent_immediately = if let CssNode::MediaQuery(_) = parent_node { false } else { true };
+        let walk_up_html_parent_immediately = walk_up_parent && if let CssNode::MediaQuery(_) = parent_node { false } else { true };
         if let CssNode::ClassName(parent_node_class) = parent_node {
             let mut is_match = false;
             let el = if walk_up_html_parent_immediately { get_parent_html_idx(element, html_nodes) } else { Some(element) };
@@ -649,7 +658,7 @@ fn move_up_ancestor_chain(
 fn move_up_class_part(
     element: usize,
     css_nodes: &Vec<(usize, &CssNode)>,
-    html_nodes: &HashMap<usize, Node>,
+    html_nodes: &HashMap<usize, &Node>,
     class_elements: &HashMap<String, HashSet<usize>>,
     parts: &Vec<ClassNamePart>,
     css_node: usize,
@@ -662,7 +671,7 @@ fn move_up_class_part(
     let node = css_nodes[css_node].1;
     // If we've reached the beginning, that means this node is done, so move up the chain
     if nested_part_idx == parts.len() - 1 {
-        return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, require_immediate_match);
+        return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, require_immediate_match, walk_up_parent);
     } else {
         let walk_el = if walk_up_parent { get_parent_html_idx(element, html_nodes) } else { Some(element) };
         if let Some(walk_el) = walk_el {
@@ -673,7 +682,7 @@ fn move_up_class_part(
     }
 }
 
-fn walk_for_html_match<F>(element: usize, html_nodes: &HashMap<usize, Node>, match_fn: F, quota: Option<i32>) -> Option<usize>
+fn walk_for_html_match<F>(element: usize, html_nodes: &HashMap<usize, &Node>, match_fn: F, quota: Option<i32>) -> Option<usize>
 where
     F: Fn(usize) -> bool
 {
@@ -692,7 +701,7 @@ where
 fn element_matches_class_part(
     part: &ClassNamePart,
     element: usize,
-    html_nodes: &HashMap<usize, Node>,
+    html_nodes: &HashMap<usize, &Node>,
     class_elements: &HashMap<String, HashSet<usize>>,
 ) -> bool {
     match part {
@@ -709,7 +718,7 @@ fn element_matches_class_part(
                 _ => false,
             }
         },
-        ClassNamePart::ArrowRight => {
+        ClassNamePart::ArrowRight | ClassNamePart::Ampersand => {
             true
         },
         ClassNamePart::PseudoClass(class) => {
@@ -740,7 +749,7 @@ fn element_matches_class_part(
 fn narrow_elements_by_ancestors(
     element: usize,
     css_nodes: &Vec<(usize, &CssNode)>,
-    html_nodes: &HashMap<usize, Node>,
+    html_nodes: &HashMap<usize, &Node>,
     class_elements: &HashMap<String, HashSet<usize>>,
     css_node: usize,
     name_part_idx: usize,
@@ -757,6 +766,7 @@ fn narrow_elements_by_ancestors(
             let walk_result = walk_for_html_match(element, html_nodes, |idx| element_matches_class_part(part, idx, html_nodes, class_elements), walk_quota);
             let (walk_up_parent, require_immediate_match) = match part {
                 ClassNamePart::Class(_) | ClassNamePart::Id(_) | ClassNamePart::PseudoClass(_) | ClassNamePart::Tag(_) | ClassNamePart::Attributes(_) | ClassNamePart::Combined(_) => (true, false),
+                ClassNamePart::Ampersand => (false, require_immediate_match),
                 ClassNamePart::ArrowRight => (false, true),
             };
             if let Some(html_match) = walk_result {
@@ -767,7 +777,7 @@ fn narrow_elements_by_ancestors(
         },
         CssNode::MediaQuery(query) => {
             if media_query_matches(query, window_size) {
-                return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, false);
+                return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, false, true);
             } else {
                 return false;
             }
@@ -778,13 +788,13 @@ fn narrow_elements_by_ancestors(
     };
 }
 
-fn get_parent_html_idx(node_idx: usize, html_nodes: &HashMap<usize, Node>) -> Option<usize> {
+fn get_parent_html_idx(node_idx: usize, html_nodes: &HashMap<usize, &Node>) -> Option<usize> {
     html_nodes.get(&node_idx).unwrap().get_parent()
 }
 
 fn collect_class_nodes_for_elements(
     css_nodes: &Vec<(usize, &CssNode)>,
-    html_nodes: &HashMap<usize, Node>,
+    raw_html_nodes: &HashMap<usize, Node>,
     window_size: &PhysicalSize<u32>,
 ) -> HashMap<usize, Vec<usize>> {
     // All class names and media queries that have properties/children and need to be resolved
@@ -802,6 +812,16 @@ fn collect_class_nodes_for_elements(
             _ => {},
         };
     }
+
+    // Only walk through elements, text and comments can't match classes
+    let html_nodes: HashMap<usize, &Node> = raw_html_nodes
+        .into_iter()
+        .filter(|(_, value)| match value {
+            Node::Element(_) => true,
+            _ => false,
+        })
+        .map(|(key, value)| (key.clone(), value))
+        .collect();
 
     let mut class_elements: HashMap<String, HashSet<usize>> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
@@ -879,7 +899,7 @@ fn collect_class_nodes_for_elements(
 
                             let mut filtered_elements = HashSet::new();
                             for el in base_elements.into_iter() {
-                                let matched_all = rules_to_apply.iter().all(|part| element_matches_class_part(part, el, html_nodes, &class_elements));
+                                let matched_all = rules_to_apply.iter().all(|part| element_matches_class_part(part, el, &html_nodes, &class_elements));
                                 if matched_all {
                                     filtered_elements.insert(el);
                                 }
@@ -907,10 +927,10 @@ fn collect_class_nodes_for_elements(
                         for el in elements.to_owned() {
                             // If there's only a single part, we've already completed this class name by doing the last one
                             let is_match = if parts.len() == 1 {
-                                move_up_ancestor_chain(el, html_nodes, css_nodes, &class_elements, node, window_size, false)
+                                move_up_ancestor_chain(el, &html_nodes, css_nodes, &class_elements, node, window_size, false, true)
                             } else {
-                                if let Some(parent_el) = get_parent_html_idx(el, html_nodes) {
-                                    narrow_elements_by_ancestors(parent_el, css_nodes, html_nodes, &class_elements, css_node_idx, name_part_idx, 1, window_size, false)
+                                if let Some(parent_el) = get_parent_html_idx(el, &html_nodes) {
+                                    narrow_elements_by_ancestors(parent_el, css_nodes, &html_nodes, &class_elements, css_node_idx, name_part_idx, 1, window_size, false)
                                 } else {
                                     false
                                 }
@@ -935,7 +955,7 @@ fn collect_class_nodes_for_elements(
 
                     for el in elements {
                         // If there's only a single part, we've already completed this class name by doing the last one
-                        let is_match = move_up_ancestor_chain(*el, html_nodes, css_nodes, &class_elements, node, window_size, false);
+                        let is_match = move_up_ancestor_chain(*el, &html_nodes, css_nodes, &class_elements, node, window_size, false, true);
 
                         if is_match {
                             matches.entry(*el).or_default().push(css_node_idx);
@@ -983,6 +1003,7 @@ fn compute_node_styles(
         None,
         &collected_class_nodes,
         &css_children_index,
+        window_size,
     );
     (node_styles, resolved_font_sizes)
 }
@@ -1736,8 +1757,8 @@ impl Renderer {
                     }
                     let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
                     let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, &style);
-                    let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None).unwrap_or(available_size.height as i32) as u32;
-                    let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None).unwrap_or(available_size.width as i32) as u32;
+                    let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None, &self.window_size).unwrap_or(available_size.height as i32) as u32;
+                    let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None, &self.window_size).unwrap_or(available_size.width as i32) as u32;
                     let (pixmap, height, width) = match element.tag.as_str() {
                         "svg" => {
                             let mut svg_data = self.get_element_html(node_idx);
@@ -1848,10 +1869,10 @@ impl Renderer {
 
                     if let Some((width, height, children)) = layout {
                         let border = RectBorder {
-                            left: RectBorderSide::parse_from_style(&style.border_left, resolved_font_size as u32, &available_size),
-                            top: RectBorderSide::parse_from_style(&style.border_top, resolved_font_size as u32, &available_size),
-                            right: RectBorderSide::parse_from_style(&style.border_right, resolved_font_size as u32, &available_size),
-                            bottom: RectBorderSide::parse_from_style(&style.border_bottom, resolved_font_size as u32, &available_size),
+                            left: RectBorderSide::parse_from_style(&style.border_left, resolved_font_size as u32, &available_size, &self.window_size),
+                            top: RectBorderSide::parse_from_style(&style.border_top, resolved_font_size as u32, &available_size, &self.window_size),
+                            right: RectBorderSide::parse_from_style(&style.border_right, resolved_font_size as u32, &available_size, &self.window_size),
+                            bottom: RectBorderSide::parse_from_style(&style.border_bottom, resolved_font_size as u32, &available_size, &self.window_size),
                         };
 
                         Some(self.register_layout_box(LayoutBox {
@@ -1942,13 +1963,13 @@ impl Renderer {
 
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).unwrap();
 
-        let min_height = get_specified_size(*resolved_font_size, &style.min_height, Some(available_size.height), None)
+        let min_height = get_specified_size(*resolved_font_size, &style.min_height, Some(available_size.height), None, &self.window_size)
             .and_then(|v| Some(v as u32));
-        let max_height = get_specified_size(*resolved_font_size, &style.max_height, Some(available_size.height), None)
+        let max_height = get_specified_size(*resolved_font_size, &style.max_height, Some(available_size.height), None, &self.window_size)
             .and_then(|v| Some(v as u32));
-        let min_width = get_specified_size(*resolved_font_size, &style.min_width, Some(available_size.width), None)
+        let min_width = get_specified_size(*resolved_font_size, &style.min_width, Some(available_size.width), None, &self.window_size)
             .and_then(|v| Some(v as u32));
-        let max_width = get_specified_size(*resolved_font_size, &style.max_width, Some(available_size.width), None)
+        let max_width = get_specified_size(*resolved_font_size, &style.max_width, Some(available_size.width), None, &self.window_size)
             .and_then(|v| Some(v as u32));
 
         let specified_width = forced_size.width.or(get_specified_size(
@@ -1956,6 +1977,7 @@ impl Renderer {
             &style.width,
             Some(available_size.width),
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
         let specified_height = forced_size.height.or(get_specified_size(
@@ -1963,6 +1985,7 @@ impl Renderer {
             &style.height,
             Some(available_size.height),
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
         let container_width_non_filling = specified_width
@@ -2062,6 +2085,7 @@ impl Renderer {
             &style.height,
             containing_block_height,
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
         let specified_width = forced_size.width.or(get_specified_size(
@@ -2069,6 +2093,7 @@ impl Renderer {
             &style.width,
             containing_block_width,
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
         self.resolved_specified_heights.insert(node_idx, specified_height);
@@ -2215,6 +2240,7 @@ impl Renderer {
             &style.width,
             containing_block_width,
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
         let specified_height = forced_size.height.or(get_specified_size(
@@ -2222,6 +2248,7 @@ impl Renderer {
             &style.height,
             containing_block_height,
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
 
@@ -2413,6 +2440,7 @@ impl Renderer {
             &style.height,
             containing_block_height,
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32));
         let specified_width = get_specified_size(
@@ -2420,6 +2448,7 @@ impl Renderer {
             &style.width,
             containing_block_width,
             None,
+            &self.window_size,
         )
         .and_then(|v| Some(v as u32));
         let has_definite_height = forced_size.height.is_some() || specified_height.is_some();
@@ -2518,7 +2547,7 @@ impl Renderer {
         }
 
         // Justify-content
-        let authored_gap = get_specified_size(font_size, &style.gap, Some(flex_available_size), None).unwrap_or(0);
+        let authored_gap = get_specified_size(font_size, &style.gap, Some(flex_available_size), None, &self.window_size).unwrap_or(0);
         let gap_total = authored_gap.saturating_mul(base_items.len().saturating_sub(1) as i32);
 
         let used_main: u32 = base_items
@@ -2940,13 +2969,13 @@ impl Renderer {
     pub fn get_paddings(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let padding_left_size =
-            get_specified_size(font_size, &style.padding_left, Some(available_size.width), None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_left, Some(available_size.width), None, &self.window_size).unwrap_or(0);
         let padding_right_size =
-            get_specified_size(font_size, &style.padding_right, Some(available_size.width), None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_right, Some(available_size.width), None, &self.window_size).unwrap_or(0);
         let padding_top_size =
-            get_specified_size(font_size, &style.padding_top, Some(available_size.height), None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_top, Some(available_size.height), None, &self.window_size).unwrap_or(0);
         let padding_bottom_size =
-            get_specified_size(font_size, &style.padding_bottom, Some(available_size.height), None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_bottom, Some(available_size.height), None, &self.window_size).unwrap_or(0);
 
         (
             padding_left_size,
@@ -2959,13 +2988,13 @@ impl Renderer {
     pub fn get_border_sizes(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let left_size =
-            get_specified_size(font_size, &style.border_left.size, Some(available_size.width), None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_left.size, Some(available_size.width), None, &self.window_size).unwrap_or(0);
         let right_size =
-            get_specified_size(font_size, &style.border_right.size, Some(available_size.width), None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_right.size, Some(available_size.width), None, &self.window_size).unwrap_or(0);
         let top_size =
-            get_specified_size(font_size, &style.border_top.size, Some(available_size.height), None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_top.size, Some(available_size.height), None, &self.window_size).unwrap_or(0);
         let bottom_size =
-            get_specified_size(font_size, &style.border_bottom.size, Some(available_size.height), None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_bottom.size, Some(available_size.height), None, &self.window_size).unwrap_or(0);
 
         (
             left_size,
@@ -2978,13 +3007,13 @@ impl Renderer {
     pub fn get_margins(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let margin_left_size =
-            get_specified_size(font_size, &style.margin_left, Some(available_size.width), None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_left, Some(available_size.width), None, &self.window_size).unwrap_or(0);
         let margin_right_size =
-            get_specified_size(font_size, &style.margin_right, Some(available_size.width), None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_right, Some(available_size.width), None, &self.window_size).unwrap_or(0);
         let margin_top_size =
-            get_specified_size(font_size, &style.margin_top, Some(available_size.height), None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_top, Some(available_size.height), None, &self.window_size).unwrap_or(0);
         let margin_bottom_size =
-            get_specified_size(font_size, &style.margin_bottom, Some(available_size.height), None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_bottom, Some(available_size.height), None, &self.window_size).unwrap_or(0);
 
         (
             margin_left_size,
@@ -3383,7 +3412,8 @@ impl Browser {
             .get(&renderer.layout_roots[0])
             .and_then(|l| Some(l.rect.height))
             .unwrap_or(0);
-        renderer.scroll_y = ((renderer.scroll_y as f32 + y)).min(0.).max(-(root_height as f32)) as i32;
+        let size = self.window.as_ref().unwrap().inner_size();
+        renderer.scroll_y = ((renderer.scroll_y as f32 + y)).min(0.).max(-(root_height as f32 - size.height as f32)) as i32;
         if let Some(window) = self.window.as_mut() {
             window.request_redraw();
         }
@@ -3392,8 +3422,8 @@ impl Browser {
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    // let mut browser = Browser::new("https://vite.dev".to_string());
-    let mut browser = Browser::new("http://localhost:5173".to_string());
+    let mut browser = Browser::new("https://vite.dev".to_string());
+    // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
