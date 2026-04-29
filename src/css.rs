@@ -1,13 +1,24 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+use crate::style::{GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, parse_property_value};
 
 const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClassNamePartAttribute {
+    KeyValue((String, String)),
+    Key(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClassNamePart {
     Class(String),
     Id(String),
     PseudoClass(String),
+    Attributes(Vec<ClassNamePartAttribute>),
     Tag(String),
+    Combined(Vec<ClassNamePart>),
+    ArrowRight,
 }
 
 #[derive(Debug, Clone)]
@@ -25,22 +36,68 @@ pub struct MediaQuery {
 }
 
 #[derive(Debug, Clone)]
+pub enum MediaQueryCriteriaComparison {
+    Is,
+    MoreOrEqual,
+}
+
+#[derive(Debug, Clone)]
+pub enum MediaQueryCriteriaValue {
+    Px(f32),
+    Rem(f32),
+    String(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct MediaQueryCriteria {
     pub property: String,
-    pub value: String,
+    pub value: MediaQueryCriteriaValue,
+    pub comparison: MediaQueryCriteriaComparison,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BorderSideValue {
+    pub size: Option<StyleSize>,
+    pub color: Option<StyleBackground>,
+    pub style: Option<StyleBorderStyle>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyValue {
+    Raw(String),
+    Size(StyleSize),
+    Color(StyleBackground),
+    Display(StyleDisplay),
+    Position(StylePosition),
+    Align(StyleAlign),
+    Int(u32),
+    JustifyContent(StyleJustifyContent),
+    FlexDirection(StyleFlexDirection),
+    Flex {
+        grow: Option<u32>,
+        shrink: Option<u32>,
+    },
+    BorderStyle(StyleBorderStyle),
+    BorderSide(BorderSideValue),
+    CombinedSize((StyleSize, StyleSize, StyleSize, StyleSize)),
+    CombinedColor((StyleBackground, StyleBackground, StyleBackground, StyleBackground)),
+    VerticalCombinedSize((StyleSize, StyleSize)),
+    HorizontalCombinedSize((StyleSize, StyleSize)),
+    GridTemplateColumns(GridTemplateColumns),
 }
 
 #[derive(Debug, Clone)]
 pub struct Property {
     pub property: String,
-    pub value: String,
+    pub value: PropertyValue,
     pub parent: Option<usize>,
+    pub important: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Variable {
     pub variable: String,
-    pub value: String,
+    pub value: PropertyValue,
     pub parent: Option<usize>,
 }
 
@@ -77,43 +134,158 @@ pub struct CssParser<'a> {
     label: String,
     pub nodes: Vec<Node>,
     node: Option<usize>,
+    in_url: bool,
+}
+
+fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
+    let mut attributes = vec![];
+    while !rest.is_empty() {
+        let Some(attribute_end) = rest.find(&"]") else {
+            break;
+        };
+        let attribute = &rest[..attribute_end];
+        rest = &rest[(attribute_end + 2).min(rest.len())..];
+
+        let split: Vec<&str> = attribute.split("=").collect();
+        if split.len() == 2 {
+            let key = split[0];
+            let mut value = split[1];
+            value = value.trim();
+            value = value.strip_prefix("'").unwrap_or(value);
+            value = value.strip_suffix("'").unwrap_or(value);
+            value = value.strip_prefix("\"").unwrap_or(value);
+            value = value.strip_suffix("\"").unwrap_or(value);
+
+            attributes.push(ClassNamePartAttribute::KeyValue((key.to_string(), value.to_string())));
+        } else if split.len() == 1 {
+            let key = split[0];
+            attributes.push(ClassNamePartAttribute::Key(key.to_string()));
+        }
+    }
+
+    Some(ClassNamePart::Attributes(attributes))
+}
+
+mod tests {
+    use crate::css::{ClassNamePart, ClassNamePartAttribute};
+
+    use super::{parse_selector_with_attributes, selector_to_parts};
+
+    #[test]
+    fn test_parse_svg() {
+        assert_eq!(
+            parse_selector_with_attributes("input").unwrap(),
+            ClassNamePart::Tag("input".to_string()),
+        );
+        assert_eq!(
+            parse_selector_with_attributes("[type='submit']").unwrap(),
+            ClassNamePart::Attributes(vec![
+                ClassNamePartAttribute::KeyValue(("type".to_string(), "submit".to_string())),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_selector_to_parts_class() {
+        assert_eq!(selector_to_parts(&String::from(".foo")), vec![ClassNamePart::Class("foo".to_string())]);
+        assert_eq!(selector_to_parts(&String::from(".foo#bar")), vec![ClassNamePart::Combined(vec![ClassNamePart::Class("foo".to_string()), ClassNamePart::Id("bar".to_string())])]);
+        assert_eq!(selector_to_parts(&String::from("input[type='submit']")), vec![ClassNamePart::Combined(vec![
+            ClassNamePart::Tag("input".to_string()),
+            ClassNamePart::Attributes(vec![ClassNamePartAttribute::KeyValue(("type".to_string(), "submit".to_string()))]),
+        ])]);
+        assert_eq!(selector_to_parts(&String::from("input[type='submit'][haha=\"lol\"]")), vec![ClassNamePart::Combined(vec![
+            ClassNamePart::Tag("input".to_string()),
+            ClassNamePart::Attributes(vec![
+                ClassNamePartAttribute::KeyValue(("type".to_string(), "submit".to_string())),
+            ]),
+            ClassNamePart::Attributes(vec![
+                ClassNamePartAttribute::KeyValue(("haha".to_string(), "lol".to_string())),
+            ]),
+        ])]);
+    }
 }
 
 pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
-    let parts = selector.split(" ");
-    parts
+    let nested_parts = selector.split(" ");
+    nested_parts
         .filter_map(|p| -> Option<ClassNamePart> {
             if p.is_empty() {
                 return None;
             }
-            let mut chars = p.chars();
-            match chars.nth(0).unwrap() {
-                '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
-                '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
-                ':' => Some(ClassNamePart::PseudoClass(chars.as_str().to_string())),
-                // This isn't entirely correct, there are ID matchers among other things, but we don't support those yet
-                _ => Some(ClassNamePart::Tag(p.to_string())),
+            let mut conditions = vec![];
+            let mut buffer = String::new();
+            // Add : here later when we need to support hover etc., but also add support for escaping it at that time
+            let new_statement = ['.', '#', '['];
+            for char in p.chars() {
+                if buffer.len() > 0 && new_statement.contains(&char) {
+                    conditions.push(buffer.clone());
+                    buffer.clear();
+                }
+                buffer.push(char);
+            }
+            if buffer.len() > 0 {
+                conditions.push(buffer);
+            }
+            let mut parsed_conditions = vec![];
+            for cond in conditions {
+                let mut chars = cond.chars();
+                let parsed = match chars.nth(0).unwrap() {
+                    '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
+                    '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
+                    ':' => Some(ClassNamePart::PseudoClass(chars.as_str().to_string())),
+                    '[' => parse_selector_with_attributes(chars.as_str()),
+                    '>' => Some(ClassNamePart::ArrowRight),
+                    _ => Some(ClassNamePart::Tag(cond.clone())),
+                };
+                match parsed {
+                    Some(parsed) => parsed_conditions.push(parsed),
+                    None => println!("Failed to parse condition: {}", cond),
+                };
+            }
+            if parsed_conditions.len() > 1 {
+                Some(ClassNamePart::Combined(parsed_conditions))
+            } else if parsed_conditions.len() == 1 {
+                Some(parsed_conditions[0].clone())
+            } else {
+                None
             }
         })
         .collect()
 }
+
+const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 2] = [(MediaQueryCriteriaComparison::Is, ":"), (MediaQueryCriteriaComparison::MoreOrEqual, ">=")];
 
 pub fn parse_media_query_parts(mut name: &str) -> Vec<MediaQueryCriteria> {
     name = name.strip_prefix("(").unwrap_or(&name);
     name = name.strip_suffix(")").unwrap_or(&name);
     let criterias: Vec<MediaQueryCriteria> = name
         .split(",")
-        .map(|l| {
+        .filter_map(|l| {
             let trimmed = l.trim().to_string();
-            let parts: Vec<&str> = trimmed.split(":").collect();
-            if parts.len() == 2 {
-                MediaQueryCriteria {
-                    property: parts[0].trim().to_string(),
-                    value: parts[1].trim().to_string(),
+            for (comparison, separator) in MEDIA_QUERY_SEPARATORS {
+                let parts: Vec<&str> = trimmed.split(separator).collect();
+                if parts.len() == 2 {
+                    let mut value = MediaQueryCriteriaValue::String(parts[1].trim().to_string());
+                    if let Some(inner) = parts[1].trim().strip_suffix("px") {
+                        if let Ok(parsed) = inner.parse::<f32>() {
+                            value = MediaQueryCriteriaValue::Px(parsed);
+                        }
+                    }
+                    if let Some(inner) = parts[1].trim().strip_suffix("rem") {
+                        if let Ok(parsed) = inner.parse::<f32>() {
+                            value = MediaQueryCriteriaValue::Rem(parsed);
+                        }
+                    }
+
+                    return Some(MediaQueryCriteria {
+                        property: parts[0].trim().to_string(),
+                        value,
+                        comparison,
+                    });
                 }
-            } else {
-                panic!();
             }
+            println!("Invalid media query: {:?}", trimmed);
+            return None;
         })
         .collect();
     criterias
@@ -127,6 +299,7 @@ impl<'a> CssParser<'a> {
             label: String::new(),
             nodes: vec![],
             node: None,
+            in_url: false,
         }
     }
 
@@ -137,6 +310,7 @@ impl<'a> CssParser<'a> {
             label: String::new(),
             nodes: vec![],
             node: None,
+            in_url: false,
         }
     }
 
@@ -144,7 +318,7 @@ impl<'a> CssParser<'a> {
         let name = self
             .label
             .trim()
-            .strip_prefix("media")
+            .strip_prefix("@media")
             .unwrap_or(&self.label)
             .trim();
 
@@ -178,30 +352,35 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_property_from_state(&mut self) {
-        let parts: Vec<&str> = self.label.split(":").collect();
-        if parts.len() != 2 {
-            panic!("Failed to parse property: {}", self.label);
-        }
-        let mut value = parts[1];
+        let parts: (&str, &str) = self.label.split_once(":").with_context(|| format!("Failed to parse property: {}", self.label)).unwrap();
+        let mut value = parts.1;
         value = value.trim();
         value = value.strip_prefix("'").unwrap_or(value);
         value = value.strip_suffix("'").unwrap_or(value);
 
-        let name = parts[0].trim().to_string();
+        let name = parts.0.trim().to_string();
 
-        if name.starts_with("--") {
-            self.nodes.push(Node::Variable(Variable {
-                variable: name,
-                value: value.to_string(),
-                parent: self.node,
-            }));
-        } else {
-            self.nodes.push(Node::Property(Property {
-                property: name,
-                value: value.to_string(),
-                parent: self.node,
-            }));
-        }
+        let parse_result = parse_property_value(name.clone(), value.to_string());
+
+        match parse_result {
+            Ok((parsed, important)) => {
+                if name.starts_with("--") {
+                    self.nodes.push(Node::Variable(Variable {
+                        variable: name,
+                        value: parsed,
+                        parent: self.node,
+                    }));
+                } else {
+                    self.nodes.push(Node::Property(Property {
+                        property: name,
+                        value: parsed,
+                        parent: self.node,
+                        important,
+                    }));
+                }
+            },
+            Err(err) => println!("Failed to parse property value: {}", err),
+        };
 
         self.label.clear();
     }
@@ -231,10 +410,11 @@ impl<'a> CssParser<'a> {
             match char {
                 '@' => match self.stage {
                     CssBuildPhase::Start | CssBuildPhase::Specifier => {
+                        self.label.push(char);
                         self.stage = CssBuildPhase::MediaQuery;
                     }
-                    _ => {
-                        panic!("Got @ at unexpected stage: {:?}", self.stage);
+                    CssBuildPhase::MediaQuery => {
+                        self.label.push(char);
                     }
                 },
                 '.' | '#' => {
@@ -281,6 +461,9 @@ impl<'a> CssParser<'a> {
                         _ => {}
                     };
                 }
+                // Ignore escape character for now
+                '\\' => {},
+                // TODO: Handle hover and other states here
                 ':' => {
                     match self.stage {
                         CssBuildPhase::Start | CssBuildPhase::Specifier => {
@@ -294,11 +477,34 @@ impl<'a> CssParser<'a> {
                 }
                 ';' => {
                     match self.stage {
-                        CssBuildPhase::Specifier => {
+                        CssBuildPhase::Specifier if !self.in_url => {
                             self.create_property_from_state();
+                        }
+                        CssBuildPhase::MediaQuery => {
+                            self.label.push(char);
                         }
                         _ => {}
                     };
+                }
+                '(' => {
+                    match self.stage {
+                        CssBuildPhase::Specifier => {
+                            self.label.push(char);
+                            if self.label.ends_with("url(") {
+                                self.in_url = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                ')' => {
+                    match self.stage {
+                        CssBuildPhase::Specifier => {
+                            self.in_url = false;
+                            self.label.push(char);
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {
                     match self.stage {

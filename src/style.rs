@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
-use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node, Property};
+use crate::css::{BorderSideValue, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, Variable};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,8 +25,9 @@ pub enum CalcExpression {
 pub enum StyleSize {
     Auto,
     Px(i32),
-    Em(i32),
-    Percent(i32),
+    Em(f32),
+    Rem(f32),
+    Percent(f32),
     Calc(Vec<CalcExpression>),
 }
 
@@ -42,6 +44,7 @@ pub enum StyleDisplay {
     InlineBlock,
     InlineFlex,
     Flex,
+    Grid,
 }
 
 impl StyleDisplay {
@@ -58,6 +61,7 @@ pub enum StyleJustifyContent {
     Center,
     SpaceBetween,
     Stretch,
+    SpaceEvenly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,6 +105,24 @@ pub struct StyleSizeAndColor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum GridColumnSize {
+    Px(i32),
+    Fraction(i32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridTemplateColumnsValue {
+    MinMax((GridColumnSize, GridColumnSize)),
+    Size(GridColumnSize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridTemplateColumns {
+    Values(Vec<GridTemplateColumnsValue>),
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     pub width: StyleSize,
     pub height: StyleSize,
@@ -138,6 +160,7 @@ pub struct Style {
     pub border_top: StyleSizeAndColor,
     pub border_right: StyleSizeAndColor,
     pub border_bottom: StyleSizeAndColor,
+    pub grid_template_columns: GridTemplateColumns,
 }
 
 pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
@@ -189,7 +212,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
                     StyleBackground::Transparent
                 }
             }
-            HtmlNode::Text(_) => StyleBackground::Transparent,
+            HtmlNode::Text(_) | HtmlNode::Comment(_) => StyleBackground::Transparent,
         },
         display: match node {
             HtmlNode::Element(element) => match element.tag.as_str() {
@@ -209,6 +232,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
                 _ => StyleDisplay::Block,
             },
             HtmlNode::Text(_) => StyleDisplay::InlineBlock,
+            HtmlNode::Comment(_) => StyleDisplay::None,
         },
         flex_shrink: 1,
         flex_grow: 0,
@@ -247,6 +271,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
                     }
                 })
                 .unwrap_or(StyleBackground::Hex(0x00_00_00_FF)),
+            HtmlNode::Comment(_) => StyleBackground::Transparent,
         },
         min_height: StyleSize::Auto,
         max_height: StyleSize::Auto,
@@ -261,7 +286,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
                     implied_text_align
                 }
             }
-            HtmlNode::Text(_) => implied_text_align,
+            HtmlNode::Text(_) | HtmlNode::Comment(_) => implied_text_align,
         },
         variables: HashMap::new(),
         font_size: parent_style
@@ -274,16 +299,41 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
         border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
         border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
         border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
+        grid_template_columns: GridTemplateColumns::None,
     }
 }
 
-fn parse_combined_style_size(
-    value: String,
-) -> Result<(StyleSize, StyleSize, StyleSize, StyleSize)> {
+fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
     let values: Vec<StyleSize> = value
         .split(" ")
         .map(|s| parse_style_size(s.to_string()))
         .collect::<Result<Vec<StyleSize>>>()?;
+
+    match values.len() {
+        1 => Ok((
+            values[0].clone(),
+            values[0].clone(),
+        )),
+        2 => Ok((
+            values[0].clone(),
+            values[1].clone(),
+        )),
+        _ => Err(anyhow!("Failed to parse inline size {}", value)),
+    }
+}
+
+fn parse_combined_style<T, F>(
+    value: String,
+    parse: F,
+) -> Result<(T, T, T, T)>
+where
+    T: Clone,
+    F: Fn(String) -> Result<T>,
+{
+    let values: Vec<T> = split_space_ignoring_parentheses(value.clone())
+        .iter()
+        .map(|s| parse(s.to_string()))
+        .collect::<Result<Vec<T>>>()?;
 
     match values.len() {
         1 => Ok((
@@ -352,15 +402,13 @@ fn parse_calc(value: &str) -> Result<StyleSize> {
         }
     }
     flush_calc_value(&mut buffer, &mut parts)?;
-    println!("{} {:?}", value, parts);
     Ok(StyleSize::Calc(parts))
 }
 
-fn parse_size_number(value: &str) -> Result<i32> {
+fn parse_size_number(value: &str) -> Result<f32> {
     Ok(value
         .parse::<f32>()
-        .with_context(|| format!("Failed to parse size value: {}", value))?
-        .round() as i32)
+        .with_context(|| format!("Failed to parse size value: {}", value))?)
 }
 
 fn parse_style_size(value: String) -> Result<StyleSize> {
@@ -377,7 +425,7 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .strip_suffix("%")
             .with_context(|| "Failed to strip percentage")?
             .trim();
-        return Ok(StyleSize::Percent(parse_size_number(percentage)?));
+        return Ok(StyleSize::Percent(parse_size_number(percentage)? as f32));
     }
     // TODO: Better handle commas later
     if value.ends_with("px") && !value.contains(",") {
@@ -385,7 +433,7 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .strip_suffix("px")
             .with_context(|| "Failed to strip px")?
             .trim();
-        return Ok(StyleSize::Px(parse_size_number(px)?));
+        return Ok(StyleSize::Px(parse_size_number(px)? as i32));
     }
     if value.ends_with("pt") {
         let pt = value
@@ -393,12 +441,20 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .with_context(|| "Failed to strip pt")?
             .trim();
         let parsed = parse_size_number(pt)?;
-        return Ok(StyleSize::Px(parsed * 96 / 72));
+        return Ok(StyleSize::Px((parsed * 96. / 72.) as i32));
+    }
+    if value.ends_with("rem") {
+        let rem = value
+            .strip_suffix("rem")
+            .with_context(|| "Failed to strip rem")?
+            .trim();
+        let parsed = parse_size_number(rem)?;
+        return Ok(StyleSize::Rem(parsed));
     }
     if value.ends_with("em") {
         let em = value
             .strip_suffix("em")
-            .with_context(|| "Failed to strip pt")?
+            .with_context(|| "Failed to strip em")?
             .trim();
         let parsed = parse_size_number(em)?;
         return Ok(StyleSize::Em(parsed));
@@ -408,6 +464,27 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
     }
     println!("Failed to parse style value \"{}\"", value);
     Ok(StyleSize::Auto)
+}
+
+fn parse_grid_size(value: String) -> Result<GridColumnSize> {
+    if value.ends_with("px") {
+        let px = value
+            .strip_suffix("px")
+            .with_context(|| "Failed to strip px")?
+            .trim();
+        return Ok(GridColumnSize::Px(parse_size_number(px)? as i32));
+    }
+    if value.ends_with("fr") {
+        let fr = value
+            .strip_suffix("fr")
+            .with_context(|| "Failed to strip fr")?
+            .trim();
+        return Ok(GridColumnSize::Fraction(parse_size_number(fr)? as i32));
+    }
+    if let Ok(parsed) = value.parse::<i32>() {
+        return Ok(GridColumnSize::Px(parsed));
+    }
+    Err(anyhow!("Failed to parse style value \"{}\"", value))
 }
 
 fn get_inline_nodes(element: &HtmlElement) -> Result<Vec<Node>> {
@@ -422,14 +499,40 @@ fn get_inline_nodes(element: &HtmlElement) -> Result<Vec<Node>> {
     }
 }
 
-fn class_part_matches_element(
+pub fn element_matched_attributes(element: &HtmlElement, attributes: &Vec<ClassNamePartAttribute>) -> bool {
+    for attribute in attributes.iter() {
+        match attribute {
+            ClassNamePartAttribute::Key(key) => {
+                if !element.attributes.contains_key(key) {
+                    return false;
+                }
+            },
+            ClassNamePartAttribute::KeyValue((key, value)) => {
+                if let Some(stripped) = key.strip_suffix('*') {
+                    if element.attributes.get(stripped).is_none_or(|v| !v.contains(value)) {
+                        return false;
+                    }
+                } else {
+                    if element.attributes.get(key).is_none_or(|v| v != value) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+pub fn class_part_matches_element(
     element: &HtmlElement,
-    element_classes: &Vec<&str>,
+    element_classes: &HashSet<String>,
     part: &ClassNamePart,
 ) -> bool {
+    // TODO: Extend to IDs and more later on
     match part {
         // Normal class matching
-        ClassNamePart::Class(class) => element_classes.contains(&class.as_str()),
+        ClassNamePart::Class(class) => element_classes.contains(class),
         ClassNamePart::Id(id) => element
             .attributes
             .get(&"id".to_string())
@@ -441,46 +544,21 @@ fn class_part_matches_element(
                 _ => false,
             }
         }
-        // Tag matching, can be extended to IDs and more later on
         ClassNamePart::Tag(part) => {
             if *part == element.tag {
                 return true;
             }
 
-            // If it's a match but has more criteras, match those as well
-            let prefix = format!("{}[", element.tag);
-            let suffix = "]";
-            if part.starts_with(&prefix) && part.ends_with(&suffix) {
-                let stripped = part
-                    .strip_prefix(&prefix)
-                    .with_context(|| format!("Failed to parse {}", part))
-                    .unwrap()
-                    .strip_suffix(&suffix)
-                    .with_context(|| format!("Failed to parse {}", part))
-                    .unwrap();
-                // We only support one = for now
-                let split: Vec<&str> = stripped.split("=").collect();
-                if split.len() == 2 {
-                    let key = split[0];
-                    let mut value = split[1];
-                    value = value.trim();
-                    value = value.strip_prefix("'").unwrap_or(value);
-                    value = value.strip_suffix("'").unwrap_or(value);
-                    value = value.strip_prefix("\"").unwrap_or(value);
-                    value = value.strip_suffix("\"").unwrap_or(value);
-
-                    if element.attributes.get(key).is_some_and(|x| x == value) {
-                        return true;
-                    }
-                } else if split.len() == 1 {
-                    if element.attributes.contains_key(split[0]) {
-                        return true;
-                    }
-                }
-            }
-
             false
-        }
+        },
+        ClassNamePart::Attributes(attributes) => {
+            element_matched_attributes(element, attributes)
+        },
+        ClassNamePart::Combined(parts) => {
+            parts.iter().all(|p| class_part_matches_element(element, element_classes, p))
+        },
+        // TODO: Implement this completely
+        ClassNamePart::ArrowRight => true,
     }
 }
 
@@ -492,18 +570,11 @@ pub struct NodeMatchResult {
 
 pub fn class_matches_element(
     element: &HtmlElement,
+    element_classes: &HashSet<String>,
     class: &ClassName,
     node_idx: usize,
     partial_matches: &mut HashMap<(usize, usize), usize>,
 ) -> NodeMatchResult {
-    let empty_str = "".to_string();
-    let element_classes: Vec<&str> = element
-        .attributes
-        .get("class")
-        .unwrap_or(&empty_str)
-        .split(" ")
-        .collect();
-
     for (part_group_idx, parts) in class.name_parts.iter().enumerate() {
         let key = (node_idx, part_group_idx);
         let progress = partial_matches.get(&key).copied().unwrap_or(0);
@@ -538,7 +609,7 @@ pub fn class_matches_element(
     }
 }
 
-fn build_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, Vec<usize>> {
+pub fn build_css_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, Vec<usize>> {
     let mut children_index = HashMap::new();
 
     for (idx, node) in nodes.iter() {
@@ -560,109 +631,20 @@ fn build_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, Vec<usize
 
 pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) -> bool {
     query.criterias.iter().all(|q| {
-        match q.property.as_str() {
+        // TODO: Implement more + handle q.comparison
+        match (q.property.as_str(), q.comparison.clone(), q.value.clone()) {
             // Default to dark mode
-            "prefers-color-scheme" => q.value == "dark",
-            "max-width" => {
-                let value = q.value.strip_suffix("px").unwrap_or(&q.value).trim();
-                let px = value.parse::<f32>();
-                if let Ok(px) = px {
-                    window_size.width < px as u32
-                } else {
-                    println!("Failed to parse max-width px: {}", q.value);
-                    false
-                }
-            }
-            p => {
-                println!("Unsupported media query property: {}", p);
+            ("prefers-color-scheme", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::String(value)) => value == "dark",
+            ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => window_size.width < px as u32,
+            ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Px(px)) => window_size.width >= px as u32,
+            // Media queries are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
+            ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Rem(rem)) => window_size.width >= rem as u32 * 16,
+            (_, _, _) => {
+                // println!("Unsupported media query property: {} {:?} {:?}", p, c, v);
                 false
             }
         }
     })
-}
-
-fn walk_class_nodes(
-    applicable_nodes: &mut Vec<usize>,
-    element: &HtmlElement,
-    nodes: &Vec<(usize, &Node)>,
-    partial_matches: &mut HashMap<(usize, usize), usize>,
-    walk_nodes: &Vec<usize>,
-    window_size: &PhysicalSize<u32>,
-) -> Result<()> {
-    let children_index = build_children_index(nodes);
-
-    for node_idx in walk_nodes {
-        let result = match nodes[*node_idx].1 {
-            Node::ClassName(class) => {
-                class_matches_element(element, class, *node_idx, partial_matches)
-            }
-            Node::MediaQuery(query) => {
-                let parent_matched = media_query_matches(query, window_size);
-                NodeMatchResult {
-                    target_matched: false,
-                    parent_matched,
-                }
-            }
-            _ => NodeMatchResult {
-                parent_matched: false,
-                target_matched: false,
-            },
-        };
-
-        let children: Vec<&usize> = children_index
-            .get(&node_idx)
-            .unwrap()
-            .iter()
-            .map(|idx| idx)
-            .collect();
-
-        if result.target_matched {
-            let applicable: Vec<&usize> = children
-                .iter()
-                .filter(|c| match nodes[***c].1 {
-                    Node::Property(_) | Node::Variable(_) => true,
-                    _ => false,
-                })
-                .cloned()
-                .collect();
-            for a in applicable {
-                applicable_nodes.push(*a);
-            }
-        }
-
-        if result.parent_matched {
-            let followups: Vec<usize> = children
-                .iter()
-                .filter(|c| match nodes[***c].1 {
-                    Node::Property(_) | Node::Variable(_) => false,
-                    _ => true,
-                })
-                .cloned()
-                .cloned()
-                .collect();
-
-            if followups.len() > 0 {
-                walk_class_nodes(
-                    applicable_nodes,
-                    element,
-                    nodes,
-                    partial_matches,
-                    &followups,
-                    window_size,
-                )?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn get_highest_parent(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> usize {
-    if let Some(parent) = nodes[node_idx].1.get_parent() {
-        get_highest_parent(nodes, parent)
-    } else {
-        node_idx
-    }
 }
 
 fn parse_border_style(value: String) -> Result<StyleBorderStyle> {
@@ -673,81 +655,17 @@ fn parse_border_style(value: String) -> Result<StyleBorderStyle> {
     }
 }
 
-fn apply_border_side(side: &mut StyleSizeAndColor, value: String) -> Result<()> {
-    let parts: Vec<&str> = value.split(" ").collect();
-    match parts.len() {
-        1 => {
-            side.size = parse_style_size(parts[0].to_string())?;
-            Ok(())
-        },
-        2 => {
-            side.size = parse_style_size(parts[0].to_string())?;
-            side.style = parse_border_style(parts[1].to_string())?;
-            Ok(())
-        },
-        3 => {
-            side.size = parse_style_size(parts[0].to_string())?;
-            side.style = parse_border_style(parts[1].to_string())?;
-            side.color = parse_color(parts[2].to_string())?;
-            Ok(())
-        },
-        len => Err(anyhow!("Unexpected border side count: {}", len)),
-    }
-}
-
-fn get_class_nodes(
-    element: &HtmlElement,
-    nodes: &Vec<(usize, &Node)>,
-    partial_matches: &mut HashMap<(usize, usize), usize>,
-    window_size: &PhysicalSize<u32>,
-) -> Result<Vec<usize>> {
-    let mut applicable_nodes: Vec<usize> = vec![];
-    let root_nodes: Vec<usize> = nodes
-        .iter()
-        .filter(|(_, n)| n.get_parent().is_none())
-        .map(|(idx, _)| idx)
+pub fn get_class_list(element: &HtmlElement) -> HashSet<String> {
+    let element_classes: HashSet<String> = element
+        .attributes
+        .get("class")
         .cloned()
+        .unwrap_or(String::new())
+        .split(" ")
+        .map(|s| s.to_string())
         .collect();
 
-    walk_class_nodes(
-        &mut applicable_nodes,
-        element,
-        nodes,
-        partial_matches,
-        &root_nodes,
-        window_size,
-    )?;
-
-    // Sort, prioritize media query over regular CSS with more to come
-    applicable_nodes.sort_by(|a, b| {
-        let highest_a = if let Some(parent) = nodes[*a].1.get_parent() {
-            Some(get_highest_parent(nodes, parent))
-        } else {
-            None
-        };
-        let highest_b = if let Some(parent) = nodes[*b].1.get_parent() {
-            Some(get_highest_parent(nodes, parent))
-        } else {
-            None
-        };
-
-        let a_comp: i32 = highest_a
-            .and_then(|idx| match nodes[idx].1 {
-                Node::MediaQuery(_) => Some(1),
-                _ => Some(0),
-            })
-            .unwrap_or(0);
-        let b_comp: i32 = highest_b
-            .and_then(|idx| match nodes[idx].1 {
-                Node::MediaQuery(_) => Some(1),
-                _ => Some(0),
-            })
-            .unwrap_or(0);
-
-        a_comp.cmp(&b_comp)
-    });
-
-    Ok(applicable_nodes)
+    element_classes
 }
 
 fn rgba_to_hex((r, g, b, a): (u8, u8, u8, u8)) -> u32 {
@@ -759,19 +677,21 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         let code_str = value
             .strip_prefix("#")
             .with_context(|| "Failed to strip hex hashtag")?;
-        let tweaked_code_str = match code_str.len() {
-            6 => u32::from_str_radix(code_str, 16),
+        let parsed = match code_str.len() {
+            8 => u32::from_str_radix(code_str, 16)?,
+            // This also adds alpha
+            6 => (u32::from_str_radix(code_str, 16)? << 8) | 0xFF,
+            4 => {
+                let expanded = code_str.chars().flat_map(|c| [c, c]).collect::<String>();
+                u32::from_str_radix(&expanded, 16)?
+            }
+            // This also adds alpha
             3 => {
                 let expanded = code_str.chars().flat_map(|c| [c, c]).collect::<String>();
-                u32::from_str_radix(&expanded, 16)
+                (u32::from_str_radix(&expanded, 16)? << 8) | 0xFF
             }
-            _ => panic!("expected 3 or 6 hex chars"),
+            _ => Err(anyhow!("expected 3, 6 or 8 hex chars, got {}", code_str))?,
         };
-        let mut parsed = tweaked_code_str
-            .ok()
-            .with_context(|| "Failed to parse HEX")?;
-        // Convert into RGBA with the alpha being 255
-        parsed = (parsed << 8) | 0xFF;
         Ok(StyleBackground::Hex(parsed))
     } else if let Some(rgba) = value.strip_prefix("rgba(") {
         let cleaned: &str = rgba.strip_suffix(")").unwrap_or(rgba);
@@ -798,42 +718,96 @@ fn parse_color(value: String) -> Result<StyleBackground> {
 }
 
 // Map variable references
+fn resolve_variable_value(value: &str, variables: &HashMap<String, String>) -> String {
+    value
+        .split(" ")
+        .map(|part| {
+            if let Some(value) = part.strip_prefix("var(") {
+                if let Some(value) = value.strip_suffix(")") {
+                    let string = value.to_string();
+                    let mapped = variables.get(&string).unwrap_or(&string).clone();
+                    mapped.to_string()
+                } else {
+                    part.to_string()
+                }
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn apply_node_variables_dependencies(variables: &mut HashMap<String, String>, variables_to_parse: &Vec<(usize, &Variable)>, variable_dependence: &mut HashMap<&str, Vec<usize>>, name: String, value: String) {
+    variables.insert(name.clone(), value.clone());
+    let Some(dependent) = variable_dependence.get(name.as_str()).cloned() else {
+        return;
+    };
+    for idx in dependent.iter() {
+        let var = variables_to_parse[*idx].1;
+        apply_node_variables_dependencies(variables, variables_to_parse, variable_dependence, var.variable.clone(), value.clone());
+    }
+    variable_dependence.remove(name.as_str());
+}
+
+fn apply_node_variables<'a>(nodes: &'a mut Vec<Node>, variables: &mut HashMap<String, String>) {
+    let variables_to_parse: Vec<(usize, &Variable)> = nodes
+        .iter()
+        .filter_map(|node| match node {
+            Node::Variable(variable) => {
+                Some(variable)
+            }
+            _ => None
+        })
+        .enumerate()
+        .collect();
+    let mut variable_dependence: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut no_dependence = vec![];
+    for (idx, var) in variables_to_parse.iter() {
+        if let PropertyValue::Raw(value) = &var.value {
+            if let Some(value) = value.strip_prefix("var(") {
+                if let Some(value) = value.strip_suffix(")") {
+                    variable_dependence.entry(value).or_default().push(*idx);
+                    continue;
+                }
+            }
+        }
+        no_dependence.push(*idx);
+    }
+    for idx in no_dependence {
+        let var = variables_to_parse[idx].1;
+        if let PropertyValue::Raw(value) = &var.value {
+            apply_node_variables_dependencies(variables, &variables_to_parse, &mut variable_dependence, var.variable.clone(), value.clone());
+        }
+    }
+    for (variable, idxs) in variable_dependence.clone() {
+        let Some(resolved) = variables.get(variable).cloned() else {
+            continue;
+        };
+
+        for idx in idxs {
+            let var = variables_to_parse[idx].1;
+            apply_node_variables_dependencies(variables, &variables_to_parse, &mut variable_dependence, var.variable.clone(), resolved.clone());
+        }
+    }
+}
+
 pub fn resolve_node_variables<'a>(
     nodes: &'a mut Vec<Node>,
     variables: &mut HashMap<String, String>,
 ) -> Vec<&'a mut Property> {
-    for node in nodes.iter() {
-        match node {
-            Node::Variable(variable) => {
-                variables.insert(variable.variable.clone(), variable.value.clone());
-            }
-            _ => {}
-        };
-    }
+    apply_node_variables(nodes, variables);
 
     let properties = nodes
         .iter_mut()
         .filter_map(|node| match node {
             Node::Property(property) => {
-                let parts: Vec<String> = property
-                    .value
-                    .split(" ")
-                    .map(|part| {
-                        if let Some(value) = part.strip_prefix("var(") {
-                            if let Some(value) = value.strip_suffix(")") {
-                                let string = value.to_string();
-                                let mapped = variables.get(&string).unwrap_or(&string).clone();
-                                mapped.to_string()
-                            } else {
-                                part.to_string()
-                            }
-                        } else {
-                            part.to_string()
-                        }
-                    })
-                    .collect();
-
-                property.value = parts.join(" ");
+                if let PropertyValue::Raw(value) = &property.value {
+                    let value = resolve_variable_value(value, variables);
+                    if let Ok((parsed, _)) = parse_property_value(property.property.clone(), value) {
+                        property.value = parsed;
+                    }
+                }
                 Some(property)
             }
             _ => None,
@@ -841,6 +815,52 @@ pub fn resolve_node_variables<'a>(
         .collect();
 
     properties
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::css::{Node, Property, PropertyValue, Variable};
+
+    use super::{resolve_node_variables, split_space_ignoring_parentheses, StyleSize};
+
+    #[test]
+    fn resolves_node_variables() {
+        let mut nodes = vec![
+            Node::Variable(Variable { variable: "--size".into(), value: PropertyValue::Raw("12px".into()), parent: None }),
+            Node::Variable(Variable { variable: "--dependent".into(), value: PropertyValue::Raw("var(--size)".into()), parent: None }),
+            Node::Variable(Variable { variable: "--another-one".into(), value: PropertyValue::Raw("var(--test)".into()), parent: None }),
+            Node::Property(Property { property: "width".into(), value: PropertyValue::Raw("var(--size)".into()), parent: None, important: false }),
+            Node::Property(Property { property: "height".into(), value: PropertyValue::Raw("var(--dependent)".into()), parent: None , important: false}),
+            Node::Property(Property { property: "gap".into(), value: PropertyValue::Raw("var(--another-one)".into()), parent: None, important: false }),
+        ];
+
+        let mut already_resolved = HashMap::new();
+        already_resolved.insert("--test".to_string(), "16px".to_string());
+        let properties = resolve_node_variables(&mut nodes, &mut already_resolved);
+
+        assert_eq!(
+            properties[0].value,
+            PropertyValue::Size(StyleSize::Px(12))
+        );
+        assert_eq!(
+            properties[1].value,
+            PropertyValue::Size(StyleSize::Px(12))
+        );
+        assert_eq!(
+            properties[2].value,
+            PropertyValue::Size(StyleSize::Px(16))
+        );
+    }
+
+    #[test]
+    fn splits_space_ignoring_parentheses() {
+        assert_eq!(
+            split_space_ignoring_parentheses("repeat(2, 1fr) 20px".into()),
+            vec!["repeat(2, 1fr)", "20px"]
+        );
+    }
 }
 
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
@@ -851,6 +871,7 @@ fn parse_justify_content(value: &str) -> StyleJustifyContent {
         "center" => StyleJustifyContent::Center,
         "space-between" => StyleJustifyContent::SpaceBetween,
         "stretch" => StyleJustifyContent::Stretch,
+        "space-evenly" => StyleJustifyContent::SpaceEvenly,
         _ => {
             println!(
                 "Failed to parse style in parse_justify_content \"{}\"",
@@ -861,315 +882,530 @@ fn parse_justify_content(value: &str) -> StyleJustifyContent {
     }
 }
 
-pub fn apply_style_property(
-    element: &HtmlElement,
-    style: &mut Style,
-    property: &Property,
-) -> Result<()> {
-    let value = property.value.clone();
-    match property.property.as_str() {
-        "width" => {
-            if element.attributes.contains_key("width") {
-                return Ok(());
+fn parse_border_side_value(value: String) -> Result<BorderSideValue> {
+    let parts: Vec<&str> = value.split(" ").collect();
+    match parts.len() {
+        1 => Ok(BorderSideValue {
+            size: Some(parse_style_size(parts[0].to_string())?),
+            color: None,
+            style: None,
+        }),
+        2 => Ok(BorderSideValue {
+            size: Some(parse_style_size(parts[0].to_string())?),
+            style: Some(parse_border_style(parts[1].to_string())?),
+            color: None,
+        }),
+        3 => Ok(BorderSideValue {
+            size: Some(parse_style_size(parts[0].to_string())?),
+            style: Some(parse_border_style(parts[1].to_string())?),
+            color: Some(parse_color(parts[2].to_string())?),
+        }),
+        len => Err(anyhow!("Unexpected border side count: {}", len)),
+    }
+}
+
+fn split_space_ignoring_parentheses(value: String) -> Vec<String> {
+    let mut parentheses_depth = 0;
+    let mut buffer = String::new();
+    let mut result = vec![];
+    let space = ' ';
+    let parentheses_start = '(';
+    let parentheses_close = ')';
+    for char in value.chars() {
+        if char == parentheses_start {
+            parentheses_depth += 1;
+            buffer.push(char);
+            continue;
+        }
+        if char == parentheses_close {
+            parentheses_depth -= 1;
+            buffer.push(char);
+            continue;
+        }
+        if char == space && parentheses_depth == 0 {
+            result.push(buffer.clone());
+            buffer.clear();
+            continue;
+        }
+        buffer.push(char);
+    }
+    if !buffer.is_empty() {
+        result.push(buffer.clone());
+    }
+    result
+}
+
+fn strip_prefix_and_suffix<'a>(value: &'a str, prefix: &'a str, suffix: &'a str) -> Option<&'a str> {
+    if let Some(stripped) = value.strip_prefix(prefix) {
+        stripped.strip_suffix(suffix)
+    } else {
+        None
+    }
+}
+
+fn parse_grid_template_columns_inner_value(value: String) -> Result<GridTemplateColumnsValue> {
+    if let Some(stripped) = strip_prefix_and_suffix(&value, "minmax(", ")") {
+        let (min, max) = stripped.split_once(",").with_context(|| "Failed to split minmax value")?;
+        let parsed_min = parse_grid_size(min.trim().to_string())?;
+        let parsed_max = parse_grid_size(max.trim().to_string())?;
+        Ok(GridTemplateColumnsValue::MinMax((parsed_min, parsed_max)))
+    } else {
+        Ok(GridTemplateColumnsValue::Size(parse_grid_size(value)?))
+    }
+}
+
+fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
+    let parts: Vec<String> = split_space_ignoring_parentheses(value);
+    // TODO: Also support minmax etc. here
+    let mut parsed: Vec<GridTemplateColumnsValue> = vec![];
+    for p in parts {
+        if let Some(stripped) = strip_prefix_and_suffix(&p, "repeat(", ")") {
+            let (count, sizes) = stripped.split_once(",").with_context(|| format!("Failed to parse repeat: {}", stripped))?;
+            let parsed_count = count.parse::<i32>().with_context(|| format!("Failed to parse count: {}", count))?;
+            let sizes_split: Vec<&str> = sizes.trim().split(" ").collect();
+            for _ in 0..parsed_count {
+                for size in sizes_split.iter() {
+                    parsed.push(parse_grid_template_columns_inner_value(size.trim().to_string())?);
+                }
             }
-            style.width = parse_style_size(value)?;
+            continue;
         }
-        "height" => {
-            if element.attributes.contains_key("height") {
-                return Ok(());
+        parsed.push(parse_grid_template_columns_inner_value(p)?);
+    }
+    Ok(PropertyValue::GridTemplateColumns(GridTemplateColumns::Values(parsed)))
+}
+
+pub fn parse_property_value(property: String, value: String) -> Result<(PropertyValue, bool)> {
+    if let Some(stripped) = value.strip_suffix("!important") {
+        return parse_property_value(property, stripped.trim().to_string()).and_then(|(value, _)| Ok((value, true)));
+    }
+
+    if property.starts_with("--") || value.contains("var(") {
+        return Ok((PropertyValue::Raw(value), false));
+    }
+
+    Ok((match property.as_str() {
+        "width" | "height" | "min-height" | "max-height" | "min-width" | "max-width" | "gap" |
+        "margin-left" | "margin-top" | "margin-right" | "margin-bottom" | "font-size" | "left" |
+        "top" | "right" | "bottom" | "padding-left" | "padding-top" | "padding-right" | "padding-bottom" |
+        "border-left-width" | "border-top-width" | "border-right-width" | "border-bottom-width" |
+        "border-width" =>
+            PropertyValue::Size(parse_style_size(value)?),
+        "margin" | "padding" =>
+            PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?),
+        "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
+        "padding-block" => PropertyValue::VerticalCombinedSize(parse_two_axis_size(value)?),
+        "padding-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
+        "background" | "background-color" | "color" |
+        "border-left-color" | "border-top-color" | "border-right-color" | "border-bottom-color" =>
+            PropertyValue::Color(parse_color(value)?),
+        "border-color" => PropertyValue::CombinedColor(parse_combined_style(value, parse_color)?),
+        "display" => PropertyValue::Display(match value.as_str().trim() {
+            "block" => Some(StyleDisplay::Block),
+            "inline-block" => Some(StyleDisplay::InlineBlock),
+            "flex" => Some(StyleDisplay::Flex),
+            "inline-flex" => Some(StyleDisplay::InlineFlex),
+            "grid" => Some(StyleDisplay::Grid),
+            "none" => Some(StyleDisplay::None),
+            _ => None
+        }.with_context(|| "Failed to parse display")?),
+        "position" => PropertyValue::Position(match value.as_str().trim() {
+            "static" => Some(StylePosition::Static),
+            "relative" => Some(StylePosition::Relative),
+            "absolute" => Some(StylePosition::Absolute),
+            "fixed" => Some(StylePosition::Fixed),
+            _ => {
+                println!("Failed to parse style position \"{}\"", value);
+                None
             }
-            style.height = parse_style_size(value)?;
-        }
-        "min-height" => {
-            style.min_height = parse_style_size(value)?;
-        }
-        "max-height" => {
-            style.max_height = parse_style_size(value)?;
-        }
-        "min-width" => {
-            style.min_width = parse_style_size(value)?;
-        }
-        "max-width" => {
-            style.max_width = parse_style_size(value)?;
-        }
-        "gap" => {
-            style.gap = parse_style_size(value)?;
-        }
-        "margin" => {
-            let (top, right, bottom, left) = parse_combined_style_size(value)?;
-            style.margin_top = top;
-            style.margin_right = right;
-            style.margin_bottom = bottom;
-            style.margin_left = left;
-        }
-        "margin-left" => {
-            style.margin_left = parse_style_size(value)?;
-        }
-        "margin-right" => {
-            style.margin_right = parse_style_size(value)?;
-        }
-        "margin-top" => {
-            style.margin_top = parse_style_size(value)?;
-        }
-        "margin-bottom" => {
-            style.margin_bottom = parse_style_size(value)?;
-        }
-        "font-size" => {
-            style.font_size = parse_style_size(value)?;
-        }
-        "left" => {
-            style.left = parse_style_size(value)?;
-        }
-        "right" => {
-            style.right = parse_style_size(value)?;
-        }
-        "top" => {
-            style.top = parse_style_size(value)?;
-        }
-        "bottom" => {
-            style.bottom = parse_style_size(value)?;
-        }
-        "padding" => {
-            let (top, right, bottom, left) = parse_combined_style_size(value)?;
-            style.padding_top = top;
-            style.padding_right = right;
-            style.padding_bottom = bottom;
-            style.padding_left = left;
-        }
-        "padding-left" => {
-            style.padding_left = parse_style_size(value)?;
-        }
-        "padding-right" => {
-            style.padding_right = parse_style_size(value)?;
-        }
-        "padding-top" => {
-            style.padding_top = parse_style_size(value)?;
-        }
-        "padding-bottom" => {
-            style.padding_bottom = parse_style_size(value)?;
-        }
-        "background" | "background-color" => {
-            let parsed = parse_color(value);
-            match parsed {
-                Ok(parsed) => {
-                    style.background = parsed;
-                }
-                Err(err) => println!("{}", err),
-            };
-        }
-        "color" => {
-            let parsed = parse_color(value);
-            match parsed {
-                Ok(parsed) => {
-                    style.color = parsed;
-                }
-                Err(err) => println!("{}", err),
-            };
-        }
-        "display" => {
-            let parsed = match value.as_str().trim() {
-                "block" => Some(StyleDisplay::Block),
-                "inline-block" => Some(StyleDisplay::InlineBlock),
-                "flex" => Some(StyleDisplay::Flex),
-                "inline-flex" => Some(StyleDisplay::InlineFlex),
-                "none" => Some(StyleDisplay::None),
-                _ => {
-                    println!("Failed to parse style display \"{}\"", value);
-                    None
-                }
-            };
-            if let Some(parsed) = parsed {
-                style.display = parsed;
-            }
-        }
-        "position" => {
-            style.position = match value.as_str().trim() {
-                "static" => StylePosition::Static,
-                "relative" => StylePosition::Relative,
-                "absolute" => StylePosition::Absolute,
-                "fixed" => StylePosition::Fixed,
-                _ => {
-                    println!("Failed to parse style position \"{}\"", value);
-                    StylePosition::Static
-                }
-            };
-        }
-        "text-align" => {
-            style.text_align = match value.as_str().trim() {
-                "left" => StyleAlign::Left,
-                "center" => StyleAlign::Center,
-                "right" => StyleAlign::Right,
-                _ => {
-                    println!("Failed to parse style text-align \"{}\"", value);
-                    StyleAlign::Left
-                }
-            };
-        }
-        "flex-shrink" => {
-            style.flex_shrink = value.parse::<u32>()?;
-        }
-        "flex-grow" => {
-            style.flex_grow = value.parse::<u32>()?;
-        }
+        }.with_context(|| "Failed to parse position")?),
+        "text-align" => PropertyValue::Align(match value.as_str().trim() {
+            "left" => Some(StyleAlign::Left),
+            "center" => Some(StyleAlign::Center),
+            "right" => Some(StyleAlign::Right),
+            _ => None
+        }.with_context(|| "Failed to parse text-align")?),
+        "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
         "flex" => {
             let parts: Vec<&str> = value.split(" ").collect();
+            let mut grow = None;
+            let mut shrink = None;
             // Flex-basis ignored for now
             match parts.len() {
                 1 => {
                     // If it can be parsed as a u32, it refers to grow
                     if let Ok(value) = parts[0].parse::<u32>() {
-                        style.flex_grow = value;
+                        grow = Some(value);
                     }
                     // Otherwise it refers to the flex-basis, which we don't yet handle
                 }
                 2 => {
-                    style.flex_grow = parts[0].parse::<u32>()?;
+                    grow = Some(parts[0].parse::<u32>()?);
                     if let Ok(value) = parts[1].parse::<u32>() {
-                        style.flex_shrink = value;
+                        shrink = Some(value);
                     }
                     // Otherwise it refers to the flex-basis, which we don't yet handle
                 }
                 3 => {
-                    style.flex_grow = parts[0].parse::<u32>()?;
-                    style.flex_shrink = parts[1].parse::<u32>()?;
+                    grow = Some(parts[0].parse::<u32>()?);
+                    shrink = Some(parts[1].parse::<u32>()?);
                 }
                 _ => {}
             }
-        }
-        "justify-content" => {
-            style.justify_content = parse_justify_content(value.as_str());
-        }
-        "align-items" => {
-            style.align_items = parse_justify_content(value.as_str());
-        }
-        "align-self" => {
-            style.align_self = parse_justify_content(value.as_str());
-        }
+            PropertyValue::Flex { grow, shrink }
+        },
+        "justify-content" | "align-items" | "align-self" =>
+            PropertyValue::JustifyContent(parse_justify_content(value.as_str())),
         "place-content" => {
             let parts: Vec<&str> = value.split(" ").collect();
             // align-content ignored for now
             match parts.len() {
-                1 => {
-                    style.justify_content = parse_justify_content(parts[0].trim());
-                }
-                2 => {
-                    style.justify_content = parse_justify_content(parts[1].trim());
-                }
-                _ => {}
+                1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
+                2 => PropertyValue::JustifyContent(parse_justify_content(parts[1].trim())),
+                _ => PropertyValue::Raw(value),
             }
         }
         "place-items" => {
             let parts: Vec<&str> = value.split(" ").collect();
             // justify-items ignored for now
             match parts.len() {
-                1 => {
-                    style.align_items = parse_justify_content(parts[0].trim());
-                }
-                2 => {
-                    style.align_items = parse_justify_content(parts[0].trim());
-                }
-                _ => {}
+                1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
+                2 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
+                _ => PropertyValue::Raw(value),
             }
         }
-        "flex-direction" => {
-            style.flex_direction = match value.as_str() {
-                "row" => StyleFlexDirection::Row,
-                "column" => StyleFlexDirection::Column,
-                _ => Err(anyhow!(
-                    "Failed to parse style flex-direction \"{}\"",
-                    value
-                ))?,
-            };
-        }
-        "border-left-width" => {
-            style.border_left.size = parse_style_size(value)?;
-        }
-        "border-left-color" => {
-            style.border_left.color = parse_color(value)?;
-        }
-        "border-left-style" => {
-            style.border_left.style = parse_border_style(value)?;
-        }
-        "border-left" => {
-            apply_border_side(&mut style.border_left, value)?;
-        }
-        "border-top-width" => {
-            style.border_top.size = parse_style_size(value)?;
-        }
-        "border-top-color" => {
-            style.border_top.color = parse_color(value)?;
-        }
-        "border-top-style" => {
-            style.border_top.style = parse_border_style(value)?;
-        }
-        "border-top" => {
-            apply_border_side(&mut style.border_top, value)?;
-        }
-        "border-right-width" => {
-            style.border_right.size = parse_style_size(value)?;
-        }
-        "border-right-color" => {
-            style.border_right.color = parse_color(value)?;
-        }
-        "border-right-style" => {
-            style.border_right.style = parse_border_style(value)?;
-        }
-        "border-right" => {
-            apply_border_side(&mut style.border_right, value)?;
-        }
-        "border-bottom-width" => {
-            style.border_bottom.size = parse_style_size(value)?;
-        }
-        "border-bottom-color" => {
-            style.border_bottom.color = parse_color(value)?;
-        }
-        "border-bottom-style" => {
-            style.border_bottom.style = parse_border_style(value)?;
-        }
-        "border-bottom" => {
-            apply_border_side(&mut style.border_bottom, value)?;
-        }
-        "border" => {
-            apply_border_side(&mut style.border_left, value.clone())?;
-            apply_border_side(&mut style.border_top, value.clone())?;
-            apply_border_side(&mut style.border_right, value.clone())?;
-            apply_border_side(&mut style.border_bottom, value.clone())?;
-        }
-        "border-width" => {
-            style.border_left.size = parse_style_size(value.clone())?;
-            style.border_top.size = parse_style_size(value.clone())?;
-            style.border_right.size = parse_style_size(value.clone())?;
-            style.border_bottom.size = parse_style_size(value.clone())?;
-        }
-        "border-style" => {
-            style.border_left.style = parse_border_style(value.clone())?;
-            style.border_top.style = parse_border_style(value.clone())?;
-            style.border_right.style = parse_border_style(value.clone())?;
-            style.border_bottom.style = parse_border_style(value.clone())?;
-        }
+        "flex-direction" => PropertyValue::FlexDirection(match value.as_str() {
+            "row" => StyleFlexDirection::Row,
+            "column" => StyleFlexDirection::Column,
+            _ => Err(anyhow!(
+                "Failed to parse style flex-direction \"{}\"",
+                value
+            ))?,
+        }),
+        "border-left-style" | "border-top-style" | "border-right-style" | "border-bottom-style" |
+        "border-style" =>
+            PropertyValue::BorderStyle(parse_border_style(value)?),
+        "border-left" | "border-top" | "border-right" | "border-bottom" | "border" =>
+            PropertyValue::BorderSide(parse_border_side_value(value)?),
+        "grid-template-columns" => parse_grid_template_columns_value(value)?,
         _ => {
-            println!("Failed to parse style \"{}\"", property.property);
+            println!("Failed to parse style \"{}\"", property);
+            PropertyValue::Raw(value)
+        }
+    }, false))
+}
+
+fn apply_parsed_border_side(side: &mut StyleSizeAndColor, value: BorderSideValue) {
+    if let Some(size) = value.size {
+        side.size = size;
+    }
+    if let Some(color) = value.color {
+        side.color = color;
+    }
+    if let Some(style) = value.style {
+        side.style = style;
+    }
+}
+
+pub fn apply_style_property(
+    element: &HtmlElement,
+    style: &mut Style,
+    property: &Property,
+) -> Result<()> {
+    match (property.property.as_str(), property.value.clone()) {
+        ("width", PropertyValue::Size(value)) => {
+            if element.attributes.contains_key("width") {
+                return Ok(());
+            }
+            style.width = value;
+        }
+        ("height", PropertyValue::Size(value)) => {
+            if element.attributes.contains_key("height") {
+                return Ok(());
+            }
+            style.height = value;
+        }
+        ("min-height", PropertyValue::Size(value)) => {
+            style.min_height = value;
+        }
+        ("max-height", PropertyValue::Size(value)) => {
+            style.max_height = value;
+        }
+        ("min-width", PropertyValue::Size(value)) => {
+            style.min_width = value;
+        }
+        ("max-width", PropertyValue::Size(value)) => {
+            style.max_width = value;
+        }
+        ("gap", PropertyValue::Size(value)) => {
+            style.gap = value;
+        }
+        ("margin", PropertyValue::CombinedSize((top, right, bottom, left))) => {
+            style.margin_top = top;
+            style.margin_right = right;
+            style.margin_bottom = bottom;
+            style.margin_left = left;
+        }
+        ("margin-left", PropertyValue::Size(value)) => {
+            style.margin_left = value;
+        }
+        ("margin-right", PropertyValue::Size(value)) => {
+            style.margin_right = value;
+        }
+        ("margin-top", PropertyValue::Size(value)) => {
+            style.margin_top = value;
+        }
+        ("margin-bottom", PropertyValue::Size(value)) => {
+            style.margin_bottom = value;
+        }
+        // This assumes LTR for now
+        ("margin-inline", PropertyValue::HorizontalCombinedSize((left, right))) => {
+            style.margin_left = left;
+            style.margin_right = right;
+        },
+        ("padding-block", PropertyValue::VerticalCombinedSize((top, bottom))) => {
+            style.padding_top = top;
+            style.padding_bottom = bottom;
+        },
+        ("padding-inline", PropertyValue::HorizontalCombinedSize((left, right))) => {
+            style.padding_left = left;
+            style.padding_right = right;
+        },
+        ("font-size", PropertyValue::Size(value)) => {
+            style.font_size = value;
+        }
+        ("left", PropertyValue::Size(value)) => {
+            style.left = value;
+        }
+        ("right", PropertyValue::Size(value)) => {
+            style.right = value;
+        }
+        ("top", PropertyValue::Size(value)) => {
+            style.top = value;
+        }
+        ("bottom", PropertyValue::Size(value)) => {
+            style.bottom = value;
+        }
+        ("padding", PropertyValue::CombinedSize((top, right, bottom, left))) => {
+            style.padding_top = top;
+            style.padding_right = right;
+            style.padding_bottom = bottom;
+            style.padding_left = left;
+        }
+        ("padding-left", PropertyValue::Size(value)) => {
+            style.padding_left = value;
+        }
+        ("padding-right", PropertyValue::Size(value)) => {
+            style.padding_right = value;
+        }
+        ("padding-top", PropertyValue::Size(value)) => {
+            style.padding_top = value;
+        }
+        ("padding-bottom", PropertyValue::Size(value)) => {
+            style.padding_bottom = value;
+        }
+        ("background" | "background-color", PropertyValue::Color(value)) => {
+            style.background = value;
+        }
+        ("color", PropertyValue::Color(value)) => {
+            style.color = value;
+        }
+        ("display", PropertyValue::Display(value)) => {
+            style.display = value;
+        }
+        ("position", PropertyValue::Position(value)) => {
+            style.position = value;
+        }
+        ("text-align", PropertyValue::Align(value)) => {
+            style.text_align = value;
+        }
+        ("flex-shrink", PropertyValue::Int(value)) => {
+            style.flex_shrink = value;
+        }
+        ("flex-grow", PropertyValue::Int(value)) => {
+            style.flex_grow = value;
+        }
+        ("flex", PropertyValue::Flex { grow, shrink }) => {
+            if let Some(grow) = grow {
+                style.flex_grow = grow;
+            }
+            if let Some(shrink) = shrink {
+                style.flex_shrink = shrink;
+            }
+        }
+        ("justify-content", PropertyValue::JustifyContent(value)) => {
+            style.justify_content = value;
+        }
+        ("align-items", PropertyValue::JustifyContent(value)) => {
+            style.align_items = value;
+        }
+        ("align-self", PropertyValue::JustifyContent(value)) => {
+            style.align_self = value;
+        }
+        ("place-content", PropertyValue::JustifyContent(value)) => {
+            style.justify_content = value;
+        }
+        ("place-items", PropertyValue::JustifyContent(value)) => {
+            style.align_items = value;
+        }
+        ("flex-direction", PropertyValue::FlexDirection(value)) => {
+            style.flex_direction = value;
+        }
+        ("border-left-width", PropertyValue::Size(value)) => {
+            style.border_left.size = value;
+        }
+        ("border-left-color", PropertyValue::Color(value)) => {
+            style.border_left.color = value;
+        }
+        ("border-left-style", PropertyValue::BorderStyle(value)) => {
+            style.border_left.style = value;
+        }
+        ("border-color", PropertyValue::CombinedColor((top, right, bottom, left))) => {
+            style.border_top.color = top;
+            style.border_right.color = right;
+            style.border_bottom.color = bottom;
+            style.border_left.color = left;
+        }
+        ("border-left", PropertyValue::BorderSide(value)) => {
+            apply_parsed_border_side(&mut style.border_left, value);
+        }
+        ("border-top-width", PropertyValue::Size(value)) => {
+            style.border_top.size = value;
+        }
+        ("border-top-color", PropertyValue::Color(value)) => {
+            style.border_top.color = value;
+        }
+        ("border-top-style", PropertyValue::BorderStyle(value)) => {
+            style.border_top.style = value;
+        }
+        ("border-top", PropertyValue::BorderSide(value)) => {
+            apply_parsed_border_side(&mut style.border_top, value);
+        }
+        ("border-right-width", PropertyValue::Size(value)) => {
+            style.border_right.size = value;
+        }
+        ("border-right-color", PropertyValue::Color(value)) => {
+            style.border_right.color = value;
+        }
+        ("border-right-style", PropertyValue::BorderStyle(value)) => {
+            style.border_right.style = value;
+        }
+        ("border-right", PropertyValue::BorderSide(value)) => {
+            apply_parsed_border_side(&mut style.border_right, value);
+        }
+        ("border-bottom-width", PropertyValue::Size(value)) => {
+            style.border_bottom.size = value;
+        }
+        ("border-bottom-color", PropertyValue::Color(value)) => {
+            style.border_bottom.color = value;
+        }
+        ("border-bottom-style", PropertyValue::BorderStyle(value)) => {
+            style.border_bottom.style = value;
+        }
+        ("border-bottom", PropertyValue::BorderSide(value)) => {
+            apply_parsed_border_side(&mut style.border_bottom, value);
+        }
+        ("border", PropertyValue::BorderSide(value)) => {
+            apply_parsed_border_side(&mut style.border_left, value.clone());
+            apply_parsed_border_side(&mut style.border_top, value.clone());
+            apply_parsed_border_side(&mut style.border_right, value.clone());
+            apply_parsed_border_side(&mut style.border_bottom, value);
+        }
+        ("border-width", PropertyValue::Size(value)) => {
+            style.border_left.size = value.clone();
+            style.border_top.size = value.clone();
+            style.border_right.size = value.clone();
+            style.border_bottom.size = value;
+        }
+        ("border-style", PropertyValue::BorderStyle(value)) => {
+            style.border_left.style = value.clone();
+            style.border_top.style = value.clone();
+            style.border_right.style = value.clone();
+            style.border_bottom.style = value;
+        }
+        ("grid-template-columns", PropertyValue::GridTemplateColumns(columns)) => {
+            style.grid_template_columns = columns;
+        },
+        (_, PropertyValue::Raw(_)) => {}
+        (_, value) => {
+            println!("Failed to apply style \"{}\" with value {:?}", property.property, value);
         }
     };
     Ok(())
 }
 
+fn get_highest_parent(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usize> {
+    let node = nodes[node_idx].1;
+    if let Some(parent) = node.get_parent() {
+        get_highest_parent(nodes, parent)
+    } else {
+        Some(node_idx)
+    }
+}
+
+fn order_css_nodes(node_idxs: &mut Vec<&usize>, nodes: &Vec<(usize, &Node)>) {
+    // Sort, prioritize media query over regular CSS with more to come
+    node_idxs.sort_by(|a, b| {
+        let a_important_score = match nodes[**a].1 {
+            Node::Property(property) => property.important as i32,
+            _ => 0i32,
+        };
+        let b_important_score = match nodes[**b].1 {
+            Node::Property(property) => property.important as i32,
+            _ => 0i32,
+        };
+
+        match a_important_score.cmp(&b_important_score) {
+            Ordering::Equal => {
+                let highest_a = (if let Some(parent) = nodes[**a].1.get_parent() {
+                    get_highest_parent(nodes, parent)
+                } else {
+                    None
+                }).unwrap_or(usize::MAX) as u32;
+                let highest_b = (if let Some(parent) = nodes[**b].1.get_parent() {
+                    get_highest_parent(nodes, parent)
+                } else {
+                    None
+                }).unwrap_or(usize::MAX) as u32;
+
+                // TODO: Handle ties by going deeper
+
+                highest_a.cmp(&highest_b)
+            },
+            ordering => ordering,
+        }
+    })
+}
+
 pub fn parse_style(
+    node_idx: usize,
     element: &HtmlElement,
-    class_css_nodes: &Vec<Node>,
+    css_nodes: &Vec<Node>,
     parent_style: Option<Style>,
     parent_variables: &mut HashMap<String, String>,
-    partial_matches: &mut HashMap<(usize, usize), usize>,
-    window_size: &PhysicalSize<u32>,
+    collected_css_nodes: &HashMap<usize, Vec<usize>>,
+    css_children_index: &HashMap<usize, Vec<usize>>,
 ) -> Result<Style> {
     let mut style = get_base_style(&HtmlNode::Element(element.clone()), parent_style);
     let mut inline_nodes = get_inline_nodes(&element)?;
-    let enumerated_nodes: Vec<(usize, &Node)> = class_css_nodes.iter().enumerate().collect();
-    let applicable_class_nodes =
-        get_class_nodes(&element, &enumerated_nodes, partial_matches, window_size)?;
-    let mut nodes: Vec<Node> = applicable_class_nodes
+    let applicable_class_nodes = collected_css_nodes.get(&node_idx).cloned().unwrap_or_default();
+    let mut applicable_class_properties = vec![];
+    for class_node in applicable_class_nodes {
+        let children = css_children_index.get(&class_node).unwrap();
+        for c in children {
+            let would = match css_nodes[*c] {
+                Node::Property(_) | Node::Variable(_) => true,
+                _ => false,
+            };
+            if would {
+                applicable_class_properties.push(c);
+            }
+        }
+    }
+    order_css_nodes(&mut applicable_class_properties, &css_nodes.iter().enumerate().collect());
+    let mut nodes: Vec<Node> = applicable_class_properties
         .iter()
-        .map(|idx| class_css_nodes[*idx].clone())
+        .map(|idx| css_nodes[**idx].clone())
         .collect();
     nodes.append(&mut inline_nodes);
     let properties = resolve_node_variables(&mut nodes, parent_variables);

@@ -64,16 +64,66 @@ const ELEMENT_ATTRIBUTES = ['src', 'style', 'id', 'class']
 
 globalThis.__EVENT_LISTENERS = {}
 
-class TextNode {
-    constructor(text) {
-        this.text = text
+class BaseNode {
+    constructor() {
+        this.__node_idx = null
+    }
+
+    get parentNode() {
+        const parent = core.ops.op_get_parent_node(this.__node_idx)
+        return nodeToElement(parent)
+    }
+
+    get nextSibling() {
+        // TODO: Probably want to port this to rust later
+        const parent = this.parentNode
+        const siblings = parent.childNodes
+        const me = siblings.findIndex(node => node.__node_idx == this.__node_idx)
+        if (me === -1) {
+            throw new Error("nextSibling: Failed to locate self")
+        }
+        return siblings.length - 1 >= me + 1 ? siblings[me + 1] : null
+    }
+
+    get firstChild() {
+        return this.childNodes.length > 0 ? this.childNodes[0] : null
     }
 }
 
-class HtmlElement {
+class TextNode extends BaseNode {
+    constructor(text) {
+        super()
+        this.text = text
+    }
+
+    registerInBackend() {
+        this.__node_idx = core.ops.op_create_text_element(this.text)
+    }
+
+    // TODO: Should probably sync these with the backend
+    get data() { return this.text }
+    set data(value) { this.text = value; }
+
+    get nodeValue() { return this.text }
+    set nodeValue(value) { this.data = value }
+
+    get textContent() { return this.text }
+    set textContent(value) { this.data = value }
+
+    get nodeType() {
+        return 3
+    }
+}
+
+class HtmlElement extends BaseNode {
     constructor(tag) {
+        super()
         this.tag = tag
         this.namespaceURI = "http://www.w3.org/1999/xhtml"
+    }
+
+    registerInBackend() {
+        this.__node_idx = core.ops.op_create_element(this.tag)
     }
 
     addEventListener(event, cb) {
@@ -93,13 +143,7 @@ class HtmlElement {
             throw new Error("Item has not been registered on rust backend yet")
         }
 
-        if (element instanceof TextNode) {
-            core.ops.op_append_text_child(this.__node_idx, element.text)
-        } else if (element instanceof CommentNode) {
-            return
-        } else {
-            core.ops.op_append_child(this.__node_idx, element.__node_idx)
-        }
+        core.ops.op_append_child(this.__node_idx, element.__node_idx)
     }
 
     getPassableAttributes() {
@@ -115,8 +159,12 @@ class HtmlElement {
         return attributes
     }
 
+    get childNodes() {
+        return core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement)
+    }
+
     hasChildNodes() {
-        return core.ops.op_get_child_nodes(this.__node_idx).length > 0
+        return this.childNodes.length > 0
     }
 
     removeChild(element) {
@@ -133,14 +181,10 @@ class HtmlElement {
         if (!newNode) {
             throw new TypeError("insertBefore called without newNode")
         }
-        if (newNode instanceof TextNode) {
-            // TODO: Pass along referenceNode here
-            core.ops.op_append_text_child(this.__node_idx, newNode.text)
-        } else if (newNode instanceof CommentNode) {
-            return
-        } else {
-            core.ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
+        if (referenceNode) {
+            console.log('referenceNode!', referenceNode)
         }
+        core.ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
     }
 
     getAttribute(attr) {
@@ -169,17 +213,7 @@ class HtmlElement {
     }
 
     get innerHTML() {
-        return this._innerHTML
-    }
-
-    get parentNode() {
-        const parent = core.ops.op_get_parent_node(this.__node_idx)
-        return nodeToElement(parent)
-    }
-
-    get firstChild() {
-        const children = core.ops.op_get_child_nodes(this.__node_idx)
-        return children.length > 0 ? nodeToElement(children[0]) : null
+        return core.ops.op_get_inner_html(this.__node_idx)
     }
 
     get nodeType() {
@@ -187,35 +221,76 @@ class HtmlElement {
     }
 
     set innerHTML(value) {
-        this._innerHTML = value
-        if (this.__node_idx) {
-            core.ops.op_set_inner_html(this.__node_idx, value);
-        }
+        core.ops.op_set_inner_html(this.__node_idx, value);
     }
 
     get textContent() {
-        return this._textContent
+        return core.ops.op_get_text_content(this.__node_idx)
     }
 
-    // TODO: Don't handle this as HTML
     set textContent(value) {
-        this._textContent = value
-        if (this.__node_idx) {
-            core.ops.op_set_inner_html(this.__node_idx, value);
-        }
+        core.ops.op_set_text_content(this.__node_idx, value);
     }
 
     get classList() {
         return new ClassList(this.class, this)
     }
 
-    // TODO: Handle deep updates and sync with rust backend
     get style() {
-        return this.__style ?? {}
+        return new CSSStyleDeclaration(this.__style, this)
     }
 
     set style(value) {
+        if (!value instanceof CSSStyleDeclaration) {
+            throw new TypeError("Unsupported style value (for now)")
+        }
         this.__style = value
+    }
+}
+
+class CSSStyleDeclaration {
+    constructor(style, element) {
+        let pairs = style ? style.split(";") : []
+        for (const pair of pairs) {
+            const [key, value] = pair.split(":")
+            this[key] = value
+        }
+        this.__element = element
+
+        return new Proxy(this, {
+            set(target, key, value) {
+                if (String(key).startsWith("__")) {
+                    return Reflect.set(target, key, value)
+                }
+
+                target.setProperty(key, value)
+                return true
+            }
+        })
+    }
+
+    getProperty(key) {
+        return this[key]
+    }
+
+    setProperty(key, value) {
+        this[key] = value
+        this.sync()
+    }
+
+    sync() {
+        const keys = Object.keys(this)
+        let out = ""
+        for (const key of keys) {
+            if (key.startsWith("__")) continue
+            const value = this[key]
+            if (typeof value !== "boolean" || typeof value !== "number" || typeof value !== "string") {
+                out += `${key}:${value};`
+            }
+        }
+
+        this.__element.__style = out
+        core.ops.op_update_attributes(this.__element.__node_idx, { style: out })
     }
 }
 
@@ -234,9 +309,18 @@ class TemplateElement extends HtmlElement {
     }
 }
 
-class CommentNode {
+class CommentNode extends BaseNode {
     constructor(data) {
+        super()
         this.data = data
+    }
+
+    registerInBackend() {
+        this.__node_idx = core.ops.op_create_comment_element(this.data)
+    }
+
+    get nodeType() {
+        return 8
     }
 }
 
@@ -246,14 +330,18 @@ class ClassList {
         this.element = element
     }
 
-    // TODO: Hook this up to the rust backend
     sync() {
         this.element.class = Array.from(this.list).join(" ")
+        core.ops.op_update_attributes(this.element.__node_idx, { class: this.element.class })
     }
 
     add(str) {
         this.list.add(str)
         this.sync()
+    }
+
+    contains(str) {
+        return this.list.has(str)
     }
 
     toggle(str) {
@@ -262,6 +350,11 @@ class ClassList {
         } else {
             this.list.add(str)
         }
+        this.sync()
+    }
+
+    remove(str) {
+        this.list.delete(str)
         this.sync()
     }
 
@@ -277,9 +370,16 @@ class ClassList {
 function nodeToElement(pair) {
     const node_idx = pair[0]
     const node = pair[1]
-    const element = new HtmlElement(node.tag)
-    for (const [key, value] of Object.entries(node.attributes)) {
-        element[key] = value
+    let element;
+    if (node.kind === "element") {
+        element = new HtmlElement(node.tag)
+        for (const [key, value] of Object.entries(node.attributes)) {
+            element[key] = value
+        }
+    } else if (node.kind === "comment") {
+        element = new CommentNode(node.comment)
+    } else if (node.kind === "text") {
+        element = new TextNode(node.text)
     }
     element.__node_idx = node_idx
     return element
@@ -307,12 +407,13 @@ globalThis.document = {
     },
     createElement(tag, ...args) {
         const element = tag === "svg" ? new SVGElement(tag, ...args) : tag === "template" ? new TemplateElement(tag, ...args) : new HtmlElement(tag, ...args)
-        const node_idx = core.ops.op_create_element(element.tag)
-        element.__node_idx = node_idx
+        element.registerInBackend()
         return element
     },
     createComment(data) {
-        return new CommentNode(data)
+        const element = new CommentNode(data)
+        element.registerInBackend()
+        return element
     },
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(id)
@@ -334,7 +435,9 @@ globalThis.document = {
         // TODO: Implement this
     },
     createTextNode(text) {
-        return new TextNode(text)
+        const element = new TextNode(text)
+        element.registerInBackend()
+        return element
     }
 };
 

@@ -19,9 +19,16 @@ pub struct TextElement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CommentElement {
+    pub comment: String,
+    pub parent: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Element(Element),
     Text(TextElement),
+    Comment(CommentElement),
 }
 
 impl Node {
@@ -29,6 +36,7 @@ impl Node {
         match self {
             Node::Element(element) => element.parent,
             Node::Text(element) => element.parent,
+            Node::Comment(element) => element.parent,
         }
     }
 
@@ -36,6 +44,7 @@ impl Node {
         match self {
             Node::Element(element) => element.parent = parent,
             Node::Text(element) => element.parent = parent,
+            Node::Comment(element) => element.parent = parent,
         }
     }
 }
@@ -97,6 +106,23 @@ impl<'a> ToV8<'a> for TextElement {
     }
 }
 
+impl<'a> ToV8<'a> for CommentElement {
+    type Error = Infallible;
+
+    fn to_v8<'i>(
+        self,
+        scope: &mut v8::PinScope<'a, 'i>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        let object = v8::Object::new(scope);
+
+        set_object_prop(scope, object, "kind", "comment");
+        set_object_prop(scope, object, "comment", self.comment);
+        set_object_prop(scope, object, "parent", self.parent);
+
+        Ok(object.into())
+    }
+}
+
 impl<'a> ToV8<'a> for Node {
     type Error = Infallible;
 
@@ -107,6 +133,7 @@ impl<'a> ToV8<'a> for Node {
         match self {
             Node::Element(element) => element.to_v8(scope),
             Node::Text(element) => element.to_v8(scope),
+            Node::Comment(element) => element.to_v8(scope),
         }
     }
 }
@@ -146,6 +173,54 @@ pub struct TraceItem {
 
 const UNIQUE_TAGS: [&str; 2] = ["script", "style"];
 
+fn decode_html_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(amp_idx) = rest.find('&') {
+        out.push_str(&rest[..amp_idx]);
+        rest = &rest[amp_idx..];
+
+        if let Some(stripped) = rest.strip_prefix("&amp;") {
+            out.push('&');
+            rest = stripped;
+            continue;
+        }
+
+        if let Some(decoded) = decode_numeric_entity(rest) {
+            out.push(decoded.0);
+            rest = decoded.1;
+            continue;
+        }
+
+        out.push('&');
+        rest = &rest[1..];
+    }
+
+    out.push_str(rest);
+    out
+}
+
+fn decode_numeric_entity(input: &str) -> Option<(char, &str)> {
+    let after_prefix = input.strip_prefix("&#")?;
+    let semicolon_idx = after_prefix.find(';')?;
+    let entity_body = &after_prefix[..semicolon_idx];
+
+    let codepoint = if let Some(hex) = entity_body
+        .strip_prefix('x')
+        .or_else(|| entity_body.strip_prefix('X'))
+    {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        entity_body.parse::<u32>().ok()?
+    };
+
+    let ch = char::from_u32(codepoint).unwrap_or('\u{FFFD}');
+    let rest = &after_prefix[semicolon_idx + 1..];
+
+    Some((ch, rest))
+}
+
 impl HtmlParser {
     pub fn new(input: String) -> Self {
         Self {
@@ -177,7 +252,7 @@ impl HtmlParser {
 
     fn close_attribute(&mut self) -> anyhow::Result<()> {
         let tag = self.tag.clone();
-        let value = self.value.clone();
+        let value = decode_html_entities(&self.value);
         let node = self.curr_node()?;
         match node {
             Node::Element(element) => {
@@ -193,16 +268,28 @@ impl HtmlParser {
     fn create_node_from_state(&mut self) -> anyhow::Result<bool> {
         let node = match self.stage {
             BuildPhase::Text => Node::Text(TextElement {
-                text: self.tag.clone(),
+                text: decode_html_entities(&self.tag),
                 parent: self.node.clone(),
             }),
             _ => Node::Element(Element {
-                tag: self.tag.clone(),
+                tag: self.tag.trim().to_string(),
                 attributes: HashMap::new(),
                 parent: self.node.clone(),
             }),
         };
         self.node = Some(self.nodes.len());
+        self.nodes.push(node);
+        Ok(true)
+    }
+
+    fn create_comment_from_state(&mut self) -> anyhow::Result<bool> {
+        let mut comment = self.tag.clone();
+        comment = comment.strip_prefix("--").unwrap_or(&comment).to_string();
+        comment = comment.strip_suffix("--").unwrap_or(&comment).to_string();
+        let node = Node::Comment(CommentElement {
+            comment,
+            parent: self.node.clone(),
+        });
         self.nodes.push(node);
         Ok(true)
     }
@@ -340,8 +427,7 @@ impl HtmlParser {
                         self.value = "".to_string();
                     }
                     BuildPhase::CommentOpen => {
-                        // Comment is done, so go back to parsing
-                        // We don't really care about comments, so don't save it
+                        self.create_comment_from_state()?;
                         self.stage = BuildPhase::Start;
                         self.tag.clear();
                     },
@@ -357,6 +443,9 @@ impl HtmlParser {
                     _ => {}
                 },
                 ' ' | '\n' => match self.stage {
+                    BuildPhase::Start => {
+                        self.tag.push(char);
+                    },
                     BuildPhase::Tag => {
                         self.create_node_from_state()?;
 
@@ -377,10 +466,6 @@ impl HtmlParser {
                 },
                 _ => match self.stage {
                     BuildPhase::Start => {
-                        // Don't count new lines as valid starts to text
-                        if char == '\n' {
-                            continue;
-                        }
                         self.stage = BuildPhase::Text;
                         self.tag.push(char);
                     }

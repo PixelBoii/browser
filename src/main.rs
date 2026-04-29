@@ -11,10 +11,11 @@ use style::{
 };
 
 use std::cell::{RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{env, fs, u32};
 
 use anyhow::{Context, Result, anyhow};
@@ -26,15 +27,15 @@ use reqwest::{Url as ReqwestUrl};
 use resvg::{tiny_skia, usvg};
 use softbuffer::{Context as SoftContext, Surface};
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, MouseButton, WindowEvent};
+use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 
-use crate::css::{ClassName, CssParser, MediaQuery, Node as CssNode, parse_media_query_parts, selector_to_parts};
+use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
-use crate::parser::TextElement;
-use crate::style::{CalcExpression, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, class_matches_element, media_query_matches};
+use crate::parser::{CommentElement, TextElement};
+use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, class_matches_element, element_matched_attributes, get_class_list, media_query_matches};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
@@ -49,7 +50,7 @@ impl RectBorderSide {
     pub fn parse_from_style(style: &StyleSizeAndColor, font_size: u32, available_size: &Size) -> Option<RectBorderSide> {
         match style.style {
             StyleBorderStyle::Solid => Some(Self {
-                size: get_specified_size(font_size, &style.size, available_size.width, None)? as u32,
+                size: get_specified_size(font_size, &style.size, Some(available_size.width), None)? as u32,
                 color: match style.color {
                     StyleBackground::Hex(hex) => hex,
                     StyleBackground::Transparent => 0xFF_FF_FF_00,
@@ -131,7 +132,7 @@ struct Renderer {
     pub nodes_idxs: Vec<usize>,
     pub nodes: HashMap<usize, parser::Node>,
     children_index: HashMap<usize, Vec<usize>>,
-    root_indices: Vec<usize>,
+    root_indice: usize,
     node_styles: HashMap<usize, Style>,
     layout_table: HashMap<usize, LayoutBox>,
     node_layout_mapping: HashMap<usize, usize>,
@@ -143,6 +144,11 @@ struct Renderer {
     resolved_font_sizes: HashMap<usize, u32>,
     window_size: PhysicalSize<u32>,
     font_handler: Rc<FontHandler>,
+    pending_dom_update: bool,
+    scroll_y: i32,
+    layout_roots: Vec<usize>,
+    resolved_specified_heights: HashMap<usize, Option<u32>>,
+    resolved_specified_widths: HashMap<usize, Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -226,15 +232,15 @@ impl ContainingNode {
             let style = renderer.node_styles.get(&waiter.node_idx).unwrap().clone();
             let mut forced_size = OptionalSize { height: None, width: None };
             let resolved_parent_font_size = renderer.get_parent_font_size(waiter.node_idx);
-            let font_size = get_specified_size(resolved_parent_font_size, &style.font_size, resolved_parent_font_size, None).with_context(|| "Failed to get specific size")? as u32;
+            let font_size = get_specified_size(resolved_parent_font_size, &style.font_size, Some(resolved_parent_font_size), None).with_context(|| "Failed to get specific size")? as u32;
             renderer.resolved_font_sizes.insert(waiter.node_idx, font_size as u32);
-            let top = get_specified_size(font_size, &style.top, waiter.available_size.height, None);
-            let right = get_specified_size(font_size, &style.right, waiter.available_size.width, None);
-            let bottom = get_specified_size(font_size, &style.bottom, waiter.available_size.height, None);
-            let left = get_specified_size(font_size, &style.left, waiter.available_size.width, None);
+            let top = get_specified_size(font_size, &style.top, Some(waiter.available_size.height), None);
+            let right = get_specified_size(font_size, &style.right, Some(waiter.available_size.width), None);
+            let bottom = get_specified_size(font_size, &style.bottom, Some(waiter.available_size.height), None);
+            let left = get_specified_size(font_size, &style.left, Some(waiter.available_size.width), None);
 
-            let margin_right = get_specified_size(font_size, &style.margin_right, waiter.available_size.width, None);
-            let margin_left = get_specified_size(font_size, &style.margin_left, waiter.available_size.width, None);
+            let margin_right = get_specified_size(font_size, &style.margin_right, Some(waiter.available_size.width), None);
+            let margin_left = get_specified_size(font_size, &style.margin_left, Some(waiter.available_size.width), None);
 
             if style.position == StylePosition::Absolute && style.width == StyleSize::Auto && left.is_some() && right.is_some() {
                 forced_size.width = Some((width as i32 - left.unwrap() - right.unwrap()) as u32);
@@ -293,14 +299,18 @@ impl ContainingNode {
 fn get_specified_size(
     font_size: u32,
     value: &StyleSize,
-    available_size: u32,
+    available_size: Option<u32>,
     auto_size: Option<i32>,
 ) -> Option<i32> {
     match value {
         StyleSize::Auto => auto_size,
         StyleSize::Percent(percentage) => {
-            let computed = available_size as f32 * (*percentage as f32 / 100f32);
-            Some(computed as i32)
+            if let Some(available_size) = available_size {
+                let computed = available_size as f32 * (*percentage as f32 / 100f32);
+                Some(computed as i32)
+            } else {
+                None
+            }
         }
         StyleSize::Px(px) => Some(*px),
         // TODO: Make this handle order of operations
@@ -330,7 +340,11 @@ fn get_specified_size(
             Some(value)
         },
         StyleSize::Em(em) => {
-            Some(*em * font_size as i32)
+            Some((*em * font_size as f32) as i32)
+        },
+        // TODO: This should actually be the font-size of the root element, so figure that out
+        StyleSize::Rem(rem) => {
+            Some((*rem * 16 as f32) as i32)
         },
     }
 }
@@ -368,7 +382,16 @@ fn blend_rgb_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, style: &Style) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn clamp_with_ratio(mut main_value: u32, max_value: u32, mut other_value: u32) -> (u32, u32) {
+    if main_value > max_value {
+        let ratio = main_value as f32 / max_value as f32;
+        main_value = max_value;
+        other_value = (other_value as f32 / ratio) as u32;
+    }
+    (main_value, other_value)
+}
+
+fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, style: &Style) -> Result<(tiny_skia::Pixmap, u32, u32)> {
     let mut opt = usvg::Options::default();
     let color_hex = match style.color {
         StyleBackground::Hex(hex) => hex,
@@ -379,7 +402,9 @@ fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, st
     let tree = usvg::Tree::from_data(&svg_data, &opt)?;
     let svg_size = tree.size().to_int_size();
 
-    let (target_h, target_w) = infer_image_size(Size { height: svg_size.height(), width: svg_size.width() }, input_w, input_h);
+    let (mut target_h, mut target_w) = infer_image_size(Size { height: svg_size.height(), width: svg_size.width() }, input_w, input_h);
+    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
 
     let mut pixmap = tiny_skia::Pixmap::new(target_w.max(1), target_h.max(1))
         .context("failed to allocate svg pixmap")?;
@@ -398,13 +423,15 @@ fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, st
     Ok((pixmap, target_h, target_w))
 }
 
-fn rasterize_png(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn rasterize_png(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
     let src = tiny_skia::Pixmap::decode_png(bytes)?;
     if input_w.is_some_and(|v| v == src.width()) && input_h.is_some_and(|v| v == src.height()) {
         return Ok((src, input_h.unwrap(), input_w.unwrap()));
     }
 
-    let (target_h, target_w) = infer_image_size(Size { height: src.height(), width: src.width() }, input_w, input_h);
+    let (mut target_h, mut target_w) = infer_image_size(Size { height: src.height(), width: src.width() }, input_w, input_h);
+    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
 
     let mut dst = tiny_skia::Pixmap::new(target_w.max(1), target_h.max(1))
         .context("failed to allocate png pixmap")?;
@@ -484,6 +511,9 @@ fn combine_css_nodes(base_url: &String, tokio: &Rc<RefCell<tokio::runtime::Runti
                     return None;
                 }
                 Node::Text(element) => Some(element.text.clone()),
+                Node::Comment(_) => {
+                    return None;
+                },
             };
 
             text
@@ -500,7 +530,10 @@ fn combine_css_nodes(base_url: &String, tokio: &Rc<RefCell<tokio::runtime::Runti
                     && element
                         .attributes
                         .get("rel")
-                        .is_some_and(|v| v == "stylesheet")
+                        .is_some_and(|v| {
+                            let rels: Vec<&str> = v.split(" ").collect();
+                            rels.contains(&"stylesheet")
+                        })
             }
             _ => false,
         })
@@ -525,37 +558,44 @@ fn combine_css_nodes(base_url: &String, tokio: &Rc<RefCell<tokio::runtime::Runti
 
 fn compute_node_style(
     node_styles: &mut HashMap<usize, Style>,
+    resolved_font_sizes: &mut HashMap<usize, u32>,
     nodes: &HashMap<usize, Node>,
     node_idx: usize,
-    root_indices: &[usize],
     children_index: &HashMap<usize, Vec<usize>>,
     css_nodes: &Vec<CssNode>,
-    parent_partial_matches: &HashMap<(usize, usize), usize>,
     parent_style: Option<Style>,
     parent_variables: &HashMap<String, String>,
-    window_size: &PhysicalSize<u32>,
+    parent_font_size: Option<u32>,
+    collected_class_nodes: &HashMap<usize, Vec<usize>>,
+    css_children_index: &HashMap<usize, Vec<usize>>,
 ) {
-    let mut partial_matches = parent_partial_matches.clone();
     let mut variables = parent_variables.clone();
     let style = match &nodes.get(&node_idx).unwrap() {
-        Node::Element(element) => parse_style(element, css_nodes, parent_style, &mut variables, &mut partial_matches, window_size).unwrap(),
+        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, css_children_index).unwrap(),
         node => get_base_style(node, parent_style),
     };
+
+    let resolved_font_size = get_specified_size(parent_font_size.unwrap_or(16), &style.font_size, Some(parent_font_size.unwrap_or(16)), None).unwrap_or_else(|| {
+        println!("Failed to get font size for node idx {}", node_idx);
+        16
+    });
+    resolved_font_sizes.insert(node_idx, resolved_font_size as u32);
 
     node_styles.insert(node_idx, style.clone());
 
     for child_idx in children_index.get(&node_idx).unwrap().iter() {
         compute_node_style(
             node_styles,
+            resolved_font_sizes,
             nodes,
             *child_idx,
-            root_indices,
             children_index,
             css_nodes,
-            &partial_matches,
             Some(style.clone()),
             &variables,
-            window_size
+            Some(resolved_font_size as u32),
+            collected_class_nodes,
+            css_children_index,
         );
     }
 }
@@ -568,6 +608,348 @@ fn parse_css_nodes(css_nodes: &Vec<String>) -> Result<Vec<CssNode>> {
     Ok(parser.nodes)
 }
 
+fn move_up_ancestor_chain(
+    element: usize,
+    html_nodes: &HashMap<usize, Node>,
+    css_nodes: &Vec<(usize, &CssNode)>,
+    class_elements: &HashMap<String, HashSet<usize>>, 
+    css_node: &CssNode,
+    window_size: &PhysicalSize<u32>,
+    require_immediate_match: bool,
+) -> bool {
+    let parent = css_node.get_parent();
+    if let Some(parent) = parent {
+        let parent_node = css_nodes[parent].1;
+        // Media queries should not cause a walk up a HTML parent
+        // I think this happens at the right time, but might be worth double-checking later
+        let walk_up_html_parent_immediately = if let CssNode::MediaQuery(_) = parent_node { false } else { true };
+        if let CssNode::ClassName(parent_node_class) = parent_node {
+            let mut is_match = false;
+            let el = if walk_up_html_parent_immediately { get_parent_html_idx(element, html_nodes) } else { Some(element) };
+            if let Some(el) = el {
+                for (name_part_idx, _) in parent_node_class.name_parts.iter().enumerate() {
+                    is_match |= narrow_elements_by_ancestors(el, css_nodes, html_nodes, class_elements, parent, name_part_idx, 0, window_size, require_immediate_match);
+                }
+            }
+            return is_match;
+        } else {
+            let el = if walk_up_html_parent_immediately { get_parent_html_idx(element, html_nodes) } else { Some(element) };
+            if let Some(el) = el {
+                return narrow_elements_by_ancestors(el, css_nodes, html_nodes, class_elements, parent, 0, 0, window_size, require_immediate_match);
+            } else {
+                return false;
+            }
+        }
+    } else {
+        // If no parent, we've reached the end and are done
+        return true;
+    }
+}
+
+fn move_up_class_part(
+    element: usize,
+    css_nodes: &Vec<(usize, &CssNode)>,
+    html_nodes: &HashMap<usize, Node>,
+    class_elements: &HashMap<String, HashSet<usize>>,
+    parts: &Vec<ClassNamePart>,
+    css_node: usize,
+    nested_part_idx: usize,
+    name_part_idx: usize,
+    window_size: &PhysicalSize<u32>,
+    walk_up_parent: bool,
+    require_immediate_match: bool,
+) -> bool {
+    let node = css_nodes[css_node].1;
+    // If we've reached the beginning, that means this node is done, so move up the chain
+    if nested_part_idx == parts.len() - 1 {
+        return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, require_immediate_match);
+    } else {
+        let walk_el = if walk_up_parent { get_parent_html_idx(element, html_nodes) } else { Some(element) };
+        if let Some(walk_el) = walk_el {
+            return narrow_elements_by_ancestors(walk_el, css_nodes, html_nodes, class_elements, css_node, name_part_idx, nested_part_idx + 1, window_size, require_immediate_match);
+        } else {
+            return false;
+        }
+    }
+}
+
+fn walk_for_html_match<F>(element: usize, html_nodes: &HashMap<usize, Node>, match_fn: F, quota: Option<i32>) -> Option<usize>
+where
+    F: Fn(usize) -> bool
+{
+    // If we're not allowed to walk anymore, give up
+    if quota.is_some_and(|quota| quota == 0) {
+        None
+    } else if match_fn(element) {
+        Some(element)
+    } else if let Some(parent) = html_nodes.get(&element).unwrap().get_parent() {
+        walk_for_html_match(parent, html_nodes, match_fn, quota.and_then(|quota| Some(quota - 1)))
+    } else {
+        None
+    }
+}
+
+fn element_matches_class_part(
+    part: &ClassNamePart,
+    element: usize,
+    html_nodes: &HashMap<usize, Node>,
+    class_elements: &HashMap<String, HashSet<usize>>,
+) -> bool {
+    match part {
+        ClassNamePart::Class(class) => {
+            if let Some(elements_to_keep) = class_elements.get(class) {
+                elements_to_keep.contains(&element)
+            } else {
+                false
+            }
+        },
+        ClassNamePart::Id(id) => {
+            match html_nodes.get(&element).unwrap() {
+                Node::Element(walk_element) => walk_element.attributes.get("id").is_some_and(|el_id| *el_id == *id),
+                _ => false,
+            }
+        },
+        ClassNamePart::ArrowRight => {
+            true
+        },
+        ClassNamePart::PseudoClass(class) => {
+            match class.as_str() {
+                // All elements are children of root
+                "root" => true,
+                _ => false,
+            }
+        },
+        ClassNamePart::Tag(tag) => {
+            match html_nodes.get(&element).unwrap() {
+                Node::Element(walk_element) => walk_element.tag == *tag,
+                _ => false,
+            }
+        },
+        ClassNamePart::Attributes(attributes) => {
+            match html_nodes.get(&element).unwrap() {
+                Node::Element(walk_element) => element_matched_attributes(walk_element, attributes),
+                _ => false,
+            }
+        },
+        ClassNamePart::Combined(combined) => {
+            combined.iter().all(|part| element_matches_class_part(part, element, html_nodes, class_elements))
+        }
+    }
+}
+
+fn narrow_elements_by_ancestors(
+    element: usize,
+    css_nodes: &Vec<(usize, &CssNode)>,
+    html_nodes: &HashMap<usize, Node>,
+    class_elements: &HashMap<String, HashSet<usize>>,
+    css_node: usize,
+    name_part_idx: usize,
+    nested_part_idx: usize,
+    window_size: &PhysicalSize<u32>,
+    require_immediate_match: bool,
+) -> bool {
+    let walk_quota = if require_immediate_match { Some(1) } else { None };
+    let node = css_nodes[css_node].1;
+    match node {
+        CssNode::ClassName(classes) => {
+            let parts = &classes.name_parts[name_part_idx];
+            let part = &parts[parts.len() - 1 - nested_part_idx];
+            let walk_result = walk_for_html_match(element, html_nodes, |idx| element_matches_class_part(part, idx, html_nodes, class_elements), walk_quota);
+            let (walk_up_parent, require_immediate_match) = match part {
+                ClassNamePart::Class(_) | ClassNamePart::Id(_) | ClassNamePart::PseudoClass(_) | ClassNamePart::Tag(_) | ClassNamePart::Attributes(_) | ClassNamePart::Combined(_) => (true, false),
+                ClassNamePart::ArrowRight => (false, true),
+            };
+            if let Some(html_match) = walk_result {
+                return move_up_class_part(html_match, css_nodes, html_nodes, class_elements, parts, css_node, nested_part_idx, name_part_idx, window_size, walk_up_parent, require_immediate_match);
+            } else {
+                return false;
+            }
+        },
+        CssNode::MediaQuery(query) => {
+            if media_query_matches(query, window_size) {
+                return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, false);
+            } else {
+                return false;
+            }
+        },
+        _ => {
+            return false;
+        },
+    };
+}
+
+fn get_parent_html_idx(node_idx: usize, html_nodes: &HashMap<usize, Node>) -> Option<usize> {
+    html_nodes.get(&node_idx).unwrap().get_parent()
+}
+
+fn collect_class_nodes_for_elements(
+    css_nodes: &Vec<(usize, &CssNode)>,
+    html_nodes: &HashMap<usize, Node>,
+    window_size: &PhysicalSize<u32>,
+) -> HashMap<usize, Vec<usize>> {
+    // All class names and media queries that have properties/children and need to be resolved
+    let mut to_resolve = HashSet::new();
+    for (idx, n) in css_nodes.iter() {
+        match n {
+            CssNode::Property(_) | CssNode::Variable(_) => {
+                // TODO: Should probably add back the variables and properties that are at the root at the end, if that's even a thing?
+                if let Some(parent) = n.get_parent() {
+                    to_resolve.insert(parent);
+                } else {
+                    println!("Found no parent for css node {}: {:?}", idx, n);
+                }
+            },
+            _ => {},
+        };
+    }
+
+    let mut class_elements: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (html_node_idx, html_node) in html_nodes.iter() {
+        match html_node {
+            Node::Element(element) => {
+                let class_list = get_class_list(element);
+                for class in class_list {
+                    class_elements.entry(class).or_default().insert(*html_node_idx);
+                }
+            },
+            _ => {},
+        };
+    }
+
+    let mut id_elements: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (html_node_idx, html_node) in html_nodes.iter() {
+        match html_node {
+            Node::Element(element) => {
+                if let Some(id) = element.attributes.get("id") {
+                    id_elements.entry(id.clone()).or_default().insert(*html_node_idx);
+
+                }
+            },
+            _ => {},
+        };
+    }
+
+    let mut tag_elements: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (html_node_idx, html_node) in html_nodes.iter() {
+        match html_node {
+            Node::Element(element) => {
+                tag_elements.entry(element.tag.clone()).or_default().insert(*html_node_idx);
+            },
+            _ => {},
+        };
+    }
+
+    let mut matches: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    for css_node_idx in to_resolve {
+        let node = css_nodes[css_node_idx].1;
+        match node {
+            CssNode::ClassName(classes) => {
+                for (name_part_idx, parts) in classes.name_parts.iter().enumerate() {
+                    let last_part = parts.last().unwrap();
+
+                    let elements: Option<HashSet<usize>> = match last_part {
+                        ClassNamePart::Class(class) => class_elements.get(class).cloned(),
+                        ClassNamePart::Id(id) => id_elements.get(id).cloned(),
+                        ClassNamePart::PseudoClass(class) => {
+                            match class.as_str() {
+                                // No parent means it's a root element
+                                "root" => {
+                                    let elements = html_nodes
+                                        .iter()
+                                        .filter(|(_, node)| node.get_parent().is_none())
+                                        .map(|(idx, _)| idx)
+                                        .cloned()
+                                        .collect::<HashSet<usize>>();
+                                    Some(elements)
+                                },
+                                _ => None,
+                            }
+                        },
+                        ClassNamePart::Tag(tag) => tag_elements.get(tag).cloned(),
+                        ClassNamePart::Combined(combined) => {
+                            let last_part_combined = combined.last().unwrap();
+                            let (indexed, base_elements) = match last_part_combined {
+                                ClassNamePart::Tag(tag) => (true, tag_elements.get(tag).cloned().unwrap_or(HashSet::new())),
+                                ClassNamePart::Class(class) => (true, class_elements.get(class).cloned().unwrap_or(HashSet::new())),
+                                ClassNamePart::Id(id) => (true, id_elements.get(id).cloned().unwrap_or(HashSet::new())),
+                                _ => (false, html_nodes.iter().map(|(idx, _)| idx).cloned().collect::<HashSet<usize>>()),
+                            };
+                            let rules_to_apply = if indexed { &combined[..combined.len() - 1].to_vec() } else { combined };
+
+                            let mut filtered_elements = HashSet::new();
+                            for el in base_elements.into_iter() {
+                                let matched_all = rules_to_apply.iter().all(|part| element_matches_class_part(part, el, html_nodes, &class_elements));
+                                if matched_all {
+                                    filtered_elements.insert(el);
+                                }
+                            }
+                            Some(filtered_elements)
+                        },
+                        // This is not super efficient, but it's not used all that much so should be okay for now
+                        ClassNamePart::Attributes(attributes) => {
+                            let filtered_elements = html_nodes
+                                .iter()
+                                .filter(|(_, node)| match node {
+                                    Node::Element(element) => element_matched_attributes(element, attributes),
+                                    _ => false,
+                                })
+                                .map(|(idx, _)| idx)
+                                .cloned()
+                                .collect();
+                            Some(filtered_elements)
+                        },
+                        // TODO: Implement remaining name part logic
+                        _ => None,
+                    };
+
+                    if let Some(elements) = elements {
+                        for el in elements.to_owned() {
+                            // If there's only a single part, we've already completed this class name by doing the last one
+                            let is_match = if parts.len() == 1 {
+                                move_up_ancestor_chain(el, html_nodes, css_nodes, &class_elements, node, window_size, false)
+                            } else {
+                                if let Some(parent_el) = get_parent_html_idx(el, html_nodes) {
+                                    narrow_elements_by_ancestors(parent_el, css_nodes, html_nodes, &class_elements, css_node_idx, name_part_idx, 1, window_size, false)
+                                } else {
+                                    false
+                                }
+                            };
+
+                            if is_match {
+                                matches.entry(el).or_default().push(css_node_idx);
+                            }
+                        }
+                    }
+                }
+            },
+            CssNode::MediaQuery(query) => {
+                if media_query_matches(query, window_size) {
+                    let elements: Vec<&usize> = html_nodes
+                        .iter()
+                        .filter_map(|(idx, node)| match node {
+                            Node::Element(_) => Some(idx),
+                            _ => None,
+                        })
+                        .collect();
+
+                    for el in elements {
+                        // If there's only a single part, we've already completed this class name by doing the last one
+                        let is_match = move_up_ancestor_chain(*el, html_nodes, css_nodes, &class_elements, node, window_size, false);
+
+                        if is_match {
+                            matches.entry(*el).or_default().push(css_node_idx);
+                        }
+                    }
+                }
+            },
+            _ => println!("Unexpected node appeared: {:?}", node),
+        }
+    }
+
+    matches
+}
+
 fn compute_node_styles(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
@@ -575,29 +957,34 @@ fn compute_node_styles(
     nodes: &HashMap<usize, Node>,
     node_idxs: &Vec<usize>,
     children_index: &HashMap<usize, Vec<usize>>,
-    root_indices: &[usize],
+    root_indice: usize,
     window_size: &PhysicalSize<u32>,
-) -> HashMap<usize, Style> {
+) -> (HashMap<usize, Style>, HashMap<usize, u32>) {
     let css_nodes = combine_css_nodes(base_url, tokio, request_cache, nodes, node_idxs, &children_index).unwrap();
     let parsed_css_nodes = parse_css_nodes(&css_nodes).unwrap();
-    let partial_matches: HashMap<(usize, usize), usize> = HashMap::new();
+
+    let css_children_index = build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
+
+    let start = Instant::now();
+    let collected_class_nodes = collect_class_nodes_for_elements(&parsed_css_nodes.iter().enumerate().collect(), &nodes, window_size);
+    println!("collect_class_nodes_for_elements took {}ms", Instant::now().duration_since(start).as_millis());
 
     let mut node_styles = HashMap::new();
-    for node_idx in root_indices.iter() {
-        compute_node_style(
-            &mut node_styles,
-            nodes,
-            *node_idx,
-            &root_indices,
-            &children_index,
-            &parsed_css_nodes,
-            &partial_matches,
-            None,
-            &HashMap::new(),
-            &window_size,
-        );
-    }
-    node_styles
+    let mut resolved_font_sizes = HashMap::new();
+    compute_node_style(
+        &mut node_styles,
+        &mut resolved_font_sizes,
+        nodes,
+        root_indice,
+        &children_index,
+        &parsed_css_nodes,
+        None,
+        &HashMap::new(),
+        None,
+        &collected_class_nodes,
+        &css_children_index,
+    );
+    (node_styles, resolved_font_sizes)
 }
 
 #[derive(Debug, Clone)]
@@ -612,11 +999,31 @@ struct JsHostState {
 }
 
 #[op2(fast)]
-fn op_create_element(state: &mut OpState, #[number] #[string] tag: String) -> Result<i32, JsError> {
+fn op_create_element(state: &mut OpState, #[string] tag: String) -> Result<i32, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Element(Element { tag, attributes: HashMap::new(), parent: None }));
-    renderer.recompute_nodes();
+    renderer.recompute_children_index();
+    let node_idx = renderer.node_idx_cursor;
+    Ok(node_idx as i32)
+}
+
+#[op2(fast)]
+fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result<i32, JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.push_node(Node::Text(TextElement { text, parent: None }));
+    renderer.recompute_children_index();
+    let node_idx = renderer.node_idx_cursor;
+    Ok(node_idx as i32)
+}
+
+#[op2(fast)]
+fn op_create_comment_element(state: &mut OpState, #[string] comment: String) -> Result<i32, JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.push_node(Node::Comment(CommentElement { comment, parent: None }));
+    renderer.recompute_children_index();
     let node_idx = renderer.node_idx_cursor;
     Ok(node_idx as i32)
 }
@@ -628,8 +1035,17 @@ fn op_append_child(state: &mut OpState, #[number] parent_idx: usize, #[number] n
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.nodes.get_mut(&node_idx).unwrap().set_parent(Some(parent_idx));
-    host.proxy.send_event(UserEvent::DomUpdated).unwrap();
+    renderer.recompute_children_index();
+    renderer.schedule_dom_update(&host.proxy);
     Ok(())
+}
+
+#[op2]
+#[string]
+fn op_get_inner_html(state: &mut OpState, #[number] node_idx: usize) -> Result<String, JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let html = host.renderer.borrow_mut().get_element_inner_html(node_idx);
+    Ok(html)
 }
 
 #[op2(fast)]
@@ -639,21 +1055,13 @@ fn op_remove_child(state: &mut OpState, #[number] child_idx: usize) -> Result<()
     Ok(())
 }
 
-#[op2(fast)]
-fn op_append_text_child(state: &mut OpState, #[number] node_idx: usize, #[string] text: String) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
-    host.renderer.borrow_mut().append_text_child(node_idx, text);
-    host.proxy.send_event(UserEvent::DomUpdated).unwrap();
-    Ok(())
-}
-
 #[op2]
 fn op_get_element_by_id(state: &mut OpState, #[string] id: String) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
     let node_idx = renderer.nodes_idxs.iter().find(|idx| match renderer.nodes.get(*idx).unwrap() {
         Node::Element(element) => element.attributes.get("id").is_some_and(|v| *v == id),
-        Node::Text(_) => false,
+        Node::Text(_) | Node::Comment(_) => false,
     });
     let node = node_idx.and_then(|idx| Some((*idx, renderer.nodes.get(idx).unwrap().clone())));
     Ok(node)
@@ -667,7 +1075,7 @@ fn op_get_elements_by_tag_name(state: &mut OpState, #[string] tag: String) -> Re
         .iter()
         .filter(|idx| match renderer.nodes.get(*idx).unwrap() {
             Node::Element(element) => element.tag == tag,
-            Node::Text(_) => false,
+            Node::Text(_) | Node::Comment(_) => false,
         })
         .map(|idx| (*idx, renderer.nodes.get(idx).unwrap().clone()))
         .collect();
@@ -702,8 +1110,31 @@ fn op_set_inner_html(state: &mut OpState, #[number] node_idx: usize, #[string] h
         renderer.remove_node(child, true);
     }
     renderer.create_children_from_html(node_idx, html);
-    host.proxy.send_event(UserEvent::DomUpdated).unwrap();
+    renderer.recompute_children_index();
+    renderer.schedule_dom_update(&host.proxy);
     Ok(())
+}
+
+#[op2(fast)]
+fn op_set_text_content(state: &mut OpState, #[number] node_idx: usize, #[string] text: String) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let children = renderer.children_index.get(&node_idx).unwrap_or(&vec![]).clone();
+    for child in children {
+        renderer.remove_node(child, true);
+    }
+    renderer.push_node(Node::Text(TextElement { text, parent: Some(node_idx) }));
+    renderer.recompute_children_index();
+    renderer.schedule_dom_update(&host.proxy);
+    Ok(())
+}
+
+#[op2]
+#[string]
+fn op_get_text_content(state: &mut OpState, #[number] node_idx: usize) -> Result<String, JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let text = host.renderer.borrow_mut().get_element_text_content(node_idx);
+    Ok(text)
 }
 
 #[op2(fast)]
@@ -740,6 +1171,23 @@ fn op_get_parent_node(state: &mut OpState, #[number] node_idx: usize) -> Result<
     Ok(parent)
 }
 
+#[op2]
+#[serde]
+fn op_update_attributes(state: &mut OpState, #[number] node_idx: usize, #[serde] attributes: HashMap<String, String>) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    match renderer.nodes.get_mut(&node_idx).unwrap() {
+        Node::Element(element) => {
+            for (key, value) in attributes {
+                element.attributes.insert(key, value);
+            }
+        },
+        _ => {},
+    };
+    renderer.schedule_dom_update(&host.proxy);
+    Ok(())
+}
+
 // This should walk the tree to be fully correct I think
 fn query_selector_all<'a>(node_idxs: &Vec<usize>, nodes_table: &'a HashMap<usize, Node>, selector: String) -> Vec<(usize, &'a Node)> {
     let class = ClassName {
@@ -752,7 +1200,8 @@ fn query_selector_all<'a>(node_idxs: &Vec<usize>, nodes_table: &'a HashMap<usize
         .iter()
         .filter(|idx| match nodes_table.get(*idx).unwrap() {
             Node::Element(element) => {
-                let result = class_matches_element(element, &class, 0, &mut partial_matches);
+                // TODO: rework, i dont think this is correct
+                let result = class_matches_element(element, &get_class_list(element), &class, 0, &mut partial_matches);
                 result.target_matched
             },
             _ => false,
@@ -766,17 +1215,22 @@ extension!(
   browser,
   ops = [
     op_create_element,
+    op_create_text_element,
+    op_create_comment_element,
     op_append_child,
     op_remove_child,
     op_get_child_nodes,
     op_get_parent_node,
-    op_append_text_child,
     op_get_element_by_id,
     op_get_elements_by_tag_name,
     op_query_selector,
     op_query_selector_all,
     op_set_inner_html,
+    op_set_text_content,
     op_media_query_matches,
+    op_update_attributes,
+    op_get_inner_html,
+    op_get_text_content,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js"],
@@ -835,7 +1289,15 @@ impl Renderer {
             .iter()
             .enumerate()
             .filter_map(|(idx, node)| node.get_parent().is_none().then_some(idx))
+            .filter(|idx| match nodes[*idx] {
+                Node::Element(_) | Node::Text(_) => true,
+                Node::Comment(_) => false,
+            })
             .collect();
+        if root_indices.len() != 1 {
+            panic!("Unexpected amount of root indices! {}", root_indices.len());
+        }
+        let root_indice = root_indices[0];
 
         let mut request_cache = HashMap::new();
 
@@ -846,15 +1308,17 @@ impl Renderer {
         let rendered_nodes_ordered = vec![];
         let hovering = None;
 
-        let resolved_font_sizes = HashMap::new();
-
         let nodes_idxs: Vec<usize> = nodes.iter().enumerate().map(|(idx, _)| idx).collect();
         let nodes_table: HashMap<usize, Node> = nodes.into_iter().enumerate().collect();
 
         let children_index = build_children_index(&nodes_table, &nodes_idxs);
-        let node_styles = compute_node_styles(&url, &tokio, &mut request_cache, &nodes_table, &nodes_idxs, &children_index, &root_indices, &window_size);
+        let (node_styles, resolved_font_sizes) = compute_node_styles(&url, &tokio, &mut request_cache, &nodes_table, &nodes_idxs, &children_index, root_indice, &window_size);
 
         let node_idx_cursor = nodes_idxs.len();
+
+        let pending_dom_update = false;
+
+        let scroll_y = 0;
 
         Self {
             url,
@@ -862,7 +1326,7 @@ impl Renderer {
             nodes_idxs,
             nodes: nodes_table,
             children_index,
-            root_indices,
+            root_indice,
             node_styles,
             layout_table,
             node_layout_mapping,
@@ -874,6 +1338,11 @@ impl Renderer {
             resolved_font_sizes,
             window_size,
             font_handler,
+            pending_dom_update,
+            scroll_y,
+            layout_roots: vec![],
+            resolved_specified_heights: HashMap::new(),
+            resolved_specified_widths: HashMap::new(),
         }
     }
 
@@ -910,11 +1379,14 @@ impl Renderer {
                                 return None;
                             }
                             Node::Text(element) => Some(Script { content: ScriptContent::Code(element.text.clone()), script_type }),
+                            Node::Comment(_) => {
+                                return None;
+                            },
                         };
 
                         text
                     }
-                    Node::Text(_) => None,
+                    Node::Text(_) | Node::Comment(_) => None,
                 }
             })
             .flatten()
@@ -928,18 +1400,21 @@ impl Renderer {
     }
 
 
-    fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32) {
+    fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
         if width == 0 || height == 0 {
             return;
         }
 
         clear_buffer(buffer, 0xFF_FF_FF_FF);
 
-        let layout_roots = self.build_layout(width, height);
-        self.rendered_nodes_ordered.clear();
-        for layout_box_idx in layout_roots {
-            self.paint_layout_box(layout_box_idx, buffer, width, height);
+        if rebuild_layout {
+            self.layout_roots = self.build_layout(width, height);
         }
+        let mut new_rendered_nodes_ordered = vec![];
+        for layout_box_idx in self.layout_roots.iter() {
+            self.paint_layout_box(*layout_box_idx, buffer, width, height, self.scroll_y, &mut new_rendered_nodes_ordered);
+        }
+        self.rendered_nodes_ordered = new_rendered_nodes_ordered;
     }
 
     fn move_entire_box(&mut self, layout_box_idx: usize, x: i32, y: i32) {
@@ -951,45 +1426,181 @@ impl Renderer {
         }
     }
 
+    fn img_src_extension(src: &str) -> Option<&'static str> {
+        if src.ends_with(".png") {
+            Some("image/png")
+        } else if src.ends_with(".svg") {
+            Some("image/svg+xml")
+        } else {
+            None
+        }
+    }
+
+    async fn fetch_img_src_data_url(
+        url: ReqwestUrl,
+        src_extension: Option<&'static str>,
+    ) -> (ReqwestUrl, Result<RequestCacheEntry>) {
+        println!("Fetching img src: {}", url);
+        let fetch_url = url.clone();
+        let cache_entry = async move {
+            let resp = reqwest::get(fetch_url).await?;
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                // TODO: Consider whether this is a sane production default
+                .or(src_extension)
+                .with_context(|| "Failed to get content-type for image")?;
+            match content_type {
+                "image/png" => Ok(RequestCacheEntry::PngData(resp.bytes().await?)),
+                "image/svg+xml" => Ok(RequestCacheEntry::SvgData(resp.text().await?)),
+                content_type => Err(anyhow!("Failed to handle image content-type: {}", content_type)),
+            }
+        }.await;
+
+        (url, cache_entry)
+    }
+
+    fn prefetch_images(&mut self) {
+        let base = match ReqwestUrl::parse(&self.url) {
+            Ok(base) => base,
+            Err(err) => {
+                println!("Failed to parse base URL for image prefetch: {}", err);
+                return;
+            }
+        };
+        let mut seen = HashSet::new();
+        let requests: Vec<(ReqwestUrl, Option<&'static str>)> = self.nodes
+            .values()
+            .filter_map(|n| match n {
+                Node::Element(element) if element.tag == "img" => {
+                    element.attributes.get("src").map(|src| src.as_str())
+                },
+                _ => None
+            })
+            .filter(|src| !src.starts_with("data:"))
+            .filter_map(|src| {
+                let url = match resolve_url(src, Some(&base)) {
+                    Ok(url) => url,
+                    Err(err) => {
+                        println!("Failed to resolve image URL {}: {}", src, err);
+                        return None;
+                    }
+                };
+                if self.request_cache.contains_key(&url) || !seen.insert(url.clone()) {
+                    return None;
+                }
+
+                Some((url, Self::img_src_extension(src)))
+            })
+            .collect();
+
+        if requests.is_empty() {
+            return;
+        }
+
+        let results = self.tokio.clone().borrow_mut().block_on(async move {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (url, src_extension) in requests {
+                join_set.spawn(Self::fetch_img_src_data_url(url, src_extension));
+            }
+
+            let mut results = Vec::new();
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(result) => results.push(result),
+                    Err(err) => println!("Failed to join image fetch task: {}", err),
+                }
+            }
+            results
+        });
+
+        for (url, cache_entry) in results {
+            match cache_entry {
+                Ok(entry) => {
+                    self.request_cache.insert(url, entry);
+                }
+                Err(err) => {
+                    println!("Failed to prefetch img src {}: {}", url, err);
+                    self.request_cache.insert(url, RequestCacheEntry::Unsupported);
+                }
+            }
+        }
+    }
+
     fn build_layout(&mut self, width: u32, height: u32) -> Vec<usize> {
-        let mut position = Position { x: 0, y: 0 };
         let mut layout_roots = Vec::new();
 
         self.node_layout_mapping.clear();
 
-        for root_idx in self.root_indices.clone() {
-            // Create initial containing node
-            self.containing_nodes.insert(root_idx, ContainingNode {
-                node_idx: root_idx,
-                waiters: vec![],
-            });
-            let containing_node_idx = root_idx;
+        self.prefetch_images();
 
-            if let Some(layout_box_idx) = self.layout_node(
-                root_idx,
-                position,
-                Size { width, height },
-                OptionalSize {
-                    height: None,
-                    width: None,
-                },
-                containing_node_idx,
-                true,
-                true,
-            ) {
-                let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
-                position.y += layout_box.rect.height as i32 + layout_box.rect.margin_bottom;
-                layout_roots.push(layout_box_idx);
-            }
+        // Create initial containing node
+        self.containing_nodes.insert(self.root_indice, ContainingNode {
+            node_idx: self.root_indice,
+            waiters: vec![],
+        });
+        let containing_node_idx = self.root_indice;
+
+        if let Some(layout_box_idx) = self.layout_node(
+            self.root_indice,
+            Position { x: 0, y: 0 },
+            Size { width, height },
+            OptionalSize {
+                height: None,
+                width: None,
+            },
+            containing_node_idx,
+            true,
+            true,
+        ) {
+            layout_roots.push(layout_box_idx);
         }
 
         layout_roots
     }
 
     fn inject_css_variables_into_str(&self, str: &mut String, variables: &HashMap<String, String>) {
+        // Return early if string doesn't need any vars
+        if !str.contains("var(") {
+            return;
+        }
         for (variable, value) in variables.iter() {
             *str = str.replace(&format!("var({})", variable), value);
         }
+    }
+
+    fn get_element_text_content(&self, node_idx: usize) -> String {
+        let mut str = String::new();
+        for child_idx in self.children_index.get(&node_idx).unwrap() {
+            str += &self.get_text_content(*child_idx);
+        }
+        str
+    }
+
+    fn get_element_inner_html(&self, node_idx: usize) -> String {
+        let mut str = String::new();
+        for child_idx in self.children_index.get(&node_idx).unwrap() {
+            str += &self.get_element_html(*child_idx);
+        }
+        str
+    }
+
+    fn get_text_content(&self, node_idx: usize) -> String {
+        let node = &self.nodes.get(&node_idx).unwrap();
+        let mut str = String::new();
+        match node {
+            Node::Text(element) => {
+                str += &element.text;
+            },
+            Node::Element(_) => {
+                for child_idx in self.children_index.get(&node_idx).unwrap() {
+                    str += &self.get_text_content(*child_idx);
+                }
+            },
+            Node::Comment(_) => {},
+        };
+        str
     }
 
     fn get_element_html(&self, node_idx: usize) -> String {
@@ -1016,7 +1627,10 @@ impl Renderer {
                 str += "</";
                 str += &element.tag;
                 str += ">";
-            }
+            },
+            Node::Comment(element) => {
+                str += &format!("<!--{}-->", element.comment);
+            },
         }
         str
     }
@@ -1024,33 +1638,14 @@ impl Renderer {
     async fn get_img_src_data(&mut self, src: &str) -> Result<RequestCacheEntry> {
         let base = ReqwestUrl::parse(&self.url)?;
         let url = resolve_url(src, Some(&base))?;
-        let src_extension = if src.ends_with(".png") {
-            Some("image/png")
-        } else if src.ends_with(".svg") {
-            Some("image/svg+xml")
-        } else {
-            None
-        };
+        let src_extension = Self::img_src_extension(src);
         if let Some(cache) = self.request_cache.get(&url) {
             match cache {
                 RequestCacheEntry::Unsupported => Err(anyhow!("Unsupported image")),
                 v => Ok(v.clone())
             }
         } else {
-            println!("Fetching img src: {}", url);
-            let resp = reqwest::get(url.clone()).await?;
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                // TODO: Consider whether this is a sane production default
-                .or(src_extension)
-                .with_context(|| "Failed to get content-type for image")?;
-            let cache_entry = match content_type {
-                "image/png" => Ok(RequestCacheEntry::PngData(resp.bytes().await?)),
-                "image/svg+xml" => Ok(RequestCacheEntry::SvgData(resp.text().await?)),
-                _ => Err(anyhow!("Failed to handle image content-type")),
-            };
+            let (url, cache_entry) = Self::fetch_img_src_data_url(url, src_extension).await;
             if let Ok(ref entry) = cache_entry {
                 self.request_cache.insert(url, entry.clone());
             } else {
@@ -1096,9 +1691,7 @@ impl Renderer {
     ) -> Option<usize> {
         let style = self.node_styles.get(&node_idx).unwrap().clone();
 
-        let resolved_parent_font_size = self.get_parent_font_size(node_idx);
-        let resolved_font_size = get_specified_size(resolved_parent_font_size, &style.font_size, resolved_parent_font_size, None)?;
-        self.resolved_font_sizes.insert(node_idx, resolved_font_size as u32);
+        let resolved_font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
         let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
             self.get_margins(node_idx, &style, available_size);
@@ -1107,10 +1700,11 @@ impl Renderer {
         cursor.y += margin_top_size as i32;
 
         match self.nodes.get(&node_idx).unwrap().clone() {
+            Node::Comment(_) => None,
             Node::Text(text) => {
                 let text = collapse_whitespace(&text.text).unwrap_or("".to_string());
                 let renderable_text = self.font_handler
-                    .get_renderable_text(text.clone(), resolved_font_size)
+                    .get_renderable_text(text.clone(), resolved_font_size as i32)
                     .inspect_err(|err| println!("Failed to get renderable text for {} {:?}", text, err))
                     .ok()?;
                 let width = forced_size.width.unwrap_or(renderable_text.width);
@@ -1126,7 +1720,7 @@ impl Renderer {
                         color: style.color,
                         margin_bottom: margin_bottom_size,
                         margin_right: margin_right_size,
-                        font_size: Some(resolved_font_size as u32),
+                        font_size: Some(resolved_font_size),
                         border: RectBorder::new_empty(),
                     },
                     kind: LayoutKind::Text(renderable_text),
@@ -1137,12 +1731,18 @@ impl Renderer {
             Node::Element(element) => {
                 if element.tag == "svg" || element.tag == "img" {
                     let style = self.node_styles.get(&node_idx).unwrap().clone();
+                    if let StyleDisplay::None = style.display {
+                        return None;
+                    }
                     let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
+                    let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, &style);
+                    let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None).unwrap_or(available_size.height as i32) as u32;
+                    let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None).unwrap_or(available_size.width as i32) as u32;
                     let (pixmap, height, width) = match element.tag.as_str() {
                         "svg" => {
                             let mut svg_data = self.get_element_html(node_idx);
                             self.inject_css_variables_into_str(&mut svg_data, &style.variables);
-                            let result = rasterize_svg(svg_data.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, &style);
+                            let result = rasterize_svg(svg_data.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style);
                             match result {
                                 Err(err) => {
                                     println!("Failed to rasterize SVG data: {}", err);
@@ -1157,7 +1757,7 @@ impl Renderer {
                                 if let Some(data) = src.strip_prefix("data:image/svg+xml,") {
                                     let mut decoded = percent_encoding::percent_decode_str(data).decode_utf8().ok()?.to_string();
                                     self.inject_css_variables_into_str(&mut decoded, &style.variables);
-                                    let result = rasterize_svg(decoded.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, &style);
+                                    let result = rasterize_svg(decoded.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style);
                                     match result {
                                         Err(err) => {
                                             println!("Failed to rasterize SVG data: {}", err);
@@ -1172,11 +1772,12 @@ impl Renderer {
                                 let img_data = self.tokio.clone().borrow_mut().block_on(self.get_img_src_data(src)).ok()?;
                                 let result = match img_data {
                                     RequestCacheEntry::PngData(bytes) => {
-                                        rasterize_png(&bytes, container_size.container_width_non_filling, container_size.container_height_non_filling).unwrap()
+                                        rasterize_png(&bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
                                     },
                                     RequestCacheEntry::SvgData(svg_data) => {
-                                        self.inject_css_variables_into_str(&mut svg_data.clone(), &style.variables);
-                                        let result = rasterize_svg(svg_data.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, &style);
+                                        let mut injected = svg_data.clone();
+                                        self.inject_css_variables_into_str(&mut injected, &style.variables);
+                                        let result = rasterize_svg(injected.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style);
                                         match result {
                                             Err(err) => {
                                                 println!("Failed to rasterize SVG data: {}", err);
@@ -1223,6 +1824,16 @@ impl Renderer {
                             save_as_final,
                         ),
                         StyleDisplay::Flex | StyleDisplay::InlineFlex => self.layout_flex(
+                            node_idx,
+                            cursor,
+                            &style,
+                            available_size,
+                            forced_size,
+                            containing_node_idx,
+                            allow_fill,
+                            save_as_final,
+                        ),
+                        StyleDisplay::Grid => self.layout_grid(
                             node_idx,
                             cursor,
                             &style,
@@ -1331,26 +1942,26 @@ impl Renderer {
 
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).unwrap();
 
-        let min_height = get_specified_size(*resolved_font_size, &style.min_height, available_size.height, None)
+        let min_height = get_specified_size(*resolved_font_size, &style.min_height, Some(available_size.height), None)
             .and_then(|v| Some(v as u32));
-        let max_height = get_specified_size(*resolved_font_size, &style.max_height, available_size.height, None)
+        let max_height = get_specified_size(*resolved_font_size, &style.max_height, Some(available_size.height), None)
             .and_then(|v| Some(v as u32));
-        let min_width = get_specified_size(*resolved_font_size, &style.min_width, available_size.width, None)
+        let min_width = get_specified_size(*resolved_font_size, &style.min_width, Some(available_size.width), None)
             .and_then(|v| Some(v as u32));
-        let max_width = get_specified_size(*resolved_font_size, &style.max_width, available_size.width, None)
+        let max_width = get_specified_size(*resolved_font_size, &style.max_width, Some(available_size.width), None)
             .and_then(|v| Some(v as u32));
 
         let specified_width = forced_size.width.or(get_specified_size(
             *resolved_font_size,
             &style.width,
-            available_size.width,
+            Some(available_size.width),
             None,
         )
         .and_then(|v| Some(v as u32)));
         let specified_height = forced_size.height.or(get_specified_size(
             *resolved_font_size,
             &style.height,
-            available_size.height,
+            Some(available_size.height),
             None,
         )
         .and_then(|v| Some(v as u32)));
@@ -1412,6 +2023,168 @@ impl Renderer {
         Ok(layout_box)
     }
 
+    fn get_grid_column(&self, current_column: i32, template_columns: &Vec<GridTemplateColumnsValue>) -> bool {
+        // Are we out of columns?
+        current_column >= template_columns.len() as i32
+    }
+
+    fn layout_grid(
+        &mut self,
+        node_idx: usize,
+        cursor: Position,
+        style: &Style,
+        available_size: Size,
+        forced_size: OptionalSize,
+        mut containing_node_idx: usize,
+        allow_fill: bool,
+        save_as_final: bool,
+    ) -> Option<(u32, u32, Vec<usize>)> {
+        let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
+        if style.position == StylePosition::Relative {
+            self.containing_nodes.insert(node_idx, ContainingNode {
+                node_idx,
+                waiters: vec![],
+            });
+            containing_node_idx = node_idx;
+        }
+        let mut children = vec![];
+        let (padding_left_size, _, padding_top_size, _) =
+            self.get_paddings(node_idx, style, available_size);
+        let mut content_position = Position {
+            x: cursor.x + padding_left_size as i32,
+            y: cursor.y + padding_top_size as i32,
+        };
+        let original_content_position = content_position.clone();
+        let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
+        let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, style);
+        let specified_height = forced_size.height.or(get_specified_size(
+            font_size,
+            &style.height,
+            containing_block_height,
+            None,
+        )
+        .and_then(|v| Some(v as u32)));
+        let specified_width = forced_size.width.or(get_specified_size(
+            font_size,
+            &style.width,
+            containing_block_width,
+            None,
+        )
+        .and_then(|v| Some(v as u32)));
+        self.resolved_specified_heights.insert(node_idx, specified_height);
+        self.resolved_specified_widths.insert(node_idx, specified_width);
+        let mut max_child_height = 0;
+        let mut longest_row_width = 0;
+        let width_to_distribute = container_sizes.inner_width;
+        let children_idxs = self.children_index.get(&node_idx).cloned().unwrap();
+        let mut current_column = 0;
+        let mut definitely_used_width = 0;
+        let mut max_total_fractions = 0;
+        if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
+            for value in template_columns.iter() {
+                match value {
+                    GridTemplateColumnsValue::Size(size) => {
+                        definitely_used_width += match size {
+                            GridColumnSize::Px(px) => *px,
+                            // TODO: This is probably not entirely correct, so come back to this
+                            GridColumnSize::Fraction(_) => panic!(),
+                        };
+                    },
+                    GridTemplateColumnsValue::MinMax((_, max)) => {
+                        if let GridColumnSize::Fraction(fraction) = max {
+                            max_total_fractions += fraction;
+                        }
+                    },
+                };
+            }
+        }
+        let dynamic_space_to_give = width_to_distribute - definitely_used_width as u32;
+        for child_idx in children_idxs.iter() {
+            let wrap = if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
+                self.get_grid_column(current_column, &template_columns)
+            } else {
+                false
+            };
+            if wrap {
+                content_position.x = 0;
+                content_position.y += max_child_height;
+                max_child_height = 0;
+                current_column = 0;
+            }
+            let specified_column_size = if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
+                match &template_columns[current_column as usize] {
+                    GridTemplateColumnsValue::Size(size) => {
+                        match size {
+                            GridColumnSize::Px(px) => *px,
+                            // TODO: This is probably not entirely correct, so come back to this
+                            GridColumnSize::Fraction(_) => panic!(),
+                        }
+                    },
+                    GridTemplateColumnsValue::MinMax((min, max)) => {
+                        let min_parsed = match min {
+                            GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Fraction(_) => panic!(),
+                        };
+                        let max_parsed = match max {
+                            GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Fraction(fraction) => (dynamic_space_to_give as f32 * (*fraction as f32 / max_total_fractions as f32)) as i32,
+                        };
+
+                        // TODO: Take min into account
+                        max_parsed
+                    },
+                }
+            } else {
+                available_size.width as i32
+            };
+            if let Some(child) = self.layout_node(
+                *child_idx,
+                content_position,
+                Size {
+                    width: specified_column_size as u32,
+                    height: container_sizes.inner_height,
+                },
+                OptionalSize {
+                    height: None,
+                    width: None,
+                },
+                containing_node_idx,
+                // Inline-block doesn't fill the width, so instruct children to not do that either
+                match style.display {
+                    StyleDisplay::InlineBlock => false,
+                    _ => allow_fill,
+                },
+                save_as_final,
+            ) {
+                let child_box = self.layout_table.get(&child).unwrap();
+                content_position.x += specified_column_size;
+                longest_row_width = longest_row_width.max(content_position.x - original_content_position.x);
+                current_column += 1;
+                max_child_height = max_child_height.max(child_box.rect.height as i32);
+                children.push(child);
+            }
+        }
+        let content_height = (content_position.y - original_content_position.y).max(max_child_height);
+        let height = specified_height
+            .unwrap_or(content_height as u32)
+            .min(container_sizes.max_height.unwrap_or(u32::MAX))
+            .max(container_sizes.min_height.unwrap_or(u32::MIN));
+        let width = if allow_fill { container_sizes.container_width } else { container_sizes.compute_actual_container_width(longest_row_width as u32) };
+        Some((width as u32, height as u32, children))
+    }
+
+    fn get_containing_block_size(&self, containing_node_idx: usize, node_idx: usize, style: &Style) -> (Option<u32>, Option<u32>) {
+        // This is the parent which this node uses for % sizing, and possibly more later on
+        let containing_block = match style.position {
+            StylePosition::Absolute | StylePosition::Fixed => Some(containing_node_idx),
+            StylePosition::Relative | StylePosition::Static => self.nodes.get(&node_idx).unwrap().get_parent(),
+        };
+        let containing_block_height = containing_block.and_then(|idx| self.resolved_specified_heights.get(&idx).unwrap().clone());
+        let containing_block_width = containing_block.and_then(|idx| self.resolved_specified_widths.get(&idx).unwrap().clone());
+
+        (containing_block_height, containing_block_width)
+    }
+
     fn layout_block(
         &mut self,
         node_idx: usize,
@@ -1435,13 +2208,25 @@ impl Renderer {
 
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
-        let specified_height = forced_size.height.or(get_specified_size(
+        let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, style);
+
+        let specified_width = forced_size.width.or(get_specified_size(
             font_size,
-            &style.height,
-            available_size.height,
+            &style.width,
+            containing_block_width,
             None,
         )
         .and_then(|v| Some(v as u32)));
+        let specified_height = forced_size.height.or(get_specified_size(
+            font_size,
+            &style.height,
+            containing_block_height,
+            None,
+        )
+        .and_then(|v| Some(v as u32)));
+
+        self.resolved_specified_heights.insert(node_idx, specified_height);
+        self.resolved_specified_widths.insert(node_idx, specified_width);
 
         let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
 
@@ -1536,7 +2321,7 @@ impl Renderer {
 
         let input_value = match &self.nodes.get(&node_idx).unwrap() {
             Node::Element(element) => element.attributes.get("value"),
-            Node::Text(_) => None,
+            Node::Text(_) | Node::Comment(_) => None,
         };
         if immediate_children.len() == 0 && input_value.is_some_and(|v| v.len() > 0) {
             let layout_box = self.create_input_text_box(node_idx, input_value.unwrap().clone(), &mut content_position, font_size, save_as_final).unwrap();
@@ -1591,6 +2376,7 @@ impl Renderer {
             StyleJustifyContent::Center => cross_free_space / 2,
             StyleJustifyContent::SpaceBetween => 0,
             StyleJustifyContent::Stretch => 0,
+            StyleJustifyContent::SpaceEvenly => 0,
         };
         cross_offset
     }
@@ -1620,15 +2406,25 @@ impl Renderer {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
         let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
+        let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, style);
 
         let specified_height = get_specified_size(
             font_size,
             &style.height,
-            available_size.height,
+            containing_block_height,
+            None,
+        )
+        .and_then(|v| Some(v as u32));
+        let specified_width = get_specified_size(
+            font_size,
+            &style.width,
+            containing_block_width,
             None,
         )
         .and_then(|v| Some(v as u32));
         let has_definite_height = forced_size.height.is_some() || specified_height.is_some();
+        self.resolved_specified_heights.insert(node_idx, specified_height);
+        self.resolved_specified_widths.insert(node_idx, specified_width);
 
         if style.position == StylePosition::Relative {
             self.containing_nodes.insert(node_idx, ContainingNode {
@@ -1722,7 +2518,7 @@ impl Renderer {
         }
 
         // Justify-content
-        let authored_gap = get_specified_size(font_size, &style.gap, flex_available_size, None).unwrap_or(0);
+        let authored_gap = get_specified_size(font_size, &style.gap, Some(flex_available_size), None).unwrap_or(0);
         let gap_total = authored_gap.saturating_mul(base_items.len().saturating_sub(1) as i32);
 
         let used_main: u32 = base_items
@@ -1745,6 +2541,11 @@ impl Renderer {
                 (0, main_free_space / (base_items.len() as u32 - 1))
             }
             StyleJustifyContent::SpaceBetween => (0, 0),
+            StyleJustifyContent::SpaceEvenly if !base_items.is_empty() => {
+                let slot = main_free_space / (base_items.len() as u32 + 1);
+                (slot, slot)
+            }
+            StyleJustifyContent::SpaceEvenly => (0, 0),
         };
 
         let main_gap = main_distributed_gap + authored_gap as u32;
@@ -1892,8 +2693,8 @@ impl Renderer {
 
                 position.x > layout_box.rect.x &&
                     position.x < end_x &&
-                    position.y > layout_box.rect.y &&
-                    position.y < end_y
+                    position.y > layout_box.rect.y + self.scroll_y &&
+                    position.y < end_y + self.scroll_y
             });
         self.hovering = hovering.copied();
     }
@@ -1904,6 +2705,7 @@ impl Renderer {
         buffer: &mut [u32],
         width: u32,
         height: u32,
+        offset_y: i32,
     ) {
         if let Some(border) = &layout_box.rect.border.left {
             draw_rect_filled(
@@ -1911,7 +2713,7 @@ impl Renderer {
                 width,
                 height,
                 layout_box.rect.x,
-                layout_box.rect.y,
+                layout_box.rect.y + offset_y,
                 border.size,
                 layout_box.rect.height,
                 border.color,
@@ -1923,7 +2725,7 @@ impl Renderer {
                 width,
                 height,
                 layout_box.rect.x,
-                layout_box.rect.y,
+                layout_box.rect.y + offset_y,
                 layout_box.rect.width,
                 border.size,
                 border.color,
@@ -1935,7 +2737,7 @@ impl Renderer {
                 width,
                 height,
                 layout_box.rect.x + layout_box.rect.width as i32 - border.size as i32,
-                layout_box.rect.y,
+                layout_box.rect.y + offset_y,
                 border.size,
                 layout_box.rect.height,
                 border.color,
@@ -1947,7 +2749,7 @@ impl Renderer {
                 width,
                 height,
                 layout_box.rect.x,
-                layout_box.rect.y + layout_box.rect.height as i32 - border.size as i32,
+                layout_box.rect.y + offset_y + layout_box.rect.height as i32 - border.size as i32,
                 layout_box.rect.width,
                 border.size,
                 border.color,
@@ -1956,14 +2758,23 @@ impl Renderer {
     }
 
     fn paint_layout_box(
-        &mut self,
+        &self,
         layout_box_idx: usize,
         buffer: &mut [u32],
         width: u32,
         height: u32,
+        offset_y: i32,
+        rendered_nodes_ordered: &mut Vec<usize>,
     ) {
-        self.rendered_nodes_ordered.push(layout_box_idx);
+        rendered_nodes_ordered.push(layout_box_idx);
         let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
+        let container_start_y = layout_box.rect.y + offset_y;
+        let container_end_y = container_start_y + layout_box.rect.height as i32;
+        // If outside viewport, don't render
+        // This is a bit naive but should be okay for now
+        if container_start_y > height as i32 || container_end_y < 0 {
+            return;
+        }
         match &layout_box.kind {
             LayoutKind::Element => {
                 let bg_hex: Option<u32> = match layout_box.rect.background {
@@ -1980,13 +2791,13 @@ impl Renderer {
                         width,
                         height,
                         layout_box.rect.x + left_border_size,
-                        layout_box.rect.y + top_border_size,
+                        container_start_y + top_border_size,
                         (layout_box.rect.width as i32 - left_border_size - right_border_size).max(0) as u32,
                         (layout_box.rect.height as i32 - top_border_size - bottom_border_size).max(0) as u32,
                         bg,
                     );
                 }
-                self.paint_borders(layout_box, buffer, width, height);
+                self.paint_borders(&layout_box, buffer, width, height, offset_y);
             }
             LayoutKind::Text(text) => {
                 let bg_hex: Option<u32> = match layout_box.rect.background {
@@ -1999,7 +2810,7 @@ impl Renderer {
                         width,
                         height,
                         layout_box.rect.x,
-                        layout_box.rect.y,
+                        container_start_y,
                         layout_box.rect.width,
                         layout_box.rect.height,
                         bg,
@@ -2016,7 +2827,7 @@ impl Renderer {
                         width,
                         height,
                         layout_box.rect.x as i32,
-                        layout_box.rect.y as i32,
+                        container_start_y as i32,
                         text,
                         color,
                         layout_box.rect.font_size.unwrap(),
@@ -2028,22 +2839,23 @@ impl Renderer {
                 let pixmap_width = pixmap_buffer.width();
                 let pixmap_height = pixmap_buffer.height();
                 let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
-                let end_y = pixmap_height.min((height as i32 - layout_box.rect.y).max(0) as u32);
+                let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
                 for pixel_x in 0..end_x {
                     for pixel_y in 0..end_y {
                         let pixel = pixels[(pixel_x + pixel_y * pixmap_width) as usize];
-                        let dist = (layout_box.rect.y as u32 * width
-                            + layout_box.rect.x as u32
-                            + (pixel_x + pixel_y * width))
-                            as usize;
-                        buffer[dist] = self.blend_premul_over_rgb(buffer[dist], pixel);
+                        let dist = container_start_y * width as i32
+                            + layout_box.rect.x
+                            + (pixel_x as i32 + pixel_y as i32 * width as i32);
+                        if dist > 0 {
+                            buffer[dist as usize] = self.blend_premul_over_rgb(buffer[dist as usize], pixel);
+                        }
                     }
                 }
             }
         }
 
-        for child in layout_box.children.clone() {
-            self.paint_layout_box(child, buffer, width, height);
+        for &child in &layout_box.children {
+            self.paint_layout_box(child, buffer, width, height, offset_y, rendered_nodes_ordered);
         }
     }
 
@@ -2065,7 +2877,7 @@ impl Renderer {
     pub fn get_parent_link(&self, idx: usize) -> Option<usize> {
         let is_link = match &self.nodes.get(&idx)? {
             Node::Element(element) => element.tag == "a",
-            Node::Text(_) => false,
+            Node::Text(_) | Node::Comment(_) => false,
         };
 
         if is_link {
@@ -2078,10 +2890,6 @@ impl Renderer {
                 None
             }
         }
-    }
-
-    pub fn append_text_child(&mut self, node_idx: usize, text: String) {
-        self.push_node(Node::Text(TextElement { text, parent: Some(node_idx) }));
     }
 
     pub fn reserve_node_idx(&mut self) {
@@ -2120,21 +2928,25 @@ impl Renderer {
         self.children_index.remove(&node_idx);
     }
 
-    pub fn recompute_nodes(&mut self) {
+    pub fn recompute_children_index(&mut self) {
         self.children_index = build_children_index(&self.nodes, &self.nodes_idxs);
-        self.node_styles = compute_node_styles(&self.url, &self.tokio, &mut self.request_cache, &self.nodes, &self.nodes_idxs, &self.children_index, &self.root_indices, &self.window_size);
+    }
+
+    pub fn recompute_nodes(&mut self) {
+        self.recompute_children_index();
+        (self.node_styles, self.resolved_font_sizes) = compute_node_styles(&self.url, &self.tokio, &mut self.request_cache, &self.nodes, &self.nodes_idxs, &self.children_index, self.root_indice, &self.window_size);
     }
 
     pub fn get_paddings(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let padding_left_size =
-            get_specified_size(font_size, &style.padding_left, available_size.width, None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_left, Some(available_size.width), None).unwrap_or(0);
         let padding_right_size =
-            get_specified_size(font_size, &style.padding_right, available_size.width, None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_right, Some(available_size.width), None).unwrap_or(0);
         let padding_top_size =
-            get_specified_size(font_size, &style.padding_top, available_size.height, None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_top, Some(available_size.height), None).unwrap_or(0);
         let padding_bottom_size =
-            get_specified_size(font_size, &style.padding_bottom, available_size.height, None).unwrap_or(0);
+            get_specified_size(font_size, &style.padding_bottom, Some(available_size.height), None).unwrap_or(0);
 
         (
             padding_left_size,
@@ -2147,13 +2959,13 @@ impl Renderer {
     pub fn get_border_sizes(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let left_size =
-            get_specified_size(font_size, &style.border_left.size, available_size.width, None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_left.size, Some(available_size.width), None).unwrap_or(0);
         let right_size =
-            get_specified_size(font_size, &style.border_right.size, available_size.width, None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_right.size, Some(available_size.width), None).unwrap_or(0);
         let top_size =
-            get_specified_size(font_size, &style.border_top.size, available_size.height, None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_top.size, Some(available_size.height), None).unwrap_or(0);
         let bottom_size =
-            get_specified_size(font_size, &style.border_bottom.size, available_size.height, None).unwrap_or(0);
+            get_specified_size(font_size, &style.border_bottom.size, Some(available_size.height), None).unwrap_or(0);
 
         (
             left_size,
@@ -2166,13 +2978,13 @@ impl Renderer {
     pub fn get_margins(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let margin_left_size =
-            get_specified_size(font_size, &style.margin_left, available_size.width, None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_left, Some(available_size.width), None).unwrap_or(0);
         let margin_right_size =
-            get_specified_size(font_size, &style.margin_right, available_size.width, None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_right, Some(available_size.width), None).unwrap_or(0);
         let margin_top_size =
-            get_specified_size(font_size, &style.margin_top, available_size.height, None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_top, Some(available_size.height), None).unwrap_or(0);
         let margin_bottom_size =
-            get_specified_size(font_size, &style.margin_bottom, available_size.height, None).unwrap_or(0);
+            get_specified_size(font_size, &style.margin_bottom, Some(available_size.height), None).unwrap_or(0);
 
         (
             margin_left_size,
@@ -2191,25 +3003,20 @@ impl Renderer {
             idx_mapping.insert(node_internal_idx, self.node_idx_cursor);
         }
         for (node_internal_idx, node) in parser.nodes.iter_mut().enumerate() {
-            match node {
-                Node::Element(element) => {
-                    // Set root elements parent to us
-                    if element.parent.is_none() {
-                        element.parent = Some(parent_idx);
-                    } else {
-                        let _ = element.parent.insert(*idx_mapping.get(&element.parent.unwrap()).unwrap());
-                    }
-                },
-                Node::Text(element) => {
-                    // Set root elements parent to us
-                    if element.parent.is_none() {
-                        element.parent = Some(parent_idx);
-                    } else {
-                        let _ = element.parent.insert(*idx_mapping.get(&element.parent.unwrap()).unwrap());
-                    }
-                },
-            };
+            // Set root elements parent to us
+            if node.get_parent().is_none() {
+                node.set_parent(Some(parent_idx));
+            } else {
+                let _ = node.set_parent(idx_mapping.get(&node.get_parent().unwrap()).copied());
+            }
             self.insert_node_at_idx(*idx_mapping.get(&node_internal_idx).unwrap(), node.clone());
+        }
+    }
+
+    pub fn schedule_dom_update(&mut self, proxy: &EventLoopProxy<UserEvent>) {
+        if !self.pending_dom_update {
+            proxy.send_event(UserEvent::DomUpdated).unwrap();
+            self.pending_dom_update = true;
         }
     }
 }
@@ -2256,11 +3063,12 @@ impl FontHandler {
 struct Browser {
     url: String,
     renderer: Option<Rc<RefCell<Renderer>>>,
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
     js_runtime: Option<Rc<RefCell<JsRuntime>>>,
     tokio: Option<Rc<RefCell<tokio::runtime::Runtime>>>,
     html_parser: Option<HtmlParser>,
     font_handler: Rc<FontHandler>,
+    layout_dirty: bool,
 }
 
 impl Browser {
@@ -2275,6 +3083,7 @@ impl Browser {
             tokio: None,
             html_parser: None,
             font_handler,
+            layout_dirty: true,
         }
     }
 
@@ -2387,6 +3196,7 @@ impl Browser {
             println!("Finished running JS code: {:?}", js_result);
         }
         if let Some(window) = self.window.as_mut() {
+            self.layout_dirty = true;
             window.request_redraw();
         }
         Ok(())
@@ -2416,6 +3226,7 @@ impl Browser {
             if let Some(hovering) = hovering {
                 // Run event listeners
                 let hovering_node_idx = renderer.layout_to_node_idx(&hovering);
+                println!("Clicked on {}", hovering_node_idx);
                 let parents: Vec<String> = renderer.get_parents(hovering_node_idx).into_iter().map(|idx| idx.to_string()).collect();
                 let code = format!(r#"
                     [{}].forEach(idx => {{
@@ -2474,12 +3285,18 @@ impl Browser {
 
     fn start_event_loop(&mut self) -> Result<()> {
         let event_loop = EventLoopBuilder::with_user_event().build().expect("Failed to create event loop");
-        self.window = Some(WindowBuilder::new()
+        let window = Arc::new(WindowBuilder::new()
             .with_title("XML demo")
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
             .build(&event_loop)
             .expect("Failed to create window"));
-        let mut size = self.window.as_ref().unwrap().inner_size();
+        self.window = Some(Arc::clone(&window));
+        let mut size = window.inner_size();
+
+        let ctx = SoftContext::new(window.display_handle().expect("Display handle"))
+                .expect("Softbuffer context failed");
+        let mut surf = Surface::new(&ctx, window.window_handle().expect("Window handle"))
+                .expect("Softbuffer surface failed");
 
         self.refresh_renderer();
 
@@ -2500,31 +3317,32 @@ impl Browser {
                 let window = self.window.as_ref().unwrap();
                 match event {
                     Event::UserEvent(UserEvent::DomUpdated) => {
-                        self.renderer.as_ref().unwrap().borrow_mut().recompute_nodes();
+                        println!("DOM UPDATED");
+                        let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                        renderer.pending_dom_update = false;
+                        renderer.recompute_nodes();
+                        self.layout_dirty = true;
                         window.request_redraw();
                     }
                     Event::WindowEvent { event, .. } => match event {
                         WindowEvent::CloseRequested => elwt.exit(),
                         WindowEvent::Resized(new_size) => {
                             size = new_size;
+                            self.layout_dirty = true;
+                            window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged { .. } => {
                             size = window.inner_size();
                         }
                         WindowEvent::RedrawRequested => {
-                            let ctx =
-                                SoftContext::new(window.display_handle().expect("Display handle"))
-                                    .expect("Softbuffer context failed");
-                            let mut surf =
-                                Surface::new(&ctx, window.window_handle().expect("Window handle"))
-                                    .expect("Softbuffer surface failed");
                             let width = NonZeroU32::new(size.width.max(1)).expect("Non-zero width");
                             let height = NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
                             surf.resize(width, height).expect("Resize failed");
 
                             let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
                             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-                            renderer.render_into(&mut buffer, size.width, size.height);
+                            renderer.render_into(&mut buffer, size.width, size.height, self.layout_dirty);
+                            self.layout_dirty = false;
                             renderer.compute_hovering(cursor);
                             buffer.present().expect("Failed to present");
                         }
@@ -2541,6 +3359,14 @@ impl Browser {
                                 _ => {},
                             }
                         }
+                        WindowEvent::MouseWheel { device_id: _, delta, phase: _ } => {
+                            match delta {
+                                MouseScrollDelta::LineDelta(_, y) => {
+                                    self.scroll_y_by(y * 80.);
+                                }
+                                _ => {}
+                            };
+                        }
                         _ => {}
                     }
                     _ => {}
@@ -2550,12 +3376,24 @@ impl Browser {
 
         Ok(())
     }
+
+    pub fn scroll_y_by(&mut self, y: f32) {
+        let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+        let root_height = renderer.layout_table
+            .get(&renderer.layout_roots[0])
+            .and_then(|l| Some(l.rect.height))
+            .unwrap_or(0);
+        renderer.scroll_y = ((renderer.scroll_y as f32 + y)).min(0.).max(-(root_height as f32)) as i32;
+        if let Some(window) = self.window.as_mut() {
+            window.request_redraw();
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("https://vite.dev".to_string());
-    // let mut browser = Browser::new("http://localhost:5173".to_string());
+    // let mut browser = Browser::new("https://vite.dev".to_string());
+    let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
@@ -2595,18 +3433,16 @@ fn format_tree(renderer: &mut Renderer, width: u32, height: u32) -> String {
     collect_layout_info(&layout_roots, &mut layout_info, &renderer.layout_table);
     let mut out = String::new();
 
-    for &idx in &renderer.root_indices {
-        write_tree(
-            &renderer.nodes,
-            &renderer.children_index,
-            &renderer.node_styles,
-            &renderer.node_layout_mapping,
-            &layout_info,
-            idx,
-            0,
-            &mut out,
-        );
-    }
+    write_tree(
+        &renderer.nodes,
+        &renderer.children_index,
+        &renderer.node_styles,
+        &renderer.node_layout_mapping,
+        &layout_info,
+        renderer.root_indice,
+        0,
+        &mut out,
+    );
 
     out
 }
@@ -2647,6 +3483,7 @@ fn write_tree(
             Some(text) => format!("Node::Text \"{text}\""),
             None => return,
         },
+        Node::Comment(element) => format!("Node::Comment \"{}\"", element.comment),
     };
     label.push_str(&format!(" [idx={}]", node_idx));
     match layout_node_mapping.get(&node_idx).and_then(|idx| layout_info.get(idx).and_then(|layout| Some((idx, layout)))) {
@@ -2789,10 +3626,12 @@ fn draw_rect_filled(
 
 #[cfg(test)]
 mod tests {
+    use super::clamp_with_ratio;
+
     use crate::css::{CssParser, Node as CssNode};
     use crate::parser::Element;
     use crate::style::{
-        Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, parse_style
+        GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, parse_style
     };
     use crate::{FontHandler, HtmlParser, Renderer};
     use anyhow::{Context, Result};
@@ -2803,6 +3642,11 @@ mod tests {
     use std::rc::Rc;
 
     const SAMPLE_PAGE_PATH: &str = "pages/google_real.html";
+
+    #[test]
+    fn clamps_with_ratio() {
+        assert_eq!(clamp_with_ratio(200, 100, 80), (100, 40));
+    }
 
     #[test]
     fn test_parse_svg() -> Result<()> {
@@ -2843,6 +3687,7 @@ mod tests {
             "width:100%;height:100%;background-color:#FFFFFF;".to_string(),
         );
         let parsed = parse_style(
+            0,
             &Element {
                 tag: "div".to_string(),
                 attributes,
@@ -2852,13 +3697,13 @@ mod tests {
             None,
             &mut HashMap::new(),
             &mut HashMap::new(),
-            &PhysicalSize { width: 1920, height: 1080 }
+            &HashMap::new(),
         )?;
 
         assert_eq!(
             Style {
-                width: StyleSize::Percent(100),
-                height: StyleSize::Percent(100),
+                width: StyleSize::Percent(100.),
+                height: StyleSize::Percent(100.),
                 background: StyleBackground::Hex(0x00_FF_FF_FF),
                 display: StyleDisplay::Block,
                 flex_shrink: 1,
@@ -2893,6 +3738,7 @@ mod tests {
                 border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
                 border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
                 border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
+                grid_template_columns: GridTemplateColumns::None,
             },
             parsed
         );
@@ -2986,7 +3832,7 @@ mod tests {
         let width = 1280;
         let height = 720;
         let mut buffer = vec![0; width * height];
-        renderer.render_into(&mut buffer, width as u32, height as u32);
+        renderer.render_into(&mut buffer, width as u32, height as u32, true);
 
         // Ensure all white, meaning nothing was painted
         assert!(buffer.iter().all(|p| *p == 0xFF_FF_FF_FF));
@@ -3010,7 +3856,7 @@ mod tests {
         let width = 1280;
         let height = 720;
         let mut buffer = vec![0; width * height];
-        renderer.render_into(&mut buffer, width as u32, height as u32);
+        renderer.render_into(&mut buffer, width as u32, height as u32, true);
 
         // Ensure all red, meaning nothing was painted
         assert!(buffer.iter().all(|p| *p == 0xFF_00_00));
@@ -3034,7 +3880,7 @@ mod tests {
         let width = 1280;
         let height = 720;
         let mut buffer = vec![0; width * height];
-        renderer.render_into(&mut buffer, width as u32, height as u32);
+        renderer.render_into(&mut buffer, width as u32, height as u32, true);
 
         // Ensure all red, meaning nothing was painted
         assert!(buffer.iter().all(|p| *p == 0xFF_00_00));
