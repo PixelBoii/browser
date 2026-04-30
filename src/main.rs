@@ -736,9 +736,7 @@ fn element_matches_class_part(
                 // All elements are children of root
                 PseudoClass::Root => true,
                 PseudoClass::Not(selector) => {
-                    // TODO: Optimize this. This runs for each element which isn't particularly optimized atm.
-                    let nodes: HashMap<usize, Node> = html_nodes.into_iter().map(|(idx, node)| (*idx, (**node).clone())).collect();
-                    let negative_matches = query_selector_all(&nodes, selector.clone(), &PhysicalSize { width: 0, height: 0 }, dom_indexes);
+                    let negative_matches = query_selector_all(&html_nodes, selector.clone(), &PhysicalSize { width: 0, height: 0 }, dom_indexes);
                     !negative_matches.contains(&element)
                 },
                 _ => false,
@@ -832,26 +830,25 @@ fn collect_class_nodes_for_elements(
             _ => {},
         };
     }
-    search_elements_for_css_nodes(to_resolve, css_nodes, raw_html_nodes, window_size, dom_indexes)
+    search_elements_for_css_nodes(to_resolve, css_nodes, &filter_to_elements(raw_html_nodes), window_size, dom_indexes)
 }
 
+fn filter_to_elements(html_nodes: &HashMap<usize, Node>) -> HashMap<usize, &Node> {
+    html_nodes
+        .into_iter()
+        .filter(|(_, value)| matches!(value, Node::Element(_)))
+        .map(|(key, value)| (*key, value))
+        .collect()
+}
+
+// It is assumed that html_nodes only contains Node::Element here
 fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
     css_nodes: &Vec<(usize, &CssNode)>,
-    raw_html_nodes: &HashMap<usize, Node>,
+    html_nodes: &HashMap<usize, &Node>,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
 ) -> HashMap<usize, Vec<usize>> {
-    // Only walk through elements, text and comments can't match classes
-    let html_nodes: HashMap<usize, &Node> = raw_html_nodes
-        .into_iter()
-        .filter(|(_, value)| match value {
-            Node::Element(_) => true,
-            _ => false,
-        })
-        .map(|(key, value)| (key.clone(), value))
-        .collect();
-
     let class_elements = &dom_indexes.class_elements;
     let id_elements = &dom_indexes.id_elements;
     let tag_elements = &dom_indexes.tag_elements;
@@ -1108,7 +1105,7 @@ fn op_get_elements_by_tag_name(state: &mut OpState, #[string] tag: String) -> Re
 fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
+    let node_idxs: Vec<usize> = query_selector_all(&filter_to_elements(&renderer.nodes), selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
     let node = node_idxs.first();
     let owned = node.cloned().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()));
     Ok(owned)
@@ -1118,7 +1115,7 @@ fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<
 fn op_query_selector_all(state: &mut OpState, #[string] selector: String) -> Result<Vec<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
+    let node_idxs: Vec<usize> = query_selector_all(&filter_to_elements(&renderer.nodes), selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
     let owned: Vec<(usize, Node)> = node_idxs.into_iter().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone())).collect();
     Ok(owned)
 }
@@ -1211,7 +1208,7 @@ fn op_update_attributes(state: &mut OpState, #[number] node_idx: usize, #[serde]
 }
 
 // This should walk the tree to be fully correct I think
-fn query_selector_all(nodes_table: &HashMap<usize, Node>, selector: Vec<ClassNamePart>, window_size: &PhysicalSize<u32>, dom_indexes: &DomIndexes) -> Vec<usize> {
+fn query_selector_all(nodes_table: &HashMap<usize, &Node>, selector: Vec<ClassNamePart>, window_size: &PhysicalSize<u32>, dom_indexes: &DomIndexes) -> Vec<usize> {
     let class = CssNode::ClassName(ClassName {
         name: vec![],
         name_parts: vec![selector],
