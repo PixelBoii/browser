@@ -1047,7 +1047,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             PropertyValue::BorderSide(parse_border_side_value(value)?),
         "grid-template-columns" => parse_grid_template_columns_value(value)?,
         _ => {
-            println!("Failed to parse style \"{}\"", property);
+            // println!("Failed to parse style \"{}\"", property);
             PropertyValue::Raw(value)
         }
     }, false))
@@ -1318,7 +1318,15 @@ fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Ve
     }
 }
 
+// TODO: Could maybe sort everything once rather than per-style
 fn order_css_nodes(node_idxs: &mut Vec<&usize>, nodes: &Vec<(usize, &Node)>) {
+    let mut chains = HashMap::new();
+    for idx in node_idxs.iter() {
+        let mut chain = vec![];
+        get_parent_chain(nodes, **idx, &mut chain);
+        chains.insert(*idx, chain);
+    }
+
     // Sort, prioritize media query over regular CSS with more to come
     node_idxs.sort_by(|a, b| {
         let a_important_score = match nodes[**a].1 {
@@ -1332,10 +1340,8 @@ fn order_css_nodes(node_idxs: &mut Vec<&usize>, nodes: &Vec<(usize, &Node)>) {
 
         match a_important_score.cmp(&b_important_score) {
             Ordering::Equal => {
-                let mut a_chain = vec![];
-                let mut b_chain = vec![];
-                get_parent_chain(nodes, **a, &mut a_chain);
-                get_parent_chain(nodes, **b, &mut b_chain);
+                let a_chain = chains.get(*a).unwrap();
+                let b_chain = chains.get(*b).unwrap();
 
                 let mut ordering = None;
 
