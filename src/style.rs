@@ -949,7 +949,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "border-left-width" | "border-top-width" | "border-right-width" | "border-bottom-width" |
         "border-width" | "padding-block-start" | "padding-block-end" | "padding-inline-start" | "padding-inline-end" =>
             PropertyValue::Size(parse_style_size(value)?),
-        "margin" | "padding" =>
+        "margin" | "padding" | "inset" =>
             PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?),
         "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
         "padding-block" => PropertyValue::VerticalCombinedSize(parse_two_axis_size(value)?),
@@ -1143,6 +1143,12 @@ pub fn apply_style_property(
         },
         ("font-size", PropertyValue::Size(value)) => {
             style.font_size = value;
+        }
+        ("inset", PropertyValue::CombinedSize((top, right, bottom, left))) => {
+            style.top = top;
+            style.right = right;
+            style.bottom = bottom;
+            style.left = left;
         }
         ("left", PropertyValue::Size(value)) => {
             style.left = value;

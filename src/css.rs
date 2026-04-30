@@ -11,10 +11,18 @@ pub enum ClassNamePartAttribute {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum PseudoClass {
+    Root,
+    Hover,
+    Has(Vec<ClassNamePart>),
+    Not(Vec<ClassNamePart>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClassNamePart {
     Class(String),
     Id(String),
-    PseudoClass(String),
+    PseudoClass(PseudoClass),
     Attributes(Vec<ClassNamePartAttribute>),
     Tag(String),
     Combined(Vec<ClassNamePart>),
@@ -206,6 +214,26 @@ mod tests {
     }
 }
 
+fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
+    if let Some(stripped) = value.strip_prefix("not(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            return Some(PseudoClass::Not(selector_to_parts(&stripped.to_string())));
+        }
+    }
+    if let Some(stripped) = value.strip_prefix("has(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            return Some(PseudoClass::Has(selector_to_parts(&stripped.to_string())));
+        }
+    }
+    if value == "hover" {
+        return Some(PseudoClass::Hover);
+    }
+    if value == "root" {
+        return Some(PseudoClass::Root);
+    }
+    None
+}
+
 pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
     let nested_parts = split_ignoring_parentheses(selector.clone(), ' ');
     nested_parts
@@ -216,14 +244,32 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
             }
             let mut conditions = vec![];
             let mut buffer = String::new();
-            // Add : here later when we need to support hover etc., but also add support for escaping it at that time
-            let new_statement = ['.', '#', '[', '>'];
+            let new_statement = ['.', '#', '[', '>', ':'];
+            let mut parentheses_depth = 0;
+            let mut escaped = false;
             for char in p.chars() {
-                if buffer.len() > 0 && new_statement.contains(&char) {
+                if char == '(' {
+                    parentheses_depth += 1;
+                    buffer.push(char);
+                    continue;
+                }
+                if char == ')' {
+                    parentheses_depth -= 1;
+                    buffer.push(char);
+                    continue;
+                }
+                if char == '\\' && !escaped {
+                    escaped = true;
+                    continue;
+                }
+                if buffer.len() > 0 && new_statement.contains(&char) && parentheses_depth == 0 && !escaped {
                     conditions.push(buffer.clone());
                     buffer.clear();
                 }
                 buffer.push(char);
+                if escaped {
+                    escaped = false;
+                }
             }
             if buffer.len() > 0 {
                 conditions.push(buffer);
@@ -234,7 +280,18 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                 let parsed = match chars.nth(0).unwrap() {
                     '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
                     '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
-                    ':' => Some(ClassNamePart::PseudoClass(chars.as_str().to_string())),
+                    ':' => {
+                        let parsed = parse_pseudo_class(chars.as_str());
+                        match parsed {
+                            Some(parsed) => Some(ClassNamePart::PseudoClass(parsed)),
+                            None => {
+                                println!("Failed to parse pseudo class: {}", chars.as_str());
+                                // This intentionally returns the entire function
+                                // If we fail to parse pseudo class, consider the whole class invalid
+                                return None;
+                            },
+                        }
+                    },
                     '[' => parse_selector_with_attributes(chars.as_str()),
                     '>' => Some(ClassNamePart::ArrowRight),
                     '&' => Some(ClassNamePart::Ampersand),
@@ -463,8 +520,6 @@ impl<'a> CssParser<'a> {
                         _ => {}
                     };
                 }
-                // Ignore escape character for now
-                '\\' => {},
                 // TODO: Handle hover and other states here
                 ':' => {
                     match self.stage {

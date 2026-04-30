@@ -32,7 +32,7 @@ use winit::event_loop::{EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 
-use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, parse_media_query_parts, selector_to_parts};
+use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, PseudoClass, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
 use crate::parser::{CommentElement, TextElement};
 use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, element_matched_attributes, get_class_list, media_query_matches};
@@ -721,9 +721,15 @@ fn element_matches_class_part(
             true
         },
         ClassNamePart::PseudoClass(class) => {
-            match class.as_str() {
+            match class {
                 // All elements are children of root
-                "root" => true,
+                PseudoClass::Root => true,
+                PseudoClass::Not(selector) => {
+                    // TODO: Optimize this. This runs for each element which isn't particularly optimized atm.
+                    let nodes: HashMap<usize, Node> = html_nodes.into_iter().map(|(idx, node)| (*idx, (**node).clone())).collect();
+                    let negative_matches = query_selector_all(&nodes, selector.clone(), &PhysicalSize { width: 0, height: 0 });
+                    !negative_matches.contains(&element)
+                },
                 _ => false,
             }
         },
@@ -875,15 +881,18 @@ fn search_elements_for_css_nodes(
         match node {
             CssNode::ClassName(classes) => {
                 for (name_part_idx, parts) in classes.name_parts.iter().enumerate() {
+                    if parts.len() == 0 {
+                        continue;
+                    }
                     let last_part = parts.last().unwrap();
 
                     let elements: Option<HashSet<usize>> = match last_part {
                         ClassNamePart::Class(class) => class_elements.get(class).cloned(),
                         ClassNamePart::Id(id) => id_elements.get(id).cloned(),
                         ClassNamePart::PseudoClass(class) => {
-                            match class.as_str() {
+                            match class {
                                 // No parent means it's a root element
-                                "root" => {
+                                PseudoClass::Root => {
                                     let elements = html_nodes
                                         .iter()
                                         .filter(|(_, node)| node.get_parent().is_none())
@@ -1116,7 +1125,7 @@ fn op_get_elements_by_tag_name(state: &mut OpState, #[string] tag: String) -> Re
 fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector, &renderer.window_size);
+    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector_to_parts(&selector), &renderer.window_size);
     let node = node_idxs.first();
     let owned = node.cloned().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()));
     Ok(owned)
@@ -1126,7 +1135,7 @@ fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<
 fn op_query_selector_all(state: &mut OpState, #[string] selector: String) -> Result<Vec<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector, &renderer.window_size);
+    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector_to_parts(&selector), &renderer.window_size);
     let owned: Vec<(usize, Node)> = node_idxs.into_iter().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone())).collect();
     Ok(owned)
 }
@@ -1219,10 +1228,10 @@ fn op_update_attributes(state: &mut OpState, #[number] node_idx: usize, #[serde]
 }
 
 // This should walk the tree to be fully correct I think
-fn query_selector_all<'a>(nodes_table: &'a HashMap<usize, Node>, selector: String, window_size: &PhysicalSize<u32>) -> Vec<usize> {
+fn query_selector_all(nodes_table: &HashMap<usize, Node>, selector: Vec<ClassNamePart>, window_size: &PhysicalSize<u32>) -> Vec<usize> {
     let class = CssNode::ClassName(ClassName {
-        name: vec![selector.clone()],
-        name_parts: vec![selector_to_parts(&selector)],
+        name: vec![],
+        name_parts: vec![selector],
         parent: None,
     });
     let css_vec = vec![class];
@@ -3421,9 +3430,9 @@ impl Browser {
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    // let mut browser = Browser::new("https://vite.dev".to_string());
+    let mut browser = Browser::new("https://vite.dev".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
+    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
         browser.dump_tree()
