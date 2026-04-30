@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::style::{GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, parse_property_value};
+use crate::style::{GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, parse_property_value, split_ignoring_parentheses};
 
 const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
 
@@ -207,8 +207,9 @@ mod tests {
 }
 
 pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
-    let nested_parts = selector.split(" ");
+    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ');
     nested_parts
+        .into_iter()
         .filter_map(|p| -> Option<ClassNamePart> {
             if p.is_empty() {
                 return None;
@@ -216,7 +217,7 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
             let mut conditions = vec![];
             let mut buffer = String::new();
             // Add : here later when we need to support hover etc., but also add support for escaping it at that time
-            let new_statement = ['.', '#', '['];
+            let new_statement = ['.', '#', '[', '>'];
             for char in p.chars() {
                 if buffer.len() > 0 && new_statement.contains(&char) {
                     conditions.push(buffer.clone());
@@ -335,9 +336,8 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_class_name_from_state(&mut self) {
-        let name: Vec<String> = self
-            .label
-            .split(",")
+        let name: Vec<String> = split_ignoring_parentheses(self.label.clone(), ',')
+            .into_iter()
             .map(|l| l.trim().to_string())
             .collect();
 

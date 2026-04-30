@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
-use crate::css::{BorderSideValue, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, Variable};
+use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, Variable};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +30,7 @@ pub enum StyleSize {
     Percent(f32),
     Vh(i32),
     Svh(i32),
+    Vw(i32),
     Calc(Vec<CalcExpression>),
 }
 
@@ -332,7 +333,7 @@ where
     T: Clone,
     F: Fn(String) -> Result<T>,
 {
-    let values: Vec<T> = split_space_ignoring_parentheses(value.clone())
+    let values: Vec<T> = split_ignoring_parentheses(value.clone(), ' ')
         .iter()
         .map(|s| parse(s.to_string()))
         .collect::<Result<Vec<T>>>()?;
@@ -366,10 +367,10 @@ where
     }
 }
 
-fn extract_operator(char: char) -> Option<CalcExpression> {
+fn extract_operator(char: char, next_char: Option<char>) -> Option<CalcExpression> {
     if char == '+' {
         Some(CalcExpression::Operator(StyleCalcOperator::Plus))
-    } else if char == '-' {
+    } else if char == '-' && next_char.is_some_and(|v| v == ' ') {
         Some(CalcExpression::Operator(StyleCalcOperator::Minus))
     } else if char == '/' {
         Some(CalcExpression::Operator(StyleCalcOperator::Divide))
@@ -395,12 +396,14 @@ fn parse_calc(value: &str) -> Result<StyleSize> {
     // Remove whitespace
     let mut value = value.to_string();
     value.retain(|c| !c.is_whitespace());
-    for char in value.chars() {
-        if let Some(operator) = extract_operator(char) {
+    let chars: Vec<char> = value.chars().collect();
+    for (char_idx, char) in chars.iter().enumerate() {
+        let next_char = if char_idx + 1 < chars.len() { Some(chars[char_idx + 1]) } else { None };
+        if let Some(operator) = extract_operator(*char, next_char) {
             flush_calc_value(&mut buffer, &mut parts)?;
             parts.push(operator);
         } else {
-            buffer.push(char);
+            buffer.push(*char);
         }
     }
     flush_calc_value(&mut buffer, &mut parts)?;
@@ -442,6 +445,13 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .with_context(|| "Failed to strip vh")?
             .trim();
         return Ok(StyleSize::Vh(parse_size_number(vh)? as i32));
+    }
+    if value.ends_with("vw") {
+        let vw = value
+            .strip_suffix("vw")
+            .with_context(|| "Failed to strip vw")?
+            .trim();
+        return Ok(StyleSize::Vw(parse_size_number(vw)? as i32));
     }
     if value.ends_with("px") {
         let px = value
@@ -537,91 +547,6 @@ pub fn element_matched_attributes(element: &HtmlElement, attributes: &Vec<ClassN
     }
 
     return true;
-}
-
-pub fn class_part_matches_element(
-    element: &HtmlElement,
-    element_classes: &HashSet<String>,
-    part: &ClassNamePart,
-) -> bool {
-    // TODO: Extend to IDs and more later on
-    match part {
-        // Normal class matching
-        ClassNamePart::Class(class) => element_classes.contains(class),
-        ClassNamePart::Id(id) => element
-            .attributes
-            .get(&"id".to_string())
-            .is_some_and(|v| *v == *id),
-        ClassNamePart::PseudoClass(class) => {
-            match class.as_str() {
-                // No parent means it's a root element
-                "root" => element.parent.is_none(),
-                _ => false,
-            }
-        }
-        ClassNamePart::Tag(part) => {
-            if *part == element.tag {
-                return true;
-            }
-
-            false
-        },
-        ClassNamePart::Attributes(attributes) => {
-            element_matched_attributes(element, attributes)
-        },
-        ClassNamePart::Combined(parts) => {
-            parts.iter().all(|p| class_part_matches_element(element, element_classes, p))
-        },
-        // TODO: Implement this completely
-        ClassNamePart::ArrowRight | ClassNamePart::Ampersand => true,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NodeMatchResult {
-    pub parent_matched: bool,
-    pub target_matched: bool,
-}
-
-pub fn class_matches_element(
-    element: &HtmlElement,
-    element_classes: &HashSet<String>,
-    class: &ClassName,
-    node_idx: usize,
-    partial_matches: &mut HashMap<(usize, usize), usize>,
-) -> NodeMatchResult {
-    for (part_group_idx, parts) in class.name_parts.iter().enumerate() {
-        let key = (node_idx, part_group_idx);
-        let progress = partial_matches.get(&key).copied().unwrap_or(0);
-
-        // If already completed and selector targets this element, return true
-        if progress == parts.len() - 1 {
-            let target_matched =
-                class_part_matches_element(element, &element_classes, &parts.last().unwrap());
-            return NodeMatchResult {
-                target_matched,
-                parent_matched: true,
-            };
-        }
-
-        // If there's still parts left to complete, handle that
-        if progress < parts.len() - 1
-            && class_part_matches_element(element, &element_classes, &parts[progress + 1])
-        {
-            partial_matches.insert(key, progress + 1);
-            // If it's now complete, return true
-            if progress + 1 == parts.len() - 1 {
-                return NodeMatchResult {
-                    target_matched: true,
-                    parent_matched: false,
-                };
-            }
-        }
-    }
-    NodeMatchResult {
-        parent_matched: false,
-        target_matched: false,
-    }
 }
 
 pub fn build_css_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, Vec<usize>> {
@@ -734,23 +659,32 @@ fn parse_color(value: String) -> Result<StyleBackground> {
 
 // Map variable references
 fn resolve_variable_value(value: &str, variables: &HashMap<String, String>) -> String {
-    value
-        .split(" ")
-        .map(|part| {
-            if let Some(value) = part.strip_prefix("var(") {
-                if let Some(value) = value.strip_suffix(")") {
-                    let string = value.to_string();
-                    let mapped = variables.get(&string).unwrap_or(&string).clone();
-                    mapped.to_string()
-                } else {
-                    part.to_string()
-                }
+    let mut out = String::new();
+    let mut buffer = String::new();
+    let mut inside = false;
+    for char in value.chars() {
+        if inside && char == ')' {
+            if let Some(mapped) = variables.get(&buffer) {
+                out += &mapped;
             } else {
-                part.to_string()
+                out += &buffer;
             }
-        })
-        .collect::<Vec<String>>()
-        .join(" ")
+            inside = false;
+            buffer.clear();
+            continue;
+        }
+        buffer.push(char);
+        if let Some(stripped) = buffer.strip_suffix("var(") {
+            inside = true;
+            out += stripped;
+            buffer.clear();
+            continue;
+        }
+    }
+    if buffer.len() > 0 {
+        out += &buffer;
+    }
+    out
 }
 
 fn apply_node_variables_dependencies(variables: &mut HashMap<String, String>, variables_to_parse: &Vec<(usize, &Variable)>, variable_dependence: &mut HashMap<&str, Vec<usize>>, name: String, value: String) {
@@ -765,7 +699,7 @@ fn apply_node_variables_dependencies(variables: &mut HashMap<String, String>, va
     variable_dependence.remove(name.as_str());
 }
 
-fn apply_node_variables<'a>(nodes: &'a mut Vec<Node>, variables: &mut HashMap<String, String>) {
+fn apply_node_variables(nodes: &Vec<Node>, variables: &mut HashMap<String, String>) {
     let variables_to_parse: Vec<(usize, &Variable)> = nodes
         .iter()
         .filter_map(|node| match node {
@@ -838,7 +772,7 @@ mod tests {
 
     use crate::css::{Node, Property, PropertyValue, Variable};
 
-    use super::{resolve_node_variables, split_space_ignoring_parentheses, StyleSize};
+    use super::{resolve_node_variables, resolve_variable_value, split_ignoring_parentheses, StyleSize};
 
     #[test]
     fn resolves_node_variables() {
@@ -870,9 +804,19 @@ mod tests {
     }
 
     #[test]
+    fn resolves_variable_values_embedded_in_strings() {
+        let variables = HashMap::from([("--size".to_string(), "12px".to_string())]);
+
+        assert_eq!(
+            resolve_variable_value("calc(var(--size) * 2)", &variables),
+            "calc(12px * 2)"
+        );
+    }
+
+    #[test]
     fn splits_space_ignoring_parentheses() {
         assert_eq!(
-            split_space_ignoring_parentheses("repeat(2, 1fr) 20px".into()),
+            split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' '),
             vec!["repeat(2, 1fr)", "20px"]
         );
     }
@@ -919,11 +863,10 @@ fn parse_border_side_value(value: String) -> Result<BorderSideValue> {
     }
 }
 
-fn split_space_ignoring_parentheses(value: String) -> Vec<String> {
+pub fn split_ignoring_parentheses(value: String, split_char: char) -> Vec<String> {
     let mut parentheses_depth = 0;
     let mut buffer = String::new();
     let mut result = vec![];
-    let space = ' ';
     let parentheses_start = '(';
     let parentheses_close = ')';
     for char in value.chars() {
@@ -937,7 +880,7 @@ fn split_space_ignoring_parentheses(value: String) -> Vec<String> {
             buffer.push(char);
             continue;
         }
-        if char == space && parentheses_depth == 0 {
+        if char == split_char && parentheses_depth == 0 {
             result.push(buffer.clone());
             buffer.clear();
             continue;
@@ -970,7 +913,7 @@ fn parse_grid_template_columns_inner_value(value: String) -> Result<GridTemplate
 }
 
 fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
-    let parts: Vec<String> = split_space_ignoring_parentheses(value);
+    let parts: Vec<String> = split_ignoring_parentheses(value, ' ');
     // TODO: Also support minmax etc. here
     let mut parsed: Vec<GridTemplateColumnsValue> = vec![];
     for p in parts {
@@ -1004,7 +947,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "margin-left" | "margin-top" | "margin-right" | "margin-bottom" | "font-size" | "left" |
         "top" | "right" | "bottom" | "padding-left" | "padding-top" | "padding-right" | "padding-bottom" |
         "border-left-width" | "border-top-width" | "border-right-width" | "border-bottom-width" |
-        "border-width" =>
+        "border-width" | "padding-block-start" | "padding-block-end" | "padding-inline-start" | "padding-inline-end" =>
             PropertyValue::Size(parse_style_size(value)?),
         "margin" | "padding" =>
             PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?),
@@ -1182,9 +1125,21 @@ pub fn apply_style_property(
             style.padding_top = top;
             style.padding_bottom = bottom;
         },
+        ("padding-block-start", PropertyValue::Size(value)) => {
+            style.padding_top = value;
+        },
+        ("padding-block-end", PropertyValue::Size(value)) => {
+            style.padding_bottom = value;
+        },
         ("padding-inline", PropertyValue::HorizontalCombinedSize((left, right))) => {
             style.padding_left = left;
             style.padding_right = right;
+        },
+        ("padding-inline-start", PropertyValue::Size(value)) => {
+            style.padding_left = value;
+        },
+        ("padding-inline-end", PropertyValue::Size(value)) => {
+            style.padding_right = value;
         },
         ("font-size", PropertyValue::Size(value)) => {
             style.font_size = value;
@@ -1349,12 +1304,11 @@ pub fn apply_style_property(
     Ok(())
 }
 
-fn get_highest_parent(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usize> {
+fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Vec<usize>) {
     let node = nodes[node_idx].1;
+    chain.push(node_idx);
     if let Some(parent) = node.get_parent() {
-        get_highest_parent(nodes, parent)
-    } else {
-        Some(node_idx)
+        get_parent_chain(nodes, parent, chain)
     }
 }
 
@@ -1372,20 +1326,22 @@ fn order_css_nodes(node_idxs: &mut Vec<&usize>, nodes: &Vec<(usize, &Node)>) {
 
         match a_important_score.cmp(&b_important_score) {
             Ordering::Equal => {
-                let highest_a = (if let Some(parent) = nodes[**a].1.get_parent() {
-                    get_highest_parent(nodes, parent)
-                } else {
-                    None
-                }).unwrap_or(usize::MAX) as u32;
-                let highest_b = (if let Some(parent) = nodes[**b].1.get_parent() {
-                    get_highest_parent(nodes, parent)
-                } else {
-                    None
-                }).unwrap_or(usize::MAX) as u32;
+                let mut a_chain = vec![];
+                let mut b_chain = vec![];
+                get_parent_chain(nodes, **a, &mut a_chain);
+                get_parent_chain(nodes, **b, &mut b_chain);
 
-                // TODO: Handle ties by going deeper
+                let mut ordering = None;
 
-                highest_a.cmp(&highest_b)
+                // At first parent which is different, compare and order ascending
+                for (a, b) in a_chain.iter().rev().zip(b_chain.iter().rev()) {
+                    if a != b {
+                        ordering = Some(a.cmp(b));
+                        break;
+                    }
+                }
+
+                ordering.unwrap_or(Ordering::Equal)
             },
             ordering => ordering,
         }

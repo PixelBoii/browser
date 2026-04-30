@@ -35,7 +35,7 @@ use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
 use crate::parser::{CommentElement, TextElement};
-use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, class_matches_element, element_matched_attributes, get_class_list, media_query_matches};
+use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, element_matched_attributes, get_class_list, media_query_matches};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
@@ -88,8 +88,6 @@ struct Rect {
     height: u32,
     background: StyleBackground,
     color: StyleBackground,
-    margin_bottom: i32,
-    margin_right: i32,
     font_size: Option<u32>,
     border: RectBorder,
 }
@@ -319,6 +317,7 @@ fn get_specified_size(
         StyleSize::Px(px) => Some(*px),
         StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
+        StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
         // TODO: Make this handle order of operations
         StyleSize::Calc(calc) => {
             let mut value = match &calc[0] {
@@ -333,7 +332,7 @@ fn get_specified_size(
                 };
                 let loop_value = match &calc[exp_idx + 1] {
                     CalcExpression::Size(size) => get_specified_size(font_size, &size, available_size, auto_size, window_size)?,
-                    _ => panic!("Expected calc expression to be size"),
+                    _ => panic!("Expected calc expression to be size. Got: {:?} [{}]", calc, exp_idx + 1),
                 };
                 value = match loop_operator {
                     StyleCalcOperator::Plus => value + loop_value,
@@ -792,6 +791,8 @@ fn get_parent_html_idx(node_idx: usize, html_nodes: &HashMap<usize, &Node>) -> O
     html_nodes.get(&node_idx).unwrap().get_parent()
 }
 
+// Wrapper around search_elements_for_css_nodes that narrows the css_nodes down to only nodes that have property/variable children
+// Query selectors skip this step
 fn collect_class_nodes_for_elements(
     css_nodes: &Vec<(usize, &CssNode)>,
     raw_html_nodes: &HashMap<usize, Node>,
@@ -812,7 +813,15 @@ fn collect_class_nodes_for_elements(
             _ => {},
         };
     }
+    search_elements_for_css_nodes(to_resolve, css_nodes, raw_html_nodes, window_size)
+}
 
+fn search_elements_for_css_nodes(
+    to_resolve: HashSet<usize>,
+    css_nodes: &Vec<(usize, &CssNode)>,
+    raw_html_nodes: &HashMap<usize, Node>,
+    window_size: &PhysicalSize<u32>,
+) -> HashMap<usize, Vec<usize>> {
     // Only walk through elements, text and comments can't match classes
     let html_nodes: HashMap<usize, &Node> = raw_html_nodes
         .into_iter()
@@ -1107,9 +1116,9 @@ fn op_get_elements_by_tag_name(state: &mut OpState, #[string] tag: String) -> Re
 fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let nodes: Vec<(usize, &Node)> = query_selector_all(&renderer.nodes_idxs, &renderer.nodes, selector);
-    let node = nodes.first();
-    let owned = node.cloned().map(|(idx, node)| (idx, node.clone()));
+    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector, &renderer.window_size);
+    let node = node_idxs.first();
+    let owned = node.cloned().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()));
     Ok(owned)
 }
 
@@ -1117,8 +1126,8 @@ fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<
 fn op_query_selector_all(state: &mut OpState, #[string] selector: String) -> Result<Vec<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let nodes: Vec<(usize, &Node)> = query_selector_all(&renderer.nodes_idxs, &renderer.nodes, selector);
-    let owned: Vec<(usize, Node)> = nodes.into_iter().map(|(idx, node)| (idx, node.clone())).collect();
+    let node_idxs: Vec<usize> = query_selector_all(&renderer.nodes, selector, &renderer.window_size);
+    let owned: Vec<(usize, Node)> = node_idxs.into_iter().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone())).collect();
     Ok(owned)
 }
 
@@ -1210,26 +1219,19 @@ fn op_update_attributes(state: &mut OpState, #[number] node_idx: usize, #[serde]
 }
 
 // This should walk the tree to be fully correct I think
-fn query_selector_all<'a>(node_idxs: &Vec<usize>, nodes_table: &'a HashMap<usize, Node>, selector: String) -> Vec<(usize, &'a Node)> {
-    let class = ClassName {
+fn query_selector_all<'a>(nodes_table: &'a HashMap<usize, Node>, selector: String, window_size: &PhysicalSize<u32>) -> Vec<usize> {
+    let class = CssNode::ClassName(ClassName {
         name: vec![selector.clone()],
         name_parts: vec![selector_to_parts(&selector)],
         parent: None,
-    };
-    let mut partial_matches = HashMap::new();
-    let filtered: Vec<(usize, &Node)> = node_idxs
-        .iter()
-        .filter(|idx| match nodes_table.get(*idx).unwrap() {
-            Node::Element(element) => {
-                // TODO: rework, i dont think this is correct
-                let result = class_matches_element(element, &get_class_list(element), &class, 0, &mut partial_matches);
-                result.target_matched
-            },
-            _ => false,
-        })
-        .map(|idx| (*idx, nodes_table.get(idx).unwrap()))
-        .collect();
-    filtered
+    });
+    let css_vec = vec![class];
+    let css_nodes: Vec<(usize, &CssNode)> = css_vec.iter().enumerate().collect();
+    let mut to_resolve = HashSet::new();
+    to_resolve.insert(0);
+    let collected = search_elements_for_css_nodes(to_resolve, &css_nodes, nodes_table, window_size);
+
+    collected.keys().cloned().collect()
 }
 
 extension!(
@@ -1703,7 +1705,7 @@ impl Renderer {
     fn layout_node(
         &mut self,
         node_idx: usize,
-        mut cursor: Position,
+        cursor: Position,
         available_size: Size,
         forced_size: OptionalSize,
         containing_node_idx: usize,
@@ -1713,12 +1715,6 @@ impl Renderer {
         let style = self.node_styles.get(&node_idx).unwrap().clone();
 
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
-
-        let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
-            self.get_margins(node_idx, &style, available_size);
-
-        cursor.x += margin_left_size as i32;
-        cursor.y += margin_top_size as i32;
 
         match self.nodes.get(&node_idx).unwrap().clone() {
             Node::Comment(_) => None,
@@ -1739,8 +1735,6 @@ impl Renderer {
                         height,
                         background: StyleBackground::Transparent,
                         color: style.color,
-                        margin_bottom: margin_bottom_size,
-                        margin_right: margin_right_size,
                         font_size: Some(resolved_font_size),
                         border: RectBorder::new_empty(),
                     },
@@ -1823,8 +1817,6 @@ impl Renderer {
                             height,
                             background: StyleBackground::Transparent,
                             color: StyleBackground::Transparent,
-                            margin_bottom: margin_bottom_size,
-                            margin_right: margin_right_size,
                             font_size: None,
                             border: RectBorder::new_empty(),
                         },
@@ -1883,8 +1875,6 @@ impl Renderer {
                                 height,
                                 background: style.background,
                                 color: style.color,
-                                margin_bottom: margin_bottom_size,
-                                margin_right: margin_right_size,
                                 font_size: None,
                                 border,
                             },
@@ -2034,8 +2024,6 @@ impl Renderer {
                 height: renderable_text.height,
                 background: StyleBackground::Transparent,
                 color: style.color,
-                margin_bottom: 0,
-                margin_right: 0,
                 font_size: Some(font_size as u32),
                 border: RectBorder::new_empty(),
             },
@@ -2299,6 +2287,11 @@ impl Renderer {
             } else {
                 None
             };
+            let child_style = self.node_styles.get(child_idx).unwrap().clone();
+            let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
+                self.get_margins(*child_idx, &child_style, available_size);
+            content_position.x += margin_left_size as i32;
+            content_position.y += margin_top_size as i32;
             if let Some(child) = self.layout_node(
                 *child_idx,
                 content_position,
@@ -2319,12 +2312,11 @@ impl Renderer {
                 save_as_final,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
-                let child_style = &self.node_styles.get(child_idx).unwrap();
                 let next_child_display: Option<StyleDisplay> = next_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
                 if child_style.display.is_inline() && next_child_display.is_none_or(|v| v.is_inline()) {
                     // TODO: This will need to support overflows
-                    content_position.x += child_box.rect.width as i32 + child_box.rect.margin_right as i32;
-                    child_width_buffer += child_box.rect.width as i32 + child_box.rect.margin_right as i32;
+                    content_position.x += child_box.rect.width as i32 + margin_right_size;
+                    child_width_buffer += child_box.rect.width as i32 + margin_right_size;
                     children_rows.last_row(child, 0);
 
                     if !child_style.position.is_free() {
@@ -2334,7 +2326,7 @@ impl Renderer {
                 } else {
                     // This is a wrap, so reset X
                     content_position.x = original_cursor.x;
-                    content_position.y += child_box.rect.height as i32 + child_box.rect.margin_bottom as i32;
+                    content_position.y += child_box.rect.height as i32 + margin_bottom_size;
                     child_width_buffer = 0;
                     children_rows.new_row(child, 0);
 
@@ -2588,8 +2580,12 @@ impl Renderer {
 
                 for (item_idx, item) in base_items.iter().enumerate() {
                     let cross_offset = self.calculate_cross_offset(&item, &style, has_definite_height, allow_fill, &container_sizes);
+                    let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
+                    let (margin_left_size, margin_right_size, margin_top_size, _) =
+                        self.get_margins(item.node_idx, &child_style, available_size);
                     // Re-compute cursor for each child so that align-self works
-                    content_position.y = original_content_cursor.y + cross_offset as i32;
+                    content_position.y = original_content_cursor.y + cross_offset as i32 + margin_top_size;
+                    content_position.x += margin_left_size;
 
                     let last = item_idx == base_items.len() - 1;
                     if let Some(child) = self.layout_node(
@@ -2608,9 +2604,8 @@ impl Renderer {
                         save_as_final,
                     ) {
                         let child_box = self.layout_table.get(&child).unwrap();
-                        let child_style = &self.node_styles.get(&item.node_idx).unwrap();
                         if !child_style.position.is_free() {
-                            content_position.x += child_box.rect.width as i32 + child_box.rect.margin_right;
+                            content_position.x += child_box.rect.width as i32 + margin_right_size;
                             children_rows.last_row(child, cross_offset as i32);
                             // Don't add gap for last item
                             if !last {
@@ -2648,7 +2643,12 @@ impl Renderer {
 
                 for (item_idx, item) in base_items.iter().enumerate() {
                     let cross_offset = self.calculate_cross_offset(&item, &style, has_definite_height, allow_fill, &container_sizes);
-                    content_position.x = original_content_cursor.x + cross_offset as i32;
+                    let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
+                    let (margin_left_size, _, margin_top_size, margin_bottom_size) =
+                        self.get_margins(item.node_idx, &child_style, available_size);
+                    content_position.x = original_content_cursor.x + cross_offset as i32 + margin_left_size;
+                    // TODO: This should probably go into the flex calculation
+                    content_position.y += margin_top_size;
 
                     let last = item_idx == base_items.len() - 1;
                     if let Some(child) = self.layout_node(
@@ -2667,10 +2667,9 @@ impl Renderer {
                         save_as_final,
                     ) {
                         let child_box = self.layout_table.get(&child).unwrap();
-                        let child_style = &self.node_styles.get(&item.node_idx).unwrap();
                         if !child_style.position.is_free() {
                             max_affecting_child_width = max_affecting_child_width.max(child_box.rect.width);
-                            content_position.y += child_box.rect.height as i32 + child_box.rect.margin_bottom;
+                            content_position.y += child_box.rect.height as i32 + margin_bottom_size;
                             children_rows.new_row(child, cross_offset as i32);
                             // Don't add gap for last item
                             if !last {
@@ -3422,9 +3421,9 @@ impl Browser {
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("https://vite.dev".to_string());
+    // let mut browser = Browser::new("https://vite.dev".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
+    let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
         browser.dump_tree()
