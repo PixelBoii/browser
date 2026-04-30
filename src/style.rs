@@ -166,7 +166,7 @@ pub struct Style {
     pub grid_template_columns: GridTemplateColumns,
 }
 
-pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
+pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
     let implied_text_align = parent_style
         .clone()
         .and_then(|v| Some(v.text_align))
@@ -294,7 +294,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<Style>) -> Style {
         variables: HashMap::new(),
         font_size: parent_style
             .clone()
-            .and_then(|v| Some(v.font_size))
+            .and_then(|v| Some(v.font_size.clone()))
             .unwrap_or(StyleSize::Px(16)),
         align_self: StyleJustifyContent::Auto,
         // TODO: This should default to currentColor
@@ -1358,7 +1358,7 @@ pub fn parse_style(
     node_idx: usize,
     element: &HtmlElement,
     css_nodes: &Vec<Node>,
-    parent_style: Option<Style>,
+    parent_style: Option<&Style>,
     parent_variables: &mut HashMap<String, String>,
     collected_css_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,

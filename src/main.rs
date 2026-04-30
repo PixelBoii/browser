@@ -576,7 +576,7 @@ fn compute_node_style(
     node_idx: usize,
     children_index: &HashMap<usize, Vec<usize>>,
     css_nodes: &Vec<CssNode>,
-    parent_style: Option<Style>,
+    parent_style: Option<usize>,
     parent_variables: &HashMap<String, String>,
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
@@ -584,6 +584,7 @@ fn compute_node_style(
     window_size: &PhysicalSize<u32>,
 ) {
     let mut variables = parent_variables.clone();
+    let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
     let style = match &nodes.get(&node_idx).unwrap() {
         Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, css_children_index).unwrap(),
         node => get_base_style(node, parent_style),
@@ -595,7 +596,7 @@ fn compute_node_style(
     });
     resolved_font_sizes.insert(node_idx, resolved_font_size as u32);
 
-    node_styles.insert(node_idx, style.clone());
+    node_styles.insert(node_idx, style);
 
     for child_idx in children_index.get(&node_idx).unwrap().iter() {
         compute_node_style(
@@ -605,7 +606,7 @@ fn compute_node_style(
             *child_idx,
             children_index,
             css_nodes,
-            Some(style.clone()),
+            Some(node_idx),
             &variables,
             Some(resolved_font_size as u32),
             collected_class_nodes,
