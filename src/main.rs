@@ -322,7 +322,7 @@ fn get_specified_size(
                 None
             }
         }
-        StyleSize::Px(px) => Some(*px),
+        StyleSize::Px(px) => Some(*px as i32),
         StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
@@ -585,7 +585,7 @@ fn compute_node_style(
 ) {
     let mut variables = parent_variables.clone();
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
-    let style = match &nodes.get(&node_idx).unwrap() {
+    let mut style = match &nodes.get(&node_idx).unwrap() {
         Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, css_children_index).unwrap(),
         node => get_base_style(node, parent_style),
     };
@@ -595,6 +595,9 @@ fn compute_node_style(
         16
     });
     resolved_font_sizes.insert(node_idx, resolved_font_size as u32);
+
+    // Set to resolved size in px so that ems dont stack on top of each other
+    style.font_size = StyleSize::Px(resolved_font_size as f32);
 
     node_styles.insert(node_idx, style);
 
@@ -1964,7 +1967,7 @@ impl Renderer {
                 (first_margin, last_margin) = match first_child_style.text_align {
                     StyleAlign::Left => panic!(),
                     StyleAlign::Center => (StyleSize::Auto, StyleSize::Auto),
-                    StyleAlign::Right => (StyleSize::Auto, StyleSize::Px(0)),
+                    StyleAlign::Right => (StyleSize::Auto, StyleSize::Px(0.)),
                 };
             }
 
@@ -3280,7 +3283,7 @@ impl Browser {
     }
 
     fn on_click(&mut self) -> Result<()> {
-        let (href, code): (Option<String>, Option<String>) = {
+        let (href, link_node_idx, code): (Option<String>, Option<usize>, Option<String>) = {
             let renderer_ref = self.renderer.as_ref().unwrap().clone();
             let renderer = renderer_ref.borrow();
             let hovering = renderer.hovering;
@@ -3290,35 +3293,57 @@ impl Browser {
                 println!("Clicked on {}", hovering_node_idx);
                 let parents: Vec<String> = renderer.get_parents(hovering_node_idx).into_iter().map(|idx| idx.to_string()).collect();
                 let code = format!(r#"
-                    [{}].forEach(idx => {{
-                        if (__EVENT_LISTENERS[`${{idx}}:click`]) {{
-                            __EVENT_LISTENERS[`${{idx}}:click`]?.forEach(cb => {{
-                                cb()
-                            }})
+                    (() => {{
+                        const event = new MouseEvent("click")
+                        // TODO: Use real tag name here
+                        event.target = new HTMLElement("div")
+                        for (const idx of [{}]) {{
+                            event.target.__node_idx = idx
+                            if (__EVENT_LISTENERS[`${{idx}}:click`]) {{
+                                __EVENT_LISTENERS[`${{idx}}:click`]?.forEach(cb => {{
+                                    cb(event)
+                                }})
+                            }}
                         }}
-                    }})
+                        return event.defaultPrevented
+                    }})()
                 "#, parents.join(", "));
 
                 let parent_link = renderer.get_parent_link(hovering_node_idx);
                 if let Some(parent) = parent_link {
                     match &renderer.nodes.get(&parent).unwrap() {
-                        Node::Element(element) => (element.attributes.get("href").cloned(), Some(code)),
-                        _ => (None, Some(code)),
+                        Node::Element(element) => (element.attributes.get("href").cloned(), Some(parent), Some(code)),
+                        _ => (None, Some(parent), Some(code)),
                     }
                 } else {
-                    (None, Some(code))
+                    (None, None, Some(code))
                 }
             } else {
-                (None, None)
+                (None, None, None)
             }
         };
 
-        if let Some(href) = href {
-            self.navigate(href.clone()).unwrap();
-        } else if let Some(code) = code {
-            self.tokio.as_ref().unwrap().clone().borrow_mut().block_on(self.execute_js(vec![
-                Script { content: ScriptContent::Code(code.to_string()), script_type: ScriptType::Classic }
-            ]))?;
+        let default_prevented = if let Some(code) = code {
+            let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+            let value = runtime.execute_script("click handler", code.clone())?;
+            let future = runtime.run_event_loop(Default::default());
+            self.tokio.as_ref().unwrap().clone().borrow_mut().block_on(future)?;
+
+            deno_core::scope!(scope, &mut *runtime);
+            let value = deno_core::v8::Local::new(scope, value);
+            value.boolean_value(scope)
+        } else {
+            false
+        };
+
+        println!("default prevented {}", default_prevented);
+
+        if let (Some(href), Some(_link_node_idx)) = (href, link_node_idx) {
+            if !default_prevented {
+                let current_url = url::Url::parse(&self.url)?;
+                let resolved_url = current_url.join(&href)?;
+                self.navigate(resolved_url.to_string()).unwrap();
+            }
         }
 
         Ok(())
@@ -3454,7 +3479,7 @@ impl Browser {
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("https://vite.dev".to_string());
+    let mut browser = Browser::new("https://vite.dev/plugins/".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
@@ -3773,15 +3798,15 @@ mod tests {
                 justify_content: StyleJustifyContent::FlexStart,
                 align_items: StyleJustifyContent::FlexStart,
                 flex_direction: StyleFlexDirection::Row,
-                gap: StyleSize::Px(0),
-                margin_left: StyleSize::Px(0),
-                margin_right: StyleSize::Px(0),
-                margin_top: StyleSize::Px(0),
-                margin_bottom: StyleSize::Px(0),
-                padding_left: StyleSize::Px(0),
-                padding_right: StyleSize::Px(0),
-                padding_top: StyleSize::Px(0),
-                padding_bottom: StyleSize::Px(0),
+                gap: StyleSize::Px(0.),
+                margin_left: StyleSize::Px(0.),
+                margin_right: StyleSize::Px(0.),
+                margin_top: StyleSize::Px(0.),
+                margin_bottom: StyleSize::Px(0.),
+                padding_left: StyleSize::Px(0.),
+                padding_right: StyleSize::Px(0.),
+                padding_top: StyleSize::Px(0.),
+                padding_bottom: StyleSize::Px(0.),
                 left: StyleSize::Auto,
                 right: StyleSize::Auto,
                 top: StyleSize::Auto,
@@ -3794,12 +3819,12 @@ mod tests {
                 position: StylePosition::Static,
                 text_align: StyleAlign::Left,
                 variables: HashMap::new(),
-                font_size: StyleSize::Px(16),
+                font_size: StyleSize::Px(16.),
                 align_self: StyleJustifyContent::Auto,
-                border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
-                border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
-                border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
-                border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3), style: StyleBorderStyle::None },
+                border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+                border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+                border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+                border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
                 grid_template_columns: GridTemplateColumns::None,
             },
             parsed

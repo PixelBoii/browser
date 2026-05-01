@@ -24,7 +24,7 @@ pub enum CalcExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleSize {
     Auto,
-    Px(i32),
+    Px(f32),
     Em(f32),
     Rem(f32),
     Percent(f32),
@@ -178,14 +178,14 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                     parse_style_size(width.clone()).unwrap()
                 } else {
                     match element.tag.as_str() {
-                        "br" => StyleSize::Px(0),
+                        "br" => StyleSize::Px(0.),
                         "input" => match element
                             .attributes
                             .get(&"type".to_string())
                             .and_then(|v| Some(v.as_str()))
                         {
                             Some("button") | Some("submit") | Some("reset") => StyleSize::Auto,
-                            _ => StyleSize::Px(20),
+                            _ => StyleSize::Px(20.),
                         },
                         _ => StyleSize::Auto,
                     }
@@ -199,8 +199,8 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                     parse_style_size(height.clone()).unwrap()
                 } else {
                     match element.tag.as_str() {
-                        "br" => StyleSize::Px(10),
-                        "input" => StyleSize::Px(22),
+                        "br" => StyleSize::Px(10.),
+                        "input" => StyleSize::Px(22.),
                         _ => StyleSize::Auto,
                     }
                 }
@@ -242,15 +242,15 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         justify_content: StyleJustifyContent::FlexStart,
         align_items: StyleJustifyContent::Stretch,
         flex_direction: StyleFlexDirection::Row,
-        gap: StyleSize::Px(0),
-        margin_left: StyleSize::Px(0),
-        margin_right: StyleSize::Px(0),
-        margin_top: StyleSize::Px(0),
-        margin_bottom: StyleSize::Px(0),
-        padding_left: StyleSize::Px(0),
-        padding_right: StyleSize::Px(0),
-        padding_top: StyleSize::Px(0),
-        padding_bottom: StyleSize::Px(0),
+        gap: StyleSize::Px(0.),
+        margin_left: StyleSize::Px(0.),
+        margin_right: StyleSize::Px(0.),
+        margin_top: StyleSize::Px(0.),
+        margin_bottom: StyleSize::Px(0.),
+        padding_left: StyleSize::Px(0.),
+        padding_right: StyleSize::Px(0.),
+        padding_top: StyleSize::Px(0.),
+        padding_bottom: StyleSize::Px(0.),
         left: StyleSize::Auto,
         right: StyleSize::Auto,
         top: StyleSize::Auto,
@@ -295,20 +295,20 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         font_size: parent_style
             .clone()
             .and_then(|v| Some(v.font_size.clone()))
-            .unwrap_or(StyleSize::Px(16)),
+            .unwrap_or(StyleSize::Px(16.)),
         align_self: StyleJustifyContent::Auto,
         // TODO: This should default to currentColor
-        border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
-        border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
-        border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
-        border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3), style: StyleBorderStyle::None },
+        border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+        border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+        border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+        border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
         grid_template_columns: GridTemplateColumns::None,
     }
 }
 
 fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
-    let values: Vec<StyleSize> = value
-        .split(" ")
+    let values: Vec<StyleSize> = split_ignoring_parentheses(value.clone(), ' ', &[])
+        .into_iter()
         .map(|s| parse_style_size(s.to_string()))
         .collect::<Result<Vec<StyleSize>>>()?;
 
@@ -333,7 +333,7 @@ where
     T: Clone,
     F: Fn(String) -> Result<T>,
 {
-    let values: Vec<T> = split_ignoring_parentheses(value.clone(), ' ')
+    let values: Vec<T> = split_ignoring_parentheses(value.clone(), ' ', &[])
         .iter()
         .map(|s| parse(s.to_string()))
         .collect::<Result<Vec<T>>>()?;
@@ -367,10 +367,10 @@ where
     }
 }
 
-fn extract_operator(char: char, next_char: Option<char>) -> Option<CalcExpression> {
+fn extract_operator(char: char) -> Option<CalcExpression> {
     if char == '+' {
         Some(CalcExpression::Operator(StyleCalcOperator::Plus))
-    } else if char == '-' && next_char.is_some_and(|v| v == ' ') {
+    } else if char == '-' {
         Some(CalcExpression::Operator(StyleCalcOperator::Minus))
     } else if char == '/' {
         Some(CalcExpression::Operator(StyleCalcOperator::Divide))
@@ -390,20 +390,25 @@ fn flush_calc_value(buffer: &mut String, parts: &mut Vec<CalcExpression>) -> Res
     Ok(())
 }
 
+const CALC_NUMBER_CHARS: [char; 11] = ['.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+
 fn parse_calc(value: &str) -> Result<StyleSize> {
     let mut parts: Vec<CalcExpression> = vec![];
     let mut buffer = String::new();
     // Remove whitespace
     let mut value = value.to_string();
     value.retain(|c| !c.is_whitespace());
-    let chars: Vec<char> = value.chars().collect();
-    for (char_idx, char) in chars.iter().enumerate() {
-        let next_char = if char_idx + 1 < chars.len() { Some(chars[char_idx + 1]) } else { None };
-        if let Some(operator) = extract_operator(*char, next_char) {
+    let mut last_numberish = false;
+    for char in value.chars() {
+        if let Some(operator) = extract_operator(char) && last_numberish {
             flush_calc_value(&mut buffer, &mut parts)?;
             parts.push(operator);
+            last_numberish = false;
         } else {
-            buffer.push(*char);
+            if char != ' ' && CALC_NUMBER_CHARS.contains(&char) {
+                last_numberish = true;
+            }
+            buffer.push(char);
         }
     }
     flush_calc_value(&mut buffer, &mut parts)?;
@@ -458,7 +463,7 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .strip_suffix("px")
             .with_context(|| "Failed to strip px")?
             .trim();
-        return Ok(StyleSize::Px(parse_size_number(px)? as i32));
+        return Ok(StyleSize::Px(parse_size_number(px)?));
     }
     if value.ends_with("pt") {
         let pt = value
@@ -466,7 +471,7 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .with_context(|| "Failed to strip pt")?
             .trim();
         let parsed = parse_size_number(pt)?;
-        return Ok(StyleSize::Px((parsed * 96. / 72.) as i32));
+        return Ok(StyleSize::Px(parsed * 96. / 72.));
     }
     if value.ends_with("rem") {
         let rem = value
@@ -484,7 +489,11 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
         let parsed = parse_size_number(em)?;
         return Ok(StyleSize::Em(parsed));
     }
-    if let Ok(parsed) = value.parse::<i32>() {
+    let mut adjusted = value.clone();
+    if value.starts_with('.') {
+        adjusted = format!("0{}", adjusted);
+    }
+    if let Ok(parsed) = adjusted.parse::<f32>() {
         return Ok(StyleSize::Px(parsed));
     }
     println!("Failed to parse style value \"{}\"", value);
@@ -572,13 +581,15 @@ pub fn build_css_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, V
 pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) -> bool {
     query.criterias.iter().all(|q| {
         // TODO: Implement more + handle q.comparison
+        // Media queries REM are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
         match (q.property.as_str(), q.comparison.clone(), q.value.clone()) {
             // Default to dark mode
             ("prefers-color-scheme", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::String(value)) => value == "dark",
             ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => window_size.width < px as u32,
             ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Px(px)) => window_size.width >= px as u32,
-            // Media queries are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
             ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Rem(rem)) => window_size.width >= rem as u32 * 16,
+            ("width", MediaQueryCriteriaComparison::LessOrEqual, MediaQueryCriteriaValue::Px(px)) => window_size.width <= px as u32,
+            ("width", MediaQueryCriteriaComparison::LessOrEqual, MediaQueryCriteriaValue::Rem(rem)) => window_size.width <= rem as u32 * 16,
             (_, _, _) => {
                 // println!("Unsupported media query property: {} {:?} {:?}", p, c, v);
                 false
@@ -791,15 +802,15 @@ mod tests {
 
         assert_eq!(
             properties[0].value,
-            PropertyValue::Size(StyleSize::Px(12))
+            PropertyValue::Size(StyleSize::Px(12.))
         );
         assert_eq!(
             properties[1].value,
-            PropertyValue::Size(StyleSize::Px(12))
+            PropertyValue::Size(StyleSize::Px(12.))
         );
         assert_eq!(
             properties[2].value,
-            PropertyValue::Size(StyleSize::Px(16))
+            PropertyValue::Size(StyleSize::Px(16.))
         );
     }
 
@@ -816,8 +827,12 @@ mod tests {
     #[test]
     fn splits_space_ignoring_parentheses() {
         assert_eq!(
-            split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' '),
+            split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' ', &[]),
             vec!["repeat(2, 1fr)", "20px"]
+        );
+        assert_eq!(
+            split_ignoring_parentheses("test>lol".into(), ' ', &['>']),
+            vec!["test", ">", "lol"]
         );
     }
 }
@@ -863,26 +878,41 @@ fn parse_border_side_value(value: String) -> Result<BorderSideValue> {
     }
 }
 
-pub fn split_ignoring_parentheses(value: String, split_char: char) -> Vec<String> {
+pub fn split_ignoring_parentheses(value: String, split_char: char, break_chars: &[char]) -> Vec<String> {
     let mut parentheses_depth = 0;
     let mut buffer = String::new();
     let mut result = vec![];
     let parentheses_start = '(';
     let parentheses_close = ')';
+    let mut auto_break = false;
     for char in value.chars() {
         if char == parentheses_start {
             parentheses_depth += 1;
             buffer.push(char);
+            auto_break = false;
             continue;
         }
         if char == parentheses_close {
             parentheses_depth -= 1;
             buffer.push(char);
+            auto_break = false;
+            continue;
+        }
+        if auto_break {
+            result.push(buffer.clone());
+            buffer = char.to_string();
+            auto_break = false;
             continue;
         }
         if char == split_char && parentheses_depth == 0 {
             result.push(buffer.clone());
             buffer.clear();
+            continue;
+        }
+        if break_chars.contains(&char) && parentheses_depth == 0 {
+            result.push(buffer.clone());
+            buffer = char.to_string();
+            auto_break = true;
             continue;
         }
         buffer.push(char);
@@ -913,7 +943,7 @@ fn parse_grid_template_columns_inner_value(value: String) -> Result<GridTemplate
 }
 
 fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
-    let parts: Vec<String> = split_ignoring_parentheses(value, ' ');
+    let parts: Vec<String> = split_ignoring_parentheses(value, ' ', &[]);
     // TODO: Also support minmax etc. here
     let mut parsed: Vec<GridTemplateColumnsValue> = vec![];
     for p in parts {

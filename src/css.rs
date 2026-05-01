@@ -14,6 +14,11 @@ pub enum ClassNamePartAttribute {
 pub enum PseudoClass {
     Root,
     Hover,
+    Active,
+    Focus,
+    Before,
+    After,
+    Host,
     Has(Vec<ClassNamePart>),
     Not(Vec<ClassNamePart>),
 }
@@ -48,6 +53,7 @@ pub struct MediaQuery {
 pub enum MediaQueryCriteriaComparison {
     Is,
     MoreOrEqual,
+    LessOrEqual,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +234,21 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     if value == "hover" {
         return Some(PseudoClass::Hover);
     }
+    if value == "active" {
+        return Some(PseudoClass::Active);
+    }
+    if value == "before" {
+        return Some(PseudoClass::Before);
+    }
+    if value == "after" {
+        return Some(PseudoClass::After);
+    }
+    if value == "focus" {
+        return Some(PseudoClass::Focus);
+    }
+    if value == "host" {
+        return Some(PseudoClass::Host);
+    }
     if value == "root" {
         return Some(PseudoClass::Root);
     }
@@ -235,7 +256,7 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
 }
 
 pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
-    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ');
+    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>']);
     nested_parts
         .into_iter()
         .filter_map(|p| -> Option<ClassNamePart> {
@@ -313,7 +334,11 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
         .collect()
 }
 
-const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 2] = [(MediaQueryCriteriaComparison::Is, ":"), (MediaQueryCriteriaComparison::MoreOrEqual, ">=")];
+const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 3] = [
+    (MediaQueryCriteriaComparison::Is, ":"),
+    (MediaQueryCriteriaComparison::MoreOrEqual, ">="),
+    (MediaQueryCriteriaComparison::LessOrEqual, "<="),
+];
 
 pub fn parse_media_query_parts(mut name: &str) -> Vec<MediaQueryCriteria> {
     name = name.strip_prefix("(").unwrap_or(&name);
@@ -393,7 +418,7 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_class_name_from_state(&mut self) {
-        let name: Vec<String> = split_ignoring_parentheses(self.label.clone(), ',')
+        let name: Vec<String> = split_ignoring_parentheses(self.label.clone(), ',', &[])
             .into_iter()
             .map(|l| l.trim().to_string())
             .collect();

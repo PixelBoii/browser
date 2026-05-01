@@ -115,6 +115,27 @@ class TextNode extends BaseNode {
     }
 }
 
+class Event {
+    constructor(name) {
+        this.name = name
+        this.target = null
+        this.defaultPrevented = false
+    }
+
+    preventDefault() {
+        this.defaultPrevented = true
+    }
+}
+
+class MouseEvent extends Event {}
+
+Object.defineProperty(globalThis, "MouseEvent", {
+    value: MouseEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
 class HtmlElement extends BaseNode {
     constructor(tag) {
         super()
@@ -247,6 +268,13 @@ class HtmlElement extends BaseNode {
         this.__style = value
     }
 }
+
+Object.defineProperty(globalThis, "HTMLElement", {
+    value: HtmlElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
 
 class CSSStyleDeclaration {
     constructor(style, element) {
