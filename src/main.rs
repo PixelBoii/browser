@@ -580,13 +580,14 @@ fn compute_node_style(
     parent_variables: &HashMap<String, String>,
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
+    class_node_specificity: &HashMap<usize, [i32; 3]>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     window_size: &PhysicalSize<u32>,
 ) {
     let mut variables = parent_variables.clone();
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
     let mut style = match &nodes.get(&node_idx).unwrap() {
-        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, css_children_index).unwrap(),
+        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, class_node_specificity, css_children_index).unwrap(),
         node => get_base_style(node, parent_style),
     };
 
@@ -613,6 +614,7 @@ fn compute_node_style(
             &variables,
             Some(resolved_font_size as u32),
             collected_class_nodes,
+            class_node_specificity,
             css_children_index,
             window_size,
         );
@@ -818,7 +820,7 @@ fn collect_class_nodes_for_elements(
     raw_html_nodes: &HashMap<usize, Node>,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
-) -> HashMap<usize, Vec<usize>> {
+) -> (HashMap<usize, Vec<usize>>, HashMap<usize, [i32; 3]>) {
     // All class names and media queries that have properties/children and need to be resolved
     let mut to_resolve = HashSet::new();
     for (idx, n) in css_nodes.iter() {
@@ -845,6 +847,28 @@ fn filter_to_elements(html_nodes: &HashMap<usize, Node>) -> HashMap<usize, &Node
         .collect()
 }
 
+// Returns a tuple representing scores to be ordered by
+// (IDs   classes/attrs/pseudo-classes   elements)
+// TODO: Implement nested pseudo classes like NOT
+fn get_specificity_tuple(parts: &Vec<ClassNamePart>) -> [i32; 3] {
+    let mut tuple = [0; 3];
+    for part in parts.iter() {
+        match part {
+            ClassNamePart::Id(_) => tuple[0] += 1,
+            ClassNamePart::Attributes(_) | ClassNamePart::PseudoClass(_) | ClassNamePart::Class(_) => tuple[1] += 1,
+            ClassNamePart::Tag(_) => tuple[2] += 1,
+            ClassNamePart::Combined(combined) => {
+                let specificity = get_specificity_tuple(combined);
+                for (idx, value) in specificity.iter().enumerate() {
+                    tuple[idx] += value;
+                }
+            },
+            _ => {},
+        };
+    }
+    tuple
+}
+
 // It is assumed that html_nodes only contains Node::Element here
 fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
@@ -852,12 +876,13 @@ fn search_elements_for_css_nodes(
     html_nodes: &HashMap<usize, &Node>,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
-) -> HashMap<usize, Vec<usize>> {
+) -> (HashMap<usize, Vec<usize>>, HashMap<usize, [i32; 3]>) {
     let class_elements = &dom_indexes.class_elements;
     let id_elements = &dom_indexes.id_elements;
     let tag_elements = &dom_indexes.tag_elements;
 
     let mut matches: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut specificity: HashMap<usize, [i32; 3]> = HashMap::new();
 
     for css_node_idx in to_resolve {
         let node = css_nodes[css_node_idx].1;
@@ -868,6 +893,7 @@ fn search_elements_for_css_nodes(
                         continue;
                     }
                     let last_part = parts.last().unwrap();
+                    let node_specificity = get_specificity_tuple(parts);
 
                     let elements: Option<HashSet<usize>> = match last_part {
                         ClassNamePart::Class(class) => class_elements.get(class).cloned(),
@@ -939,6 +965,8 @@ fn search_elements_for_css_nodes(
 
                             if is_match {
                                 matches.entry(el).or_default().push(css_node_idx);
+                                // TODO: Probably index this by css node idx + name part idx
+                                specificity.insert(css_node_idx, node_specificity);
                             }
                         }
                     }
@@ -968,7 +996,7 @@ fn search_elements_for_css_nodes(
         }
     }
 
-    matches
+    (matches, specificity)
 }
 
 fn compute_node_styles(
@@ -988,7 +1016,7 @@ fn compute_node_styles(
     let css_children_index = build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
 
     let start = Instant::now();
-    let collected_class_nodes = collect_class_nodes_for_elements(&parsed_css_nodes.iter().enumerate().collect(), &nodes, window_size, dom_indexes);
+    let (collected_class_nodes, class_node_specificity) = collect_class_nodes_for_elements(&parsed_css_nodes.iter().enumerate().collect(), &nodes, window_size, dom_indexes);
     println!("collect_class_nodes_for_elements took {}ms", Instant::now().duration_since(start).as_millis());
 
     let mut node_styles = HashMap::new();
@@ -1004,6 +1032,7 @@ fn compute_node_styles(
         &HashMap::new(),
         None,
         &collected_class_nodes,
+        &class_node_specificity,
         &css_children_index,
         window_size,
     );
@@ -1222,7 +1251,7 @@ fn query_selector_all(nodes_table: &HashMap<usize, &Node>, selector: Vec<ClassNa
     let css_nodes: Vec<(usize, &CssNode)> = css_vec.iter().enumerate().collect();
     let mut to_resolve = HashSet::new();
     to_resolve.insert(0);
-    let collected = search_elements_for_css_nodes(to_resolve, &css_nodes, nodes_table, window_size, dom_indexes);
+    let (collected, _) = search_elements_for_css_nodes(to_resolve, &css_nodes, nodes_table, window_size, dom_indexes);
 
     collected.keys().cloned().collect()
 }
@@ -3479,9 +3508,9 @@ impl Browser {
 
 fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("https://vite.dev/plugins/".to_string());
+    // let mut browser = Browser::new("https://vite.dev/plugins/".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
+    let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
         browser.dump_tree()
@@ -3784,6 +3813,7 @@ mod tests {
             None,
             &mut HashMap::new(),
             &mut HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
         )?;
 
