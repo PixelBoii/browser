@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
 use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, Variable};
+use crate::get_specificity_tuple;
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -698,28 +699,43 @@ fn resolve_variable_value(value: &str, variables: &HashMap<String, String>) -> S
     out
 }
 
-fn apply_node_variables_dependencies(variables: &mut HashMap<String, String>, variables_to_parse: &Vec<(usize, &Variable)>, variable_dependence: &mut HashMap<&str, Vec<usize>>, name: String, value: String) {
-    variables.insert(name.clone(), value.clone());
+fn apply_node_variables_dependencies(collected_variables: &mut HashMap<usize, String>, css_nodes: &Vec<Node>, variable_dependence: &mut HashMap<&str, Vec<usize>>, var_idx: usize, value: String) {
+    collected_variables.insert(var_idx, value.clone());
+    let name = match &css_nodes[var_idx] {
+        Node::Variable(variable) => &variable.variable,
+        _ => panic!(),
+    };
     let Some(dependent) = variable_dependence.get(name.as_str()).cloned() else {
         return;
     };
     for idx in dependent.iter() {
-        let var = variables_to_parse[*idx].1;
-        apply_node_variables_dependencies(variables, variables_to_parse, variable_dependence, var.variable.clone(), value.clone());
+        apply_node_variables_dependencies(collected_variables, css_nodes, variable_dependence, *idx, value.clone());
     }
     variable_dependence.remove(name.as_str());
 }
 
-fn apply_node_variables(nodes: &Vec<Node>, variables: &mut HashMap<String, String>) {
-    let variables_to_parse: Vec<(usize, &Variable)> = nodes
+fn order_variables(idxs: &Vec<&usize>, nodes: &[Node], class_node_specificity: &HashMap<usize, [i32; 3]>) -> Vec<usize> {
+    let mut idxs = idxs.clone();
+    let node_mapping: Vec<(usize, &Node)> = nodes.iter().enumerate().collect();
+    order_css_nodes(&mut idxs, &node_mapping, class_node_specificity);
+
+    idxs.into_iter().copied().collect()
+}
+
+fn apply_node_variables(
+    nodes: &Vec<(usize, Node)>,
+    variables: &mut HashMap<String, String>,
+    css_nodes: &Vec<Node>,
+    class_node_specificity: &HashMap<usize, [i32; 3]>,
+) {
+    let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
-        .filter_map(|node| match node {
+        .filter_map(|(idx, node)| match node {
             Node::Variable(variable) => {
-                Some(variable)
+                Some((*idx, variable))
             }
             _ => None
         })
-        .enumerate()
         .collect();
     let mut variable_dependence: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut no_dependence = vec![];
@@ -734,10 +750,14 @@ fn apply_node_variables(nodes: &Vec<Node>, variables: &mut HashMap<String, Strin
         }
         no_dependence.push(*idx);
     }
+    let mut collected_variables: HashMap<usize, String> = HashMap::new();
     for idx in no_dependence {
-        let var = variables_to_parse[idx].1;
-        if let PropertyValue::Raw(value) = &var.value {
-            apply_node_variables_dependencies(variables, &variables_to_parse, &mut variable_dependence, var.variable.clone(), value.clone());
+        let value = match &css_nodes[idx] {
+            Node::Variable(variable) => &variable.value,
+            _ => panic!(),
+        };
+        if let PropertyValue::Raw(value) = value {
+            apply_node_variables_dependencies(&mut collected_variables, css_nodes, &mut variable_dependence, idx, value.clone());
         }
     }
     for (variable, idxs) in variable_dependence.clone() {
@@ -746,21 +766,29 @@ fn apply_node_variables(nodes: &Vec<Node>, variables: &mut HashMap<String, Strin
         };
 
         for idx in idxs {
-            let var = variables_to_parse[idx].1;
-            apply_node_variables_dependencies(variables, &variables_to_parse, &mut variable_dependence, var.variable.clone(), resolved.clone());
+            apply_node_variables_dependencies(&mut collected_variables, css_nodes, &mut variable_dependence, idx, resolved.clone());
         }
+    }
+    let unordered_collected_idxs = collected_variables.keys().collect::<Vec<&usize>>();
+    let ordered_idxs = order_variables(&unordered_collected_idxs, css_nodes, class_node_specificity);
+    for idx in ordered_idxs {
+        let value = collected_variables.get(&idx).unwrap();
+        let var = variables_to_parse.get(&idx).unwrap();
+        variables.insert(var.variable.clone(), value.to_string());
     }
 }
 
 pub fn resolve_node_variables<'a>(
-    nodes: &'a mut Vec<Node>,
+    nodes: &'a mut Vec<(usize, Node)>,
     variables: &mut HashMap<String, String>,
+    css_nodes: &Vec<Node>,
+    class_node_specificity: &HashMap<usize, [i32; 3]>,
 ) -> Vec<&'a mut Property> {
-    apply_node_variables(nodes, variables);
+    apply_node_variables(nodes, variables, css_nodes, class_node_specificity);
 
     let properties = nodes
         .iter_mut()
-        .filter_map(|node| match node {
+        .filter_map(|(_, node)| match node {
             Node::Property(property) => {
                 if let PropertyValue::Raw(value) = &property.value {
                     let value = resolve_variable_value(value, variables);
@@ -787,7 +815,7 @@ mod tests {
 
     #[test]
     fn resolves_node_variables() {
-        let mut nodes = vec![
+        let nodes = vec![
             Node::Variable(Variable { variable: "--size".into(), value: PropertyValue::Raw("12px".into()), parent: None }),
             Node::Variable(Variable { variable: "--dependent".into(), value: PropertyValue::Raw("var(--size)".into()), parent: None }),
             Node::Variable(Variable { variable: "--another-one".into(), value: PropertyValue::Raw("var(--test)".into()), parent: None }),
@@ -798,7 +826,8 @@ mod tests {
 
         let mut already_resolved = HashMap::new();
         already_resolved.insert("--test".to_string(), "16px".to_string());
-        let properties = resolve_node_variables(&mut nodes, &mut already_resolved);
+        let mut nodes_to_parse = nodes.clone().into_iter().enumerate().collect();
+        let properties = resolve_node_variables(&mut nodes_to_parse, &mut already_resolved, &nodes, &HashMap::new());
 
         assert_eq!(
             properties[0].value,
@@ -1447,12 +1476,13 @@ pub fn parse_style(
         }
     }
     order_css_nodes(&mut applicable_class_properties, &css_nodes.iter().enumerate().collect(), class_node_specificity);
-    let mut nodes: Vec<Node> = applicable_class_properties
+    let mut nodes: Vec<(usize, Node)> = applicable_class_properties
         .iter()
-        .map(|idx| css_nodes[**idx].clone())
+        .map(|idx| (**idx, css_nodes[**idx].clone()))
         .collect();
-    nodes.append(&mut inline_nodes);
-    let properties = resolve_node_variables(&mut nodes, parent_variables);
+    // TODO: ADD THIS BACK!
+    // nodes.append(&mut inline_nodes);
+    let properties = resolve_node_variables(&mut nodes, parent_variables, css_nodes, class_node_specificity);
     style.variables = parent_variables.clone();
     for property in properties {
         if let Err(result) = apply_style_property(&element, &mut style, &property) {
