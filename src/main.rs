@@ -5,6 +5,7 @@ mod loader;
 
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use parser::{Element, HtmlParser, Node};
+use resvg::tiny_skia::IntSize;
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
     StyleSize, get_base_style, parse_style,
@@ -20,9 +21,9 @@ use std::{env, fs, u32};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes};
-use deno_core::{JsRuntime, OpState, extension, op2};
+use deno_core::{JsRuntime, OpState, extension, op2, v8};
 use deno_core::error::JsError;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle};
 use reqwest::{Url as ReqwestUrl};
 use resvg::{tiny_skia, usvg};
 use softbuffer::{Context as SoftContext, Surface};
@@ -98,6 +99,7 @@ struct RenderableText {
     glyphs: Vec<Option<OutlinedGlyph>>,
     width: u32,
     height: u32,
+    line_height: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +133,36 @@ struct DomIndexes {
 }
 
 #[derive(Debug)]
+struct CanvasBuffer {
+    buffer: Vec<u32>,
+    width: u32,
+    height: u32,
+}
+
+impl CanvasBuffer {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            buffer: vec![0xFF_FF_FF; width as usize * height as usize],
+            width,
+            height,
+        }
+    }
+
+    fn resize_if_needed(&mut self, width: u32, height: u32) {
+        if self.width == width
+            && self.height == height
+            && self.buffer.len() == width as usize * height as usize
+        {
+            return;
+        }
+
+        self.width = width;
+        self.height = height;
+        self.buffer.resize(width as usize * height as usize, 0);
+    }
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
     node_idx_cursor: usize,
@@ -155,6 +187,7 @@ struct Renderer {
     resolved_specified_heights: HashMap<usize, Option<u32>>,
     resolved_specified_widths: HashMap<usize, Option<u32>>,
     dom_indexes: DomIndexes,
+    canvas_buffers: HashMap<usize, CanvasBuffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -1050,6 +1083,15 @@ struct JsHostState {
     proxy: EventLoopProxy<UserEvent>
 }
 
+#[op2]
+fn op_tls_peer_certificate<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[smi] _rid: u32,
+    _detailed: bool,
+) -> v8::Local<'s, v8::Value> {
+    v8::null(scope).into()
+}
+
 #[op2(fast)]
 fn op_create_element(state: &mut OpState, #[string] tag: String) -> Result<i32, JsError> {
     let host = state.borrow_mut::<JsHostState>();
@@ -1240,6 +1282,145 @@ fn op_update_attributes(state: &mut OpState, #[number] node_idx: usize, #[serde]
     Ok(())
 }
 
+fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
+    match node {
+        Node::Element(element) => (
+            element.attributes.get("width").and_then(|v| v.parse::<u32>().ok()).or(Some(150)),
+            element.attributes.get("height").and_then(|v| v.parse::<u32>().ok()).or(Some(150)),
+        ),
+        _ => (None, None),
+    }
+}
+
+#[op2(fast)]
+fn op_fill_canvas_rect(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let node = renderer.nodes.get(&node_idx).unwrap();
+    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
+        return Ok(());
+    };
+
+    let x = x.round() as i32;
+    let y = y.round() as i32;
+    let width = width.round() as u32;
+    let height = height.round() as u32;
+
+    let canvas = renderer.canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+    canvas.resize_if_needed(node_width, node_height);
+
+    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y, width, height, 0x00_00_00_FF);
+
+    renderer.schedule_dom_update(&host.proxy);
+
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_stroke_canvas_rect(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    line_width: f64,
+) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let node = renderer.nodes.get(&node_idx).unwrap();
+    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
+        return Ok(());
+    };
+
+    let x = x.round() as i32;
+    let y = y.round() as i32;
+    let width = width.round() as u32;
+    let height = height.round() as u32;
+    let line_width = line_width.round() as u32;
+
+    let canvas = renderer.canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+    canvas.resize_if_needed(node_width, node_height);
+
+    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y, line_width, height, 0x00_00_00_FF); // Left
+    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y, width, line_width, 0x00_00_00_FF); // Top
+    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x + width as i32 - line_width as i32, y, line_width, height, 0x00_00_00_FF); // Right
+    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y + height as i32 - line_width as i32, width, line_width, 0x00_00_00_FF); // Bottom
+
+    renderer.schedule_dom_update(&host.proxy);
+
+    Ok(())
+}
+
+#[op2]
+fn op_canvas_path_stroke(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[serde] path: Vec<Vec<f64>>,
+    line_width: f64,
+) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let node = renderer.nodes.get(&node_idx).unwrap();
+    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
+        return Ok(());
+    };
+
+    let canvas = renderer.canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+
+    let mut cursor = Position { x: path[0][0] as i32, y: path[0][1] as i32 };
+    let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
+    for line in path.iter().skip(1) {
+        let x = line[0];
+        let y = line[1];
+        let start_x = cursor.x as f64;
+        let start_y = cursor.y as f64;
+        let x_delta = x - cursor.x as f64;
+        let y_delta = y - cursor.y as f64;
+
+        let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+        let stride = node_width as usize;
+
+        let x_ratio = x_delta / hyp as f64;
+        let y_ratio = y_delta / hyp as f64;
+
+        let line_width_offset = -line_width as i32 / 2;
+        let line_width_end = line_width as i32 / 2;
+
+        for idx in 0..hyp {
+            for wxidx in line_width_offset..line_width_end {
+                for wyidx in line_width_offset..line_width_end {
+                    let px = (start_x + idx as f64 * x_ratio + wxidx as f64).round().min(node_width as f64) as i32;
+                    let py = (start_y + idx as f64 * y_ratio + wyidx as f64).round().min(node_height as f64) as i32;
+
+                    let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
+                    row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
+                }
+            }
+        }
+
+        cursor.x = x.round() as i32;
+        cursor.y = y.round() as i32;
+    }
+
+    renderer.schedule_dom_update(&host.proxy);
+
+    Ok(())
+}
+
 // This should walk the tree to be fully correct I think
 fn query_selector_all(nodes_table: &HashMap<usize, &Node>, selector: Vec<ClassNamePart>, window_size: &PhysicalSize<u32>, dom_indexes: &DomIndexes) -> Vec<usize> {
     let class = CssNode::ClassName(ClassName {
@@ -1276,10 +1457,31 @@ extension!(
     op_update_attributes,
     op_get_inner_html,
     op_get_text_content,
+    op_tls_peer_certificate,
+    op_fill_canvas_rect,
+    op_stroke_canvas_rect,
+    op_canvas_path_stroke,
   ],
   esm_entry_point = "ext:browser/runtime.js",
-  esm = [dir "src", "runtime.js"],
+  esm = [dir "src", "runtime.js", "runtime_fetch.js"],
+  state = |state| {
+    let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
+      sys_traits::impls::RealSys,
+    ));
+    state.put(deno_permissions::PermissionsContainer::allow_all(parser));
+  },
 );
+
+fn deno_fetch_without_telemetry() -> deno_core::Extension {
+    let mut extension = deno_fetch::deno_fetch::init(Default::default());
+    extension.esm_files.to_mut().retain(|source| {
+        !matches!(
+            source.specifier,
+            "ext:deno_fetch/26_fetch.js" | "ext:deno_fetch/27_eventsource.js"
+        )
+    });
+    extension
+}
 
 #[derive(Debug)]
 pub struct MarginRows {
@@ -1430,6 +1632,7 @@ impl Renderer {
             resolved_specified_heights: HashMap::new(),
             resolved_specified_widths: HashMap::new(),
             dom_indexes,
+            canvas_buffers: HashMap::new(),
         }
     }
 
@@ -1785,7 +1988,7 @@ impl Renderer {
             Node::Text(text) => {
                 let text = collapse_whitespace(&text.text).unwrap_or("".to_string());
                 let renderable_text = self.font_handler
-                    .get_renderable_text(text.clone(), resolved_font_size as i32)
+                    .get_renderable_text(text.clone(), resolved_font_size as i32, Some(available_size.width))
                     .inspect_err(|err| println!("Failed to get renderable text for {} {:?}", text, err))
                     .ok()?;
                 let width = forced_size.width.unwrap_or(renderable_text.width);
@@ -1808,7 +2011,7 @@ impl Renderer {
                 }, save_as_final))
             }
             Node::Element(element) => {
-                if element.tag == "svg" || element.tag == "img" {
+                if element.tag == "svg" || element.tag == "img" || element.tag == "canvas" {
                     let style = self.node_styles.get(&node_idx).unwrap().clone();
                     if let StyleDisplay::None = style.display {
                         return None;
@@ -1818,6 +2021,22 @@ impl Renderer {
                     let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None, &self.window_size).unwrap_or(available_size.height as i32) as u32;
                     let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None, &self.window_size).unwrap_or(available_size.width as i32) as u32;
                     let (pixmap, height, width) = match element.tag.as_str() {
+                        "canvas" => {
+                            let (Some(canvas_width), Some(canvas_height)) = (match self.nodes.get(&node_idx).unwrap() {
+                                Node::Element(element) => (
+                                    element.attributes.get("width").and_then(|v| v.parse::<u32>().ok()).or(Some(150)),
+                                    element.attributes.get("height").and_then(|v| v.parse::<u32>().ok()).or(Some(150)),
+                                ),
+                                _ => (None, None),
+                            }) else {
+                                return None;
+                            };
+                            let canvas = self.canvas_buffers.entry(node_idx).or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
+                            canvas.resize_if_needed(canvas_width, canvas_height);
+                            let data = rgb_buffer_to_premul_bytes(&canvas.buffer);
+                            let pixmap = tiny_skia::Pixmap::from_vec(data, IntSize::from_wh(canvas_width, canvas_height)?)?;
+                            (pixmap, container_size.container_height, container_size.container_width)
+                        },
                         "svg" => {
                             let mut svg_data = self.get_element_html(node_idx);
                             self.inject_css_variables_into_str(&mut svg_data, &style.variables);
@@ -2078,7 +2297,7 @@ impl Renderer {
     fn create_input_text_box(&mut self, node_idx: usize, input_value: String, cursor: &mut Position, font_size: u32, save_as_final: bool) -> Result<usize> {
         let style = &self.node_styles.get(&node_idx).unwrap();
         let text = collapse_whitespace(&input_value).unwrap();
-        let renderable_text = self.font_handler.get_renderable_text(text, font_size as i32).with_context(|| "Failed to compute renderable text")?;
+        let renderable_text = self.font_handler.get_renderable_text(text, font_size as i32, None).with_context(|| "Failed to compute renderable text")?;
 
         let layout_box = self.register_layout_box(LayoutBox {
             rect: Rect {
@@ -3127,20 +3346,32 @@ impl FontHandler {
         })
     }
 
-    pub fn get_renderable_text(&self, text: String, font_px: i32) -> Result<RenderableText> {
+    pub fn get_renderable_text(&self, text: String, font_px: i32, max_width: Option<u32>) -> Result<RenderableText> {
         let scaled_font = self.font.as_scaled(font_px as f32);
         let mut glyphs = vec![];
         let mut width = 0f32;
+        let mut width_buffer = 0f32;
+        let mut lines = 1;
         for char in text.chars() {
             let glyph = self.outline_glyph_for(char, font_px as f32);
             glyphs.push(glyph);
-            width += scaled_font.h_advance(self.font.glyph_id(char));
+            let advance = scaled_font.h_advance(self.font.glyph_id(char));
+            if max_width.is_some_and(|max_width| width + advance >= max_width as f32) && char == ' ' {
+                width_buffer = 0f32;
+                lines += 1;
+            } else {
+                width_buffer += advance;
+                width = width.max(width_buffer)
+            }
         }
+        let line_height = scaled_font.height() + scaled_font.line_gap();
+        let height = (line_height * lines as f32) as u32;
         Ok(RenderableText {
             text,
             glyphs,
             width: width as u32,
-            height: (scaled_font.height() + scaled_font.line_gap()) as u32,
+            height,
+            line_height,
         })
     }
 
@@ -3162,6 +3393,7 @@ struct Browser {
     html_parser: Option<HtmlParser>,
     font_handler: Rc<FontHandler>,
     layout_dirty: bool,
+    layout_booted: bool,
 }
 
 impl Browser {
@@ -3177,6 +3409,7 @@ impl Browser {
             html_parser: None,
             font_handler,
             layout_dirty: true,
+            layout_booted: false,
         }
     }
 
@@ -3233,6 +3466,8 @@ impl Browser {
                         None,
                         broadcast_channel,
                     ),
+                    deno_net::deno_net::init(None, None),
+                    deno_fetch_without_telemetry(),
                 ],
                 ..Default::default()
             })))
@@ -3398,6 +3633,30 @@ impl Browser {
         self.renderer = Some(Rc::new(RefCell::new(Renderer::new(self.url.clone(), self.tokio.as_ref().unwrap().clone(), nodes, size, Rc::clone(&self.font_handler)))));
     }
 
+    fn render(&mut self, surf: &mut Surface<DisplayHandle, WindowHandle>, size: &PhysicalSize<u32>, cursor: &Position) -> bool {
+        let start = Instant::now();
+
+        let width = NonZeroU32::new(size.width.max(1)).expect("Non-zero width");
+        let height = NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
+        surf.resize(width, height).expect("Resize failed");
+
+        let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
+        let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+        renderer.render_into(&mut buffer, size.width, size.height, self.layout_dirty);
+        self.layout_dirty = false;
+        renderer.compute_hovering(*cursor);
+        buffer.present().expect("Failed to present");
+
+        println!("Render took {} microseconds", Instant::now().duration_since(start).as_micros());
+
+        if !self.layout_booted {
+            self.layout_booted = true;
+            true
+        } else {
+            false
+        }
+    }
+
     fn start_event_loop(&mut self) -> Result<()> {
         let event_loop = EventLoopBuilder::with_user_event().build().expect("Failed to create event loop");
         let window = Arc::new(WindowBuilder::new()
@@ -3421,9 +3680,6 @@ impl Browser {
         });
 
         self.setup_js_dom()?;
-
-        let js_result = self.run_js();
-        println!("Finished running JS code: {:?}", js_result);
 
         let mut cursor = Position { x: 0, y: 0 };
 
@@ -3450,16 +3706,11 @@ impl Browser {
                             size = window.inner_size();
                         }
                         WindowEvent::RedrawRequested => {
-                            let width = NonZeroU32::new(size.width.max(1)).expect("Non-zero width");
-                            let height = NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
-                            surf.resize(width, height).expect("Resize failed");
-
-                            let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
-                            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-                            renderer.render_into(&mut buffer, size.width, size.height, self.layout_dirty);
-                            self.layout_dirty = false;
-                            renderer.compute_hovering(cursor);
-                            buffer.present().expect("Failed to present");
+                            let first_boot = self.render(&mut surf, &size, &cursor);
+                            if first_boot {
+                                let js_result = self.run_js();
+                                println!("Finished running JS code: {:?}", js_result);
+                            }
                         }
                         WindowEvent::CursorMoved { device_id: _, position } => {
                             cursor = Position {
@@ -3507,10 +3758,12 @@ impl Browser {
 }
 
 fn main() -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    // let mut browser = Browser::new("https://vite.dev/plugins/".to_string());
+    let mut browser = Browser::new("https://vite.dev".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
+    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
         browser.dump_tree()
@@ -3670,6 +3923,7 @@ fn draw_text(
 ) {
     let scaled_font = font_handler.font.as_scaled(font_px as f32);
     let mut pen_x: f32 = x as f32;
+    let mut pen_y: f32 = y as f32;
     let mut previous = None;
 
     for (ch, glyph) in renderable_text.text.chars().zip(renderable_text.glyphs.clone()) {
@@ -3678,9 +3932,16 @@ fn draw_text(
             pen_x += scaled_font.kern(previous_id, glyph_id);
         }
         if let Some(glyph) = glyph {
-            draw_glyph(buffer, width, height, pen_x as i32, (y as f32 + scaled_font.ascent() + glyph.px_bounds().min.y) as i32, glyph, color);
+            draw_glyph(buffer, width, height, pen_x as i32, (pen_y + scaled_font.ascent() + glyph.px_bounds().min.y) as i32, glyph, color);
         }
-        pen_x += scaled_font.h_advance(glyph_id);
+        let advance = scaled_font.h_advance(glyph_id);
+        // Line break
+        if pen_x - x as f32 + advance > renderable_text.width as f32 && ch == ' ' {
+            pen_x = x as f32;
+            pen_y += renderable_text.line_height;
+        } else {
+            pen_x += advance;
+        }
         previous = Some(glyph_id);
     }
 }
@@ -3714,6 +3975,20 @@ fn rgba_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
+fn rgb_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(buffer.len() * 4);
+
+    for pixel in buffer {
+        let r = ((pixel >> 16) & 0xFF) as u8;
+        let g = ((pixel >> 8) & 0xFF) as u8;
+        let b = (pixel & 0xFF) as u8;
+
+        bytes.extend_from_slice(&[r, g, b, 0xFF]);
+    }
+
+    bytes
+}
+
 fn draw_rect_filled(
     buffer: &mut [u32],
     width: u32,
@@ -3732,10 +4007,11 @@ fn draw_rect_filled(
     let end_y = (y + h as i32).min(max_y);
     let stride = width as usize;
 
+    let color_tuple = rgba_to_premul_tuple(color);
     for py in start_y..end_y {
         let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
         for px in start_x..end_x {
-            row[px as usize] = blend_rgb_with_rgba(row[px as usize], rgba_to_premul_tuple(color));
+            row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
         }
     }
 }

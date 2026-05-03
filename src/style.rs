@@ -1131,15 +1131,9 @@ pub fn apply_style_property(
 ) -> Result<()> {
     match (property.property.as_str(), property.value.clone()) {
         ("width", PropertyValue::Size(value)) => {
-            if element.attributes.contains_key("width") {
-                return Ok(());
-            }
             style.width = value;
         }
         ("height", PropertyValue::Size(value)) => {
-            if element.attributes.contains_key("height") {
-                return Ok(());
-            }
             style.height = value;
         }
         ("min-height", PropertyValue::Size(value)) => {

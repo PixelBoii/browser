@@ -19,6 +19,13 @@ import * as messagePort from "ext:deno_web/13_message_port.js";
 import * as compression from "ext:deno_web/14_compression.js";
 import * as performance from "ext:deno_web/15_performance.js";
 import * as imageData from "ext:deno_web/16_image_data.js";
+import * as net from "ext:deno_net/01_net.js";
+import * as tls from "ext:deno_net/02_tls.js";
+import * as headers from "ext:deno_fetch/20_headers.js";
+import * as formData from "ext:deno_fetch/21_formdata.js";
+import * as request from "ext:deno_fetch/23_request.js";
+import * as response from "ext:deno_fetch/23_response.js";
+import * as fetch from "ext:browser/runtime_fetch.js";
 
 const { core } = Deno
 let nextTimerId = 1
@@ -269,8 +276,73 @@ class HtmlElement extends BaseNode {
     }
 }
 
+class CanvasRenderingContext2D {
+    constructor(canvas) {
+        this.canvas = canvas
+        this.lineWidth = 1
+        this.path = null
+        this.cursor = null
+    }
+
+    fillRect(x, y, width, height) {
+        core.ops.op_fill_canvas_rect(this.canvas.__node_idx, x, y, width, height)
+    }
+
+    strokeRect(x, y, width, height) {
+        core.ops.op_stroke_canvas_rect(this.canvas.__node_idx, x, y, width, height, this.lineWidth)
+    }
+
+    beginPath() {
+        this.path = []
+    }
+
+    moveTo(x, y) {
+        this.cursor = [x, y]
+    }
+
+    lineTo(x, y) {
+        if (this.path.length === 0) {
+            this.path.push(this.cursor)
+        }
+        this.path.push([x, y])
+        this.cursor = [x, y]
+    }
+
+    closePath() {
+        this.path.push(this.path[0])
+    }
+
+    stroke() {
+        if (!this.path) {
+            return
+        }
+
+        core.ops.op_canvas_path_stroke(this.canvas.__node_idx, this.path, this.lineWidth)
+    }
+}
+
+class HtmlCanvasElement extends HtmlElement {
+    constructor(tag) {
+        super(tag)
+    }
+
+    getContext(type) {
+        if (type === "2d") {
+            return new CanvasRenderingContext2D(this)
+        } else {
+            return null
+        }
+    }
+}
+
 Object.defineProperty(globalThis, "HTMLElement", {
     value: HtmlElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLCanvasElement", {
+    value: HtmlCanvasElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -400,7 +472,8 @@ function nodeToElement(pair) {
     const node = pair[1]
     let element;
     if (node.kind === "element") {
-        element = new HtmlElement(node.tag)
+        const elementClass = tagToElement(node.tag)
+        element = new elementClass(node.tag)
         for (const [key, value] of Object.entries(node.attributes)) {
             element[key] = value
         }
@@ -413,18 +486,22 @@ function nodeToElement(pair) {
     return element
 }
 
-Object.defineProperty(globalThis, "HTMLElement", {
-    value: SVGElement,
-    enumerable: true,
-    configurable: true,
-    writable: true,
-})
 Object.defineProperty(globalThis, "SVGElement", {
     value: SVGElement,
     enumerable: true,
     configurable: true,
     writable: true,
 })
+
+function tagToElement(tag) {
+    return tag === "svg" ?
+        SVGElement :
+        tag === "template" ?
+            TemplateElement :
+            tag === "canvas" ?
+                HtmlCanvasElement :
+                HtmlElement
+}
 
 globalThis.document = {
     referrer: "",
@@ -434,7 +511,8 @@ globalThis.document = {
         return element
     },
     createElement(tag, ...args) {
-        const element = tag === "svg" ? new SVGElement(tag, ...args) : tag === "template" ? new TemplateElement(tag, ...args) : new HtmlElement(tag, ...args)
+        const elementClass = tagToElement(tag)
+        const element = new elementClass(tag, ...args)
         element.registerInBackend()
         return element
     },
@@ -615,6 +693,44 @@ Object.defineProperty(globalThis, "history", {
     configurable: true,
     writable: true,
 })
+
+// Set up the callback for Wasm streaming ops
+Deno.core.setWasmStreamingCallback(fetch.handleWasmStreaming);
+
+Object.defineProperty(globalThis, "fetch", {
+  value: fetch.fetch,
+  enumerable: true,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "Request", {
+  value: request.Request,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "Response", {
+  value: response.Response,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "Headers", {
+  value: headers.Headers,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "FormData", {
+  value: formData.FormData,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
 
 globalThis.window = globalThis
 globalThis.self = globalThis
