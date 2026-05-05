@@ -46,6 +46,7 @@ pub enum StyleDisplay {
     None,
     Block,
     InlineBlock,
+    Inline,
     InlineFlex,
     Flex,
     Grid,
@@ -53,7 +54,7 @@ pub enum StyleDisplay {
 
 impl StyleDisplay {
     pub fn is_inline(self) -> bool {
-        self == StyleDisplay::InlineBlock || self == StyleDisplay::InlineFlex
+        self == StyleDisplay::InlineBlock || self == StyleDisplay::InlineFlex || self == StyleDisplay::Inline
     }
 }
 
@@ -211,7 +212,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         background: match node {
             HtmlNode::Element(element) => {
                 if element.tag == "input" {
-                    StyleBackground::Hex(0xDD_DD_DD)
+                    StyleBackground::Hex(0xDD_DD_DD_FF)
                 } else {
                     StyleBackground::Transparent
                 }
@@ -220,7 +221,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         },
         display: match node {
             HtmlNode::Element(element) => match element.tag.as_str() {
-                "head" | "script" | "style" => StyleDisplay::None,
+                "head" | "script" | "style" | "noscript" => StyleDisplay::None,
                 "button" | "input" => {
                     if element
                         .attributes
@@ -233,9 +234,10 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                     }
                 }
                 "span" | "img" | "a" => StyleDisplay::InlineBlock,
+                "br" => StyleDisplay::Inline,
                 _ => StyleDisplay::Block,
             },
-            HtmlNode::Text(_) => StyleDisplay::InlineBlock,
+            HtmlNode::Text(_) => StyleDisplay::Inline,
             HtmlNode::Comment(_) => StyleDisplay::None,
         },
         flex_shrink: 1,
@@ -662,6 +664,21 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         }
         let hex = rgba_to_hex((parsed_parts[0], parsed_parts[1], parsed_parts[2], alpha));
         Ok(StyleBackground::Hex(hex))
+    } else if let Some(rgb) = value.strip_prefix("rgb(") {
+        let cleaned: &str = rgb.strip_suffix(")").unwrap_or(rgb);
+        let parts: Vec<&str> = cleaned.split(",").collect();
+        if parts.len() != 3 {
+            panic!("Invalid RGB string: {}", cleaned);
+        }
+        let parsed_parts: Vec<u8> = parts
+            .iter()
+            .filter_map(|part| part.trim().parse::<u8>().ok())
+            .collect();
+        if parsed_parts.len() != 3 {
+            panic!("Invalid RGBA string: {}", cleaned);
+        }
+        let hex = rgba_to_hex((parsed_parts[0], parsed_parts[1], parsed_parts[2], 255));
+        Ok(StyleBackground::Hex(hex))
     } else if value == "transparent" || value == "none" {
         Ok(StyleBackground::Transparent)
     } else {
@@ -752,6 +769,10 @@ fn apply_node_variables(
     }
     let mut collected_variables: HashMap<usize, String> = HashMap::new();
     for idx in no_dependence {
+        // Ignore fake idxs
+        if idx == usize::MAX {
+            continue;
+        }
         let value = match &css_nodes[idx] {
             Node::Variable(variable) => &variable.value,
             _ => panic!(),
@@ -1020,6 +1041,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "display" => PropertyValue::Display(match value.as_str().trim() {
             "block" => Some(StyleDisplay::Block),
             "inline-block" => Some(StyleDisplay::InlineBlock),
+            "inline" => Some(StyleDisplay::Inline),
             "flex" => Some(StyleDisplay::Flex),
             "inline-flex" => Some(StyleDisplay::InlineFlex),
             "grid" => Some(StyleDisplay::Grid),
@@ -1374,6 +1396,18 @@ fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Ve
     }
 }
 
+fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usize> {
+    let node = nodes[node_idx].1;
+    if let Some(parent) = node.get_parent() {
+        if let Node::Layer(_) = nodes[parent].1 {
+            return Some(parent);
+        } else {
+            return get_parent_layer(nodes, parent)
+        }
+    }
+    None
+}
+
 fn get_specificity_order(a_specificity: &[i32; 3], b_specificity: &[i32; 3]) -> Ordering {
     for idx in 0usize..3usize {
         if a_specificity[idx] > b_specificity[idx] {
@@ -1411,6 +1445,15 @@ fn order_css_nodes(
     }
 
     node_idxs.sort_by(|a, b| {
+        let a_layer = get_parent_layer(nodes, **a);
+        let b_layer = get_parent_layer(nodes, **b);
+
+        let layer_ordering = a_layer.cmp(&b_layer);
+
+        if layer_ordering != Ordering::Equal {
+            return layer_ordering;
+        }
+
         let a_important_score = match nodes[**a].1 {
             Node::Property(property) => property.important as i32,
             _ => 0i32,
@@ -1454,7 +1497,7 @@ pub fn parse_style(
     css_children_index: &HashMap<usize, Vec<usize>>,
 ) -> Result<Style> {
     let mut style = get_base_style(&HtmlNode::Element(element.clone()), parent_style);
-    let mut inline_nodes = get_inline_nodes(&element)?;
+    let inline_nodes = get_inline_nodes(&element)?;
     let applicable_class_nodes = collected_css_nodes.get(&node_idx).cloned().unwrap_or_default();
     let mut applicable_class_properties = vec![];
     for class_node in applicable_class_nodes {
@@ -1474,8 +1517,8 @@ pub fn parse_style(
         .iter()
         .map(|idx| (**idx, css_nodes[**idx].clone()))
         .collect();
-    // TODO: ADD THIS BACK!
-    // nodes.append(&mut inline_nodes);
+    // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
+    nodes.append(&mut inline_nodes.into_iter().map(|node| (usize::MAX, node)).collect());
     let properties = resolve_node_variables(&mut nodes, parent_variables, css_nodes, class_node_specificity);
     style.variables = parent_variables.clone();
     for property in properties {

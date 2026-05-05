@@ -187,6 +187,12 @@ fn decode_html_entities(input: &str) -> String {
             continue;
         }
 
+        if let Some(stripped) = rest.strip_prefix("&copy;") {
+            out.push('©');
+            rest = stripped;
+            continue;
+        }
+
         if let Some(decoded) = decode_numeric_entity(rest) {
             out.push(decoded.0);
             rest = decoded.1;

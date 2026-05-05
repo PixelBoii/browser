@@ -14,7 +14,7 @@ import * as streams from "ext:deno_web/06_streams.js";
 import * as encoding from "ext:deno_web/08_text_encoding.js";
 import * as file from "ext:deno_web/09_file.js";
 import * as fileReader from "ext:deno_web/10_filereader.js";
-import * as location from "ext:deno_web/12_location.js";
+// import * as location from "ext:deno_web/12_location.js";
 import * as messagePort from "ext:deno_web/13_message_port.js";
 import * as compression from "ext:deno_web/14_compression.js";
 import * as performance from "ext:deno_web/15_performance.js";
@@ -26,6 +26,7 @@ import * as formData from "ext:deno_fetch/21_formdata.js";
 import * as request from "ext:deno_fetch/23_request.js";
 import * as response from "ext:deno_fetch/23_response.js";
 import * as fetch from "ext:browser/runtime_fetch.js";
+import * as crypto from "ext:deno_crypto/00_crypto.js";
 
 const { core } = Deno
 let nextTimerId = 1
@@ -97,10 +98,24 @@ class BaseNode {
     }
 }
 
+BaseNode.ELEMENT_NODE = 1
+BaseNode.TEXT_NODE = 3
+BaseNode.COMMENT_NODE = 8
+BaseNode.DOCUMENT_NODE = 9
+BaseNode.DOCUMENT_FRAGMENT_NODE = 11
+
+Object.defineProperty(globalThis, "Node", {
+    value: BaseNode,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class TextNode extends BaseNode {
     constructor(text) {
         super()
         this.text = text
+        this.registerInBackend()
     }
 
     registerInBackend() {
@@ -148,6 +163,18 @@ class HtmlElement extends BaseNode {
         super()
         this.tag = tag
         this.namespaceURI = "http://www.w3.org/1999/xhtml"
+        this.registerInBackend()
+
+        return new Proxy(this, {
+            set(target, key, value) {
+                if (String(key).startsWith("__")) {
+                    return Reflect.set(target, key, value)
+                }
+
+                target.setAttribute(key, value)
+                return true
+            }
+        })
     }
 
     registerInBackend() {
@@ -160,6 +187,10 @@ class HtmlElement extends BaseNode {
             globalThis.__EVENT_LISTENERS[key] = []
         }
         globalThis.__EVENT_LISTENERS[key].push(cb)
+    }
+
+    set onload(cb) {
+        this.addEventListener('load', cb)
     }
 
     appendChild(element) {
@@ -221,6 +252,10 @@ class HtmlElement extends BaseNode {
 
     setAttribute(attr, value) {
         this[attr] = value
+        if (this.__node_idx) {
+            // TODO: This should probably not stringify all values
+            core.ops.op_update_attributes(this.__node_idx, { [attr]: String(value) })
+        }
     }
 
     removeAttribute(attr) {
@@ -234,6 +269,16 @@ class HtmlElement extends BaseNode {
     // TODO: Implement this
     getComputedStyle() {
         return {}
+    }
+
+    querySelector(selector) {
+        const node = core.ops.op_query_selector(selector, this.__node_idx)
+        return node ? nodeToElement(node) : null
+    }
+
+    querySelectorAll(selector) {
+        const nodes = core.ops.op_query_selector_all(selector, this.__node_idx)
+        return nodes.map(nodeToElement)
     }
 
     get tagName() {
@@ -402,6 +447,19 @@ class SVGElement extends HtmlElement {
     }
 }
 
+class Image extends HTMLElement {
+    constructor() {
+        super("img")
+    }
+}
+
+Object.defineProperty(globalThis, "Image", {
+    value: Image,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class TemplateElement extends HtmlElement {
     // TODO: Actually return a fragment of children here
     get content() {
@@ -413,6 +471,7 @@ class CommentNode extends BaseNode {
     constructor(data) {
         super()
         this.data = data
+        this.registerInBackend()
     }
 
     registerInBackend() {
@@ -475,7 +534,9 @@ function nodeToElement(pair) {
         const elementClass = tagToElement(node.tag)
         element = new elementClass(node.tag)
         for (const [key, value] of Object.entries(node.attributes)) {
-            element[key] = value
+            if (ELEMENT_ATTRIBUTES.includes(key)) {
+                element.setAttribute(key, value)
+            }
         }
     } else if (node.kind === "comment") {
         element = new CommentNode(node.comment)
@@ -503,8 +564,31 @@ function tagToElement(tag) {
                 HtmlElement
 }
 
+const documentFonts = {
+    status: "loaded",
+    ready: Promise.resolve([]),
+    load() {
+        return Promise.resolve([])
+    },
+    check() {
+        return true
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    dispatchEvent() {
+        return true
+    },
+}
+
 globalThis.document = {
+    get cookie() {
+        return core.ops.op_get_cookie(globalThis.location.href)
+    },
+    set cookie(newValue) {
+        core.ops.op_set_cookie(globalThis.location.href, String(newValue))
+    },
     referrer: "",
+    fonts: documentFonts,
     createElementNS(ns, tag) {
         const element = this.createElement(tag)
         element.namespaceURI = ns
@@ -513,17 +597,15 @@ globalThis.document = {
     createElement(tag, ...args) {
         const elementClass = tagToElement(tag)
         const element = new elementClass(tag, ...args)
-        element.registerInBackend()
         return element
     },
     createComment(data) {
         const element = new CommentNode(data)
-        element.registerInBackend()
         return element
     },
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(id)
-        return nodeToElement(node)
+        return node ? nodeToElement(node) : null
     },
     getElementsByTagName(tag) {
         const nodes = core.ops.op_get_elements_by_tag_name(tag)
@@ -540,9 +622,11 @@ globalThis.document = {
     addEventListener(event, cb) {
         // TODO: Implement this
     },
+    removeEventListener(event, cb) {
+        // TODO: Implement this
+    },
     createTextNode(text) {
         const element = new TextNode(text)
-        element.registerInBackend()
         return element
     }
 };
@@ -575,13 +659,84 @@ Object.defineProperty(globalThis, "clearInterval", {
   writable: true,
 });
 
+function initLocation(href) {
+    Object.defineProperty(globalThis, "location", {
+        value: new Location(href),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+    })
+}
+
+class Location {
+    constructor(href) {
+        this.__url = new URL(href);
+    }
+
+    reload() {
+        console.log('reload!')
+    }
+
+    replace() {
+        console.log('replace!')
+    }
+
+    assign() {
+        console.log('assign!')
+    }
+
+    get href() {
+        return this.__url.href
+    }
+
+    set href(value) {
+        core.ops.op_set_location_href(value, true)
+    }
+
+    get host() {
+        return this.__url.host
+    }
+
+    get port() {
+        return this.__url.port
+    }
+
+    get origin() {
+        return this.__url.origin
+    }
+
+    get pathname() {
+        return this.__url.pathname
+    }
+
+    get search() {
+        return this.__url.search
+    }
+
+    get hash() {
+        return this.__url.hash
+    }
+
+    get protocol() {
+        return this.__url.protocol
+    }
+
+    get ancestorOrigins() {
+        // TODO: Replace with a `DOMStringList` instance.
+        return {
+            length: 0,
+            item: () => null,
+            contains: () => false,
+        };
+    }
+}
+
 Object.defineProperty(globalThis, "__init_location", {
-    value: location.setLocationHref,
+    value: initLocation,
     enumerable: true,
     configurable: true,
     writable: true
 })
-Object.defineProperty(globalThis, "location", location.locationDescriptor)
 
 // TODO: Implement this
 function getComputedStyle() {
@@ -599,6 +754,10 @@ Object.defineProperties(globalThis, {
     URL: { value: url.URL, configurable: true, writable: true },
     URLSearchParams: { value: url.URLSearchParams, configurable: true, writable: true },
     URLPattern: { value: urlPattern.URLPattern, configurable: true, writable: true },
+    performance: { value: performance.performance, configurable: true, writable: true },
+    Performance: { value: performance.Performance, configurable: true, writable: true },
+    PerformanceObserver: { value: performance.PerformanceObserver, configurable: true, writable: true },
+    DOMException: { value: DOMException.DOMException, configurable: true, writable: true },
 });
 
 // Poor mans storage
@@ -653,7 +812,8 @@ Object.defineProperty(globalThis, "matchMedia", {
 })
 
 const navigator = {
-    // TODO: Don't hardcode this
+    // This is set by setup_js_dom in rust
+    userAgent: null,
     platform: "Linux x86_64"
 }
 
@@ -676,14 +836,18 @@ Object.defineProperty(globalThis, "addEventListener", {
     writable: true,
 })
 
-// TODO: Implement this
 class History {
     constructor() {
         this.state = null
     }
 
-    replaceState() {
-        this.state = null
+    replaceState(state, unused, url) {
+        this.state = state
+
+        if (url) {
+            globalThis.location.__url = new URL(url, globalThis.location.__url)
+            core.ops.op_set_location_href(url, false)
+        }
     }
 }
 
@@ -731,6 +895,70 @@ Object.defineProperty(globalThis, "FormData", {
   configurable: true,
   writable: true,
 });
+
+Object.defineProperties(globalThis, {
+  atob: {
+    value: base64.atob,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  },
+  btoa: {
+    value: base64.btoa,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  },
+});
+
+Object.defineProperty(globalThis, "CryptoKey", {
+  value: crypto.CryptoKey,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "crypto", {
+  value: crypto.crypto,
+  enumerable: false,
+  configurable: true,
+  writable: false,
+});
+
+Object.defineProperty(globalThis, "Crypto", {
+  value: crypto.Crypto,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "SubtleCrypto", {
+  value: crypto.SubtleCrypto,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+class XMLHttpRequest {
+    constructor() {
+        //
+    }
+
+    addEventListener(event, cb) {
+        //
+    }
+
+    send() {
+        //
+    }
+}
+
+Object.defineProperty(globalThis, "XMLHttpRequest", {
+    value: XMLHttpRequest,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 globalThis.window = globalThis
 globalThis.self = globalThis

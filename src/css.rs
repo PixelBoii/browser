@@ -117,8 +117,15 @@ pub struct Variable {
 }
 
 #[derive(Debug, Clone)]
+pub struct Layer {
+    pub name: String,
+    pub parent: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Node {
     MediaQuery(MediaQuery),
+    Layer(Layer),
     ClassName(ClassName),
     Variable(Variable),
     Property(Property),
@@ -131,6 +138,7 @@ impl Node {
             Node::Variable(element) => element.parent,
             Node::Property(element) => element.parent,
             Node::MediaQuery(element) => element.parent,
+            Node::Layer(element) => element.parent,
         }
     }
 }
@@ -400,19 +408,30 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_media_query_from_state(&mut self) {
-        let name = self
+        if let Some(stripped) = self
             .label
             .trim()
-            .strip_prefix("@media")
-            .unwrap_or(&self.label)
-            .trim();
+            .strip_prefix("@layer")
+        {
+            self.nodes.push(Node::Layer(Layer {
+                name: stripped.trim().to_string(),
+                parent: self.node,
+            }));
+        } else {
+            let name = self
+                .label
+                .trim()
+                .strip_prefix("@media")
+                .unwrap_or(&self.label)
+                .trim();
 
-        let criterias = parse_media_query_parts(name);
+            let criterias = parse_media_query_parts(name);
 
-        self.nodes.push(Node::MediaQuery(MediaQuery {
-            criterias,
-            parent: self.node,
-        }));
+            self.nodes.push(Node::MediaQuery(MediaQuery {
+                criterias,
+                parent: self.node,
+            }));
+        }
         self.node = Some(self.nodes.len() - 1);
         self.label.clear();
     }

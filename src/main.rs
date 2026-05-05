@@ -5,6 +5,7 @@ mod loader;
 
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use parser::{Element, HtmlParser, Node};
+use reqwest::cookie::{CookieStore, Jar};
 use resvg::tiny_skia::IntSize;
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
@@ -13,10 +14,12 @@ use style::{
 
 use std::cell::{RefCell};
 use std::collections::{HashMap, HashSet};
+use std::future::poll_fn;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 use std::{env, fs, u32};
 
 use anyhow::{Context, Result, anyhow};
@@ -29,7 +32,7 @@ use resvg::{tiny_skia, usvg};
 use softbuffer::{Context as SoftContext, Surface};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{EventLoopBuilder, EventLoopProxy};
+use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 
@@ -40,6 +43,10 @@ use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemp
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
+
+// Many websites rely on the user-agent to be one of the major browsers, so we don't use our own for now
+const USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
 struct RectBorderSide {
@@ -130,6 +137,8 @@ struct DomIndexes {
     class_elements: HashMap<String, HashSet<usize>>,
     tag_elements: HashMap<String, HashSet<usize>>,
     id_elements: HashMap<String, HashSet<usize>>,
+    children_index: HashMap<usize, Vec<usize>>,
+    root_indice: usize,
 }
 
 #[derive(Debug)]
@@ -168,8 +177,6 @@ struct Renderer {
     node_idx_cursor: usize,
     pub nodes_idxs: Vec<usize>,
     pub nodes: HashMap<usize, parser::Node>,
-    children_index: HashMap<usize, Vec<usize>>,
-    root_indice: usize,
     node_styles: HashMap<usize, Style>,
     layout_table: HashMap<usize, LayoutBox>,
     node_layout_mapping: HashMap<usize, usize>,
@@ -188,6 +195,7 @@ struct Renderer {
     resolved_specified_widths: HashMap<usize, Option<u32>>,
     dom_indexes: DomIndexes,
     canvas_buffers: HashMap<usize, CanvasBuffer>,
+    network_fetch: Rc<RefCell<NetworkFetch>>,
 }
 
 #[derive(Debug, Clone)]
@@ -510,19 +518,19 @@ fn resolve_url(href: &str, base_url: Option<&ReqwestUrl>) -> Result<ReqwestUrl> 
     Ok(base_url.join(href)?)
 }
 
-async fn fetch_link_strings(base_url: &String, request_cache: &mut HashMap<ReqwestUrl, RequestCacheEntry>, links: &Vec<&String>, map_fn: impl Fn(String) -> RequestCacheEntry) -> Result<Vec<String>> {
+async fn fetch_link_strings(base_url: &String, network_fetch: &Rc<RefCell<NetworkFetch>>, links: &Vec<&String>, map_fn: impl Fn(String) -> RequestCacheEntry) -> Result<Vec<String>> {
     let mut results = vec![];
     for link in links.iter() {
         // TODO: Don't hardcode this
         let base = ReqwestUrl::parse(base_url)?;
         let url = resolve_url(link, Some(&base))?;
 
-        if let Some(cache) = request_cache.get(&url) {
+        if let Some(cache) = network_fetch.borrow_mut().request_cache.get(&url) {
             results.push(cache.clone());
         } else {
-            let resp = reqwest::get(url.clone()).await?.text().await?;
+            let resp = network_fetch.borrow_mut().client.get(url.clone()).send().await?.text().await?;
             let cache_entry = map_fn(resp);
-            request_cache.insert(url, cache_entry.clone());
+            network_fetch.borrow_mut().request_cache.insert(url, cache_entry.clone());
 
             results.push(cache_entry);
         }
@@ -535,7 +543,7 @@ async fn fetch_link_strings(base_url: &String, request_cache: &mut HashMap<Reqwe
     Ok(strings)
 }
 
-fn combine_css_nodes(base_url: &String, tokio: &Rc<RefCell<tokio::runtime::Runtime>>, request_cache: &mut HashMap<ReqwestUrl, RequestCacheEntry>, nodes: &HashMap<usize, Node>, node_idxs: &Vec<usize>, children_index: &HashMap<usize, Vec<usize>>) -> Result<Vec<String>> {
+fn combine_css_nodes(base_url: &String, tokio: &Rc<RefCell<tokio::runtime::Runtime>>, network_fetch: &Rc<RefCell<NetworkFetch>>, nodes: &HashMap<usize, Node>, node_idxs: &Vec<usize>, children_index: &HashMap<usize, Vec<usize>>) -> Result<Vec<String>> {
     let mut css_nodes: Vec<String> = node_idxs
         .iter()
         .filter(|idx| match nodes.get(*idx).unwrap() {
@@ -591,7 +599,7 @@ fn combine_css_nodes(base_url: &String, tokio: &Rc<RefCell<tokio::runtime::Runti
         .collect();
 
     let mut fetched_nodes = if stylesheet_links.len() > 0 {
-        tokio.borrow_mut().block_on(fetch_link_strings(base_url, request_cache, &stylesheet_links, |str| RequestCacheEntry::CssData(str)))?
+        tokio.borrow_mut().block_on(fetch_link_strings(base_url, &network_fetch, &stylesheet_links, |str| RequestCacheEntry::CssData(str)))?
     } else {
         vec![]
     };
@@ -678,7 +686,7 @@ fn move_up_ancestor_chain(
         let parent_node = css_nodes[parent].1;
         // Media queries should not cause a walk up a HTML parent
         // I think this happens at the right time, but might be worth double-checking later
-        let walk_up_html_parent_immediately = walk_up_parent && if let CssNode::MediaQuery(_) = parent_node { false } else { true };
+        let walk_up_html_parent_immediately = walk_up_parent && !matches!(parent_node, CssNode::MediaQuery(_) | CssNode::Layer(_));
         if let CssNode::ClassName(parent_node_class) = parent_node {
             let mut is_match = false;
             let el = if walk_up_html_parent_immediately { get_parent_html_idx(element, html_nodes) } else { Some(element) };
@@ -835,6 +843,10 @@ fn narrow_elements_by_ancestors(
             } else {
                 return false;
             }
+        },
+        // Layers always pass through, they just affect sorting
+        CssNode::Layer(_) => {
+            return move_up_ancestor_chain(element, html_nodes, css_nodes, class_elements, node, window_size, false, true, dom_indexes);
         },
         _ => {
             return false;
@@ -1025,6 +1037,25 @@ fn search_elements_for_css_nodes(
                     }
                 }
             },
+            // Layers always pass through, they just affect sorting
+            CssNode::Layer(_) => {
+                let elements: Vec<&usize> = html_nodes
+                    .iter()
+                    .filter_map(|(idx, node)| match node {
+                        Node::Element(_) => Some(idx),
+                        _ => None,
+                    })
+                    .collect();
+
+                for el in elements {
+                    // If there's only a single part, we've already completed this class name by doing the last one
+                    let is_match = move_up_ancestor_chain(*el, &html_nodes, css_nodes, &class_elements, node, window_size, false, true, dom_indexes);
+
+                    if is_match {
+                        matches.entry(*el).or_default().push(css_node_idx);
+                    }
+                }
+            },
             _ => println!("Unexpected node appeared: {:?}", node),
         }
     }
@@ -1035,15 +1066,13 @@ fn search_elements_for_css_nodes(
 fn compute_node_styles(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
-    request_cache: &mut HashMap<ReqwestUrl, RequestCacheEntry>,
+    network_fetch: &Rc<RefCell<NetworkFetch>>,
     nodes: &HashMap<usize, Node>,
     node_idxs: &Vec<usize>,
-    children_index: &HashMap<usize, Vec<usize>>,
-    root_indice: usize,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
 ) -> (HashMap<usize, Style>, HashMap<usize, u32>) {
-    let css_nodes = combine_css_nodes(base_url, tokio, request_cache, nodes, node_idxs, &children_index).unwrap();
+    let css_nodes = combine_css_nodes(base_url, tokio, network_fetch, nodes, node_idxs, &dom_indexes.children_index).unwrap();
     let parsed_css_nodes = parse_css_nodes(&css_nodes).unwrap();
 
     let css_children_index = build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
@@ -1058,8 +1087,8 @@ fn compute_node_styles(
         &mut node_styles,
         &mut resolved_font_sizes,
         nodes,
-        root_indice,
-        &children_index,
+        dom_indexes.root_indice,
+        &dom_indexes.children_index,
         &parsed_css_nodes,
         None,
         &HashMap::new(),
@@ -1075,6 +1104,7 @@ fn compute_node_styles(
 #[derive(Debug, Clone)]
 enum UserEvent {
     DomUpdated,
+    Navigate((String, bool)),
 }
 
 #[derive(Debug, Clone)]
@@ -1093,11 +1123,54 @@ fn op_tls_peer_certificate<'s>(
 }
 
 #[op2(fast)]
+fn op_set_location_href(state: &mut OpState, #[string] href: String, reload: bool) -> Result<(), JsError> {
+    let host = state.borrow::<JsHostState>();
+
+    host.proxy.send_event(UserEvent::Navigate((href, reload))).unwrap();
+
+    Ok(())
+}
+
+// TODO: Somehow hook this into fetch as well
+#[op2(fast)]
+fn op_set_cookie(state: &mut OpState, #[string] url: String, #[string] cookie: String) -> Result<(), JsError> {
+    let Ok(url) = ReqwestUrl::parse(&url) else {
+        return Ok(());
+    };
+
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let network_fetch = renderer.network_fetch.borrow();
+    let jar = &network_fetch.cookie_jar;
+    jar.add_cookie_str(&cookie, &url);
+    Ok(())
+}
+
+#[op2]
+#[string]
+fn op_get_cookie(state: &mut OpState, #[string] url: String) -> Result<String, JsError> {
+    let Ok(url) = ReqwestUrl::parse(&url) else {
+        return Ok(String::new());
+    };
+
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let network_fetch = renderer.network_fetch.borrow();
+    let cookie = network_fetch
+        .cookie_jar
+        .cookies(&url)
+        .and_then(|value| value.to_str().ok().map(String::from))
+        .unwrap_or_default();
+
+    Ok(cookie)
+}
+
+#[op2(fast)]
 fn op_create_element(state: &mut OpState, #[string] tag: String) -> Result<i32, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Element(Element { tag, attributes: HashMap::new(), parent: None }));
-    renderer.recompute_children_index();
+    renderer.recompute_dom_indexes();
     let node_idx = renderer.node_idx_cursor;
     Ok(node_idx as i32)
 }
@@ -1107,7 +1180,7 @@ fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Text(TextElement { text, parent: None }));
-    renderer.recompute_children_index();
+    renderer.recompute_dom_indexes();
     let node_idx = renderer.node_idx_cursor;
     Ok(node_idx as i32)
 }
@@ -1117,7 +1190,7 @@ fn op_create_comment_element(state: &mut OpState, #[string] comment: String) -> 
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Comment(CommentElement { comment, parent: None }));
-    renderer.recompute_children_index();
+    renderer.recompute_dom_indexes();
     let node_idx = renderer.node_idx_cursor;
     Ok(node_idx as i32)
 }
@@ -1129,7 +1202,7 @@ fn op_append_child(state: &mut OpState, #[number] parent_idx: usize, #[number] n
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.nodes.get_mut(&node_idx).unwrap().set_parent(Some(parent_idx));
-    renderer.recompute_children_index();
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update(&host.proxy);
     Ok(())
 }
@@ -1177,21 +1250,39 @@ fn op_get_elements_by_tag_name(state: &mut OpState, #[string] tag: String) -> Re
 }
 
 #[op2]
-fn op_query_selector(state: &mut OpState, #[string] selector: String) -> Result<Option<(usize, Node)>, JsError> {
+fn op_query_selector(state: &mut OpState, #[string] selector: String, #[number] required_parent: Option<usize>) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs: Vec<usize> = query_selector_all(&filter_to_elements(&renderer.nodes), selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
+    let mut node_idxs: Vec<usize> = query_selector_all(&filter_to_elements(&renderer.nodes), selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
+    if let Some(required_parent) = required_parent {
+        node_idxs = node_idxs.into_iter().filter(|idx| has_parent(&renderer.nodes, *idx, required_parent)).collect();
+    }
     let node = node_idxs.first();
     let owned = node.cloned().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()));
     Ok(owned)
 }
 
+fn has_parent(nodes_table: &HashMap<usize, Node>, node_idx: usize, target_parent: usize) -> bool {
+    if node_idx == target_parent {
+        return true;
+    }
+
+    if let Some(parent) = nodes_table.get(&node_idx).unwrap().get_parent() {
+        has_parent(nodes_table, parent, target_parent)
+    } else {
+        false
+    }
+}
+
 #[op2]
-fn op_query_selector_all(state: &mut OpState, #[string] selector: String) -> Result<Vec<(usize, Node)>, JsError> {
+fn op_query_selector_all(state: &mut OpState, #[string] selector: String, #[number] required_parent: Option<usize>) -> Result<Vec<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
     let node_idxs: Vec<usize> = query_selector_all(&filter_to_elements(&renderer.nodes), selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes);
-    let owned: Vec<(usize, Node)> = node_idxs.into_iter().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone())).collect();
+    let mut owned: Vec<(usize, Node)> = node_idxs.into_iter().map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone())).collect();
+    if let Some(required_parent) = required_parent {
+        owned = owned.into_iter().filter(|(idx, _)| has_parent(&renderer.nodes, *idx, required_parent)).collect();
+    }
     Ok(owned)
 }
 
@@ -1199,12 +1290,12 @@ fn op_query_selector_all(state: &mut OpState, #[string] selector: String) -> Res
 fn op_set_inner_html(state: &mut OpState, #[number] node_idx: usize, #[string] html: String) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let children = renderer.children_index.get(&node_idx).unwrap_or(&vec![]).clone();
+    let children = renderer.dom_indexes.children_index.get(&node_idx).unwrap_or(&vec![]).clone();
     for child in children {
         renderer.remove_node(child, true);
     }
     renderer.create_children_from_html(node_idx, html);
-    renderer.recompute_children_index();
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update(&host.proxy);
     Ok(())
 }
@@ -1213,12 +1304,12 @@ fn op_set_inner_html(state: &mut OpState, #[number] node_idx: usize, #[string] h
 fn op_set_text_content(state: &mut OpState, #[number] node_idx: usize, #[string] text: String) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let children = renderer.children_index.get(&node_idx).unwrap_or(&vec![]).clone();
+    let children = renderer.dom_indexes.children_index.get(&node_idx).unwrap_or(&vec![]).clone();
     for child in children {
         renderer.remove_node(child, true);
     }
     renderer.push_node(Node::Text(TextElement { text, parent: Some(node_idx) }));
-    renderer.recompute_children_index();
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update(&host.proxy);
     Ok(())
 }
@@ -1247,6 +1338,7 @@ fn op_get_child_nodes(state: &mut OpState, #[number] node_idx: usize) -> Result<
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
     let children: Vec<(usize, Node)> = renderer
+        .dom_indexes
         .children_index
         .get(&node_idx)
         .unwrap()
@@ -1461,6 +1553,9 @@ extension!(
     op_fill_canvas_rect,
     op_stroke_canvas_rect,
     op_canvas_path_stroke,
+    op_set_cookie,
+    op_get_cookie,
+    op_set_location_href,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js", "runtime_fetch.js"],
@@ -1470,6 +1565,15 @@ extension!(
     ));
     state.put(deno_permissions::PermissionsContainer::allow_all(parser));
   },
+);
+
+extension!(
+  deno_node_crypto_shim,
+  esm = [
+    "ext:deno_node/internal/crypto/constants.ts" = {
+      source = "export const kKeyObject = Symbol('kKeyObject');"
+    },
+  ],
 );
 
 fn deno_fetch_without_telemetry() -> deno_core::Extension {
@@ -1528,9 +1632,17 @@ pub enum ScriptType {
 pub struct Script {
     content: ScriptContent,
     script_type: ScriptType,
+    node_idx: Option<usize>,
+}
+
+fn sorted_node_idxs(nodes: &HashMap<usize, Node>) -> Vec<usize> {
+    let mut node_idxs: Vec<usize> = nodes.keys().copied().collect();
+    node_idxs.sort_unstable();
+    node_idxs
 }
 
 fn get_dom_indexes(html_nodes: &HashMap<usize, Node>) -> DomIndexes {
+    let nodes_idxs = sorted_node_idxs(html_nodes);
     let mut class_elements: HashMap<String, HashSet<usize>> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
         match html_node {
@@ -1567,30 +1679,40 @@ fn get_dom_indexes(html_nodes: &HashMap<usize, Node>) -> DomIndexes {
         };
     }
 
+    let children_index = build_children_index(&html_nodes, &nodes_idxs);
+
+    let mut root_indices: Vec<usize> = html_nodes
+        .iter()
+        .filter_map(|(idx, node)| node.get_parent().is_none().then_some(idx))
+        .filter(|idx| match html_nodes.get(idx).unwrap() {
+            Node::Element(_) | Node::Text(_) => true,
+            Node::Comment(_) => false,
+        })
+        .cloned()
+        .collect();
+    root_indices.sort_unstable();
+    let root_indice = root_indices
+        .iter()
+        .find(|idx| match html_nodes.get(idx).unwrap() {
+            Node::Element(element) => element.tag == "html",
+            Node::Text(_) | Node::Comment(_) => false,
+        })
+        .or(root_indices.first())
+        .copied()
+        .expect("Expected at least one root index");
+
     DomIndexes {
         class_elements,
         tag_elements,
-        id_elements
+        id_elements,
+        children_index,
+        root_indice
     }
 }
 
 impl Renderer {
-    fn new(url: String, tokio: Rc<RefCell<tokio::runtime::Runtime>>, nodes: Vec<Node>, window_size: PhysicalSize<u32>, font_handler: Rc<FontHandler>) -> Self {
-        let root_indices: Vec<usize> = nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, node)| node.get_parent().is_none().then_some(idx))
-            .filter(|idx| match nodes[*idx] {
-                Node::Element(_) | Node::Text(_) => true,
-                Node::Comment(_) => false,
-            })
-            .collect();
-        if root_indices.len() != 1 {
-            panic!("Unexpected amount of root indices! {}", root_indices.len());
-        }
-        let root_indice = root_indices[0];
-
-        let mut request_cache = HashMap::new();
+    fn new(url: String, tokio: Rc<RefCell<tokio::runtime::Runtime>>, nodes_table: HashMap<usize, Node>, window_size: PhysicalSize<u32>, font_handler: Rc<FontHandler>, network_fetch: Rc<RefCell<NetworkFetch>>, dom_indexes: DomIndexes) -> Self {
+        let request_cache = HashMap::new();
 
         let layout_table = HashMap::new();
         let containing_nodes = HashMap::new();
@@ -1599,12 +1721,9 @@ impl Renderer {
         let rendered_nodes_ordered = vec![];
         let hovering = None;
 
-        let nodes_idxs: Vec<usize> = nodes.iter().enumerate().map(|(idx, _)| idx).collect();
-        let nodes_table: HashMap<usize, Node> = nodes.into_iter().enumerate().collect();
+        let nodes_idxs = sorted_node_idxs(&nodes_table);
 
-        let children_index = build_children_index(&nodes_table, &nodes_idxs);
-        let dom_indexes = get_dom_indexes(&nodes_table);
-        let (node_styles, resolved_font_sizes) = compute_node_styles(&url, &tokio, &mut request_cache, &nodes_table, &nodes_idxs, &children_index, root_indice, &window_size, &dom_indexes);
+        let (node_styles, resolved_font_sizes) = compute_node_styles(&url, &tokio, &network_fetch, &nodes_table, &nodes_idxs, &window_size, &dom_indexes);
 
         let node_idx_cursor = nodes_idxs.len();
 
@@ -1613,8 +1732,6 @@ impl Renderer {
             node_idx_cursor,
             nodes_idxs,
             nodes: nodes_table,
-            children_index,
-            root_indice,
             node_styles,
             layout_table,
             node_layout_mapping,
@@ -1633,6 +1750,7 @@ impl Renderer {
             resolved_specified_widths: HashMap::new(),
             dom_indexes,
             canvas_buffers: HashMap::new(),
+            network_fetch,
         }
     }
 
@@ -1646,16 +1764,22 @@ impl Renderer {
             .map(|idx| -> Option<Script> {
                 match self.nodes.get(idx).unwrap() {
                     Node::Element(element) => {
-                        let script_type = match element.attributes.get("type").and_then(|v| Some(v.as_str())) {
-                            Some("module") => ScriptType::Module,
-                            _ => ScriptType::Classic,
+                        let script_type = match element.attributes.get("type").map(|v| v.trim().to_ascii_lowercase()) {
+                            None => ScriptType::Classic,
+                            Some(script_type) if script_type.is_empty() => ScriptType::Classic,
+                            Some(script_type) if script_type == "text/javascript" => ScriptType::Classic,
+                            Some(script_type) if script_type == "application/javascript" => ScriptType::Classic,
+                            Some(script_type) if script_type == "text/ecmascript" => ScriptType::Classic,
+                            Some(script_type) if script_type == "application/ecmascript" => ScriptType::Classic,
+                            Some(script_type) if script_type == "module" => ScriptType::Module,
+                            _ => return None,
                         };
                         let src = element.attributes.get("src");
                         if let Some(src) = src {
-                            return Some(Script { content: ScriptContent::Link(src.to_string()), script_type });
+                            return Some(Script { content: ScriptContent::Link(src.to_string()), script_type, node_idx: Some(*idx) });
                         }
 
-                        let children = &self.children_index.get(idx).unwrap();
+                        let children = &self.dom_indexes.children_index.get(idx).unwrap();
                         if children.len() != 1 {
                             println!("Unexpected children count: {}", children.len());
                             return None;
@@ -1668,7 +1792,7 @@ impl Renderer {
                                 println!("Got element when expecting JS text {:?}", element);
                                 return None;
                             }
-                            Node::Text(element) => Some(Script { content: ScriptContent::Code(element.text.clone()), script_type }),
+                            Node::Text(element) => Some(Script { content: ScriptContent::Code(element.text.clone()), script_type, node_idx: Some(*idx) }),
                             Node::Comment(_) => {
                                 return None;
                             },
@@ -1727,19 +1851,24 @@ impl Renderer {
     }
 
     async fn fetch_img_src_data_url(
+        client: reqwest::Client,
         url: ReqwestUrl,
-        src_extension: Option<&'static str>,
+        src_extension: &'static str,
     ) -> (ReqwestUrl, Result<RequestCacheEntry>) {
         println!("Fetching img src: {}", url);
         let fetch_url = url.clone();
         let cache_entry = async move {
-            let resp = reqwest::get(fetch_url).await?;
+            let resp = client
+                .get(fetch_url)
+                .header(reqwest::header::ACCEPT, src_extension)
+                .send()
+                .await?;
             let content_type = resp
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 // TODO: Consider whether this is a sane production default
-                .or(src_extension)
+                .or(Some(src_extension))
                 .with_context(|| "Failed to get content-type for image")?;
             match content_type {
                 "image/png" => Ok(RequestCacheEntry::PngData(resp.bytes().await?)),
@@ -1760,7 +1889,7 @@ impl Renderer {
             }
         };
         let mut seen = HashSet::new();
-        let requests: Vec<(ReqwestUrl, Option<&'static str>)> = self.nodes
+        let requests: Vec<(ReqwestUrl, &'static str)> = self.nodes
             .values()
             .filter_map(|n| match n {
                 Node::Element(element) if element.tag == "img" => {
@@ -1781,7 +1910,7 @@ impl Renderer {
                     return None;
                 }
 
-                Some((url, Self::img_src_extension(src)))
+                Some((url, Self::img_src_extension(src)?))
             })
             .collect();
 
@@ -1789,10 +1918,12 @@ impl Renderer {
             return;
         }
 
+        let client = self.network_fetch.borrow().client.clone();
         let results = self.tokio.clone().borrow_mut().block_on(async move {
             let mut join_set = tokio::task::JoinSet::new();
             for (url, src_extension) in requests {
-                join_set.spawn(Self::fetch_img_src_data_url(url, src_extension));
+                let client = client.clone();
+                join_set.spawn(Self::fetch_img_src_data_url(client, url, src_extension));
             }
 
             let mut results = Vec::new();
@@ -1826,14 +1957,14 @@ impl Renderer {
         self.prefetch_images();
 
         // Create initial containing node
-        self.containing_nodes.insert(self.root_indice, ContainingNode {
-            node_idx: self.root_indice,
+        self.containing_nodes.insert(self.dom_indexes.root_indice, ContainingNode {
+            node_idx: self.dom_indexes.root_indice,
             waiters: vec![],
         });
-        let containing_node_idx = self.root_indice;
+        let containing_node_idx = self.dom_indexes.root_indice;
 
         if let Some(layout_box_idx) = self.layout_node(
-            self.root_indice,
+            self.dom_indexes.root_indice,
             Position { x: 0, y: 0 },
             Size { width, height },
             OptionalSize {
@@ -1862,7 +1993,7 @@ impl Renderer {
 
     fn get_element_text_content(&self, node_idx: usize) -> String {
         let mut str = String::new();
-        for child_idx in self.children_index.get(&node_idx).unwrap() {
+        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
             str += &self.get_text_content(*child_idx);
         }
         str
@@ -1870,7 +2001,7 @@ impl Renderer {
 
     fn get_element_inner_html(&self, node_idx: usize) -> String {
         let mut str = String::new();
-        for child_idx in self.children_index.get(&node_idx).unwrap() {
+        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
             str += &self.get_element_html(*child_idx);
         }
         str
@@ -1884,7 +2015,7 @@ impl Renderer {
                 str += &element.text;
             },
             Node::Element(_) => {
-                for child_idx in self.children_index.get(&node_idx).unwrap() {
+                for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
                     str += &self.get_text_content(*child_idx);
                 }
             },
@@ -1911,7 +2042,7 @@ impl Renderer {
                     str += "\"";
                 }
                 str += ">";
-                for child_idx in self.children_index.get(&node_idx).unwrap() {
+                for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
                     str += &self.get_element_html(*child_idx);
                 }
                 str += "</";
@@ -1928,14 +2059,14 @@ impl Renderer {
     async fn get_img_src_data(&mut self, src: &str) -> Result<RequestCacheEntry> {
         let base = ReqwestUrl::parse(&self.url)?;
         let url = resolve_url(src, Some(&base))?;
-        let src_extension = Self::img_src_extension(src);
+        let src_extension = Self::img_src_extension(src).with_context(|| format!("Unsupported img extension: {}", src))?;
         if let Some(cache) = self.request_cache.get(&url) {
             match cache {
                 RequestCacheEntry::Unsupported => Err(anyhow!("Unsupported image")),
                 v => Ok(v.clone())
             }
         } else {
-            let (url, cache_entry) = Self::fetch_img_src_data_url(url, src_extension).await;
+            let (url, cache_entry) = Self::fetch_img_src_data_url(self.network_fetch.borrow().client.clone(), url, src_extension).await;
             if let Ok(ref entry) = cache_entry {
                 self.request_cache.insert(url, entry.clone());
             } else {
@@ -2109,7 +2240,7 @@ impl Renderer {
                     }, save_as_final))
                 } else {
                     let layout = match style.display {
-                        StyleDisplay::Block | StyleDisplay::InlineBlock => self.layout_block(
+                        StyleDisplay::Block | StyleDisplay::InlineBlock | StyleDisplay::Inline => self.layout_block(
                             node_idx,
                             cursor,
                             &style,
@@ -2372,7 +2503,7 @@ impl Renderer {
         let mut max_child_height = 0;
         let mut longest_row_width = 0;
         let width_to_distribute = container_sizes.inner_width;
-        let children_idxs = self.children_index.get(&node_idx).cloned().unwrap();
+        let children_idxs = self.dom_indexes.children_index.get(&node_idx).cloned().unwrap();
         let mut current_column = 0;
         let mut definitely_used_width = 0;
         let mut max_total_fractions = 0;
@@ -2447,7 +2578,7 @@ impl Renderer {
                 containing_node_idx,
                 // Inline-block doesn't fill the width, so instruct children to not do that either
                 match style.display {
-                    StyleDisplay::InlineBlock => false,
+                    StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
                     _ => allow_fill,
                 },
                 save_as_final,
@@ -2528,7 +2659,7 @@ impl Renderer {
 
         let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
 
-        let children_idxs: Vec<usize> = self.children_index.get(&node_idx).unwrap().clone();
+        let children_idxs: Vec<usize> = self.dom_indexes.children_index.get(&node_idx).unwrap().clone();
 
         let immediate_children: Vec<&usize> = children_idxs.iter().filter(|c| {
             let style = &self.node_styles.get(*c).unwrap();
@@ -2565,6 +2696,11 @@ impl Renderer {
 
         for child_local_idx in 0..immediate_children.len() {
             let child_idx = immediate_children[child_local_idx];
+            let prev_child_idx = if child_local_idx >= 1 {
+                Some(immediate_children[child_local_idx - 1])
+            } else {
+                None
+            };
             let next_child_idx = if child_local_idx + 1 < immediate_children.len() {
                 Some(immediate_children[child_local_idx + 1])
             } else {
@@ -2589,14 +2725,15 @@ impl Renderer {
                 containing_node_idx,
                 // Inline-block doesn't fill the width, so instruct children to not do that either
                 match style.display {
-                    StyleDisplay::InlineBlock => false,
+                    StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
                     _ => allow_fill,
                 },
                 save_as_final,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
+                let prev_child_display: Option<StyleDisplay> = prev_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
                 let next_child_display: Option<StyleDisplay> = next_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
-                if child_style.display.is_inline() && next_child_display.is_none_or(|v| v.is_inline()) {
+                if child_style.display.is_inline() && prev_child_display.is_none_or(|v| v.is_inline()) && next_child_display.is_none_or(|v| v.is_inline()) {
                     // TODO: This will need to support overflows
                     content_position.x += child_box.rect.width as i32 + margin_right_size;
                     child_width_buffer += child_box.rect.width as i32 + margin_right_size;
@@ -2644,7 +2781,7 @@ impl Renderer {
             .max(container_sizes.min_height.unwrap_or(u32::MIN));
 
         // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
-        let wants_to_fill = style.display != StyleDisplay::InlineBlock;
+        let wants_to_fill = style.display != StyleDisplay::InlineBlock && style.display != StyleDisplay::Inline;
         let width = if allow_fill && wants_to_fill { container_sizes.container_width } else { container_sizes.compute_actual_container_width(max_child_width) };
 
         // Margin: auto
@@ -2738,7 +2875,7 @@ impl Renderer {
             containing_node_idx = node_idx;
         }
 
-        for child_idx in self.children_index.get(&node_idx).unwrap().clone() {
+        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap().clone() {
             if let Some(child) = self.layout_node(
                 child_idx,
                 Position { x: 0, y: 0 },
@@ -3219,16 +3356,16 @@ impl Renderer {
 
     pub fn remove_node(&mut self, node_idx: usize, remove_from_parent: bool) {
         // Remove children
-        for child in self.children_index.get(&node_idx).unwrap().clone() {
+        for child in self.dom_indexes.children_index.get(&node_idx).unwrap().clone() {
             self.remove_node(child, false);
         }
 
         // Remove from parent
         if remove_from_parent {
             if let Some(parent) = self.nodes.get(&node_idx).unwrap().get_parent() {
-                let children = self.children_index.get(&parent).unwrap();
+                let children = self.dom_indexes.children_index.get(&parent).unwrap();
                 let filtered: Vec<usize> = children.into_iter().filter(|idx| **idx != node_idx).cloned().collect();
-                self.children_index.insert(parent, filtered);
+                self.dom_indexes.children_index.insert(parent, filtered);
             }
         }
 
@@ -3236,17 +3373,16 @@ impl Renderer {
         self.nodes_idxs = self.nodes_idxs.iter().filter(|idx| **idx != node_idx).cloned().collect();
         self.nodes.remove(&node_idx);
         self.node_layout_mapping.remove(&node_idx);
-        self.children_index.remove(&node_idx);
+        self.dom_indexes.children_index.remove(&node_idx);
     }
 
-    pub fn recompute_children_index(&mut self) {
-        self.children_index = build_children_index(&self.nodes, &self.nodes_idxs);
+    pub fn recompute_dom_indexes(&mut self) {
+        self.dom_indexes = get_dom_indexes(&self.nodes);
     }
 
     pub fn recompute_nodes(&mut self) {
-        self.recompute_children_index();
-        self.dom_indexes = get_dom_indexes(&self.nodes);
-        (self.node_styles, self.resolved_font_sizes) = compute_node_styles(&self.url, &self.tokio, &mut self.request_cache, &self.nodes, &self.nodes_idxs, &self.children_index, self.root_indice, &self.window_size, &self.dom_indexes);
+        self.recompute_dom_indexes();
+        (self.node_styles, self.resolved_font_sizes) = compute_node_styles(&self.url, &self.tokio, &self.network_fetch, &self.nodes, &self.nodes_idxs, &self.window_size, &self.dom_indexes);
     }
 
     pub fn get_paddings(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
@@ -3384,6 +3520,42 @@ impl FontHandler {
     }
 }
 
+#[derive(Debug)]
+struct NetworkFetch {
+    request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
+    client: reqwest::Client,
+    cookie_jar: Arc<Jar>,
+}
+
+impl NetworkFetch {
+    pub fn new() -> Self {
+        let cookie_jar = Arc::new(Jar::default());
+        Self {
+            request_cache: HashMap::new(),
+            client: reqwest::Client::builder()
+                .cookie_provider(Arc::clone(&cookie_jar))
+                .user_agent(USER_AGENT)
+                .build()
+                .unwrap(),
+            cookie_jar,
+        }
+    }
+}
+
+struct ExecutedScripts {
+    links: Vec<String>,
+    nodes: Vec<usize>,
+}
+
+impl ExecutedScripts {
+    pub fn new() -> Self {
+        Self {
+            links: vec![],
+            nodes: vec![],
+        }
+    }
+}
+
 struct Browser {
     url: String,
     renderer: Option<Rc<RefCell<Renderer>>>,
@@ -3394,6 +3566,8 @@ struct Browser {
     font_handler: Rc<FontHandler>,
     layout_dirty: bool,
     layout_booted: bool,
+    executed_scripts: ExecutedScripts,
+    network_fetch: Rc<RefCell<NetworkFetch>>,
 }
 
 impl Browser {
@@ -3408,20 +3582,25 @@ impl Browser {
             tokio: None,
             html_parser: None,
             font_handler,
+            executed_scripts: ExecutedScripts::new(),
             layout_dirty: true,
             layout_booted: false,
+            network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
         }
     }
 
-    async fn get_html(&self, url: String) -> Result<String> {
+    async fn get_html(&self, url: String) -> Result<(String, String)> {
         if let Some(stripped) = url.strip_prefix("file://") {
             let contents = fs::read_to_string(stripped)?;
-            Ok(contents)
+            Ok((contents, url))
         } else {
             let url = resolve_url(&url, None)?;
             println!("Fetching HTML for {:?}", url);
-            let resp = reqwest::get(url).await?.text().await?;
-            Ok(resp)
+            let client = &self.network_fetch.borrow_mut().client;
+            let resp = client.get(url).send().await?;
+            let url = resp.url().to_string();
+            let text = resp.text().await?;
+            Ok((text, url))
         }
     }
 
@@ -3430,12 +3609,16 @@ impl Browser {
         self.navigate(self.url.clone())?;
         self.install_js_host();
         let event_loop = EventLoopBuilder::with_user_event().build().expect("Failed to create event loop");
+        let nodes_table = self.html_parser.as_ref().unwrap().nodes.clone().into_iter().enumerate().collect();
+        let dom_indexes = get_dom_indexes(&nodes_table);
         self.renderer = Some(Rc::new(RefCell::new(Renderer::new(
             self.url.clone(),
             self.tokio.as_ref().unwrap().clone(),
-            self.html_parser.as_ref().unwrap().nodes.clone(),
+            nodes_table,
             PhysicalSize { width: WINDOW_WIDTH, height: WINDOW_HEIGHT },
             Rc::clone(&self.font_handler),
+            Rc::clone(&self.network_fetch),
+            dom_indexes,
         ))));
         self.js_runtime.as_mut().unwrap().borrow_mut().op_state().borrow_mut().put(JsHostState {
             renderer: self.renderer.as_mut().cloned().unwrap(),
@@ -3445,6 +3628,8 @@ impl Browser {
 
         let js_result = self.run_js();
         println!("Finished running JS code: {:?}", js_result);
+
+        self.pump_js_event_loop_once()?;
 
         self.renderer.as_ref().unwrap().borrow_mut().recompute_nodes();
 
@@ -3468,28 +3653,88 @@ impl Browser {
                     ),
                     deno_net::deno_net::init(None, None),
                     deno_fetch_without_telemetry(),
+                    deno_node_crypto_shim::init(),
+                    deno_crypto::deno_crypto::init(None),
                 ],
                 ..Default::default()
             })))
         );
     }
 
+    fn drain_microtasks(runtime: &mut JsRuntime) {
+        deno_core::scope!(scope, runtime);
+        scope.perform_microtask_checkpoint();
+    }
+
+    fn pump_js_event_loop_once(&mut self) -> Result<bool> {
+        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+
+        self.tokio.as_ref().unwrap().clone().borrow_mut().block_on(async {
+            poll_fn(|cx| {
+                match runtime.poll_event_loop(cx, Default::default()) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(false)),
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+                    Poll::Pending => Poll::Ready(Ok(true)),
+                }
+            }).await
+        })
+    }
+
     async fn execute_js(&mut self, scripts: Vec<Script>) -> Result<()> {
         let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
         for (idx, js) in scripts.iter().enumerate() {
+            if let ScriptContent::Link(link) = &js.content {
+                if self.executed_scripts.links.contains(&link) {
+                    println!("Script has already been ran, ignoring: {}", link);
+                    continue;
+                }
+
+                self.executed_scripts.links.push(link.to_string());
+            } else if let Some(node_idx) = js.node_idx {
+                if self.executed_scripts.nodes.contains(&node_idx) {
+                    println!("Script has already been ran, ignoring: {}", node_idx);
+                    continue;
+                }
+
+                self.executed_scripts.nodes.push(node_idx);
+            }
+
             match &js.content {
                 ScriptContent::Code(code) => {
                     let code_context: String = code.chars().take(40).collect();
                     runtime.execute_script(format!("injected code {} ({})", idx, code_context), code.clone())?;
+                    Self::drain_microtasks(&mut runtime);
                 }
                 ScriptContent::Link(link) => {
                     let base = ReqwestUrl::parse(&self.url)?;
                     let url = resolve_url(&link, Some(&base))?;
-                    let module_id = runtime.load_side_es_module(&url).await?;
-                    runtime.mod_evaluate(module_id).await?;
+                    match js.script_type {
+                        ScriptType::Classic => {
+                            let code = self.network_fetch.borrow_mut().client.get(url.clone()).send().await?.text().await?;
+                            runtime.execute_script(url.to_string(), code)?;
+                            Self::drain_microtasks(&mut runtime);
+                        }
+                        ScriptType::Module => {
+                            let module_id = runtime.load_side_es_module(&url).await?;
+                            let result = runtime.mod_evaluate(module_id);
+                            runtime.with_event_loop_promise(result, Default::default()).await?;
+                        }
+                    }
                 }
             };
-            runtime.run_event_loop(Default::default()).await?;
+
+            // Run onload handlers
+            if let Some(node_idx) = js.node_idx {
+                let code = format!(r#"
+                    if (__EVENT_LISTENERS[`${{{}}}:load`]) {{
+                        __EVENT_LISTENERS[`${{{}}}:load`]?.forEach(cb => {{
+                            cb()
+                        }})
+                    }}
+                "#, node_idx, node_idx);
+                runtime.execute_script("script onload", code.clone())?;
+                Self::drain_microtasks(&mut runtime);
+            }
         }
 
         Ok(())
@@ -3505,11 +3750,70 @@ impl Browser {
         Ok(())
     }
 
-    pub fn navigate(&mut self, href: String) -> Result<()> {
-        self.url = href.clone();
-        println!("Changing url to {}", self.url);
+    fn detect_html_redirect_walk_inner(&mut self, node_idx: usize) -> Option<Result<()>> {
+        let nodes = &self.html_parser.as_ref().unwrap().nodes;
+        let node = &nodes[node_idx];
 
-        let input = self.tokio.as_ref().unwrap().borrow_mut().block_on(self.get_html(self.url.clone()))?;
+        let Node::Element(element) = node else {
+            return None;
+        };
+        if element.tag == "meta" && element.attributes.get("http-equiv").is_some_and(|v| v.to_lowercase() == "refresh") {
+            let Some(content) = element.attributes.get("content") else {
+                return None;
+            };
+            let Some((delay, instructions)) = content.split_once(";") else {
+                return None;
+            };
+            let Some(url) = instructions.strip_prefix("url=") else {
+                return None;
+            };
+            let Ok(delay) = delay.parse::<f64>() else {
+                return None;
+            };
+            // Who cares about the delay
+            // TODO: Care about the delay
+            let Ok(current_url) = url::Url::parse(&self.url) else {
+                return None;
+            };
+            let Ok(resolved_url) = current_url.join(&url) else {
+                return None;
+            };
+            println!("Detected HTML redirect to {}", resolved_url);
+            return Some(self.navigate(resolved_url.to_string()));
+        }
+        None
+    }
+
+    fn detect_html_redirect_walk(&mut self, node_idx: usize, dom_indexes: &DomIndexes) -> Option<Result<()>> {
+        let html_tag = match self.html_parser.as_ref().unwrap().nodes.get(node_idx).unwrap() {
+            Node::Element(element) => Some(element.tag.clone()),
+            _ => None,
+        };
+        if let Some(result) = self.detect_html_redirect_walk_inner(node_idx) {
+            return Some(result);
+        } else if html_tag.is_none_or(|v| v != "noscript") {
+            let children = dom_indexes
+                .children_index
+                .get(&node_idx)
+                .unwrap()
+                .clone();
+            for child in children {
+                if let Some(result) = self.detect_html_redirect_walk(child, dom_indexes) {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
+    fn detect_html_redirect(&mut self, dom_indexes: &DomIndexes) -> Option<Result<()>> {
+        self.detect_html_redirect_walk(dom_indexes.root_indice, dom_indexes)
+    }
+
+    pub fn navigate(&mut self, href: String) -> Result<()> {
+        let (input, final_url) = self.tokio.as_ref().unwrap().borrow_mut().block_on(self.get_html(href))?;
+        println!("Changing url to {}", final_url);
+        self.url = final_url;
 
         self.html_parser = Some(HtmlParser::new(input));
         self.html_parser.as_mut().unwrap().parse().expect(&format!(
@@ -3518,7 +3822,6 @@ impl Browser {
         ));
 
         if self.renderer.is_some() {
-            self.refresh_renderer();
             self.setup_js_dom()?;
             let js_result = self.run_js();
             println!("Finished running JS code: {:?}", js_result);
@@ -3543,7 +3846,10 @@ impl Browser {
         self.register_tokio_runtime()?;
         self.navigate(self.url.clone())?;
         self.install_js_host();
-        self.start_event_loop()
+        let nodes_table = self.html_parser.as_mut().unwrap().nodes.clone().into_iter().enumerate().collect();
+        let dom_indexes = get_dom_indexes(&nodes_table);
+        self.detect_html_redirect(&dom_indexes);
+        self.start_event_loop(nodes_table, dom_indexes)
     }
 
     fn on_click(&mut self) -> Result<()> {
@@ -3619,18 +3925,27 @@ impl Browser {
             document.body = document.querySelector("body");
             document.head = document.querySelector("head");
 
+            navigator.userAgent = "{}";
+
             window.__init_location("{}");
-        "#, self.url).to_string());
+        "#, USER_AGENT, self.url).to_string());
         self.tokio.as_ref().unwrap().clone().borrow_mut().block_on(self.execute_js(vec![
-            Script { content: code, script_type: ScriptType::Classic }
+            Script { content: code, script_type: ScriptType::Classic, node_idx: None }
         ]))?;
         Ok(())
     }
 
-    fn refresh_renderer(&mut self) {
+    fn refresh_renderer(&mut self, nodes_table: HashMap<usize, Node>, dom_indexes: DomIndexes) {
         let size = self.window.as_ref().unwrap().inner_size();
-        let nodes = self.html_parser.as_mut().unwrap().nodes.clone();
-        self.renderer = Some(Rc::new(RefCell::new(Renderer::new(self.url.clone(), self.tokio.as_ref().unwrap().clone(), nodes, size, Rc::clone(&self.font_handler)))));
+        self.renderer = Some(Rc::new(RefCell::new(Renderer::new(
+            self.url.clone(),
+            self.tokio.as_ref().unwrap().clone(),
+            nodes_table,
+            size,
+            Rc::clone(&self.font_handler),
+            Rc::clone(&self.network_fetch),
+            dom_indexes,
+        ))));
     }
 
     fn render(&mut self, surf: &mut Surface<DisplayHandle, WindowHandle>, size: &PhysicalSize<u32>, cursor: &Position) -> bool {
@@ -3657,7 +3972,23 @@ impl Browser {
         }
     }
 
-    fn start_event_loop(&mut self) -> Result<()> {
+    fn execute_dom_update(&mut self) {
+        println!("DOM UPDATED");
+        let window = self.window.as_ref().unwrap();
+        self.renderer.as_ref().unwrap().borrow_mut().pending_dom_update = false;
+        self.renderer.as_ref().unwrap().borrow_mut().recompute_nodes();
+        self.layout_dirty = true;
+        window.request_redraw();
+        let js_result = self.run_js();
+        println!("Finished running JS code: {:?}", js_result);
+
+        // If the JS caused another update, execute it immediately
+        if self.renderer.as_ref().unwrap().borrow_mut().pending_dom_update {
+            self.execute_dom_update();
+        }
+    }
+
+    fn start_event_loop(&mut self, nodes_table: HashMap<usize, Node>, dom_indexes: DomIndexes) -> Result<()> {
         let event_loop = EventLoopBuilder::with_user_event().build().expect("Failed to create event loop");
         let window = Arc::new(WindowBuilder::new()
             .with_title("XML demo")
@@ -3672,7 +4003,7 @@ impl Browser {
         let mut surf = Surface::new(&ctx, window.window_handle().expect("Window handle"))
                 .expect("Softbuffer surface failed");
 
-        self.refresh_renderer();
+        self.refresh_renderer(nodes_table, dom_indexes);
 
         self.js_runtime.as_mut().unwrap().borrow_mut().op_state().borrow_mut().put(JsHostState {
             renderer: self.renderer.as_mut().cloned().unwrap(),
@@ -3688,13 +4019,21 @@ impl Browser {
                 let window = self.window.as_ref().unwrap();
                 match event {
                     Event::UserEvent(UserEvent::DomUpdated) => {
-                        println!("DOM UPDATED");
-                        let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                        renderer.pending_dom_update = false;
-                        renderer.recompute_nodes();
-                        self.layout_dirty = true;
-                        window.request_redraw();
-                    }
+                        self.execute_dom_update()
+                    },
+                    Event::UserEvent(UserEvent::Navigate((href, reload))) => {
+                        let current_url = url::Url::parse(&self.url).unwrap();
+                        let resolved_url = current_url.join(&href).unwrap();
+                        if reload {
+                            if let Err(err) = self.navigate(resolved_url.to_string()) {
+                                eprintln!("Navigation failed: {err:?}");
+                            }
+                        } else {
+                            self.url = resolved_url.to_string();
+                            self.renderer.as_mut().unwrap().borrow_mut().url = resolved_url.to_string();
+                            self.setup_js_dom().unwrap();
+                        }
+                    },
                     Event::WindowEvent { event, .. } => match event {
                         WindowEvent::CloseRequested => elwt.exit(),
                         WindowEvent::Resized(new_size) => {
@@ -3735,6 +4074,33 @@ impl Browser {
                         }
                         _ => {}
                     }
+                    Event::AboutToWait => {
+                        match self.pump_js_event_loop_once() {
+                            Ok(js_pending) => {
+                                let dom_pending = self.renderer
+                                    .as_ref()
+                                    .unwrap()
+                                    .borrow()
+                                    .pending_dom_update;
+
+                                if dom_pending {
+                                    self.execute_dom_update();
+                                }
+
+                                if js_pending {
+                                    elwt.set_control_flow(
+                                        ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16))
+                                    );
+                                } else {
+                                    elwt.set_control_flow(ControlFlow::Wait);
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("JS event loop error: {err:?}");
+                                elwt.set_control_flow(ControlFlow::Wait);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             })
@@ -3763,7 +4129,7 @@ fn main() -> Result<()> {
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
     let mut browser = Browser::new("https://vite.dev".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
+    // let mut browser = Browser::new("file:///home/pontus/browser/pages/google_redirect.html".to_string());
 
     if dump_tree {
         browser.dump_tree()
@@ -3804,11 +4170,11 @@ fn format_tree(renderer: &mut Renderer, width: u32, height: u32) -> String {
 
     write_tree(
         &renderer.nodes,
-        &renderer.children_index,
+        &renderer.dom_indexes.children_index,
         &renderer.node_styles,
         &renderer.node_layout_mapping,
         &layout_info,
-        renderer.root_indice,
+        renderer.dom_indexes.root_indice,
         0,
         &mut out,
     );
@@ -4025,7 +4391,7 @@ mod tests {
     use crate::style::{
         GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, parse_style
     };
-    use crate::{FontHandler, HtmlParser, Renderer};
+    use crate::{FontHandler, HtmlParser, NetworkFetch, Renderer, get_dom_indexes};
     use anyhow::{Context, Result};
     use winit::dpi::PhysicalSize;
     use std::cell::RefCell;
@@ -4056,7 +4422,9 @@ mod tests {
             .ok()
             .with_context(|| "Failed to construct tokio")?));
 
-        let renderer = Renderer::new("http://localhost:5173".to_string(), tokio, parser.nodes, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()));
+        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
+        let dom_indexes = get_dom_indexes(&nodes_table);
+        let renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes);
         assert_eq!(renderer.get_element_html(1), svg_input);
 
         Ok(())
@@ -4221,7 +4589,9 @@ mod tests {
             .ok()
             .with_context(|| "Failed to construct tokio")?));
 
-        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, parser.nodes, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()));
+        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
+        let dom_indexes = get_dom_indexes(&nodes_table);
+        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes);
         let width = 1280;
         let height = 720;
         let mut buffer = vec![0; width * height];
@@ -4245,7 +4615,9 @@ mod tests {
             .ok()
             .with_context(|| "Failed to construct tokio")?));
 
-        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, parser.nodes, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()));
+        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
+        let dom_indexes = get_dom_indexes(&nodes_table);
+        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes);
         let width = 1280;
         let height = 720;
         let mut buffer = vec![0; width * height];
@@ -4269,7 +4641,9 @@ mod tests {
             .ok()
             .with_context(|| "Failed to construct tokio")?));
 
-        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, parser.nodes, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()));
+        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
+        let dom_indexes = get_dom_indexes(&nodes_table);
+        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes);
         let width = 1280;
         let height = 720;
         let mut buffer = vec![0; width * height];
