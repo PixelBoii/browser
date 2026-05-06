@@ -78,6 +78,11 @@ pub struct BorderSideValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StyleComplexBackground {
+    pub background: StyleBackground,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum PropertyValue {
     Raw(String),
     Size(StyleSize),
@@ -99,6 +104,7 @@ pub enum PropertyValue {
     VerticalCombinedSize((StyleSize, StyleSize)),
     HorizontalCombinedSize((StyleSize, StyleSize)),
     GridTemplateColumns(GridTemplateColumns),
+    ComplexBackground(StyleComplexBackground),
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +166,14 @@ pub struct CssParser<'a> {
     in_url: bool,
 }
 
+pub fn unquote(mut value: &str) -> &str {
+    value = value.strip_prefix("'").unwrap_or(value);
+    value = value.strip_suffix("'").unwrap_or(value);
+    value = value.strip_prefix("\"").unwrap_or(value);
+    value = value.strip_suffix("\"").unwrap_or(value);
+    value
+}
+
 fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
     let mut attributes = vec![];
     while !rest.is_empty() {
@@ -173,11 +187,7 @@ fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
         if split.len() == 2 {
             let key = split[0];
             let mut value = split[1];
-            value = value.trim();
-            value = value.strip_prefix("'").unwrap_or(value);
-            value = value.strip_suffix("'").unwrap_or(value);
-            value = value.strip_prefix("\"").unwrap_or(value);
-            value = value.strip_suffix("\"").unwrap_or(value);
+            value = unquote(value.trim());
 
             attributes.push(ClassNamePartAttribute::KeyValue((key.to_string(), value.to_string())));
         } else if split.len() == 1 {

@@ -68,7 +68,7 @@ function setIntervalImpl(callback, delay = 0, ...args) {
     return createTimer(callback, delay, args, true)
 }
 
-const ELEMENT_ATTRIBUTES = ['src', 'style', 'id', 'class']
+const ELEMENT_ATTRIBUTES = ['src', 'style', 'id', 'class', 'height', 'width']
 
 globalThis.__EVENT_LISTENERS = {}
 

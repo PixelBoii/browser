@@ -62,6 +62,9 @@ impl RectBorderSide {
                 color: match style.color {
                     StyleBackground::Hex(hex) => hex,
                     StyleBackground::Transparent => 0xFF_FF_FF_00,
+                    StyleBackground::DataUrl(_) => {
+                        return None;
+                    },
                 },
             }),
             StyleBorderStyle::None => None,
@@ -186,6 +189,7 @@ struct Renderer {
     pub hovering: Option<usize>,
     tokio: Rc<RefCell<tokio::runtime::Runtime>>,
     resolved_font_sizes: HashMap<usize, u32>,
+    resolved_pixmaps: HashMap<String, tiny_skia::Pixmap>,
     window_size: PhysicalSize<u32>,
     font_handler: Rc<FontHandler>,
     pending_dom_update: bool,
@@ -1741,6 +1745,7 @@ impl Renderer {
             hovering,
             tokio,
             resolved_font_sizes,
+            resolved_pixmaps: HashMap::new(),
             window_size,
             font_handler,
             pending_dom_update: false,
@@ -2281,6 +2286,12 @@ impl Renderer {
                             bottom: RectBorderSide::parse_from_style(&style.border_bottom, resolved_font_size as u32, &available_size, &self.window_size),
                         };
 
+                        if let StyleBackground::DataUrl((format, data)) = &style.background {
+                            let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
+                            let _ = self.resolve_background_data_url(node_idx, format, data, &container_size, &style)
+                                .inspect_err(|err| eprintln!("An error occured while resolving background data url: {}", err));
+                        }
+
                         Some(self.register_layout_box(LayoutBox {
                             rect: Rect {
                                 x: cursor.x,
@@ -2302,6 +2313,26 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    fn resolve_background_data_url(&mut self, node_idx: usize, format: &String, data: &String, container_size: &ContainerSizes, style: &Style) -> Result<()> {
+        match format.as_str() {
+            "image/svg+xml" => {
+                let mut svg_data = percent_encoding::percent_decode_str(data).decode_utf8()?.to_string();
+                self.inject_css_variables_into_str(&mut svg_data, &style.variables);
+                let result = rasterize_svg(svg_data.as_bytes(), Some(container_size.container_width), Some(container_size.container_height), container_size.container_width, container_size.container_height, &style);
+                match result {
+                    Err(err) => {
+                        println!("Failed to rasterize SVG data: {}", err);
+                    },
+                    Ok((pixmap, _, _)) => {
+                        self.resolved_pixmaps.insert(node_idx.to_string(), pixmap);
+                    },
+                };
+            },
+            format => panic!("Unsupported background data format: {}", format),
+        };
+        Ok(())
     }
 
     fn get_margin_free_space_to_give(&self, free_space: u32, first_margin: &StyleSize, last_margin: &StyleSize) -> u32 {
@@ -2437,7 +2468,7 @@ impl Renderer {
                 width: renderable_text.width,
                 height: renderable_text.height,
                 background: StyleBackground::Transparent,
-                color: style.color,
+                color: style.color.clone(),
                 font_size: Some(font_size as u32),
                 border: RectBorder::new_empty(),
             },
@@ -3205,6 +3236,33 @@ impl Renderer {
         }
     }
 
+    fn apply_pixmap_on_buffer(
+        &self,
+        layout_box: &LayoutBox,
+        buffer: &mut [u32],
+        width: u32,
+        height: u32,
+        container_start_y: i32,
+        pixmap_buffer: &tiny_skia::Pixmap
+    ) {
+        let pixels = pixmap_buffer.pixels();
+        let pixmap_width = pixmap_buffer.width();
+        let pixmap_height = pixmap_buffer.height();
+        let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
+        let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
+        for pixel_x in 0..end_x {
+            for pixel_y in 0..end_y {
+                let pixel = pixels[(pixel_x + pixel_y * pixmap_width) as usize];
+                let dist = container_start_y * width as i32
+                    + layout_box.rect.x
+                    + (pixel_x as i32 + pixel_y as i32 * width as i32);
+                if dist > 0 {
+                    buffer[dist as usize] = self.blend_premul_over_rgb(buffer[dist as usize], pixel);
+                }
+            }
+        }
+    }
+
     fn paint_layout_box(
         &self,
         layout_box_idx: usize,
@@ -3225,26 +3283,30 @@ impl Renderer {
         }
         match &layout_box.kind {
             LayoutKind::Element => {
-                let bg_hex: Option<u32> = match layout_box.rect.background {
-                    StyleBackground::Hex(code) => Some(code),
-                    _ => None,
+                let left_border_size = layout_box.rect.border.left.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
+                let top_border_size = layout_box.rect.border.top.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
+                let right_border_size = layout_box.rect.border.right.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
+                let bottom_border_size = layout_box.rect.border.bottom.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
+                match &layout_box.rect.background {
+                    StyleBackground::Hex(code) => {
+                        draw_rect_filled(
+                            buffer,
+                            width,
+                            height,
+                            layout_box.rect.x + left_border_size,
+                            container_start_y + top_border_size,
+                            (layout_box.rect.width as i32 - left_border_size - right_border_size).max(0) as u32,
+                            (layout_box.rect.height as i32 - top_border_size - bottom_border_size).max(0) as u32,
+                            code.clone(),
+                        );
+                    },
+                    StyleBackground::DataUrl(_) => {
+                        if let Some(pixmap) = self.resolved_pixmaps.get(&layout_box.node_idx.to_string()) {
+                            self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap);
+                        }
+                    },
+                    _ => {},
                 };
-                if let Some(bg) = bg_hex {
-                    let left_border_size = layout_box.rect.border.left.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
-                    let top_border_size = layout_box.rect.border.top.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
-                    let right_border_size = layout_box.rect.border.right.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
-                    let bottom_border_size = layout_box.rect.border.bottom.as_ref().and_then(|v| Some(v.size)).unwrap_or(0) as i32;
-                    draw_rect_filled(
-                        buffer,
-                        width,
-                        height,
-                        layout_box.rect.x + left_border_size,
-                        container_start_y + top_border_size,
-                        (layout_box.rect.width as i32 - left_border_size - right_border_size).max(0) as u32,
-                        (layout_box.rect.height as i32 - top_border_size - bottom_border_size).max(0) as u32,
-                        bg,
-                    );
-                }
                 self.paint_borders(&layout_box, buffer, width, height, offset_y);
             }
             LayoutKind::Text(text) => {
@@ -3283,22 +3345,7 @@ impl Renderer {
                 }
             }
             LayoutKind::PixMap(pixmap_buffer) => {
-                let pixels = pixmap_buffer.pixels();
-                let pixmap_width = pixmap_buffer.width();
-                let pixmap_height = pixmap_buffer.height();
-                let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
-                let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
-                for pixel_x in 0..end_x {
-                    for pixel_y in 0..end_y {
-                        let pixel = pixels[(pixel_x + pixel_y * pixmap_width) as usize];
-                        let dist = container_start_y * width as i32
-                            + layout_box.rect.x
-                            + (pixel_x as i32 + pixel_y as i32 * width as i32);
-                        if dist > 0 {
-                            buffer[dist as usize] = self.blend_premul_over_rgb(buffer[dist as usize], pixel);
-                        }
-                    }
-                }
+                self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap_buffer);
             }
         }
 
@@ -4127,9 +4174,9 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("https://vite.dev".to_string());
+    // let mut browser = Browser::new("https://vite.dev".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    // let mut browser = Browser::new("file:///home/pontus/browser/pages/google_redirect.html".to_string());
+    let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
         browser.dump_tree()

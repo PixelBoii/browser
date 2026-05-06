@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
-use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, Variable};
-use crate::get_specificity_tuple;
+use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, StyleComplexBackground, Variable, unquote};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,10 +34,11 @@ pub enum StyleSize {
     Calc(Vec<CalcExpression>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StyleBackground {
     Transparent,
     Hex(u32),
+    DataUrl((String, String)),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -261,7 +261,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         color: match node {
             HtmlNode::Element(element) => parent_style
                 .clone()
-                .and_then(|v| Some(v.color))
+                .and_then(|v| Some(v.color.clone()))
                 .unwrap_or(if element.tag == "input" {
                     StyleBackground::Hex(0x00_00_00_FF)
                 } else {
@@ -271,7 +271,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                 .clone()
                 .and_then(|v| {
                     if v.color != StyleBackground::Transparent {
-                        Some(v.color)
+                        Some(v.color.clone())
                     } else {
                         None
                     }
@@ -1013,6 +1013,25 @@ fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
     Ok(PropertyValue::GridTemplateColumns(GridTemplateColumns::Values(parsed)))
 }
 
+fn parse_background(value: String) -> Result<PropertyValue> {
+    let parts = split_ignoring_parentheses(value, ' ', &[]);
+    let mut background = StyleBackground::Transparent;
+    for part in parts {
+        if let Some(stripped) = part.strip_prefix("url(") {
+            if let Some(stripped) = stripped.strip_suffix(")") {
+                let stripped = unquote(stripped);
+                if let Some(data) = stripped.strip_prefix("data:") {
+                    let (format, data) = data.split_once(',').with_context(|| "Failed to parse data url")?;
+                    background = StyleBackground::DataUrl((format.to_string(), data.to_string()));
+                } else {
+                    //
+                }
+            }
+        }
+    }
+    Ok(PropertyValue::ComplexBackground(StyleComplexBackground { background }))
+}
+
 pub fn parse_property_value(property: String, value: String) -> Result<(PropertyValue, bool)> {
     if let Some(stripped) = value.strip_suffix("!important") {
         return parse_property_value(property, stripped.trim().to_string()).and_then(|(value, _)| Ok((value, true)));
@@ -1034,7 +1053,8 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
         "padding-block" => PropertyValue::VerticalCombinedSize(parse_two_axis_size(value)?),
         "padding-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
-        "background" | "background-color" | "color" |
+        "background" => parse_background(value)?,
+        "background-color" | "color" |
         "border-left-color" | "border-top-color" | "border-right-color" | "border-bottom-color" =>
             PropertyValue::Color(parse_color(value)?),
         "border-color" => PropertyValue::CombinedColor(parse_combined_style(value, parse_color)?),
@@ -1255,6 +1275,10 @@ pub fn apply_style_property(
         ("padding-bottom", PropertyValue::Size(value)) => {
             style.padding_bottom = value;
         }
+        ("background", PropertyValue::ComplexBackground(background)) => {
+            style.background = background.background;
+            // TODO: Add more attribute mappings here
+        },
         ("background" | "background-color", PropertyValue::Color(value)) => {
             style.background = value;
         }
