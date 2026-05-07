@@ -4,7 +4,7 @@ mod style;
 mod loader;
 
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
-use image::{ImageReader};
+use image::{DynamicImage, ImageReader};
 use parser::{Element, HtmlParser, Node};
 use reqwest::cookie::{CookieStore, Jar};
 use resvg::tiny_skia::{IntSize, Pixmap};
@@ -14,6 +14,7 @@ use style::{
 };
 
 use std::cell::{RefCell};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::io::Cursor;
@@ -41,7 +42,7 @@ use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, Overflow, PseudoClass, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
 use crate::parser::{CommentElement, TextElement};
-use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, element_matched_attributes, get_class_list, media_query_matches};
+use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, element_matched_attributes, get_chain_order, get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
@@ -204,6 +205,7 @@ struct Renderer {
     dom_indexes: DomIndexes,
     canvas_buffers: HashMap<usize, CanvasBuffer>,
     network_fetch: Rc<RefCell<NetworkFetch>>,
+    cached_rasterizations: CachedRasterizations,
 }
 
 #[derive(Debug, Clone)]
@@ -485,13 +487,18 @@ fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, ma
     Ok((pixmap, target_h, target_w))
 }
 
-fn rasterize_png(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
-    let src = tiny_skia::Pixmap::decode_png(bytes)?;
-    if input_w.is_some_and(|v| v == src.width()) && input_h.is_some_and(|v| v == src.height()) {
-        return Ok((src, input_h.unwrap(), input_w.unwrap()));
+fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+    let pixmap = if let Some(cached) = cached_rasterizations.decoded_pngs.get(src) {
+        cached
+    } else {
+        cached_rasterizations.decoded_pngs.insert(src.clone(), tiny_skia::Pixmap::decode_png(bytes)?);
+        cached_rasterizations.decoded_pngs.get(src).unwrap()
+    };
+    if input_w.is_some_and(|v| v == pixmap.width()) && input_h.is_some_and(|v| v == pixmap.height()) {
+        return Ok((pixmap.clone(), input_h.unwrap(), input_w.unwrap()));
     }
 
-    let (mut target_h, mut target_w) = infer_image_size(Size { height: src.height(), width: src.width() }, input_w, input_h);
+    let (mut target_h, mut target_w) = infer_image_size(Size { height: pixmap.height(), width: pixmap.width() }, input_w, input_h);
     (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
     (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
 
@@ -501,13 +508,13 @@ fn rasterize_png(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w
     dst.as_mut().draw_pixmap(
         0,
         0,
-        src.as_ref(),
+        pixmap.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         tiny_skia::Transform::from_row(
-            target_w as f32 / src.width() as f32,
+            target_w as f32 / pixmap.width() as f32,
             0.0,
             0.0,
-            target_h as f32 / src.height() as f32,
+            target_h as f32 / pixmap.height() as f32,
             0.0,
             0.0,
         ),
@@ -517,26 +524,38 @@ fn rasterize_png(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w
     Ok((dst, target_h, target_w))
 }
 
-fn rasterize_jpeg(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
-    let mut reader = ImageReader::new(Cursor::new(bytes));
-    reader.set_format(image::ImageFormat::Jpeg);
-    let result = reader.decode()?;
+fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+    let result = if let Some(cached) = cached_rasterizations.decoded_jpegs.get(src) {
+        cached
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(bytes));
+        reader.set_format(image::ImageFormat::Jpeg);
+        cached_rasterizations.decoded_jpegs.insert(src.clone(), reader.decode()?);
+        cached_rasterizations.decoded_jpegs.get(src).unwrap()
+    };
 
     let (mut target_h, mut target_w) = infer_image_size(Size { height: result.height(), width: result.width() }, input_w, input_h);
     (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
     (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
 
-    let result = result.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
-    let rgba = result.to_rgba8();
+    let key = (src.clone(), target_h, target_w);
+    let pixmap = if let Some(cached) = cached_rasterizations.jpegs.get(&key) {
+        cached
+    } else {
+        let result = result.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        let rgba = result.to_rgba8();
 
-    let width = rgba.width();
-    let height = rgba.height();
-    let pixmap = Pixmap::from_vec(
-        rgba.to_owned().into_raw(),
-        IntSize::from_wh(width, height).with_context(|| "Failed to create IntSize")?
-    ).with_context(|| "Failed to convert to pixmap")?;
+        let width = rgba.width();
+        let height = rgba.height();
+        let value = Pixmap::from_vec(
+            rgba.to_owned().into_raw(),
+            IntSize::from_wh(width, height).with_context(|| "Failed to create IntSize")?
+        ).with_context(|| "Failed to convert to pixmap")?;
+        cached_rasterizations.jpegs.insert(key.clone(), value);
+        cached_rasterizations.jpegs.get(&key).unwrap()
+    };
 
-    Ok((pixmap, target_h, target_w))
+    Ok((pixmap.clone(), target_h, target_w))
 }
 
 fn resolve_url(href: &str, base_url: Option<&ReqwestUrl>) -> Result<ReqwestUrl> {
@@ -651,14 +670,14 @@ fn compute_node_style(
     parent_variables: &HashMap<String, String>,
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
-    class_node_specificity: &HashMap<usize, [i32; 3]>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     window_size: &PhysicalSize<u32>,
+    css_node_ranking: &HashMap<usize, usize>,
 ) {
     let mut variables = parent_variables.clone();
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
     let mut style = match &nodes.get(&node_idx).unwrap() {
-        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, class_node_specificity, css_children_index).unwrap(),
+        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, css_children_index, css_node_ranking).unwrap(),
         node => get_base_style(node, parent_style),
     };
 
@@ -685,9 +704,9 @@ fn compute_node_style(
             &variables,
             Some(resolved_font_size as u32),
             collected_class_nodes,
-            class_node_specificity,
             css_children_index,
             window_size,
+            css_node_ranking,
         );
     }
 }
@@ -1093,6 +1112,63 @@ fn search_elements_for_css_nodes(
     (matches, specificity)
 }
 
+fn compute_css_node_ranking(raw_nodes: &Vec<CssNode>, class_node_specificity: &HashMap<usize, [i32; 3]>) -> HashMap<usize, usize> {
+    let nodes: Vec<(usize, &CssNode)> = raw_nodes.into_iter().enumerate().collect();
+    let node_idxs: Vec<&usize> = nodes.iter().map(|(idx, _)| idx).collect();
+    let mut chains = HashMap::new();
+    for idx in node_idxs.iter() {
+        let mut chain = vec![];
+        get_parent_chain(&nodes, **idx, &mut chain);
+        chains.insert(*idx, chain);
+    }
+    let mut sorted_idxs = node_idxs.clone();
+    sorted_idxs.sort_by(|a, b| {
+        let a_layer = get_parent_layer(&nodes, **a);
+        let b_layer = get_parent_layer(&nodes, **b);
+
+        let layer_ordering = a_layer.cmp(&b_layer);
+
+        if layer_ordering != Ordering::Equal {
+            return layer_ordering;
+        }
+
+        let a_important_score = match nodes[**a].1 {
+            CssNode::Property(property) => property.important as i32,
+            _ => 0i32,
+        };
+        let b_important_score = match nodes[**b].1 {
+            CssNode::Property(property) => property.important as i32,
+            _ => 0i32,
+        };
+
+        match a_important_score.cmp(&b_important_score) {
+            Ordering::Equal => {
+                let a_chain = chains.get(a).unwrap();
+                let b_chain = chains.get(b).unwrap();
+
+                let a_parent = if a_chain.len() >= 2 { Some(a_chain[1]) } else { None };
+                let b_parent = if b_chain.len() >= 2 { Some(b_chain[1]) } else { None };
+
+                let a_specificity = a_parent.and_then(|parent| class_node_specificity.get(&parent)).unwrap_or(&[0; 3]);
+                let b_specificity = b_parent.and_then(|parent| class_node_specificity.get(&parent)).unwrap_or(&[0; 3]);
+
+                let specificity_order = get_specificity_order(a_specificity, b_specificity);
+
+                match specificity_order {
+                    Ordering::Equal => get_chain_order(a_chain, b_chain),
+                    ordering => ordering
+                }
+            },
+            ordering => ordering,
+        }
+    });
+    sorted_idxs
+        .into_iter()
+        .enumerate()
+        .map(|(ranking, idx)| (idx.clone(), ranking))
+        .collect()
+}
+
 fn compute_node_styles(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
@@ -1111,6 +1187,9 @@ fn compute_node_styles(
     let (collected_class_nodes, class_node_specificity) = collect_class_nodes_for_elements(&parsed_css_nodes.iter().enumerate().collect(), &nodes, window_size, dom_indexes);
     println!("collect_class_nodes_for_elements took {}ms", Instant::now().duration_since(start).as_millis());
 
+    let start = Instant::now();
+    let css_node_ranking: HashMap<usize, usize> = compute_css_node_ranking(&parsed_css_nodes, &class_node_specificity);
+
     let mut node_styles = HashMap::new();
     let mut resolved_font_sizes = HashMap::new();
     compute_node_style(
@@ -1124,10 +1203,11 @@ fn compute_node_styles(
         &HashMap::new(),
         None,
         &collected_class_nodes,
-        &class_node_specificity,
         &css_children_index,
         window_size,
+        &css_node_ranking,
     );
+    println!("computing styles took {}ms", Instant::now().duration_since(start).as_millis());
     (node_styles, resolved_font_sizes)
 }
 
@@ -1740,6 +1820,23 @@ fn get_dom_indexes(html_nodes: &HashMap<usize, Node>) -> DomIndexes {
     }
 }
 
+#[derive(Debug)]
+struct CachedRasterizations {
+    decoded_pngs: HashMap<String, Pixmap>,
+    decoded_jpegs: HashMap<String, DynamicImage>,
+    jpegs: HashMap<(String, u32, u32), Pixmap>,
+}
+
+impl CachedRasterizations {
+    pub fn new() -> Self {
+        Self {
+            decoded_pngs: HashMap::new(),
+            decoded_jpegs: HashMap::new(),
+            jpegs: HashMap::new(),
+        }
+    }
+}
+
 impl Renderer {
     fn new(url: String, tokio: Rc<RefCell<tokio::runtime::Runtime>>, nodes_table: HashMap<usize, Node>, window_size: PhysicalSize<u32>, font_handler: Rc<FontHandler>, network_fetch: Rc<RefCell<NetworkFetch>>, dom_indexes: DomIndexes) -> Self {
         let request_cache = HashMap::new();
@@ -1782,6 +1879,7 @@ impl Renderer {
             dom_indexes,
             canvas_buffers: HashMap::new(),
             network_fetch,
+            cached_rasterizations: CachedRasterizations::new(),
         }
     }
 
@@ -2266,10 +2364,10 @@ impl Renderer {
                                 let img_data = self.tokio.clone().borrow_mut().block_on(self.get_img_src_data(src)).ok()?;
                                 let result = match img_data {
                                     RequestCacheEntry::PngData(bytes) => {
-                                        rasterize_png(&bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
+                                        rasterize_png(&mut self.cached_rasterizations, src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
                                     },
                                     RequestCacheEntry::JpegData(bytes) => {
-                                        rasterize_jpeg(&bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
+                                        rasterize_jpeg(&mut self.cached_rasterizations, &src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
                                     },
                                     RequestCacheEntry::SvgData(svg_data) => {
                                         let mut injected = svg_data.clone();

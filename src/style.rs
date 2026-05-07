@@ -733,10 +733,13 @@ fn apply_node_variables_dependencies(collected_variables: &mut HashMap<usize, St
     variable_dependence.remove(name.as_str());
 }
 
-fn order_variables(idxs: &Vec<&usize>, nodes: &[Node], class_node_specificity: &HashMap<usize, [i32; 3]>) -> Vec<usize> {
+fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &HashMap<usize, usize>) -> Vec<usize> {
     let mut idxs = idxs.clone();
-    let node_mapping: Vec<(usize, &Node)> = nodes.iter().enumerate().collect();
-    order_css_nodes(&mut idxs, &node_mapping, class_node_specificity);
+    idxs.sort_by(|a, b| {
+        let a_rank = css_node_ranking.get(&a).unwrap();
+        let b_rank = css_node_ranking.get(&b).unwrap();
+        a_rank.cmp(b_rank)
+    });
 
     idxs.into_iter().copied().collect()
 }
@@ -745,7 +748,7 @@ fn apply_node_variables(
     nodes: &Vec<(usize, Node)>,
     variables: &mut HashMap<String, String>,
     css_nodes: &Vec<Node>,
-    class_node_specificity: &HashMap<usize, [i32; 3]>,
+    css_node_ranking: &HashMap<usize, usize>,
 ) {
     let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
@@ -793,7 +796,7 @@ fn apply_node_variables(
         }
     }
     let unordered_collected_idxs = collected_variables.keys().collect::<Vec<&usize>>();
-    let ordered_idxs = order_variables(&unordered_collected_idxs, css_nodes, class_node_specificity);
+    let ordered_idxs = order_variables(&unordered_collected_idxs, css_node_ranking);
     for idx in ordered_idxs {
         let value = collected_variables.get(&idx).unwrap();
         let var = variables_to_parse.get(&idx).unwrap();
@@ -805,9 +808,9 @@ pub fn resolve_node_variables<'a>(
     nodes: &'a mut Vec<(usize, Node)>,
     variables: &mut HashMap<String, String>,
     css_nodes: &Vec<Node>,
-    class_node_specificity: &HashMap<usize, [i32; 3]>,
+    css_node_ranking: &HashMap<usize, usize>,
 ) -> Vec<&'a mut Property> {
-    apply_node_variables(nodes, variables, css_nodes, class_node_specificity);
+    apply_node_variables(nodes, variables, css_nodes, css_node_ranking);
 
     let properties = nodes
         .iter_mut()
@@ -1178,7 +1181,6 @@ fn apply_parsed_border_side(side: &mut StyleSizeAndColor, value: BorderSideValue
 }
 
 pub fn apply_style_property(
-    element: &HtmlElement,
     style: &mut Style,
     property: &Property,
 ) -> Result<()> {
@@ -1423,7 +1425,7 @@ pub fn apply_style_property(
     Ok(())
 }
 
-fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Vec<usize>) {
+pub fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Vec<usize>) {
     let node = nodes[node_idx].1;
     chain.push(node_idx);
     if let Some(parent) = node.get_parent() {
@@ -1434,7 +1436,7 @@ fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Ve
     }
 }
 
-fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usize> {
+pub fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usize> {
     let node = nodes[node_idx].1;
     if let Some(parent) = node.get_parent() {
         if let Node::Layer(_) = nodes[parent].1 {
@@ -1446,7 +1448,7 @@ fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usiz
     None
 }
 
-fn get_specificity_order(a_specificity: &[i32; 3], b_specificity: &[i32; 3]) -> Ordering {
+pub fn get_specificity_order(a_specificity: &[i32; 3], b_specificity: &[i32; 3]) -> Ordering {
     for idx in 0usize..3usize {
         if a_specificity[idx] > b_specificity[idx] {
             return Ordering::Greater; 
@@ -1458,7 +1460,7 @@ fn get_specificity_order(a_specificity: &[i32; 3], b_specificity: &[i32; 3]) -> 
     Ordering::Equal
 }
 
-fn get_chain_order(a_chain: &Vec<usize>, b_chain: &Vec<usize>) -> Ordering {
+pub fn get_chain_order(a_chain: &Vec<usize>, b_chain: &Vec<usize>) -> Ordering {
     // At first parent which is different, compare and order ascending
     for (a, b) in a_chain.iter().rev().zip(b_chain.iter().rev()) {
         if a != b {
@@ -1469,61 +1471,6 @@ fn get_chain_order(a_chain: &Vec<usize>, b_chain: &Vec<usize>) -> Ordering {
     Ordering::Equal
 }
 
-// TODO: Could maybe sort everything once rather than per-style
-fn order_css_nodes(
-    node_idxs: &mut Vec<&usize>,
-    nodes: &Vec<(usize, &Node)>,
-    class_node_specificity: &HashMap<usize, [i32; 3]>,
-) {
-    let mut chains = HashMap::new();
-    for idx in node_idxs.iter() {
-        let mut chain = vec![];
-        get_parent_chain(nodes, **idx, &mut chain);
-        chains.insert(*idx, chain);
-    }
-
-    node_idxs.sort_by(|a, b| {
-        let a_layer = get_parent_layer(nodes, **a);
-        let b_layer = get_parent_layer(nodes, **b);
-
-        let layer_ordering = a_layer.cmp(&b_layer);
-
-        if layer_ordering != Ordering::Equal {
-            return layer_ordering;
-        }
-
-        let a_important_score = match nodes[**a].1 {
-            Node::Property(property) => property.important as i32,
-            _ => 0i32,
-        };
-        let b_important_score = match nodes[**b].1 {
-            Node::Property(property) => property.important as i32,
-            _ => 0i32,
-        };
-
-        match a_important_score.cmp(&b_important_score) {
-            Ordering::Equal => {
-                let a_chain = chains.get(*a).unwrap();
-                let b_chain = chains.get(*b).unwrap();
-
-                let a_parent = if a_chain.len() >= 2 { Some(a_chain[1]) } else { None };
-                let b_parent = if b_chain.len() >= 2 { Some(b_chain[1]) } else { None };
-
-                let a_specificity = a_parent.and_then(|parent| class_node_specificity.get(&parent)).unwrap_or(&[0; 3]);
-                let b_specificity = b_parent.and_then(|parent| class_node_specificity.get(&parent)).unwrap_or(&[0; 3]);
-
-                let specificity_order = get_specificity_order(a_specificity, b_specificity);
-
-                match specificity_order {
-                    Ordering::Equal => get_chain_order(a_chain, b_chain),
-                    ordering => ordering
-                }
-            },
-            ordering => ordering,
-        }
-    })
-}
-
 pub fn parse_style(
     node_idx: usize,
     element: &HtmlElement,
@@ -1531,8 +1478,8 @@ pub fn parse_style(
     parent_style: Option<&Style>,
     parent_variables: &mut HashMap<String, String>,
     collected_css_nodes: &HashMap<usize, Vec<usize>>,
-    class_node_specificity: &HashMap<usize, [i32; 3]>,
     css_children_index: &HashMap<usize, Vec<usize>>,
+    css_node_ranking: &HashMap<usize, usize>,
 ) -> Result<Style> {
     let mut style = get_base_style(&HtmlNode::Element(element.clone()), parent_style);
     let inline_nodes = get_inline_nodes(&element)?;
@@ -1550,17 +1497,21 @@ pub fn parse_style(
             }
         }
     }
-    order_css_nodes(&mut applicable_class_properties, &css_nodes.iter().enumerate().collect(), class_node_specificity);
+    applicable_class_properties.sort_by(|a, b| {
+        let a_rank = css_node_ranking.get(&a).unwrap();
+        let b_rank = css_node_ranking.get(&b).unwrap();
+        a_rank.cmp(b_rank)
+    });
     let mut nodes: Vec<(usize, Node)> = applicable_class_properties
         .iter()
         .map(|idx| (**idx, css_nodes[**idx].clone()))
         .collect();
     // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
     nodes.append(&mut inline_nodes.into_iter().map(|node| (usize::MAX, node)).collect());
-    let properties = resolve_node_variables(&mut nodes, parent_variables, css_nodes, class_node_specificity);
+    let properties = resolve_node_variables(&mut nodes, parent_variables, css_nodes, css_node_ranking);
     style.variables = parent_variables.clone();
     for property in properties {
-        if let Err(result) = apply_style_property(&element, &mut style, &property) {
+        if let Err(result) = apply_style_property(&mut style, &property) {
             println!(
                 "Failed to apply property {:?} due to: {:?}",
                 property, result
