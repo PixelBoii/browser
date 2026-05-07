@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
-use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Property, PropertyValue, StyleComplexBackground, Variable, unquote};
+use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, unquote};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +166,7 @@ pub struct Style {
     pub border_right: StyleSizeAndColor,
     pub border_bottom: StyleSizeAndColor,
     pub grid_template_columns: GridTemplateColumns,
+    pub overflow: Overflow,
 }
 
 pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
@@ -306,6 +307,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
         border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
         grid_template_columns: GridTemplateColumns::None,
+        overflow: Overflow::Visible,
     }
 }
 
@@ -992,6 +994,14 @@ fn parse_grid_template_columns_inner_value(value: String) -> Result<GridTemplate
     }
 }
 
+fn parse_overflow(value: String) -> Result<PropertyValue> {
+    match value.as_str() {
+        "hidden" => Ok(PropertyValue::Overflow(Overflow::Hidden)),
+        "visible" => Ok(PropertyValue::Overflow(Overflow::Visible)),
+        _ => Err(anyhow!("Failed to parse overflow value: {}", value))
+    }
+}
+
 fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
     let parts: Vec<String> = split_ignoring_parentheses(value, ' ', &[]);
     // TODO: Also support minmax etc. here
@@ -1147,6 +1157,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "border-left" | "border-top" | "border-right" | "border-bottom" | "border" =>
             PropertyValue::BorderSide(parse_border_side_value(value)?),
         "grid-template-columns" => parse_grid_template_columns_value(value)?,
+        "overflow" => parse_overflow(value)?,
         _ => {
             // println!("Failed to parse style \"{}\"", property);
             PropertyValue::Raw(value)
@@ -1400,6 +1411,9 @@ pub fn apply_style_property(
         }
         ("grid-template-columns", PropertyValue::GridTemplateColumns(columns)) => {
             style.grid_template_columns = columns;
+        },
+        ("overflow", PropertyValue::Overflow(overflow)) => {
+            style.overflow = overflow;
         },
         (_, PropertyValue::Raw(_)) => {}
         (_, value) => {

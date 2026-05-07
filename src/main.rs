@@ -38,7 +38,7 @@ use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 
-use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, PseudoClass, parse_media_query_parts, selector_to_parts};
+use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, Overflow, PseudoClass, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
 use crate::parser::{CommentElement, TextElement};
 use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, element_matched_attributes, get_class_list, media_query_matches};
@@ -127,6 +127,7 @@ struct LayoutBox {
     kind: LayoutKind,
     children: Vec<usize>,
     node_idx: usize,
+    allow_overflow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1843,6 +1844,35 @@ impl Renderer {
         scripts
     }
 
+    fn apply_overflow_constraints_inner(&mut self, layout_box_id: usize, mut overflow_box: Option<(u32, u32, u32, u32)>) {
+        let layout_box = self.layout_table.get_mut(&layout_box_id).unwrap();
+
+        if let Some((start_x, start_y, end_x, end_y)) = overflow_box {
+            layout_box.rect.x = layout_box.rect.x.max(start_x as i32);
+            layout_box.rect.y = layout_box.rect.y.max(start_y as i32);
+            let target_end_x = layout_box.rect.x + layout_box.rect.width as i32;
+            let overflow_right = target_end_x - end_x as i32;
+            layout_box.rect.width = layout_box.rect.width.saturating_sub_signed(overflow_right.max(0));
+            let target_end_y = layout_box.rect.y + layout_box.rect.height as i32;
+            let overflow_bottom = target_end_y - end_y as i32;
+            layout_box.rect.height = layout_box.rect.height.saturating_sub_signed(overflow_bottom.max(0));
+        }
+
+        if !layout_box.allow_overflow {
+            let rect = &layout_box.rect;
+            overflow_box = Some((rect.x as u32, rect.y as u32, (rect.x + rect.width as i32) as u32, (rect.y + rect.height as i32) as u32));
+        }
+
+        for child in layout_box.children.clone() {
+            self.apply_overflow_constraints_inner(child, overflow_box);
+        }
+    }
+
+    fn apply_overflow_constraints(&mut self) {
+        for l in self.layout_roots.clone() {
+            self.apply_overflow_constraints_inner(l, None);
+        }
+    }
 
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
         if width == 0 || height == 0 {
@@ -1853,6 +1883,7 @@ impl Renderer {
 
         if rebuild_layout {
             self.layout_roots = self.build_layout(width, height);
+            self.apply_overflow_constraints();
         }
         let mut new_rendered_nodes_ordered = vec![];
         for layout_box_idx in self.layout_roots.iter() {
@@ -2172,6 +2203,7 @@ impl Renderer {
                     kind: LayoutKind::Text(renderable_text),
                     children: vec![],
                     node_idx,
+                    allow_overflow: style.overflow == Overflow::Visible,
                 }, save_as_final))
             }
             Node::Element(element) => {
@@ -2273,6 +2305,7 @@ impl Renderer {
                         kind: LayoutKind::PixMap(pixmap),
                         children: vec![],
                         node_idx,
+                        allow_overflow: style.overflow == Overflow::Visible,
                     }, save_as_final))
                 } else {
                     let layout = match style.display {
@@ -2337,6 +2370,7 @@ impl Renderer {
                             kind: LayoutKind::Element,
                             children,
                             node_idx,
+                            allow_overflow: style.overflow == Overflow::Visible,
                         }, save_as_final))
                     } else {
                         None
@@ -2506,6 +2540,7 @@ impl Renderer {
             kind: LayoutKind::Text(renderable_text),
             children: vec![],
             node_idx,
+            allow_overflow: style.overflow == Overflow::Visible,
         }, save_as_final);
         Ok(layout_box)
     }
@@ -3277,17 +3312,18 @@ impl Renderer {
         pixmap_buffer: &tiny_skia::Pixmap
     ) {
         let pixels = pixmap_buffer.pixels();
-        let pixmap_width = pixmap_buffer.width();
-        let pixmap_height = pixmap_buffer.height();
+        let pixmap_width = layout_box.rect.width.min(pixmap_buffer.width());
+        let pixmap_height = layout_box.rect.height.min(pixmap_buffer.height());
         let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
-        let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
+        let end_y = pixmap_height.min(height);
         for pixel_x in 0..end_x {
             for pixel_y in 0..end_y {
                 let pixel = pixels[(pixel_x + pixel_y * pixmap_width) as usize];
                 let dist = container_start_y * width as i32
                     + layout_box.rect.x
-                    + (pixel_x as i32 + pixel_y as i32 * width as i32);
-                if dist > 0 {
+                    + pixel_x as i32
+                    + pixel_y as i32 * width as i32;
+                if dist > 0 && dist < buffer.len() as i32 {
                     buffer[dist as usize] = self.blend_premul_over_rgb(buffer[dist as usize], pixel);
                 }
             }
@@ -4464,7 +4500,7 @@ fn draw_rect_filled(
 mod tests {
     use super::clamp_with_ratio;
 
-    use crate::css::{CssParser, Node as CssNode};
+    use crate::css::{CssParser, Node as CssNode, Overflow};
     use crate::parser::Element;
     use crate::style::{
         GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, parse_style
@@ -4578,6 +4614,7 @@ mod tests {
                 border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
                 border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
                 grid_template_columns: GridTemplateColumns::None,
+                overflow: Overflow::Visible,
             },
             parsed
         );

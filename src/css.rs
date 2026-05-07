@@ -83,6 +83,12 @@ pub struct StyleComplexBackground {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Overflow {
+    Hidden,
+    Visible,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum PropertyValue {
     Raw(String),
     Size(StyleSize),
@@ -105,6 +111,7 @@ pub enum PropertyValue {
     HorizontalCombinedSize((StyleSize, StyleSize)),
     GridTemplateColumns(GridTemplateColumns),
     ComplexBackground(StyleComplexBackground),
+    Overflow(Overflow),
 }
 
 #[derive(Debug, Clone)]
