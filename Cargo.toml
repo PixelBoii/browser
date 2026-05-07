@@ -25,3 +25,4 @@ deno_permissions = "=0.104.0"
 rustls = { version = "=0.23.28", default-features = false, features = ["logging", "std", "tls12", "aws_lc_rs"] }
 sys_traits = { version = "=0.1.27", features = ["libc", "real"] }
 deno_crypto = "=0.259.0"
+image = "0.25.10"

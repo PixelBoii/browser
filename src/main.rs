@@ -4,9 +4,10 @@ mod style;
 mod loader;
 
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
+use image::{ImageReader};
 use parser::{Element, HtmlParser, Node};
 use reqwest::cookie::{CookieStore, Jar};
-use resvg::tiny_skia::IntSize;
+use resvg::tiny_skia::{IntSize, Pixmap};
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
     StyleSize, get_base_style, parse_style,
@@ -15,6 +16,7 @@ use style::{
 use std::cell::{RefCell};
 use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
+use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -132,6 +134,7 @@ enum RequestCacheEntry {
     PngData(Bytes),
     SvgData(String),
     CssData(String),
+    JpegData(Bytes),
     Unsupported,
 }
 
@@ -511,6 +514,28 @@ fn rasterize_png(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w
     );
 
     Ok((dst, target_h, target_w))
+}
+
+fn rasterize_jpeg(bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+    let mut reader = ImageReader::new(Cursor::new(bytes));
+    reader.set_format(image::ImageFormat::Jpeg);
+    let result = reader.decode()?;
+
+    let (mut target_h, mut target_w) = infer_image_size(Size { height: result.height(), width: result.width() }, input_w, input_h);
+    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+
+    let result = result.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
+    let rgba = result.to_rgba8();
+
+    let width = rgba.width();
+    let height = rgba.height();
+    let pixmap = Pixmap::from_vec(
+        rgba.to_owned().into_raw(),
+        IntSize::from_wh(width, height).with_context(|| "Failed to create IntSize")?
+    ).with_context(|| "Failed to convert to pixmap")?;
+
+    Ok((pixmap, target_h, target_w))
 }
 
 fn resolve_url(href: &str, base_url: Option<&ReqwestUrl>) -> Result<ReqwestUrl> {
@@ -1850,6 +1875,8 @@ impl Renderer {
             Some("image/png")
         } else if src.ends_with(".svg") {
             Some("image/svg+xml")
+        } else if src.ends_with(".jpg") || src.ends_with(".jpeg") {
+            Some("image/jpeg")
         } else {
             None
         }
@@ -1878,6 +1905,7 @@ impl Renderer {
             match content_type {
                 "image/png" => Ok(RequestCacheEntry::PngData(resp.bytes().await?)),
                 "image/svg+xml" => Ok(RequestCacheEntry::SvgData(resp.text().await?)),
+                "image/jpeg" => Ok(RequestCacheEntry::JpegData(resp.bytes().await?)),
                 content_type => Err(anyhow!("Failed to handle image content-type: {}", content_type)),
             }
         }.await;
@@ -2207,6 +2235,9 @@ impl Renderer {
                                 let result = match img_data {
                                     RequestCacheEntry::PngData(bytes) => {
                                         rasterize_png(&bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
+                                    },
+                                    RequestCacheEntry::JpegData(bytes) => {
+                                        rasterize_jpeg(&bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
                                     },
                                     RequestCacheEntry::SvgData(svg_data) => {
                                         let mut injected = svg_data.clone();
@@ -4174,9 +4205,9 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    // let mut browser = Browser::new("https://vite.dev".to_string());
+    let mut browser = Browser::new("https://vite.dev".to_string());
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
+    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string());
 
     if dump_tree {
         browser.dump_tree()
