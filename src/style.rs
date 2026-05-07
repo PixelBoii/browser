@@ -733,12 +733,12 @@ fn apply_node_variables_dependencies(collected_variables: &mut HashMap<usize, St
     variable_dependence.remove(name.as_str());
 }
 
-fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &HashMap<usize, usize>) -> Vec<usize> {
+fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &[usize]) -> Vec<usize> {
     let mut idxs = idxs.clone();
     idxs.sort_by(|a, b| {
-        let a_rank = css_node_ranking.get(&a).unwrap();
-        let b_rank = css_node_ranking.get(&b).unwrap();
-        a_rank.cmp(b_rank)
+        let a_rank = css_node_ranking[**a];
+        let b_rank = css_node_ranking[**b];
+        a_rank.cmp(&b_rank)
     });
 
     idxs.into_iter().copied().collect()
@@ -748,7 +748,7 @@ fn apply_node_variables(
     nodes: &Vec<(usize, Node)>,
     variables: &mut HashMap<String, String>,
     css_nodes: &Vec<Node>,
-    css_node_ranking: &HashMap<usize, usize>,
+    css_node_ranking: &[usize],
 ) {
     let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
@@ -808,7 +808,7 @@ pub fn resolve_node_variables<'a>(
     nodes: &'a mut Vec<(usize, Node)>,
     variables: &mut HashMap<String, String>,
     css_nodes: &Vec<Node>,
-    css_node_ranking: &HashMap<usize, usize>,
+    css_node_ranking: &[usize],
 ) -> Vec<&'a mut Property> {
     apply_node_variables(nodes, variables, css_nodes, css_node_ranking);
 
@@ -853,7 +853,8 @@ mod tests {
         let mut already_resolved = HashMap::new();
         already_resolved.insert("--test".to_string(), "16px".to_string());
         let mut nodes_to_parse = nodes.clone().into_iter().enumerate().collect();
-        let properties = resolve_node_variables(&mut nodes_to_parse, &mut already_resolved, &nodes, &HashMap::new());
+        let css_node_ranking = vec![0; nodes.len()];
+        let properties = resolve_node_variables(&mut nodes_to_parse, &mut already_resolved, &nodes, &css_node_ranking);
 
         assert_eq!(
             properties[0].value,
@@ -1479,7 +1480,7 @@ pub fn parse_style(
     parent_variables: &mut HashMap<String, String>,
     collected_css_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
-    css_node_ranking: &HashMap<usize, usize>,
+    css_node_ranking: &[usize],
 ) -> Result<Style> {
     let mut style = get_base_style(&HtmlNode::Element(element.clone()), parent_style);
     let inline_nodes = get_inline_nodes(&element)?;
@@ -1498,10 +1499,11 @@ pub fn parse_style(
         }
     }
     applicable_class_properties.sort_by(|a, b| {
-        let a_rank = css_node_ranking.get(&a).unwrap();
-        let b_rank = css_node_ranking.get(&b).unwrap();
-        a_rank.cmp(b_rank)
+        let a_rank = css_node_ranking[**a];
+        let b_rank = css_node_ranking[**b];
+        a_rank.cmp(&b_rank)
     });
+
     let mut nodes: Vec<(usize, Node)> = applicable_class_properties
         .iter()
         .map(|idx| (**idx, css_nodes[**idx].clone()))

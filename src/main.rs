@@ -672,7 +672,7 @@ fn compute_node_style(
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     window_size: &PhysicalSize<u32>,
-    css_node_ranking: &HashMap<usize, usize>,
+    css_node_ranking: &[usize],
 ) {
     let mut variables = parent_variables.clone();
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
@@ -1112,7 +1112,7 @@ fn search_elements_for_css_nodes(
     (matches, specificity)
 }
 
-fn compute_css_node_ranking(raw_nodes: &Vec<CssNode>, class_node_specificity: &HashMap<usize, [i32; 3]>) -> HashMap<usize, usize> {
+fn compute_css_node_ranking(raw_nodes: &Vec<CssNode>, class_node_specificity: &HashMap<usize, [i32; 3]>) -> Vec<usize> {
     let nodes: Vec<(usize, &CssNode)> = raw_nodes.into_iter().enumerate().collect();
     let node_idxs: Vec<&usize> = nodes.iter().map(|(idx, _)| idx).collect();
     let mut chains = HashMap::new();
@@ -1162,11 +1162,11 @@ fn compute_css_node_ranking(raw_nodes: &Vec<CssNode>, class_node_specificity: &H
             ordering => ordering,
         }
     });
-    sorted_idxs
-        .into_iter()
-        .enumerate()
-        .map(|(ranking, idx)| (idx.clone(), ranking))
-        .collect()
+    let mut rankings = vec![0; raw_nodes.len()];
+    for (ranking, idx) in sorted_idxs.into_iter().enumerate() {
+        rankings[*idx] = ranking;
+    }
+    rankings
 }
 
 fn compute_node_styles(
@@ -1188,7 +1188,7 @@ fn compute_node_styles(
     println!("collect_class_nodes_for_elements took {}ms", Instant::now().duration_since(start).as_millis());
 
     let start = Instant::now();
-    let css_node_ranking: HashMap<usize, usize> = compute_css_node_ranking(&parsed_css_nodes, &class_node_specificity);
+    let css_node_ranking = compute_css_node_ranking(&parsed_css_nodes, &class_node_specificity);
 
     let mut node_styles = HashMap::new();
     let mut resolved_font_sizes = HashMap::new();
@@ -4670,7 +4670,7 @@ mod tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
+            &[],
         )?;
 
         assert_eq!(
