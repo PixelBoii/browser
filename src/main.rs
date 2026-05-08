@@ -42,7 +42,7 @@ use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use crate::css::{ClassName, ClassNamePart, CssParser, MediaQuery, Node as CssNode, Overflow, PseudoClass, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
 use crate::parser::{CommentElement, TextElement};
-use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, build_css_children_index, element_matched_attributes, get_chain_order, get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches};
+use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, StyleZIndex, build_css_children_index, element_matched_attributes, get_chain_order, get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
@@ -129,6 +129,7 @@ struct LayoutBox {
     children: Vec<usize>,
     node_idx: usize,
     allow_overflow: bool,
+    z_index: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -2320,6 +2321,7 @@ impl Renderer {
                     children: vec![],
                     node_idx,
                     allow_overflow: style.overflow == Overflow::Visible,
+                    z_index: 0,
                 }, save_as_final))
             }
             Node::Element(element) => {
@@ -2428,6 +2430,7 @@ impl Renderer {
                         children: vec![],
                         node_idx,
                         allow_overflow: style.overflow == Overflow::Visible,
+                        z_index: 0,
                     }, save_as_final))
                 } else {
                     let layout = match self.node_styles.get(&node_idx).unwrap().display {
@@ -2464,7 +2467,7 @@ impl Renderer {
                         StyleDisplay::None => None,
                     };
 
-                    if let Some((width, height, children)) = layout {
+                    if let Some((width, height, mut children)) = layout {
                         let style = self.node_styles.get(&node_idx).unwrap();
                         let style_bg = style.background.clone();
                         let style_color = style.color.clone();
@@ -2475,12 +2478,22 @@ impl Renderer {
                             right: RectBorderSide::parse_from_style(&style.border_right, resolved_font_size as u32, &available_size, &self.window_size),
                             bottom: RectBorderSide::parse_from_style(&style.border_bottom, resolved_font_size as u32, &available_size, &self.window_size),
                         };
+                        let z_index = match style.z_index {
+                            StyleZIndex::Auto => 0,
+                            StyleZIndex::Number(value) => value,
+                        };
 
                         if let StyleBackground::DataUrl((format, data)) = &style_bg {
                             let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
                             let _ = self.resolve_background_data_url(node_idx, format, data, &container_size, mode)
                                 .inspect_err(|err| eprintln!("An error occured while resolving background data url: {}", err));
                         }
+
+                        children.sort_by(|a, b| {
+                            let a_z = self.layout_table.get(a).unwrap().z_index;
+                            let b_z = self.layout_table.get(b).unwrap().z_index;
+                            a_z.cmp(&b_z)
+                        });
 
                         Some(self.register_layout_box(LayoutBox {
                             rect: Rect {
@@ -2497,6 +2510,7 @@ impl Renderer {
                             children,
                             node_idx,
                             allow_overflow,
+                            z_index,
                         }, save_as_final))
                     } else {
                         None
@@ -2668,6 +2682,7 @@ impl Renderer {
             children: vec![],
             node_idx,
             allow_overflow: style.overflow == Overflow::Visible,
+            z_index: 0,
         }, save_as_final);
         Ok(layout_box)
     }
@@ -2819,7 +2834,7 @@ impl Renderer {
                 children.push(child);
             }
         }
-        let content_height = (content_position.y - original_content_position.y).max(max_child_height);
+        let content_height = (content_position.y + max_child_height) - original_content_position.y;
         let height = specified_height
             .unwrap_or(content_height as u32)
             .min(container_sizes.max_height.unwrap_or(u32::MAX))
@@ -4643,7 +4658,7 @@ mod tests {
     use crate::css::{CssParser, Node as CssNode, Overflow};
     use crate::parser::Element;
     use crate::style::{
-        GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, parse_style
+        GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, StyleZIndex, parse_style
     };
     use crate::{FontHandler, HtmlParser, NetworkFetch, Renderer, get_dom_indexes};
     use anyhow::{Context, Result};
@@ -4755,6 +4770,7 @@ mod tests {
                 border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
                 grid_template_columns: GridTemplateColumns::None,
                 overflow: Overflow::Visible,
+                z_index: StyleZIndex::Auto,
             },
             parsed
         );

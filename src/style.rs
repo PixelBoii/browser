@@ -129,6 +129,12 @@ pub enum GridTemplateColumns {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StyleZIndex {
+    Number(i32),
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     pub width: StyleSize,
     pub height: StyleSize,
@@ -168,6 +174,7 @@ pub struct Style {
     pub border_bottom: StyleSizeAndColor,
     pub grid_template_columns: GridTemplateColumns,
     pub overflow: Overflow,
+    pub z_index: StyleZIndex,
 }
 
 impl Style {
@@ -211,6 +218,7 @@ impl Style {
             border_bottom: self.border_bottom.clone(),
             grid_template_columns: self.grid_template_columns.clone(),
             overflow: self.overflow.clone(),
+            z_index: self.z_index.clone(),
         }
     }
 }
@@ -354,7 +362,20 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
         grid_template_columns: GridTemplateColumns::None,
         overflow: Overflow::Visible,
+        z_index: StyleZIndex::Auto
     }
+}
+
+fn parse_z_index(value: String) -> Result<StyleZIndex> {
+    if value == "auto" {
+        return Ok(StyleZIndex::Auto);
+    }
+
+    if let Ok(parsed) = value.parse::<i32>() {
+        return Ok(StyleZIndex::Number(parsed));
+    }
+
+    Err(anyhow!("Failed to parse z-index: {}", value))
 }
 
 fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
@@ -1245,6 +1266,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             PropertyValue::BorderSide(parse_border_side_value(value)?),
         "grid-template-columns" => parse_grid_template_columns_value(value)?,
         "overflow" => parse_overflow(value)?,
+        "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
         _ => {
             // println!("Failed to parse style \"{}\"", property);
             PropertyValue::Raw(value)
@@ -1500,6 +1522,9 @@ pub fn apply_style_property(
         },
         ("overflow", PropertyValue::Overflow(overflow)) => {
             style.overflow = overflow;
+        },
+        ("z-index", PropertyValue::ZIndex(value)) => {
+            style.z_index = value;
         },
         (_, PropertyValue::Raw(_)) => {}
         (_, value) => {
