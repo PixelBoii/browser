@@ -667,17 +667,16 @@ fn compute_node_style(
     children_index: &HashMap<usize, Vec<usize>>,
     css_nodes: &Vec<CssNode>,
     parent_style: Option<usize>,
-    parent_variables: &HashMap<String, String>,
+    parent_variables: &Rc<HashMap<String, String>>,
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     window_size: &PhysicalSize<u32>,
     css_node_ranking: &[usize],
 ) {
-    let mut variables = parent_variables.clone();
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
     let mut style = match &nodes.get(&node_idx).unwrap() {
-        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, &mut variables, collected_class_nodes, css_children_index, css_node_ranking).unwrap(),
+        Node::Element(element) => parse_style(node_idx, element, css_nodes, parent_style, parent_variables, collected_class_nodes, css_children_index, css_node_ranking).unwrap(),
         node => get_base_style(node, parent_style),
     };
 
@@ -690,6 +689,8 @@ fn compute_node_style(
     // Set to resolved size in px so that ems dont stack on top of each other
     style.font_size = StyleSize::Px(resolved_font_size as f32);
 
+    let resolved_variables = Rc::clone(&style.variables);
+
     node_styles.insert(node_idx, style);
 
     for child_idx in children_index.get(&node_idx).unwrap().iter() {
@@ -701,7 +702,7 @@ fn compute_node_style(
             children_index,
             css_nodes,
             Some(node_idx),
-            &variables,
+            &resolved_variables,
             Some(resolved_font_size as u32),
             collected_class_nodes,
             css_children_index,
@@ -1200,7 +1201,7 @@ fn compute_node_styles(
         &dom_indexes.children_index,
         &parsed_css_nodes,
         None,
-        &HashMap::new(),
+        &Rc::new(HashMap::new()),
         None,
         &collected_class_nodes,
         &css_children_index,
@@ -4673,7 +4674,7 @@ mod tests {
             },
             &vec![],
             None,
-            &mut HashMap::new(),
+            &Rc::new(HashMap::new()),
             &mut HashMap::new(),
             &HashMap::new(),
             &[],
@@ -4710,7 +4711,7 @@ mod tests {
                 max_width: StyleSize::Auto,
                 position: StylePosition::Static,
                 text_align: StyleAlign::Left,
-                variables: HashMap::new(),
+                variables: Rc::new(HashMap::new()),
                 font_size: StyleSize::Px(16.),
                 align_self: StyleJustifyContent::Auto,
                 border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },

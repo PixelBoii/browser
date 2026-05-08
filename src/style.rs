@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
@@ -158,7 +159,7 @@ pub struct Style {
     pub top: StyleSize,
     pub bottom: StyleSize,
     pub text_align: StyleAlign,
-    pub variables: HashMap<String, String>,
+    pub variables: Rc<HashMap<String, String>>,
     pub font_size: StyleSize,
     pub align_self: StyleJustifyContent,
     pub border_left: StyleSizeAndColor,
@@ -201,7 +202,7 @@ impl Style {
             top: self.top.clone(),
             bottom: self.bottom.clone(),
             text_align: self.text_align,
-            variables: HashMap::new(),
+            variables: Rc::new(HashMap::new()),
             font_size: self.font_size.clone(),
             align_self: self.align_self,
             border_left: self.border_left.clone(),
@@ -340,7 +341,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             }
             HtmlNode::Text(_) | HtmlNode::Comment(_) => implied_text_align,
         },
-        variables: HashMap::new(),
+        variables: Rc::new(HashMap::new()),
         font_size: parent_style
             .clone()
             .and_then(|v| Some(v.font_size.clone()))
@@ -791,10 +792,10 @@ fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &[usize]) -> Vec<usize>
 
 fn apply_node_variables(
     nodes: &Vec<(usize, Node)>,
-    variables: &mut HashMap<String, String>,
+    variables: &Rc<HashMap<String, String>>,
     css_nodes: &Vec<Node>,
     css_node_ranking: &[usize],
-) {
+) -> Rc<HashMap<String, String>> {
     let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
         .filter_map(|(idx, node)| match node {
@@ -840,29 +841,34 @@ fn apply_node_variables(
             apply_node_variables_dependencies(&mut collected_variables, css_nodes, &mut variable_dependence, idx, resolved.clone());
         }
     }
+    if collected_variables.len() == 0 {
+        return Rc::clone(variables);
+    }
     let unordered_collected_idxs = collected_variables.keys().collect::<Vec<&usize>>();
     let ordered_idxs = order_variables(&unordered_collected_idxs, css_node_ranking);
+    let mut new_variables = (**variables).clone();
     for idx in ordered_idxs {
         let value = collected_variables.get(&idx).unwrap();
         let var = variables_to_parse.get(&idx).unwrap();
-        variables.insert(var.variable.clone(), value.to_string());
+        new_variables.insert(var.variable.clone(), value.to_string());
     }
+    Rc::new(new_variables)
 }
 
 pub fn resolve_node_variables<'a>(
     nodes: &'a mut Vec<(usize, Node)>,
-    variables: &mut HashMap<String, String>,
+    variables: &Rc<HashMap<String, String>>,
     css_nodes: &Vec<Node>,
     css_node_ranking: &[usize],
-) -> Vec<&'a mut Property> {
-    apply_node_variables(nodes, variables, css_nodes, css_node_ranking);
+) -> (Vec<&'a mut Property>, Rc<HashMap<String, String>>) {
+    let resolved_variables = apply_node_variables(nodes, variables, css_nodes, css_node_ranking);
 
     let properties = nodes
         .iter_mut()
         .filter_map(|(_, node)| match node {
             Node::Property(property) => {
                 if let PropertyValue::Raw(value) = &property.value {
-                    let value = resolve_variable_value(value, variables);
+                    let value = resolve_variable_value(value, &resolved_variables);
                     if let Ok((parsed, _)) = parse_property_value(property.property.clone(), value) {
                         property.value = parsed;
                     }
@@ -873,12 +879,12 @@ pub fn resolve_node_variables<'a>(
         })
         .collect();
 
-    properties
+    (properties, resolved_variables)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, rc::Rc};
 
     use crate::css::{Node, Property, PropertyValue, Variable};
 
@@ -899,7 +905,7 @@ mod tests {
         already_resolved.insert("--test".to_string(), "16px".to_string());
         let mut nodes_to_parse = nodes.clone().into_iter().enumerate().collect();
         let css_node_ranking = vec![0; nodes.len()];
-        let properties = resolve_node_variables(&mut nodes_to_parse, &mut already_resolved, &nodes, &css_node_ranking);
+        let (properties, _) = resolve_node_variables(&mut nodes_to_parse, &mut Rc::new(already_resolved), &nodes, &css_node_ranking);
 
         assert_eq!(
             properties[0].value,
@@ -1522,7 +1528,7 @@ pub fn parse_style(
     element: &HtmlElement,
     css_nodes: &Vec<Node>,
     parent_style: Option<&Style>,
-    parent_variables: &mut HashMap<String, String>,
+    parent_variables: &Rc<HashMap<String, String>>,
     collected_css_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     css_node_ranking: &[usize],
@@ -1555,8 +1561,8 @@ pub fn parse_style(
         .collect();
     // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
     nodes.append(&mut inline_nodes.into_iter().map(|node| (usize::MAX, node)).collect());
-    let properties = resolve_node_variables(&mut nodes, parent_variables, css_nodes, css_node_ranking);
-    style.variables = parent_variables.clone();
+    let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_nodes, css_node_ranking);
+    style.variables = resolved_variables;
     for property in properties {
         if let Err(result) = apply_style_property(&mut style, &property) {
             println!(
