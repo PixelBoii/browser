@@ -3928,8 +3928,9 @@ impl Browser {
         });
         self.setup_js_dom()?;
 
+        let start = Instant::now();
         let js_result = self.run_js();
-        println!("Finished running JS code: {:?}", js_result);
+        println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
 
         self.pump_js_event_loop_once()?;
 
@@ -4125,8 +4126,9 @@ impl Browser {
 
         if self.renderer.is_some() {
             self.setup_js_dom()?;
+            let start = Instant::now();
             let js_result = self.run_js();
-            println!("Finished running JS code: {:?}", js_result);
+            println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
         }
         if let Some(window) = self.window.as_mut() {
             self.layout_dirty = true;
@@ -4281,8 +4283,9 @@ impl Browser {
         self.renderer.as_ref().unwrap().borrow_mut().recompute_nodes();
         self.layout_dirty = true;
         window.request_redraw();
+        let start = Instant::now();
         let js_result = self.run_js();
-        println!("Finished running JS code: {:?}", js_result);
+        println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
 
         // If the JS caused another update, execute it immediately
         if self.renderer.as_ref().unwrap().borrow_mut().pending_dom_update {
@@ -4349,8 +4352,9 @@ impl Browser {
                         WindowEvent::RedrawRequested => {
                             let first_boot = self.render(&mut surf, &size, &cursor);
                             if first_boot {
+                                let start = Instant::now();
                                 let js_result = self.run_js();
-                                println!("Finished running JS code: {:?}", js_result);
+                                println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
                             }
                         }
                         WindowEvent::CursorMoved { device_id: _, position } => {
