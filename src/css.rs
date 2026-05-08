@@ -89,6 +89,12 @@ pub enum Overflow {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum VariableTemplatePart {
+    Text(String),
+    Var(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum PropertyValue {
     Raw(String),
     Size(StyleSize),
@@ -112,6 +118,7 @@ pub enum PropertyValue {
     GridTemplateColumns(GridTemplateColumns),
     ComplexBackground(StyleComplexBackground),
     Overflow(Overflow),
+    VariableTemplate(Vec<VariableTemplatePart>),
 }
 
 #[derive(Debug, Clone)]

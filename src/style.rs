@@ -5,7 +5,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
-use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, unquote};
+use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, VariableTemplatePart, unquote};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -734,18 +734,13 @@ fn parse_color(value: String) -> Result<StyleBackground> {
     }
 }
 
-// Map variable references
-fn resolve_variable_value(value: &str, variables: &HashMap<String, String>) -> String {
-    let mut out = String::new();
+fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
+    let mut out = vec![];
     let mut buffer = String::new();
     let mut inside = false;
     for char in value.chars() {
         if inside && char == ')' {
-            if let Some(mapped) = variables.get(&buffer) {
-                out += &mapped;
-            } else {
-                out += &buffer;
-            }
+            out.push(VariableTemplatePart::Var(buffer.drain(..).collect()));
             inside = false;
             buffer.clear();
             continue;
@@ -753,13 +748,13 @@ fn resolve_variable_value(value: &str, variables: &HashMap<String, String>) -> S
         buffer.push(char);
         if let Some(stripped) = buffer.strip_suffix("var(") {
             inside = true;
-            out += stripped;
+            out.push(VariableTemplatePart::Text(stripped.to_string()));
             buffer.clear();
             continue;
         }
     }
     if buffer.len() > 0 {
-        out += &buffer;
+        out.push(VariableTemplatePart::Text(buffer));
     }
     out
 }
@@ -855,6 +850,25 @@ fn apply_node_variables(
     Rc::new(new_variables)
 }
 
+fn resolve_variable_template(template: &Vec<VariableTemplatePart>, resolved_variables: &Rc<HashMap<String, String>>) -> String {
+    let mut out = String::new();
+    for el in template.iter() {
+        match el {
+            VariableTemplatePart::Text(text) => {
+                out += text;
+            },
+            VariableTemplatePart::Var(var) => {
+                if let Some(value) = resolved_variables.get(var) {
+                    out += value;
+                } else {
+                    out += var;
+                }
+            }
+        };
+    }
+    out
+}
+
 pub fn resolve_node_variables<'a>(
     nodes: &'a mut Vec<(usize, Node)>,
     variables: &Rc<HashMap<String, String>>,
@@ -867,8 +881,8 @@ pub fn resolve_node_variables<'a>(
         .iter_mut()
         .filter_map(|(_, node)| match node {
             Node::Property(property) => {
-                if let PropertyValue::Raw(value) = &property.value {
-                    let value = resolve_variable_value(value, &resolved_variables);
+                if let PropertyValue::VariableTemplate(template) = &property.value {
+                    let value = resolve_variable_template(template, &resolved_variables);
                     if let Ok((parsed, _)) = parse_property_value(property.property.clone(), value) {
                         property.value = parsed;
                     }
@@ -886,9 +900,9 @@ pub fn resolve_node_variables<'a>(
 mod tests {
     use std::{collections::HashMap, rc::Rc};
 
-    use crate::css::{Node, Property, PropertyValue, Variable};
+    use crate::{css::{Node, Property, PropertyValue, Variable}, style::{parse_property_value, resolve_variable_template}};
 
-    use super::{resolve_node_variables, resolve_variable_value, split_ignoring_parentheses, StyleSize};
+    use super::{resolve_node_variables, split_ignoring_parentheses, StyleSize};
 
     #[test]
     fn resolves_node_variables() {
@@ -922,13 +936,20 @@ mod tests {
     }
 
     #[test]
-    fn resolves_variable_values_embedded_in_strings() {
+    fn resolves_variable_values_embedded_in_strings() -> anyhow::Result<()> {
+        let (value, _) = parse_property_value("margin-left".to_string(), "calc(var(--size) * 2)".to_string())?;
         let variables = HashMap::from([("--size".to_string(), "12px".to_string())]);
 
+        let value = match value {
+            PropertyValue::VariableTemplate(template) => template,
+            _ => Err(anyhow::anyhow!("Invalid value parsed"))?,
+        };
+
         assert_eq!(
-            resolve_variable_value("calc(var(--size) * 2)", &variables),
+            resolve_variable_template(&value, &Rc::new(variables)),
             "calc(12px * 2)"
         );
+        Ok(())
     }
 
     #[test]
@@ -1102,7 +1123,11 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         return parse_property_value(property, stripped.trim().to_string()).and_then(|(value, _)| Ok((value, true)));
     }
 
-    if property.starts_with("--") || value.contains("var(") {
+    if value.contains("var(") {
+        return Ok((PropertyValue::VariableTemplate(parse_variable_template(&value)), false));
+    }
+
+    if property.starts_with("--") {
         return Ok((PropertyValue::Raw(value), false));
     }
 
