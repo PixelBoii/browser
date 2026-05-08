@@ -802,6 +802,7 @@ fn apply_node_variables(
             _ => None
         })
         .collect();
+
     let mut variable_dependence: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut no_dependence = vec![];
     for (idx, var) in variables_to_parse.iter() {
@@ -816,6 +817,7 @@ fn apply_node_variables(
         }
         no_dependence.push(*idx);
     }
+
     let mut collected_variables: HashMap<usize, String> = HashMap::new();
     for idx in no_dependence {
         // Ignore fake idxs
@@ -844,6 +846,7 @@ fn apply_node_variables(
     }
     let unordered_collected_idxs = collected_variables.keys().collect::<Vec<&usize>>();
     let ordered_idxs = order_variables(&unordered_collected_idxs, css_node_ranking);
+
     let mut new_variables = (**variables).clone();
     for idx in ordered_idxs {
         let value = collected_variables.get(&idx).unwrap();
@@ -1563,8 +1566,11 @@ pub fn parse_style(
     css_node_ranking: &[usize],
 ) -> Result<Style> {
     let mut style = get_base_style(&HtmlNode::Element(element.clone()), parent_style);
+
     let inline_nodes = get_inline_nodes(&element)?;
+
     let applicable_class_nodes = collected_css_nodes.get(&node_idx).cloned().unwrap_or_default();
+
     let mut applicable_class_properties = vec![];
     for class_node in applicable_class_nodes {
         let children = css_children_index.get(&class_node).unwrap();
@@ -1578,6 +1584,7 @@ pub fn parse_style(
             }
         }
     }
+
     applicable_class_properties.sort_by(|a, b| {
         let a_rank = css_node_ranking[**a];
         let b_rank = css_node_ranking[**b];
@@ -1590,8 +1597,10 @@ pub fn parse_style(
         .collect();
     // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
     nodes.append(&mut inline_nodes.into_iter().map(|node| (usize::MAX, node)).collect());
+
     let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_nodes, css_node_ranking);
     style.variables = resolved_variables;
+
     for property in properties {
         if let Err(result) = apply_style_property(&mut style, &property) {
             println!(

@@ -140,6 +140,12 @@ enum RequestCacheEntry {
     Unsupported,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum LayoutMode {
+    BaseCalculation,
+    Complete,
+}
+
 #[derive(Debug)]
 struct DomIndexes {
     class_elements: HashMap<String, HashSet<usize>>,
@@ -284,7 +290,7 @@ impl ContainerSizes {
 }
 
 impl ContainingNode {
-    pub fn layout_waiters(&mut self, renderer: &mut Renderer, height: u32, width: u32, children: &mut Vec<usize>) -> Result<()> {
+    pub fn layout_waiters(&mut self, renderer: &mut Renderer, height: u32, width: u32, children: &mut Vec<usize>, mode: &LayoutMode) -> Result<()> {
         for waiter in &self.waiters {
             let style = renderer.node_styles.get(&waiter.node_idx).unwrap().clone();
             let mut forced_size = OptionalSize { height: None, width: None };
@@ -314,6 +320,7 @@ impl ContainingNode {
                 self.node_idx,
                 true,
                 true,
+                mode,
             ) {
                 let waiter_layout_box = renderer.layout_table.get(&layout_idx).unwrap().clone();
 
@@ -455,7 +462,7 @@ fn clamp_with_ratio(mut main_value: u32, max_value: u32, mut other_value: u32) -
     (main_value, other_value)
 }
 
-fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, style: &Style) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, style: &Style, mode: &LayoutMode) -> Result<(tiny_skia::Pixmap, u32, u32)> {
     let mut opt = usvg::Options::default();
     let color_hex = match style.color {
         StyleBackground::Hex(hex) => hex,
@@ -473,21 +480,23 @@ fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, ma
     let mut pixmap = tiny_skia::Pixmap::new(target_w.max(1), target_h.max(1))
         .context("failed to allocate svg pixmap")?;
 
-    let scale = f32::min(
-        target_w as f32 / svg_size.width() as f32,
-        target_h as f32 / svg_size.height() as f32,
-    );
+    if *mode == LayoutMode::Complete {
+        let scale = f32::min(
+            target_w as f32 / svg_size.width() as f32,
+            target_h as f32 / svg_size.height() as f32,
+        );
 
-    let tx = (target_w as f32 - svg_size.width() as f32 * scale) * 0.5;
-    let ty = (target_h as f32 - svg_size.height() as f32 * scale) * 0.5;
+        let tx = (target_w as f32 - svg_size.width() as f32 * scale) * 0.5;
+        let ty = (target_h as f32 - svg_size.height() as f32 * scale) * 0.5;
 
-    let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+        let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+    }
 
     Ok((pixmap, target_h, target_w))
 }
 
-fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, mode: &LayoutMode) -> Result<(tiny_skia::Pixmap, u32, u32)> {
     let pixmap = if let Some(cached) = cached_rasterizations.decoded_pngs.get(src) {
         cached
     } else {
@@ -505,26 +514,28 @@ fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String,
     let mut dst = tiny_skia::Pixmap::new(target_w.max(1), target_h.max(1))
         .context("failed to allocate png pixmap")?;
 
-    dst.as_mut().draw_pixmap(
-        0,
-        0,
-        pixmap.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::from_row(
-            target_w as f32 / pixmap.width() as f32,
-            0.0,
-            0.0,
-            target_h as f32 / pixmap.height() as f32,
-            0.0,
-            0.0,
-        ),
-        None,
-    );
+    if *mode == LayoutMode::Complete {
+        dst.as_mut().draw_pixmap(
+            0,
+            0,
+            pixmap.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            tiny_skia::Transform::from_row(
+                target_w as f32 / pixmap.width() as f32,
+                0.0,
+                0.0,
+                target_h as f32 / pixmap.height() as f32,
+                0.0,
+                0.0,
+            ),
+            None,
+        );
+    }
 
     Ok((dst, target_h, target_w))
 }
 
-fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn prepare_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(u32, u32)> {
     let result = if let Some(cached) = cached_rasterizations.decoded_jpegs.get(src) {
         cached
     } else {
@@ -538,11 +549,16 @@ fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String
     (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
     (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
 
+    Ok((target_h, target_w))
+}
+
+fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String, target_w: u32, target_h: u32) -> Result<tiny_skia::Pixmap> {
+    let decoded = cached_rasterizations.decoded_jpegs.get(src).unwrap();
     let key = (src.clone(), target_h, target_w);
     let pixmap = if let Some(cached) = cached_rasterizations.jpegs.get(&key) {
         cached
     } else {
-        let result = result.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        let result = decoded.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
         let rgba = result.to_rgba8();
 
         let width = rgba.width();
@@ -555,7 +571,7 @@ fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String
         cached_rasterizations.jpegs.get(&key).unwrap()
     };
 
-    Ok((pixmap.clone(), target_h, target_w))
+    Ok(pixmap.clone())
 }
 
 fn resolve_url(href: &str, base_url: Option<&ReqwestUrl>) -> Result<ReqwestUrl> {
@@ -2137,6 +2153,7 @@ impl Renderer {
             containing_node_idx,
             true,
             true,
+            &LayoutMode::Complete,
         ) {
             layout_roots.push(layout_box_idx);
         }
@@ -2272,6 +2289,7 @@ impl Renderer {
         containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
+        mode: &LayoutMode,
     ) -> Option<usize> {
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
@@ -2334,7 +2352,7 @@ impl Renderer {
                         "svg" => {
                             let mut svg_data = self.get_element_html(node_idx);
                             self.inject_css_variables_into_str(&mut svg_data, &style.variables);
-                            let result = rasterize_svg(svg_data.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style);
+                            let result = rasterize_svg(svg_data.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style, mode);
                             match result {
                                 Err(err) => {
                                     println!("Failed to rasterize SVG data: {}", err);
@@ -2349,7 +2367,7 @@ impl Renderer {
                                 if let Some(data) = src.strip_prefix("data:image/svg+xml,") {
                                     let mut decoded = percent_encoding::percent_decode_str(data).decode_utf8().ok()?.to_string();
                                     self.inject_css_variables_into_str(&mut decoded, &style.variables);
-                                    let result = rasterize_svg(decoded.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style);
+                                    let result = rasterize_svg(decoded.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style, mode);
                                     match result {
                                         Err(err) => {
                                             println!("Failed to rasterize SVG data: {}", err);
@@ -2364,15 +2382,21 @@ impl Renderer {
                                 let img_data = self.tokio.clone().borrow_mut().block_on(self.get_img_src_data(src)).ok()?;
                                 let result = match img_data {
                                     RequestCacheEntry::PngData(bytes) => {
-                                        rasterize_png(&mut self.cached_rasterizations, src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
+                                        rasterize_png(&mut self.cached_rasterizations, src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, mode).unwrap()
                                     },
                                     RequestCacheEntry::JpegData(bytes) => {
-                                        rasterize_jpeg(&mut self.cached_rasterizations, &src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap()
+                                        let (target_h, target_w) = prepare_jpeg(&mut self.cached_rasterizations, &src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap();
+                                        if *mode == LayoutMode::Complete {
+                                            let pixmap = rasterize_jpeg(&mut self.cached_rasterizations, src, target_w, target_h).unwrap();
+                                            (pixmap, target_h, target_w)
+                                        } else {
+                                            (Pixmap::new(target_w, target_h).unwrap(), target_h, target_w)
+                                        }
                                     },
                                     RequestCacheEntry::SvgData(svg_data) => {
                                         let mut injected = svg_data.clone();
                                         self.inject_css_variables_into_str(&mut injected, &style.variables);
-                                        let result = rasterize_svg(injected.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style);
+                                        let result = rasterize_svg(injected.as_bytes(), container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h, &style, mode);
                                         match result {
                                             Err(err) => {
                                                 println!("Failed to rasterize SVG data: {}", err);
@@ -2415,6 +2439,7 @@ impl Renderer {
                             containing_node_idx,
                             allow_fill,
                             save_as_final,
+                            mode,
                         ),
                         StyleDisplay::Flex | StyleDisplay::InlineFlex => self.layout_flex(
                             node_idx,
@@ -2424,6 +2449,7 @@ impl Renderer {
                             containing_node_idx,
                             allow_fill,
                             save_as_final,
+                            mode,
                         ),
                         StyleDisplay::Grid => self.layout_grid(
                             node_idx,
@@ -2433,6 +2459,7 @@ impl Renderer {
                             containing_node_idx,
                             allow_fill,
                             save_as_final,
+                            mode,
                         ),
                         StyleDisplay::None => None,
                     };
@@ -2451,7 +2478,7 @@ impl Renderer {
 
                         if let StyleBackground::DataUrl((format, data)) = &style_bg {
                             let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
-                            let _ = self.resolve_background_data_url(node_idx, format, data, &container_size)
+                            let _ = self.resolve_background_data_url(node_idx, format, data, &container_size, mode)
                                 .inspect_err(|err| eprintln!("An error occured while resolving background data url: {}", err));
                         }
 
@@ -2479,13 +2506,13 @@ impl Renderer {
         }
     }
 
-    fn resolve_background_data_url(&mut self, node_idx: usize, format: &String, data: &String, container_size: &ContainerSizes) -> Result<()> {
+    fn resolve_background_data_url(&mut self, node_idx: usize, format: &String, data: &String, container_size: &ContainerSizes, mode: &LayoutMode) -> Result<()> {
         let style = self.node_styles.get(&node_idx).unwrap();
         match format.as_str() {
             "image/svg+xml" => {
                 let mut svg_data = percent_encoding::percent_decode_str(data).decode_utf8()?.to_string();
                 self.inject_css_variables_into_str(&mut svg_data, &style.variables);
-                let result = rasterize_svg(svg_data.as_bytes(), Some(container_size.container_width), Some(container_size.container_height), container_size.container_width, container_size.container_height, &style);
+                let result = rasterize_svg(svg_data.as_bytes(), Some(container_size.container_width), Some(container_size.container_height), container_size.container_width, container_size.container_height, &style, mode);
                 match result {
                     Err(err) => {
                         println!("Failed to rasterize SVG data: {}", err);
@@ -2659,6 +2686,7 @@ impl Renderer {
         mut containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
+        mode: &LayoutMode,
     ) -> Option<(u32, u32, Vec<usize>)> {
         let style = self.node_styles.get(&node_idx).unwrap();
         let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
@@ -2781,6 +2809,7 @@ impl Renderer {
                 containing_node_idx,
                 child_allow_fill,
                 save_as_final,
+                mode,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
                 content_position.x += specified_column_size;
@@ -2820,6 +2849,7 @@ impl Renderer {
         mut containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
+        mode: &LayoutMode,
     ) -> Option<(u32, u32, Vec<usize>)> {
         let style = self.node_styles.get(&node_idx).unwrap();
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
@@ -2933,6 +2963,7 @@ impl Renderer {
                 containing_node_idx,
                 child_allow_fill,
                 save_as_final,
+                mode,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
                 let prev_child_display: Option<StyleDisplay> = prev_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
@@ -2992,7 +3023,7 @@ impl Renderer {
 
         if containing_node_idx == node_idx {
             let mut containing_node = self.containing_nodes.get_mut(&containing_node_idx).unwrap().clone();
-            containing_node.layout_waiters(self, height, width, &mut children).ok()?;
+            containing_node.layout_waiters(self, height, width, &mut children, mode).ok()?;
             self.containing_nodes.insert(containing_node_idx, containing_node);
         }
 
@@ -3031,6 +3062,7 @@ impl Renderer {
         mut containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
+        mode: &LayoutMode,
     ) -> Option<(u32, u32, Vec<usize>)> {
         let style = self.node_styles.get(&node_idx).unwrap().clone_without_variables();
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
@@ -3092,6 +3124,7 @@ impl Renderer {
                 containing_node_idx,
                 false,
                 false,
+                &LayoutMode::BaseCalculation,
             ) {
                 let child_style: &Style = &self.node_styles.get(&child_idx).unwrap();
                 let child_box = self.layout_table.get(&child).unwrap();
@@ -3224,6 +3257,7 @@ impl Renderer {
                         containing_node_idx,
                         allow_fill,
                         save_as_final,
+                        mode,
                     ) {
                         let child_box = self.layout_table.get(&child).unwrap();
                         if !child_style.position.is_free() {
@@ -3287,6 +3321,7 @@ impl Renderer {
                         containing_node_idx,
                         allow_fill,
                         save_as_final,
+                        mode,
                     ) {
                         let child_box = self.layout_table.get(&child).unwrap();
                         if !child_style.position.is_free() {
