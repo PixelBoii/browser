@@ -169,6 +169,51 @@ pub struct Style {
     pub overflow: Overflow,
 }
 
+impl Style {
+    pub fn clone_without_variables(&self) -> Self {
+        Style {
+            width: self.width.clone(),
+            height: self.height.clone(),
+            background: self.background.clone(),
+            display: self.display,
+            flex_shrink: self.flex_shrink,
+            flex_grow: self.flex_grow,
+            justify_content: self.justify_content,
+            align_items: self.align_items,
+            flex_direction: self.flex_direction,
+            gap: self.gap.clone(),
+            margin_left: self.margin_left.clone(),
+            margin_right: self.margin_right.clone(),
+            margin_top: self.margin_top.clone(),
+            margin_bottom: self.margin_bottom.clone(),
+            padding_left: self.padding_left.clone(),
+            padding_right: self.padding_right.clone(),
+            padding_top: self.padding_top.clone(),
+            padding_bottom: self.padding_bottom.clone(),
+            color: self.color.clone(),
+            min_height: self.min_height.clone(),
+            max_height: self.max_height.clone(),
+            min_width: self.min_width.clone(),
+            max_width: self.max_width.clone(),
+            position: self.position,
+            left: self.left.clone(),
+            right: self.right.clone(),
+            top: self.top.clone(),
+            bottom: self.bottom.clone(),
+            text_align: self.text_align,
+            variables: HashMap::new(),
+            font_size: self.font_size.clone(),
+            align_self: self.align_self,
+            border_left: self.border_left.clone(),
+            border_top: self.border_top.clone(),
+            border_right: self.border_right.clone(),
+            border_bottom: self.border_bottom.clone(),
+            grid_template_columns: self.grid_template_columns.clone(),
+            overflow: self.overflow.clone(),
+        }
+    }
+}
+
 pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
     let implied_text_align = parent_style
         .clone()

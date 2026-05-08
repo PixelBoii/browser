@@ -2272,13 +2272,12 @@ impl Renderer {
         allow_fill: bool,
         save_as_final: bool,
     ) -> Option<usize> {
-        let style = self.node_styles.get(&node_idx).unwrap().clone();
-
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
         match self.nodes.get(&node_idx).unwrap().clone() {
             Node::Comment(_) => None,
             Node::Text(text) => {
+                let style = self.node_styles.get(&node_idx).unwrap();
                 let text = collapse_whitespace(&text.text).unwrap_or("".to_string());
                 let renderable_text = self.font_handler
                     .get_renderable_text(text.clone(), resolved_font_size as i32, Some(available_size.width))
@@ -2294,7 +2293,7 @@ impl Renderer {
                         width,
                         height,
                         background: StyleBackground::Transparent,
-                        color: style.color,
+                        color: style.color.clone(),
                         font_size: Some(resolved_font_size),
                         border: RectBorder::new_empty(),
                     },
@@ -2406,11 +2405,10 @@ impl Renderer {
                         allow_overflow: style.overflow == Overflow::Visible,
                     }, save_as_final))
                 } else {
-                    let layout = match style.display {
+                    let layout = match self.node_styles.get(&node_idx).unwrap().display {
                         StyleDisplay::Block | StyleDisplay::InlineBlock | StyleDisplay::Inline => self.layout_block(
                             node_idx,
                             cursor,
-                            &style,
                             available_size,
                             forced_size,
                             containing_node_idx,
@@ -2420,7 +2418,6 @@ impl Renderer {
                         StyleDisplay::Flex | StyleDisplay::InlineFlex => self.layout_flex(
                             node_idx,
                             cursor,
-                            &style,
                             available_size,
                             forced_size,
                             containing_node_idx,
@@ -2430,7 +2427,6 @@ impl Renderer {
                         StyleDisplay::Grid => self.layout_grid(
                             node_idx,
                             cursor,
-                            &style,
                             available_size,
                             forced_size,
                             containing_node_idx,
@@ -2441,6 +2437,10 @@ impl Renderer {
                     };
 
                     if let Some((width, height, children)) = layout {
+                        let style = self.node_styles.get(&node_idx).unwrap();
+                        let style_bg = style.background.clone();
+                        let style_color = style.color.clone();
+                        let allow_overflow = style.overflow == Overflow::Visible;
                         let border = RectBorder {
                             left: RectBorderSide::parse_from_style(&style.border_left, resolved_font_size as u32, &available_size, &self.window_size),
                             top: RectBorderSide::parse_from_style(&style.border_top, resolved_font_size as u32, &available_size, &self.window_size),
@@ -2448,9 +2448,9 @@ impl Renderer {
                             bottom: RectBorderSide::parse_from_style(&style.border_bottom, resolved_font_size as u32, &available_size, &self.window_size),
                         };
 
-                        if let StyleBackground::DataUrl((format, data)) = &style.background {
+                        if let StyleBackground::DataUrl((format, data)) = &style_bg {
                             let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
-                            let _ = self.resolve_background_data_url(node_idx, format, data, &container_size, &style)
+                            let _ = self.resolve_background_data_url(node_idx, format, data, &container_size)
                                 .inspect_err(|err| eprintln!("An error occured while resolving background data url: {}", err));
                         }
 
@@ -2460,15 +2460,15 @@ impl Renderer {
                                 y: cursor.y,
                                 width,
                                 height,
-                                background: style.background,
-                                color: style.color,
+                                background: style_bg,
+                                color: style_color,
                                 font_size: None,
                                 border,
                             },
                             kind: LayoutKind::Element,
                             children,
                             node_idx,
-                            allow_overflow: style.overflow == Overflow::Visible,
+                            allow_overflow,
                         }, save_as_final))
                     } else {
                         None
@@ -2478,7 +2478,8 @@ impl Renderer {
         }
     }
 
-    fn resolve_background_data_url(&mut self, node_idx: usize, format: &String, data: &String, container_size: &ContainerSizes, style: &Style) -> Result<()> {
+    fn resolve_background_data_url(&mut self, node_idx: usize, format: &String, data: &String, container_size: &ContainerSizes) -> Result<()> {
+        let style = self.node_styles.get(&node_idx).unwrap();
         match format.as_str() {
             "image/svg+xml" => {
                 let mut svg_data = percent_encoding::percent_decode_str(data).decode_utf8()?.to_string();
@@ -2652,13 +2653,13 @@ impl Renderer {
         &mut self,
         node_idx: usize,
         cursor: Position,
-        style: &Style,
         available_size: Size,
         forced_size: OptionalSize,
         mut containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
     ) -> Option<(u32, u32, Vec<usize>)> {
+        let style = self.node_styles.get(&node_idx).unwrap();
         let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
         if style.position == StylePosition::Relative {
             self.containing_nodes.insert(node_idx, ContainingNode {
@@ -2721,8 +2722,14 @@ impl Renderer {
             }
         }
         let dynamic_space_to_give = width_to_distribute - definitely_used_width as u32;
+        // Inline-block doesn't fill the width, so instruct children to not do that either
+        let child_allow_fill = match style.display {
+            StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
+            _ => allow_fill,
+        };
+        let grid_template_columns = style.grid_template_columns.clone();
         for child_idx in children_idxs.iter() {
-            let wrap = if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
+            let wrap = if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
                 self.get_grid_column(current_column, &template_columns)
             } else {
                 false
@@ -2733,7 +2740,7 @@ impl Renderer {
                 max_child_height = 0;
                 current_column = 0;
             }
-            let specified_column_size = if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
+            let specified_column_size = if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
                 match &template_columns[current_column as usize] {
                     GridTemplateColumnsValue::Size(size) => {
                         match size {
@@ -2771,11 +2778,7 @@ impl Renderer {
                     width: None,
                 },
                 containing_node_idx,
-                // Inline-block doesn't fill the width, so instruct children to not do that either
-                match style.display {
-                    StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
-                    _ => allow_fill,
-                },
+                child_allow_fill,
                 save_as_final,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
@@ -2811,13 +2814,13 @@ impl Renderer {
         &mut self,
         node_idx: usize,
         cursor: Position,
-        style: &Style,
         available_size: Size,
         forced_size: OptionalSize,
         mut containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
     ) -> Option<(u32, u32, Vec<usize>)> {
+        let style = self.node_styles.get(&node_idx).unwrap();
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
             self.get_paddings(node_idx, style, available_size);
 
@@ -2889,6 +2892,15 @@ impl Renderer {
 
         let mut children_rows = MarginRows::new();
 
+        // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
+        let wants_to_fill = style.display != StyleDisplay::InlineBlock && style.display != StyleDisplay::Inline;
+
+        // Inline-block doesn't fill the width, so instruct children to not do that either
+        let child_allow_fill = match style.display {
+            StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
+            _ => allow_fill,
+        };
+
         for child_local_idx in 0..immediate_children.len() {
             let child_idx = immediate_children[child_local_idx];
             let prev_child_idx = if child_local_idx >= 1 {
@@ -2918,11 +2930,7 @@ impl Renderer {
                     width: None,
                 },
                 containing_node_idx,
-                // Inline-block doesn't fill the width, so instruct children to not do that either
-                match style.display {
-                    StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
-                    _ => allow_fill,
-                },
+                child_allow_fill,
                 save_as_final,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
@@ -2975,8 +2983,6 @@ impl Renderer {
             .min(container_sizes.max_height.unwrap_or(u32::MAX))
             .max(container_sizes.min_height.unwrap_or(u32::MIN));
 
-        // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
-        let wants_to_fill = style.display != StyleDisplay::InlineBlock && style.display != StyleDisplay::Inline;
         let width = if allow_fill && wants_to_fill { container_sizes.container_width } else { container_sizes.compute_actual_container_width(max_child_width) };
 
         // Margin: auto
@@ -3019,15 +3025,15 @@ impl Renderer {
         &mut self,
         node_idx: usize,
         cursor: Position,
-        style: &Style,
         available_size: Size,
         forced_size: OptionalSize,
         mut containing_node_idx: usize,
         allow_fill: bool,
         save_as_final: bool,
     ) -> Option<(u32, u32, Vec<usize>)> {
+        let style = self.node_styles.get(&node_idx).unwrap().clone_without_variables();
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
-            self.get_paddings(node_idx, style, available_size);
+            self.get_paddings(node_idx, &style, available_size);
 
         let mut content_position = Position {
             x: cursor.x + padding_left_size as i32,
@@ -3039,8 +3045,8 @@ impl Renderer {
 
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
-        let container_sizes = self.get_container_sizes(node_idx, &forced_size, style, &available_size);
-        let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, style);
+        let container_sizes = self.get_container_sizes(node_idx, &forced_size, &style, &available_size);
+        let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, &style);
 
         let specified_height = get_specified_size(
             font_size,
