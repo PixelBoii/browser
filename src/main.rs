@@ -166,7 +166,7 @@ struct CanvasBuffer {
 impl CanvasBuffer {
     fn new(width: u32, height: u32) -> Self {
         Self {
-            buffer: vec![0xFF_FF_FF; width as usize * height as usize],
+            buffer: vec![0xFF_FF_FF_00; width as usize * height as usize],
             width,
             height,
         }
@@ -559,7 +559,7 @@ fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String
     let pixmap = if let Some(cached) = cached_rasterizations.jpegs.get(&key) {
         cached
     } else {
-        let result = decoded.resize(target_w, target_h, image::imageops::FilterType::Triangle);
+        let result = decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
         let rgba = result.to_rgba8();
 
         let width = rgba.width();
@@ -2347,7 +2347,7 @@ impl Renderer {
                             };
                             let canvas = self.canvas_buffers.entry(node_idx).or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
                             canvas.resize_if_needed(canvas_width, canvas_height);
-                            let data = rgb_buffer_to_premul_bytes(&canvas.buffer);
+                            let data = rgba_buffer_to_premul_bytes(&canvas.buffer);
                             let pixmap = tiny_skia::Pixmap::from_vec(data, IntSize::from_wh(canvas_width, canvas_height)?)?;
                             (pixmap, container_size.container_height, container_size.container_width)
                         },
@@ -2414,6 +2414,10 @@ impl Renderer {
                         },
                         _ => panic!(),
                     };
+                    let z_index = match style.z_index {
+                        StyleZIndex::Auto => 0,
+                        StyleZIndex::Number(value) => value,
+                    };
 
                     Some(self.register_layout_box(LayoutBox {
                         rect: Rect {
@@ -2430,7 +2434,7 @@ impl Renderer {
                         children: vec![],
                         node_idx,
                         allow_overflow: style.overflow == Overflow::Visible,
-                        z_index: 0,
+                        z_index,
                     }, save_as_final))
                 } else {
                     let layout = match self.node_styles.get(&node_idx).unwrap().display {
@@ -2929,7 +2933,8 @@ impl Renderer {
 
             containing_node
                 .waiters
-                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size, cursor: content_position });
+                // Note: We use the cursor here rather than content_position as free children are not affected by padding
+                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size, cursor: cursor.clone() });
         }
 
         let mut max_child_width: u32 = 0;
@@ -3124,9 +3129,31 @@ impl Renderer {
             containing_node_idx = node_idx;
         }
 
-        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap().clone() {
+        let children_idxs = self.dom_indexes.children_index.get(&node_idx).unwrap().clone();
+
+        let immediate_children: Vec<&usize> = children_idxs.iter().filter(|c| {
+            let style = &self.node_styles.get(*c).unwrap();
+            !style.position.is_free()
+        }).collect();
+        let free_children: Vec<&usize> = children_idxs.iter().filter(|c| {
+            let style = &self.node_styles.get(*c).unwrap();
+            style.position.is_free()
+        }).collect();
+
+        for child_idx in free_children {
+            let containing_node = self.containing_nodes
+                .get_mut(&containing_node_idx)
+                .unwrap();
+
+            containing_node
+                .waiters
+                // Note: We use the cursor here rather than content_position as free children are not affected by padding
+                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size, cursor: cursor.clone() });
+        }
+
+        for child_idx in immediate_children {
             if let Some(child) = self.layout_node(
-                child_idx,
+                *child_idx,
                 Position { x: 0, y: 0 },
                 Size {
                     width: container_sizes.inner_width,
@@ -3152,7 +3179,7 @@ impl Renderer {
                     StyleFlexDirection::Column => child_box.rect.width,
                 };
                 base_items.push(FlexItem {
-                    node_idx: child_idx,
+                    node_idx: *child_idx,
                     target_size: size as f32,
                     base_size: size as f32,
                     cross_size: cross_size as f32,
@@ -3374,6 +3401,12 @@ impl Renderer {
         };
 
         height = height.min(container_sizes.max_height.unwrap_or(u32::MAX)).max(container_sizes.min_height.unwrap_or(u32::MIN));
+
+        if containing_node_idx == node_idx {
+            let mut containing_node = self.containing_nodes.get_mut(&containing_node_idx).unwrap().clone();
+            containing_node.layout_waiters(self, height, width, &mut children, mode).ok()?;
+            self.containing_nodes.insert(containing_node_idx, containing_node);
+        }
 
         Some((width, height, children))
     }
@@ -4610,15 +4643,13 @@ fn rgba_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
-fn rgb_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
+fn rgba_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(buffer.len() * 4);
 
     for pixel in buffer {
-        let r = ((pixel >> 16) & 0xFF) as u8;
-        let g = ((pixel >> 8) & 0xFF) as u8;
-        let b = (pixel & 0xFF) as u8;
+        let [r, g, b, a] = pixel.to_be_bytes();
 
-        bytes.extend_from_slice(&[r, g, b, 0xFF]);
+        bytes.extend_from_slice(&[r, g, b, a]);
     }
 
     bytes
