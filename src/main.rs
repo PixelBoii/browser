@@ -558,7 +558,7 @@ fn rasterize_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String
     let pixmap = if let Some(cached) = cached_rasterizations.jpegs.get(&key) {
         cached
     } else {
-        let result = decoded.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        let result = decoded.resize(target_w, target_h, image::imageops::FilterType::Triangle);
         let rgba = result.to_rgba8();
 
         let width = rgba.width();
