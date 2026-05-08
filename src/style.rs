@@ -738,7 +738,7 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
     let mut out = vec![];
     let mut buffer = String::new();
     let mut inside = false;
-    for char in value.chars() {
+    for char in value.trim().chars() {
         if inside && char == ')' {
             out.push(VariableTemplatePart::Var(buffer.drain(..).collect()));
             inside = false;
@@ -748,7 +748,9 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
         buffer.push(char);
         if let Some(stripped) = buffer.strip_suffix("var(") {
             inside = true;
-            out.push(VariableTemplatePart::Text(stripped.to_string()));
+            if stripped.len() > 0 {
+                out.push(VariableTemplatePart::Text(stripped.to_string()));
+            }
             buffer.clear();
             continue;
         }
@@ -803,10 +805,11 @@ fn apply_node_variables(
     let mut variable_dependence: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut no_dependence = vec![];
     for (idx, var) in variables_to_parse.iter() {
-        if let PropertyValue::Raw(value) = &var.value {
-            if let Some(value) = value.strip_prefix("var(") {
-                if let Some(value) = value.strip_suffix(")") {
-                    variable_dependence.entry(value).or_default().push(*idx);
+        if let PropertyValue::VariableTemplate(template) = &var.value {
+            // TODO: Handle multi variable dependence
+            if template.len() == 1 {
+                if let VariableTemplatePart::Var(var) = &template[0] {
+                    variable_dependence.entry(var).or_default().push(*idx);
                     continue;
                 }
             }
@@ -905,14 +908,14 @@ mod tests {
     use super::{resolve_node_variables, split_ignoring_parentheses, StyleSize};
 
     #[test]
-    fn resolves_node_variables() {
+    fn resolves_node_variables() -> anyhow::Result<()> {
         let nodes = vec![
-            Node::Variable(Variable { variable: "--size".into(), value: PropertyValue::Raw("12px".into()), parent: None }),
-            Node::Variable(Variable { variable: "--dependent".into(), value: PropertyValue::Raw("var(--size)".into()), parent: None }),
-            Node::Variable(Variable { variable: "--another-one".into(), value: PropertyValue::Raw("var(--test)".into()), parent: None }),
-            Node::Property(Property { property: "width".into(), value: PropertyValue::Raw("var(--size)".into()), parent: None, important: false }),
-            Node::Property(Property { property: "height".into(), value: PropertyValue::Raw("var(--dependent)".into()), parent: None , important: false}),
-            Node::Property(Property { property: "gap".into(), value: PropertyValue::Raw("var(--another-one)".into()), parent: None, important: false }),
+            Node::Variable(Variable { variable: "--size".into(), value: parse_property_value("--size".into(), "12px".into())?.0, parent: None }),
+            Node::Variable(Variable { variable: "--dependent".into(), value: parse_property_value("--dependent".into(), "var(--size)".into())?.0, parent: None }),
+            Node::Variable(Variable { variable: "--another-one".into(), value: parse_property_value("--another-one".into(), "var(--test)".into())?.0, parent: None }),
+            Node::Property(Property { property: "width".into(), value: parse_property_value("width".into(), "var(--size)".into())?.0, parent: None, important: false }),
+            Node::Property(Property { property: "height".into(), value: parse_property_value("height".into(), "var(--dependent)".into())?.0, parent: None , important: false}),
+            Node::Property(Property { property: "gap".into(), value: parse_property_value("gap".into(), "var(--another-one)".into())?.0, parent: None, important: false }),
         ];
 
         let mut already_resolved = HashMap::new();
@@ -933,6 +936,7 @@ mod tests {
             properties[2].value,
             PropertyValue::Size(StyleSize::Px(16.))
         );
+        Ok(())
     }
 
     #[test]
