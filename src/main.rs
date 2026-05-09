@@ -2070,9 +2070,9 @@ impl Renderer {
         };
         let mut seen = HashSet::new();
         let requests: Vec<(ReqwestUrl, &'static str)> = self.nodes
-            .values()
-            .filter_map(|n| match n {
-                Node::Element(element) if element.tag == "img" => {
+            .iter()
+            .filter_map(|(idx, n)| match n {
+                Node::Element(element) if element.tag == "img" && self.node_styles.get(idx).unwrap().display != StyleDisplay::None => {
                     element.attributes.get("src").map(|src| src.as_str())
                 },
                 _ => None
@@ -2093,6 +2093,8 @@ impl Renderer {
                 Some((url, Self::img_src_extension(src)?))
             })
             .collect();
+
+        println!("Pre-fetching {} images", requests.len());
 
         if requests.is_empty() {
             return;
