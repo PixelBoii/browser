@@ -2926,17 +2926,6 @@ impl Renderer {
             containing_node_idx = node_idx;
         }
 
-        for child_idx in free_children {
-            let containing_node = self.containing_nodes
-                .get_mut(&containing_node_idx)
-                .unwrap();
-
-            containing_node
-                .waiters
-                // Note: We use the cursor here rather than content_position as free children are not affected by padding
-                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size, cursor: cursor.clone() });
-        }
-
         let mut max_child_width: u32 = 0;
         let mut max_child_height: u32 = 0;
         let mut child_width_buffer = 0;
@@ -3041,6 +3030,17 @@ impl Renderer {
         let free_space_y = (container_sizes.inner_height as i32 - content_height as i32).max(0) as u32;
         self.divide_free_space_for_margin(&children_rows, width as i32 - padding_left_size - padding_right_size, free_space_y);
 
+        for child_idx in free_children {
+            let containing_node = self.containing_nodes
+                .get_mut(&containing_node_idx)
+                .unwrap();
+
+            containing_node
+                .waiters
+                // Note: We use the cursor here rather than content_position as free children are not affected by padding
+                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size: Size { height, width }, cursor: cursor.clone() });
+        }
+
         if containing_node_idx == node_idx {
             let mut containing_node = self.containing_nodes.get_mut(&containing_node_idx).unwrap().clone();
             containing_node.layout_waiters(self, height, width, &mut children, mode).ok()?;
@@ -3140,17 +3140,6 @@ impl Renderer {
             style.position.is_free()
         }).collect();
 
-        for child_idx in free_children {
-            let containing_node = self.containing_nodes
-                .get_mut(&containing_node_idx)
-                .unwrap();
-
-            containing_node
-                .waiters
-                // Note: We use the cursor here rather than content_position as free children are not affected by padding
-                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size, cursor: cursor.clone() });
-        }
-
         for child_idx in immediate_children {
             if let Some(child) = self.layout_node(
                 *child_idx,
@@ -3226,7 +3215,7 @@ impl Renderer {
         }
 
         // Stretch children on cross-axis if appropiate
-        if style.align_items == StyleJustifyContent::Stretch {
+        if style.align_items == StyleJustifyContent::Stretch && allow_fill {
             for item in &mut base_items {
                 let child_style: &Style = &self.node_styles.get(&item.node_idx).unwrap();
                 if child_style.width == StyleSize::Auto {
@@ -3401,6 +3390,17 @@ impl Renderer {
         };
 
         height = height.min(container_sizes.max_height.unwrap_or(u32::MAX)).max(container_sizes.min_height.unwrap_or(u32::MIN));
+
+        for child_idx in free_children {
+            let containing_node = self.containing_nodes
+                .get_mut(&containing_node_idx)
+                .unwrap();
+
+            containing_node
+                .waiters
+                // Note: We use the cursor here rather than content_position as free children are not affected by padding
+                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size: Size { height, width }, cursor: cursor.clone() });
+        }
 
         if containing_node_idx == node_idx {
             let mut containing_node = self.containing_nodes.get_mut(&containing_node_idx).unwrap().clone();
