@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
 use anyhow::{Context, Result, anyhow};
@@ -101,25 +101,14 @@ struct Rect {
     width: u32,
     height: u32,
     background: StyleBackground,
-    color: StyleBackground,
-    font_size: Option<u32>,
     border: RectBorder,
-}
-
-#[derive(Debug, Clone)]
-struct RenderableText {
-    text: String,
-    glyphs: Vec<Option<OutlinedGlyph>>,
-    width: u32,
-    height: u32,
-    line_height: f32,
 }
 
 #[derive(Debug, Clone)]
 enum LayoutKind {
     Element,
-    PixMap(tiny_skia::Pixmap),
-    Text(RenderableText),
+    PixMap((tiny_skia::Pixmap, bool)),
+    Text(tiny_skia::Pixmap),
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +175,28 @@ impl CanvasBuffer {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ScrollAnimation {
+    start: i32,
+    end: i32,
+    start_at: SystemTime,
+    duration: Duration,
+}
+
+#[derive(Debug, Clone)]
+enum Animation {
+    ScrollAnimation(ScrollAnimation),
+}
+
+impl Animation {
+    pub fn is_done(&self) -> bool {
+        match self {
+            Animation::ScrollAnimation(animation) =>
+                animation.start_at.checked_add(animation.duration).unwrap().lt(&SystemTime::now())
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Renderer {
     url: String,
@@ -213,6 +224,7 @@ struct Renderer {
     canvas_buffers: HashMap<usize, CanvasBuffer>,
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
+    animations: Vec<Animation>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +444,28 @@ fn infer_image_size(base_size: Size, input_w: Option<u32>, input_h: Option<u32>)
     (target_h, target_w)
 }
 
+fn blend_rgba_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
+    let a = src.3 as u32;
+    if a == 0 {
+        return dst;
+    }
+    if a == 255 {
+        return ((src.0 as u32) << 24) | ((src.1 as u32) << 16) | ((src.2 as u32) << 8) | (src.3 as u32);
+    }
+
+    let inv_a = 255 - a;
+
+    let dr = (dst >> 24) & 0xFF;
+    let dg = (dst >> 16) & 0xFF;
+    let db = (dst >> 8) & 0xFF;
+
+    let r = src.0 as u32 + (dr * inv_a + 127) / 255;
+    let g = src.1 as u32 + (dg * inv_a + 127) / 255;
+    let b = src.2 as u32 + (db * inv_a + 127) / 255;
+
+    (r << 24) | (g << 16) | (b << 8) | a
+}
+
 fn blend_rgb_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
     let a = src.3 as u32;
     if a == 0 {
@@ -463,7 +497,7 @@ fn clamp_with_ratio(mut main_value: u32, max_value: u32, mut other_value: u32) -
     (main_value, other_value)
 }
 
-fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, style: &Style, mode: &LayoutMode) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, style: &Style, mode: &LayoutMode) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
     let mut opt = usvg::Options::default();
     let color_hex = match style.color {
         StyleBackground::Hex(hex) => hex,
@@ -494,10 +528,15 @@ fn rasterize_svg(svg_data: &[u8], input_w: Option<u32>, input_h: Option<u32>, ma
         resvg::render(&tree, transform, &mut pixmap.as_mut());
     }
 
-    Ok((pixmap, target_h, target_w))
+    let opaque = *mode == LayoutMode::Complete && pixmap_is_opaque(&pixmap);
+    Ok((pixmap, target_h, target_w, opaque))
 }
 
-fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, mode: &LayoutMode) -> Result<(tiny_skia::Pixmap, u32, u32)> {
+fn pixmap_is_opaque(pixmap: &tiny_skia::Pixmap) -> bool {
+    pixmap.pixels().iter().all(|p| p.alpha() == 255)
+}
+
+fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32, mode: &LayoutMode) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
     let pixmap = if let Some(cached) = cached_rasterizations.decoded_pngs.get(src) {
         cached
     } else {
@@ -505,7 +544,8 @@ fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String,
         cached_rasterizations.decoded_pngs.get(src).unwrap()
     };
     if input_w.is_some_and(|v| v == pixmap.width()) && input_h.is_some_and(|v| v == pixmap.height()) {
-        return Ok((pixmap.clone(), input_h.unwrap(), input_w.unwrap()));
+        let opaque = pixmap_is_opaque(pixmap);
+        return Ok((pixmap.clone(), input_h.unwrap(), input_w.unwrap(), opaque));
     }
 
     let (mut target_h, mut target_w) = infer_image_size(Size { height: pixmap.height(), width: pixmap.width() }, input_w, input_h);
@@ -533,7 +573,8 @@ fn rasterize_png(cached_rasterizations: &mut CachedRasterizations, src: &String,
         );
     }
 
-    Ok((dst, target_h, target_w))
+    let opaque = *mode == LayoutMode::Complete && pixmap_is_opaque(&dst);
+    Ok((dst, target_h, target_w, opaque))
 }
 
 fn prepare_jpeg(cached_rasterizations: &mut CachedRasterizations, src: &String, bytes: &[u8], input_w: Option<u32>, input_h: Option<u32>, max_w: u32, max_h: u32) -> Result<(u32, u32)> {
@@ -1538,7 +1579,7 @@ fn op_fill_canvas_rect(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
     canvas.resize_if_needed(node_width, node_height);
 
-    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y, width, height, 0x00_00_00_FF);
+    draw_rect_filled(&mut canvas.buffer, false, node_width, node_height, x, y, width, height, 0x00_00_00_FF);
 
     renderer.schedule_dom_update(&host.proxy);
 
@@ -1573,10 +1614,10 @@ fn op_stroke_canvas_rect(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
     canvas.resize_if_needed(node_width, node_height);
 
-    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y, line_width, height, 0x00_00_00_FF); // Left
-    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y, width, line_width, 0x00_00_00_FF); // Top
-    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x + width as i32 - line_width as i32, y, line_width, height, 0x00_00_00_FF); // Right
-    draw_rect_filled(&mut canvas.buffer, node_width, node_height, x, y + height as i32 - line_width as i32, width, line_width, 0x00_00_00_FF); // Bottom
+    draw_rect_filled(&mut canvas.buffer, false, node_width, node_height, x, y, line_width, height, 0x00_00_00_FF); // Left
+    draw_rect_filled(&mut canvas.buffer, false, node_width, node_height, x, y, width, line_width, 0x00_00_00_FF); // Top
+    draw_rect_filled(&mut canvas.buffer, false, node_width, node_height, x + width as i32 - line_width as i32, y, line_width, height, 0x00_00_00_FF); // Right
+    draw_rect_filled(&mut canvas.buffer, false, node_width, node_height, x, y + height as i32 - line_width as i32, width, line_width, 0x00_00_00_FF); // Bottom
 
     renderer.schedule_dom_update(&host.proxy);
 
@@ -1898,6 +1939,7 @@ impl Renderer {
             canvas_buffers: HashMap::new(),
             network_fetch,
             cached_rasterizations: CachedRasterizations::new(),
+            animations: vec![],
         }
     }
 
@@ -2014,6 +2056,30 @@ impl Renderer {
         layout_box.rect.y += y;
         for child in layout_box.children.clone() {
             self.move_entire_box(child, x, y);
+        }
+    }
+
+    fn tick_animations(&mut self) -> bool {
+        if self.animations.len() > 0 {
+            let mut to_keep = vec![];
+            for a in self.animations.iter() {
+                match a {
+                    Animation::ScrollAnimation(animation) => {
+                        let elapsed = SystemTime::now().duration_since(animation.start_at).unwrap();
+                        let progress = elapsed.div_duration_f32(animation.duration).clamp(0., 1.);
+                        let curr_value = animation.start as f32 + (animation.end - animation.start) as f32 * progress;
+                        self.scroll_y = curr_value as i32;
+                    }
+                }
+                if a.is_done() {
+                    continue;
+                }
+                to_keep.push(a.clone());
+            }
+            self.animations = to_keep;
+            self.animations.len() > 0
+        } else {
+            false
         }
     }
 
@@ -2301,12 +2367,11 @@ impl Renderer {
             Node::Text(text) => {
                 let style = self.node_styles.get(&node_idx).unwrap();
                 let text = collapse_whitespace(&text.text).unwrap_or("".to_string());
-                let renderable_text = self.font_handler
-                    .get_renderable_text(text.clone(), resolved_font_size as i32, Some(available_size.width))
-                    .inspect_err(|err| println!("Failed to get renderable text for {} {:?}", text, err))
-                    .ok()?;
-                let width = forced_size.width.unwrap_or(renderable_text.width);
-                let height = forced_size.height.unwrap_or(renderable_text.height);
+                let text_hex = match style.color {
+                    StyleBackground::Hex(code) => Some(code),
+                    _ => None,
+                }?;
+                let (buffer, width, height) = text_to_buffer(&self.font_handler, text_hex, &text, resolved_font_size, Some(available_size.width))?;
 
                 Some(self.register_layout_box(LayoutBox {
                     rect: Rect {
@@ -2315,11 +2380,9 @@ impl Renderer {
                         width,
                         height,
                         background: StyleBackground::Transparent,
-                        color: style.color.clone(),
-                        font_size: Some(resolved_font_size),
                         border: RectBorder::new_empty(),
                     },
-                    kind: LayoutKind::Text(renderable_text),
+                    kind: LayoutKind::Text(buffer),
                     children: vec![],
                     node_idx,
                     allow_overflow: style.overflow == Overflow::Visible,
@@ -2336,7 +2399,7 @@ impl Renderer {
                     let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, &style);
                     let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None, &self.window_size).unwrap_or(available_size.height as i32) as u32;
                     let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None, &self.window_size).unwrap_or(available_size.width as i32) as u32;
-                    let (pixmap, height, width) = match element.tag.as_str() {
+                    let (pixmap, height, width, opaque) = match element.tag.as_str() {
                         "canvas" => {
                             let (Some(canvas_width), Some(canvas_height)) = (match self.nodes.get(&node_idx).unwrap() {
                                 Node::Element(element) => (
@@ -2351,7 +2414,7 @@ impl Renderer {
                             canvas.resize_if_needed(canvas_width, canvas_height);
                             let data = rgba_buffer_to_premul_bytes(&canvas.buffer);
                             let pixmap = tiny_skia::Pixmap::from_vec(data, IntSize::from_wh(canvas_width, canvas_height)?)?;
-                            (pixmap, container_size.container_height, container_size.container_width)
+                            (pixmap, container_size.container_height, container_size.container_width, false)
                         },
                         "svg" => {
                             let mut svg_data = self.get_element_html(node_idx);
@@ -2392,9 +2455,9 @@ impl Renderer {
                                         let (target_h, target_w) = prepare_jpeg(&mut self.cached_rasterizations, &src, &bytes, container_size.container_width_non_filling, container_size.container_height_non_filling, max_w, max_h).unwrap();
                                         if *mode == LayoutMode::Complete {
                                             let pixmap = rasterize_jpeg(&mut self.cached_rasterizations, src, target_w, target_h).unwrap();
-                                            (pixmap, target_h, target_w)
+                                            (pixmap, target_h, target_w, true)
                                         } else {
-                                            (Pixmap::new(target_w, target_h).unwrap(), target_h, target_w)
+                                            (Pixmap::new(target_w, target_h).unwrap(), target_h, target_w, true)
                                         }
                                     },
                                     RequestCacheEntry::SvgData(svg_data) => {
@@ -2428,11 +2491,9 @@ impl Renderer {
                             width,
                             height,
                             background: StyleBackground::Transparent,
-                            color: StyleBackground::Transparent,
-                            font_size: None,
                             border: RectBorder::new_empty(),
                         },
-                        kind: LayoutKind::PixMap(pixmap),
+                        kind: LayoutKind::PixMap((pixmap, opaque)),
                         children: vec![],
                         node_idx,
                         allow_overflow: style.overflow == Overflow::Visible,
@@ -2476,7 +2537,6 @@ impl Renderer {
                     if let Some((width, height, mut children)) = layout {
                         let style = self.node_styles.get(&node_idx).unwrap();
                         let style_bg = style.background.clone();
-                        let style_color = style.color.clone();
                         let allow_overflow = style.overflow == Overflow::Visible;
                         let border = RectBorder {
                             left: RectBorderSide::parse_from_style(&style.border_left, resolved_font_size as u32, &available_size, &self.window_size),
@@ -2508,8 +2568,6 @@ impl Renderer {
                                 width,
                                 height,
                                 background: style_bg,
-                                color: style_color,
-                                font_size: None,
                                 border,
                             },
                             kind: LayoutKind::Element,
@@ -2537,7 +2595,7 @@ impl Renderer {
                     Err(err) => {
                         println!("Failed to rasterize SVG data: {}", err);
                     },
-                    Ok((pixmap, _, _)) => {
+                    Ok((pixmap, _, _, _)) => {
                         self.resolved_pixmaps.insert(node_idx.to_string(), pixmap);
                     },
                 };
@@ -2671,20 +2729,22 @@ impl Renderer {
     fn create_input_text_box(&mut self, node_idx: usize, input_value: String, cursor: &mut Position, font_size: u32, save_as_final: bool) -> Result<usize> {
         let style = &self.node_styles.get(&node_idx).unwrap();
         let text = collapse_whitespace(&input_value).unwrap();
-        let renderable_text = self.font_handler.get_renderable_text(text, font_size as i32, None).with_context(|| "Failed to compute renderable text")?;
+        let text_hex = match style.color {
+            StyleBackground::Hex(code) => Some(code),
+            _ => None,
+        }.with_context(|| "No color was specified for text")?;
+        let (buffer, width, height) = text_to_buffer(&self.font_handler, text_hex, &text, font_size, None).with_context(|| "Failed to build pixmap for input text")?;
 
         let layout_box = self.register_layout_box(LayoutBox {
             rect: Rect {
                 x: cursor.x,
                 y: cursor.y,
-                width: renderable_text.width,
-                height: renderable_text.height,
+                width,
+                height,
                 background: StyleBackground::Transparent,
-                color: style.color.clone(),
-                font_size: Some(font_size as u32),
                 border: RectBorder::new_empty(),
             },
-            kind: LayoutKind::Text(renderable_text),
+            kind: LayoutKind::Text(buffer),
             children: vec![],
             node_idx,
             allow_overflow: style.overflow == Overflow::Visible,
@@ -3445,6 +3505,7 @@ impl Renderer {
         if let Some(border) = &layout_box.rect.border.left {
             draw_rect_filled(
                 buffer,
+                false,
                 width,
                 height,
                 layout_box.rect.x,
@@ -3457,6 +3518,7 @@ impl Renderer {
         if let Some(border) = &layout_box.rect.border.top {
             draw_rect_filled(
                 buffer,
+                false,
                 width,
                 height,
                 layout_box.rect.x,
@@ -3469,6 +3531,7 @@ impl Renderer {
         if let Some(border) = &layout_box.rect.border.right {
             draw_rect_filled(
                 buffer,
+                false,
                 width,
                 height,
                 layout_box.rect.x + layout_box.rect.width as i32 - border.size as i32,
@@ -3481,6 +3544,7 @@ impl Renderer {
         if let Some(border) = &layout_box.rect.border.bottom {
             draw_rect_filled(
                 buffer,
+                false,
                 width,
                 height,
                 layout_box.rect.x,
@@ -3499,22 +3563,26 @@ impl Renderer {
         width: u32,
         height: u32,
         container_start_y: i32,
-        pixmap_buffer: &tiny_skia::Pixmap
+        pixmap_buffer: &tiny_skia::Pixmap,
+        opaque: bool,
     ) {
         let pixels = pixmap_buffer.pixels();
         let pixmap_width = layout_box.rect.width.min(pixmap_buffer.width());
         let pixmap_height = layout_box.rect.height.min(pixmap_buffer.height());
         let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
-        let end_y = pixmap_height.min(height);
-        for pixel_x in 0..end_x {
-            for pixel_y in 0..end_y {
-                let pixel = pixels[(pixel_x + pixel_y * pixmap_width) as usize];
-                let dist = container_start_y * width as i32
-                    + layout_box.rect.x
-                    + pixel_x as i32
-                    + pixel_y as i32 * width as i32;
-                if dist > 0 && dist < buffer.len() as i32 {
-                    buffer[dist as usize] = self.blend_premul_over_rgb(buffer[dist as usize], pixel);
+        let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
+        let start_y = (-container_start_y).max(0) as u32;
+        for pixel_y in start_y..end_y {
+            let src_start = (pixel_y * pixmap_width) as usize;
+            let src_row = &pixels[src_start..src_start + pixmap_width as usize];
+            let dst_start = (container_start_y * width as i32 + layout_box.rect.x + pixel_y as i32 * width as i32) as usize;
+            let dst_row = &mut buffer[dst_start..(dst_start + pixmap_width as usize)];
+            for pixel_x in 0..end_x {
+                let pixel = src_row[pixel_x as usize];
+                if opaque {
+                    dst_row[pixel_x as usize] = ((pixel.red() as u32) << 16) | ((pixel.green() as u32) << 8) | (pixel.blue() as u32);
+                } else {
+                    dst_row[pixel_x as usize] = self.blend_premul_over_rgb(dst_row[pixel_x as usize], pixel);
                 }
             }
         }
@@ -3548,6 +3616,7 @@ impl Renderer {
                     StyleBackground::Hex(code) => {
                         draw_rect_filled(
                             buffer,
+                            false,
                             width,
                             height,
                             layout_box.rect.x + left_border_size,
@@ -3559,7 +3628,7 @@ impl Renderer {
                     },
                     StyleBackground::DataUrl(_) => {
                         if let Some(pixmap) = self.resolved_pixmaps.get(&layout_box.node_idx.to_string()) {
-                            self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap);
+                            self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap, false);
                         }
                     },
                     _ => {},
@@ -3574,6 +3643,7 @@ impl Renderer {
                 if let Some(bg) = bg_hex {
                     draw_rect_filled(
                         buffer,
+                        false,
                         width,
                         height,
                         layout_box.rect.x,
@@ -3583,26 +3653,10 @@ impl Renderer {
                         bg,
                     );
                 }
-                let text_hex: Option<u32> = match layout_box.rect.color {
-                    StyleBackground::Hex(code) => Some(code),
-                    _ => None,
-                };
-                if let Some(color) = text_hex {
-                    draw_text(
-                        &self.font_handler,
-                        buffer,
-                        width,
-                        height,
-                        layout_box.rect.x as i32,
-                        container_start_y as i32,
-                        text,
-                        color,
-                        layout_box.rect.font_size.unwrap(),
-                    );
-                }
+                self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, text, false);
             }
-            LayoutKind::PixMap(pixmap_buffer) => {
-                self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap_buffer);
+            LayoutKind::PixMap((pixmap_buffer, opaque)) => {
+                self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap_buffer, *opaque);
             }
         }
 
@@ -3783,35 +3837,6 @@ impl FontHandler {
         let font = FontRef::try_from_slice(include_bytes!("./InterVariable.ttf"))?;
         Ok(Self {
             font,
-        })
-    }
-
-    pub fn get_renderable_text(&self, text: String, font_px: i32, max_width: Option<u32>) -> Result<RenderableText> {
-        let scaled_font = self.font.as_scaled(font_px as f32);
-        let mut glyphs = vec![];
-        let mut width = 0f32;
-        let mut width_buffer = 0f32;
-        let mut lines = 1;
-        for char in text.chars() {
-            let glyph = self.outline_glyph_for(char, font_px as f32);
-            glyphs.push(glyph);
-            let advance = scaled_font.h_advance(self.font.glyph_id(char));
-            if max_width.is_some_and(|max_width| width + advance >= max_width as f32) && char == ' ' {
-                width_buffer = 0f32;
-                lines += 1;
-            } else {
-                width_buffer += advance;
-                width = width.max(width_buffer)
-            }
-        }
-        let line_height = scaled_font.height() + scaled_font.line_gap();
-        let height = (line_height * lines as f32) as u32;
-        Ok(RenderableText {
-            text,
-            glyphs,
-            width: width as u32,
-            height,
-            line_height,
         })
     }
 
@@ -4254,6 +4279,25 @@ impl Browser {
         ))));
     }
 
+    fn tick_animations(&mut self) -> bool {
+        let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+        renderer.tick_animations()
+    }
+
+    fn render_loop(&mut self, surf: &mut Surface<DisplayHandle, WindowHandle>, size: &PhysicalSize<u32>, cursor: &Position) {
+        let first_boot = self.render(surf, &size, &cursor);
+        if first_boot {
+            let start = Instant::now();
+            let js_result = self.run_js();
+            println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
+        }
+
+        // If there are animations, continue re-rendering until there aren't
+        if self.tick_animations() {
+            self.render_loop(surf, size, cursor);
+        }
+    }
+
     fn render(&mut self, surf: &mut Surface<DisplayHandle, WindowHandle>, size: &PhysicalSize<u32>, cursor: &Position) -> bool {
         let start = Instant::now();
 
@@ -4352,12 +4396,7 @@ impl Browser {
                             size = window.inner_size();
                         }
                         WindowEvent::RedrawRequested => {
-                            let first_boot = self.render(&mut surf, &size, &cursor);
-                            if first_boot {
-                                let start = Instant::now();
-                                let js_result = self.run_js();
-                                println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
-                            }
+                            self.render_loop(&mut surf, &size, &cursor);
                         }
                         WindowEvent::CursorMoved { device_id: _, position } => {
                             cursor = Position {
@@ -4375,7 +4414,7 @@ impl Browser {
                         WindowEvent::MouseWheel { device_id: _, delta, phase: _ } => {
                             match delta {
                                 MouseScrollDelta::LineDelta(_, y) => {
-                                    self.scroll_y_by(y * 80.);
+                                    self.scroll_y_by(y * 140.);
                                 }
                                 _ => {}
                             };
@@ -4424,7 +4463,21 @@ impl Browser {
             .and_then(|l| Some(l.rect.height))
             .unwrap_or(0);
         let size = self.window.as_ref().unwrap().inner_size();
-        renderer.scroll_y = ((renderer.scroll_y as f32 + y)).min(0.).max(-(root_height as f32 - size.height as f32)) as i32;
+        let scroll_y = renderer.scroll_y;
+        if let Some(Animation::ScrollAnimation(existing_animation)) = renderer.animations.iter_mut().find(|a| matches!(a, Animation::ScrollAnimation(_))) {
+            let target_scroll = ((existing_animation.end as f32 + y)).min(0.).max(-(root_height as f32 - size.height as f32)) as i32;
+            existing_animation.start_at = SystemTime::now();
+            existing_animation.start = scroll_y;
+            existing_animation.end = target_scroll;
+        } else {
+            let target_scroll = ((renderer.scroll_y as f32 + y)).min(0.).max(-(root_height as f32 - size.height as f32)) as i32;
+            renderer.animations.push(Animation::ScrollAnimation(ScrollAnimation {
+                start: scroll_y,
+                end: target_scroll,
+                start_at: SystemTime::now(),
+                duration: Duration::from_millis(60),
+            }));
+        }
         if let Some(window) = self.window.as_mut() {
             window.request_redraw();
         }
@@ -4584,40 +4637,61 @@ fn collapse_whitespace(text: &str) -> Option<String> {
     }
 }
 
-fn draw_text(
+struct GlyphPosition {
+    x: f32,
+    y: f32,
+    glyph: OutlinedGlyph,
+}
+
+fn text_to_buffer(
     font_handler: &Rc<FontHandler>,
-    buffer: &mut [u32],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    renderable_text: &RenderableText,
     color: u32,
+    text: &String,
     font_px: u32,
-) {
+    max_width: Option<u32>,
+) -> Option<(Pixmap, u32, u32)> {
     let scaled_font = font_handler.font.as_scaled(font_px as f32);
+    let mut width = 0f32;
+    let x = 0;
+    let y = 0;
     let mut pen_x: f32 = x as f32;
     let mut pen_y: f32 = y as f32;
     let mut previous = None;
 
-    for (ch, glyph) in renderable_text.text.chars().zip(renderable_text.glyphs.clone()) {
+    let mut glyph_positions = vec![];
+
+    let line_height = scaled_font.height() + scaled_font.line_gap();
+    for ch in text.chars() {
         let glyph_id = font_handler.font.glyph_id(ch);
         if let Some(previous_id) = previous {
             pen_x += scaled_font.kern(previous_id, glyph_id);
         }
-        if let Some(glyph) = glyph {
-            draw_glyph(buffer, width, height, pen_x as i32, (pen_y + scaled_font.ascent() + glyph.px_bounds().min.y) as i32, glyph, color);
+        if let Some(glyph) = font_handler.outline_glyph_for(ch, font_px as f32) {
+            glyph_positions.push(GlyphPosition {
+                x: pen_x,
+                y: pen_y,
+                glyph,
+            });
         }
         let advance = scaled_font.h_advance(glyph_id);
         // Line break
-        if pen_x - x as f32 + advance > renderable_text.width as f32 && ch == ' ' {
+        if max_width.is_some_and(|max_width| pen_x + advance >= max_width as f32) && ch == ' ' {
             pen_x = x as f32;
-            pen_y += renderable_text.line_height;
+            pen_y += line_height;
         } else {
             pen_x += advance;
+            width = width.max(pen_x)
         }
         previous = Some(glyph_id);
     }
+    let width = width as u32;
+    let height = (pen_y + line_height) as u32;
+    let mut buffer = vec![0x00_00_00_00; (width * height) as usize];
+    for glyph_pos in glyph_positions {
+        draw_glyph(&mut buffer, width, height, glyph_pos.x as i32, (glyph_pos.y + scaled_font.ascent() + glyph_pos.glyph.px_bounds().min.y) as i32, &glyph_pos.glyph, color);
+    }
+    let pixmap = Pixmap::from_vec(rgba_buffer_to_premul_bytes(&buffer), IntSize::from_wh(width, height)?)?;
+    Some((pixmap, width, height))
 }
 
 fn with_coverage(color: u32, c: f32) -> u32 {
@@ -4633,11 +4707,11 @@ fn draw_glyph(
     height: u32,
     x: i32,
     y: i32,
-    glyph: OutlinedGlyph,
+    glyph: &OutlinedGlyph,
     color: u32,
 ) {
     glyph.draw(|glyph_x, glyph_y, c| {
-        draw_rect_filled(buffer, width, height, x + glyph_x as i32, y + glyph_y as i32, 1, 1, with_coverage(color, c));
+        draw_rect_filled(buffer, true, width, height, x + glyph_x as i32, y + glyph_y as i32, 1, 1, with_coverage(color, c));
     });
 }
 
@@ -4653,7 +4727,7 @@ fn rgba_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(buffer.len() * 4);
 
     for pixel in buffer {
-        let [r, g, b, a] = pixel.to_be_bytes();
+        let (r, g, b, a) = rgba_to_premul_tuple(*pixel);
 
         bytes.extend_from_slice(&[r, g, b, a]);
     }
@@ -4663,6 +4737,7 @@ fn rgba_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
 
 fn draw_rect_filled(
     buffer: &mut [u32],
+    buffer_rgba: bool,
     width: u32,
     height: u32,
     x: i32,
@@ -4683,7 +4758,11 @@ fn draw_rect_filled(
     for py in start_y..end_y {
         let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
         for px in start_x..end_x {
-            row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
+            if buffer_rgba {
+                row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+            } else {
+                row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
+            }
         }
     }
 }
