@@ -86,6 +86,13 @@ pub struct StyleComplexBackground {
 pub enum Overflow {
     Hidden,
     Visible,
+    Auto,
+}
+
+impl Overflow {
+    pub fn visible(&self) -> bool {
+        *self == Overflow::Visible || *self == Overflow::Auto
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +115,7 @@ pub enum PropertyValue {
     Flex {
         grow: Option<u32>,
         shrink: Option<u32>,
+        basis: Option<StyleSize>,
     },
     BorderStyle(StyleBorderStyle),
     BorderSide(BorderSideValue),
@@ -144,12 +152,19 @@ pub struct Layer {
 }
 
 #[derive(Debug, Clone)]
+pub struct PropertyDefinition {
+    pub name: String,
+    pub parent: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Node {
     MediaQuery(MediaQuery),
     Layer(Layer),
     ClassName(ClassName),
     Variable(Variable),
     Property(Property),
+    PropertyDefinition(PropertyDefinition),
 }
 
 impl Node {
@@ -160,6 +175,7 @@ impl Node {
             Node::Property(element) => element.parent,
             Node::MediaQuery(element) => element.parent,
             Node::Layer(element) => element.parent,
+            Node::PropertyDefinition(element) => element.parent,
         }
     }
 }
@@ -434,6 +450,15 @@ impl<'a> CssParser<'a> {
 
     fn create_media_query_from_state(&mut self) {
         if let Some(stripped) = self
+            .label
+            .trim()
+            .strip_prefix("@property")
+        {
+            self.nodes.push(Node::PropertyDefinition(PropertyDefinition {
+                name: stripped.trim().to_string(),
+                parent: self.node,
+            }));
+        } else if let Some(stripped) = self
             .label
             .trim()
             .strip_prefix("@layer")

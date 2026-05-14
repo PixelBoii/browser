@@ -68,9 +68,18 @@ function setIntervalImpl(callback, delay = 0, ...args) {
     return createTimer(callback, delay, args, true)
 }
 
-const ELEMENT_ATTRIBUTES = ['src', 'style', 'id', 'class', 'height', 'width']
-
 globalThis.__EVENT_LISTENERS = {}
+
+class SVGAnimatedString {
+    //
+}
+
+Object.defineProperty(globalThis, "SVGAnimatedString", {
+    value: SVGAnimatedString,
+    configurable: true,
+    writable: true,
+    enumerable: true
+})
 
 class BaseNode {
     constructor() {
@@ -79,7 +88,12 @@ class BaseNode {
 
     get parentNode() {
         const parent = core.ops.op_get_parent_node(this.__node_idx)
-        return nodeToElement(parent)
+        return parent ? nodeToElement(parent) : null
+    }
+
+    get parentElement() {
+        const parent = this.parentNode
+        return parent?.nodeType === Node.ELEMENT_NODE ? parent : null
     }
 
     get nextSibling() {
@@ -115,16 +129,22 @@ class TextNode extends BaseNode {
     constructor(text) {
         super()
         this.text = text
-        this.registerInBackend()
+        if (autoRegisterNode) {
+            this.registerInBackend()
+        }
     }
 
     registerInBackend() {
         this.__node_idx = core.ops.op_create_text_element(this.text)
     }
 
-    // TODO: Should probably sync these with the backend
     get data() { return this.text }
-    set data(value) { this.text = value; }
+    set data(value) {
+        this.text = String(value)
+        if (this.__node_idx != null) {
+            core.ops.op_set_text_content(this.__node_idx, this.text)
+        }
+    }
 
     get nodeValue() { return this.text }
     set nodeValue(value) { this.data = value }
@@ -149,6 +169,13 @@ class Event {
     }
 }
 
+Object.defineProperty(globalThis, "Event", {
+    value: Event,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
 class MouseEvent extends Event {}
 
 Object.defineProperty(globalThis, "MouseEvent", {
@@ -158,23 +185,29 @@ Object.defineProperty(globalThis, "MouseEvent", {
     writable: true,
 });
 
+let autoRegisterNode = true
+
+function withoutAutoRegisterNode(cb) {
+    let prev = autoRegisterNode
+    autoRegisterNode = false
+    let res = null
+    try {
+        res = cb()
+    } finally {
+        autoRegisterNode = prev
+    }
+    return res
+}
+
 class HtmlElement extends BaseNode {
     constructor(tag) {
         super()
         this.tag = tag
         this.namespaceURI = "http://www.w3.org/1999/xhtml"
-        this.registerInBackend()
-
-        return new Proxy(this, {
-            set(target, key, value) {
-                if (String(key).startsWith("__")) {
-                    return Reflect.set(target, key, value)
-                }
-
-                target.setAttribute(key, value)
-                return true
-            }
-        })
+        this.__attributes = {}
+        if (autoRegisterNode) {
+            this.registerInBackend()
+        }
     }
 
     registerInBackend() {
@@ -183,10 +216,7 @@ class HtmlElement extends BaseNode {
 
     addEventListener(event, cb) {
         const key = `${this.__node_idx}:${event}`
-        if (!(key in globalThis.__EVENT_LISTENERS)) {
-            globalThis.__EVENT_LISTENERS[key] = []
-        }
-        globalThis.__EVENT_LISTENERS[key].push(cb)
+        registerEventListener(key, cb)
     }
 
     set onload(cb) {
@@ -198,28 +228,20 @@ class HtmlElement extends BaseNode {
             throw new TypeError("Element is not an object")
         }
 
-        if (!this.__node_idx) {
+        if (this.__node_idx == null) {
             throw new Error("Item has not been registered on rust backend yet")
         }
 
         core.ops.op_append_child(this.__node_idx, element.__node_idx)
-    }
-
-    getPassableAttributes() {
-        let attributes = {}
-
-        for (const attr in ELEMENT_ATTRIBUTES) {
-            if (this[attr] !== null && this[attr] !== undefined) {
-                attributes[attr] = this[attr]
-            }
-        }
-        attributes = Object.fromEntries(Object.entries(attributes).filter(([k, v]) => v))
-
-        return attributes
+        return element
     }
 
     get childNodes() {
         return core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement)
+    }
+
+    get children() {
+        return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
     }
 
     hasChildNodes() {
@@ -231,39 +253,58 @@ class HtmlElement extends BaseNode {
             throw new TypeError("Element is not an object")
         }
 
-        if (element.__node_idx) {
+        if (element.__node_idx != null) {
             core.ops.op_remove_child(element.__node_idx)
         }
+        return element
+    }
+
+    replaceChild(newChild, oldChild) {
+        this.insertBefore(newChild, oldChild)
+        this.removeChild(oldChild)
+        return oldChild
     }
 
     insertBefore(newNode, referenceNode) {
         if (!newNode) {
             throw new TypeError("insertBefore called without newNode")
         }
-        if (referenceNode) {
-            console.log('referenceNode!', referenceNode)
+        if (referenceNode && newNode.__node_idx === referenceNode.__node_idx) {
+            return newNode
         }
         core.ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
+        return newNode
     }
 
     getAttribute(attr) {
-        return this[attr]
+        return this.hasAttribute(attr) ? this.__attributes[attr] : null
     }
 
     setAttribute(attr, value) {
-        this[attr] = value
-        if (this.__node_idx) {
+        this.__attributes[attr] = value
+        if (this.__node_idx != null) {
             // TODO: This should probably not stringify all values
             core.ops.op_update_attributes(this.__node_idx, { [attr]: String(value) })
         }
     }
 
     removeAttribute(attr) {
-        this[attr] = undefined
+        this.__attributes[attr] = undefined
+        if (this.__node_idx != null) {
+            core.ops.op_remove_attribute(this.__node_idx, attr)
+        }
     }
 
     hasAttribute(attr) {
-        return !!this[attr]
+        return Object.hasOwn(this.__attributes, attr) && this.__attributes[attr] !== undefined
+    }
+
+    getAttributeNames() {
+        return Object.keys(this.__attributes).filter(attr => this.__attributes[attr] !== undefined)
+    }
+
+    remove() {
+        this.parentNode?.removeChild(this)
     }
 
     // TODO: Implement this
@@ -281,8 +322,17 @@ class HtmlElement extends BaseNode {
         return nodes.map(nodeToElement)
     }
 
+    closest(selector) {
+        const node = core.ops.op_get_closest(selector, this.__node_idx)
+        return node ? nodeToElement(node) : null
+    }
+
     get tagName() {
         return this.tag.toUpperCase()
+    }
+
+    get nodeName() {
+        return this.tagName
     }
 
     get innerHTML() {
@@ -306,19 +356,118 @@ class HtmlElement extends BaseNode {
     }
 
     get classList() {
-        return new ClassList(this.class, this)
+        return new ClassList(this.__attributes.class, this)
     }
 
     get style() {
-        return new CSSStyleDeclaration(this.__style, this)
+        return new CSSStyleDeclaration(this.__attributes.style, this)
     }
 
     set style(value) {
         if (!value instanceof CSSStyleDeclaration) {
             throw new TypeError("Unsupported style value (for now)")
         }
-        this.__style = value
+        this.__attributes.style = value
     }
+
+    get href() {
+        const value = this.getAttribute("href")
+        return value == null ? "" : new URL(value, globalThis.location.href).href
+    }
+
+    set href(value) {
+        this.setAttribute('href', value)
+    }
+
+    get rel() {
+        return this.getAttribute('rel') ?? ''
+    }
+
+    set rel(value) {
+        this.setAttribute('rel', value)
+    }
+
+    get relList() {
+        return {
+            supports(feature) {
+                return feature === 'modulepreload'
+            }
+        }
+    }
+
+    get src() {
+        return this.getAttribute('src')
+    }
+
+    set src(value) {
+        this.setAttribute('src', value)
+    }
+
+    get id() {
+        return this.getAttribute('id')
+    }
+
+    set id(value) {
+        this.setAttribute('id', value)
+    }
+
+    get className() {
+        return this.getAttribute('class') ?? ''
+    }
+
+    set className(value) {
+        this.setAttribute('class', value)
+    }
+
+    get value() {
+        return this.getAttribute('value') ?? ''
+    }
+
+    set value(value) {
+        this.setAttribute('value', value)
+    }
+
+    get selected() {
+        return this.hasAttribute('selected')
+    }
+
+    set selected(value) {
+        if (value) {
+            this.setAttribute('selected', '')
+        } else {
+            this.removeAttribute('selected')
+        }
+    }
+
+    get height() {
+        return this.getAttribute('height')
+    }
+
+    set height(value) {
+        this.setAttribute('height', value)
+    }
+
+    get width() {
+        return this.getAttribute('width')
+    }
+
+    set width(value) {
+        this.setAttribute('width', value)
+    }
+
+    get dataset() {
+        let data = Object.entries(this.__attributes)
+            .filter(([key, value]) => key.startsWith('data-'))
+            .map(([key, value]) => [camelize(key.replace('data-', '')).replaceAll('-', ''), value])
+        return Object.fromEntries(data)
+    }
+}
+
+function camelize(str) {
+    return str.replace(/(?:^\w|[A-Z]|\b\w|\s+)/g, function(match, index) {
+        if (+match === 0) return "";
+        return index === 0 ? match.toLowerCase() : match.toUpperCase();
+    });
 }
 
 class CanvasRenderingContext2D {
@@ -386,6 +535,12 @@ Object.defineProperty(globalThis, "HTMLElement", {
     configurable: true,
     writable: true,
 });
+Object.defineProperty(globalThis, "Element", {
+    value: HtmlElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
 Object.defineProperty(globalThis, "HTMLCanvasElement", {
     value: HtmlCanvasElement,
     enumerable: true,
@@ -393,14 +548,49 @@ Object.defineProperty(globalThis, "HTMLCanvasElement", {
     writable: true,
 });
 
+class IntersectionObserver {
+    constructor(callback) {
+        if (typeof callback !== "function") {
+            throw new TypeError("IntersectionObserver callback must be a function")
+        }
+
+        this.callback = callback
+        this.targets = new Set()
+    }
+
+    observe(target) {
+        this.targets.add(target)
+    }
+
+    unobserve(target) {
+        this.targets.delete(target)
+    }
+
+    disconnect() {
+        this.targets.clear()
+    }
+
+    takeRecords() {
+        return []
+    }
+}
+
+Object.defineProperty(globalThis, "IntersectionObserver", {
+    value: IntersectionObserver,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
 class CSSStyleDeclaration {
     constructor(style, element) {
+        this.__element = element
+        this.__properties = {}
         let pairs = style ? style.split(";") : []
         for (const pair of pairs) {
             const [key, value] = pair.split(":")
-            this[key] = value
+            this.__properties[key] = value
         }
-        this.__element = element
 
         return new Proxy(this, {
             set(target, key, value) {
@@ -415,25 +605,23 @@ class CSSStyleDeclaration {
     }
 
     getProperty(key) {
-        return this[key]
+        return this.__properties[key]
     }
 
     setProperty(key, value) {
-        this[key] = value
+        this.__properties[key] = value
         this.sync()
     }
 
+    // TODO: Need to convert property names into correct format. For example, background_color to background-color
     sync() {
         const keys = Object.keys(this)
         let out = ""
-        for (const key of keys) {
-            if (key.startsWith("__")) continue
-            const value = this[key]
-            if (typeof value !== "boolean" || typeof value !== "number" || typeof value !== "string") {
-                out += `${key}:${value};`
-            }
+        for (const [key, value] of Object.entries(this.__properties)) {
+            out += `${key}:${value};`
         }
 
+        console.log(out)
         this.__element.__style = out
         core.ops.op_update_attributes(this.__element.__node_idx, { style: out })
     }
@@ -471,11 +659,24 @@ class CommentNode extends BaseNode {
     constructor(data) {
         super()
         this.data = data
-        this.registerInBackend()
+        if (autoRegisterNode) {
+            this.registerInBackend()
+        }
     }
 
     registerInBackend() {
         this.__node_idx = core.ops.op_create_comment_element(this.data)
+    }
+
+    get nodeValue() { return this.data }
+    set nodeValue(value) { this.textContent = value }
+
+    get textContent() { return this.data }
+    set textContent(value) {
+        this.data = String(value)
+        if (this.__node_idx != null) {
+            core.ops.op_set_text_content(this.__node_idx, this.data)
+        }
     }
 
     get nodeType() {
@@ -532,20 +733,30 @@ function nodeToElement(pair) {
     let element;
     if (node.kind === "element") {
         const elementClass = tagToElement(node.tag)
-        element = new elementClass(node.tag)
+        element = withoutAutoRegisterNode(() => new elementClass(node.tag))
         for (const [key, value] of Object.entries(node.attributes)) {
-            if (ELEMENT_ATTRIBUTES.includes(key)) {
-                element.setAttribute(key, value)
-            }
+            element.setAttribute(key, value)
         }
     } else if (node.kind === "comment") {
-        element = new CommentNode(node.comment)
+        element = withoutAutoRegisterNode(() => new CommentNode(node.comment))
     } else if (node.kind === "text") {
-        element = new TextNode(node.text)
+        element = withoutAutoRegisterNode(() => new TextNode(node.text))
     }
     element.__node_idx = node_idx
     return element
 }
+
+function elementFromNodeIdx(idx) {
+    const element = core.ops.op_get_node(idx)
+    return element ? nodeToElement(element) : null
+}
+
+Object.defineProperty(globalThis, "__elementFromNodeIdx", {
+    value: elementFromNodeIdx,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 Object.defineProperty(globalThis, "SVGElement", {
     value: SVGElement,
@@ -628,6 +839,9 @@ globalThis.document = {
     createTextNode(text) {
         const element = new TextNode(text)
         return element
+    },
+    createDocumentFragment() {
+        return this.createElement("fragment")
     }
 };
 
@@ -750,11 +964,18 @@ Object.defineProperty(globalThis, "getComputedStyle", {
     writable: true,
 })
 
+// TODO: This is quite naive, improve this
+const browserPerformance = performance.Performance
+browserPerformance.timing = {
+    navigationStart: Date.now(),
+}
+browserPerformance.now = Date.now
+
 Object.defineProperties(globalThis, {
     URL: { value: url.URL, configurable: true, writable: true },
     URLSearchParams: { value: url.URLSearchParams, configurable: true, writable: true },
     URLPattern: { value: urlPattern.URLPattern, configurable: true, writable: true },
-    performance: { value: performance.performance, configurable: true, writable: true },
+    performance: { value: browserPerformance, configurable: true, writable: true },
     Performance: { value: performance.Performance, configurable: true, writable: true },
     PerformanceObserver: { value: performance.PerformanceObserver, configurable: true, writable: true },
     DOMException: { value: DOMException.DOMException, configurable: true, writable: true },
@@ -824,9 +1045,30 @@ Object.defineProperty(globalThis, "navigator", {
     writable: true,
 })
 
-// TODO: Implement this
-function addEventListener(event, cb) {
+function registerEventListener(key, cb) {
+    if (!(key in globalThis.__EVENT_LISTENERS)) {
+        globalThis.__EVENT_LISTENERS[key] = []
+    }
+    globalThis.__EVENT_LISTENERS[key].push(cb)
+}
 
+function runEventListeners(event_key, event) {
+    if (__EVENT_LISTENERS[event_key]) {
+        __EVENT_LISTENERS[event_key]?.forEach(cb => {
+            cb(event)
+        })
+    }
+}
+
+Object.defineProperty(globalThis, "runEventListeners", {
+    value: runEventListeners,
+    enumerable: true,
+    configurable: true,
+    writable: true
+})
+
+function addEventListener(event, cb) {
+    registerEventListener(`window:${event}`, cb)
 }
 
 Object.defineProperty(globalThis, "addEventListener", {
@@ -839,6 +1081,15 @@ Object.defineProperty(globalThis, "addEventListener", {
 class History {
     constructor() {
         this.state = null
+    }
+
+    pushState(state, unused, url) {
+        this.state = state
+
+        if (url) {
+            globalThis.location.__url = new URL(url, globalThis.location.__url)
+            core.ops.op_set_location_href(url, false)
+        }
     }
 
     replaceState(state, unused, url) {
@@ -955,6 +1206,27 @@ class XMLHttpRequest {
 
 Object.defineProperty(globalThis, "XMLHttpRequest", {
     value: XMLHttpRequest,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class MutationObserver {
+    constructor(cb) {
+        //
+    }
+
+    observe(node, config) {
+        //
+    }
+
+    disconnect() {
+        //
+    }
+}
+
+Object.defineProperty(globalThis, "MutationObserver", {
+    value: MutationObserver,
     enumerable: true,
     configurable: true,
     writable: true,

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use deno_core::{ToV8, v8};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap};
 use std::convert::Infallible;
 
 const SELF_CLOSING_TAGS: [&str; 6] = ["br", "input", "meta", "link", "img", "hr"];
@@ -159,7 +159,6 @@ pub struct HtmlParser {
     pub tag: String,
     value: String,
     pub nodes: Vec<Node>,
-    pub traces: VecDeque<TraceItem>,
     node: Option<usize>,
 }
 
@@ -235,7 +234,6 @@ impl HtmlParser {
             value: "".to_string(),
             stage: BuildPhase::Start,
             nodes: vec![],
-            traces: VecDeque::new(),
             node: None,
         }
     }
@@ -257,7 +255,7 @@ impl HtmlParser {
     }
 
     fn close_attribute(&mut self) -> anyhow::Result<()> {
-        let tag = self.tag.clone();
+        let tag = self.tag.drain(..).collect();
         let value = decode_html_entities(&self.value);
         let node = self.curr_node()?;
         match node {
@@ -266,7 +264,6 @@ impl HtmlParser {
             }
             _ => {}
         }
-        self.tag = "".to_string();
         self.value = "".to_string();
         Ok(())
     }
@@ -315,16 +312,10 @@ impl HtmlParser {
     }
 
     pub fn get_context(&self) -> String {
-        let traces = self
-            .traces
-            .iter()
-            .map(|t| format!("{:?}", t))
-            .collect::<VecDeque<String>>();
         format!(
-            "{} {:?} {}",
+            "{} {:?}",
             self.tag,
             self.stage,
-            Vec::from(traces).join("\n")
         )
     }
 
@@ -332,15 +323,6 @@ impl HtmlParser {
         let input = self.input.clone();
         let chars = input.chars();
         for char in chars {
-            if self.traces.len() >= 200 {
-                self.traces.pop_back();
-            }
-            self.traces.push_front(TraceItem {
-                char,
-                tag: self.tag.clone(),
-                stage: self.stage.clone(),
-            });
-
             // If in a script we ignore most parsing logic and just keep adding to "tag" until we see </script>
             if self.stage == BuildPhase::ScriptOpen {
                 self.tag.push(char);

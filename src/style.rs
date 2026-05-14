@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -142,6 +143,7 @@ pub struct Style {
     pub display: StyleDisplay,
     pub flex_shrink: u32,
     pub flex_grow: u32,
+    pub flex_basis: StyleSize,
     pub justify_content: StyleJustifyContent,
     pub align_items: StyleJustifyContent,
     pub flex_direction: StyleFlexDirection,
@@ -173,7 +175,8 @@ pub struct Style {
     pub border_right: StyleSizeAndColor,
     pub border_bottom: StyleSizeAndColor,
     pub grid_template_columns: GridTemplateColumns,
-    pub overflow: Overflow,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
     pub z_index: StyleZIndex,
 }
 
@@ -186,6 +189,7 @@ impl Style {
             display: self.display,
             flex_shrink: self.flex_shrink,
             flex_grow: self.flex_grow,
+            flex_basis: self.flex_basis.clone(),
             justify_content: self.justify_content,
             align_items: self.align_items,
             flex_direction: self.flex_direction,
@@ -217,7 +221,8 @@ impl Style {
             border_right: self.border_right.clone(),
             border_bottom: self.border_bottom.clone(),
             grid_template_columns: self.grid_template_columns.clone(),
-            overflow: self.overflow.clone(),
+            overflow_x: self.overflow_x.clone(),
+            overflow_y: self.overflow_y.clone(),
             z_index: self.z_index.clone(),
         }
     }
@@ -297,6 +302,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         },
         flex_shrink: 1,
         flex_grow: 0,
+        flex_basis: StyleSize::Auto,
         justify_content: StyleJustifyContent::FlexStart,
         align_items: StyleJustifyContent::Stretch,
         flex_direction: StyleFlexDirection::Row,
@@ -361,7 +367,8 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
         border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
         grid_template_columns: GridTemplateColumns::None,
-        overflow: Overflow::Visible,
+        overflow_x: Overflow::Auto,
+        overflow_y: Overflow::Auto,
         z_index: StyleZIndex::Auto
     }
 }
@@ -516,6 +523,20 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
             .trim();
         return Ok(StyleSize::Svh(parse_size_number(svh)? as i32));
     }
+    if value.ends_with("dvh") {
+        let dvh = value
+            .strip_suffix("dvh")
+            .with_context(|| "Failed to strip dvh")?
+            .trim();
+        return Ok(StyleSize::Vh(parse_size_number(dvh)? as i32));
+    }
+    if value.ends_with("lvh") {
+        let lvh = value
+            .strip_suffix("lvh")
+            .with_context(|| "Failed to strip lvh")?
+            .trim();
+        return Ok(StyleSize::Vh(parse_size_number(lvh)? as i32));
+    }
     if value.ends_with("vh") {
         let vh = value
             .strip_suffix("vh")
@@ -657,6 +678,8 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
         match (q.property.as_str(), q.comparison.clone(), q.value.clone()) {
             // Default to dark mode
             ("prefers-color-scheme", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::String(value)) => value == "dark",
+            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => window_size.width >= px as u32,
+            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Rem(rem)) => window_size.width >= rem as u32 * 16,
             ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => window_size.width < px as u32,
             ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Px(px)) => window_size.width >= px as u32,
             ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Rem(rem)) => window_size.width >= rem as u32 * 16,
@@ -716,37 +739,36 @@ fn parse_color(value: String) -> Result<StyleBackground> {
             _ => Err(anyhow!("expected 3, 6 or 8 hex chars, got {}", code_str))?,
         };
         Ok(StyleBackground::Hex(parsed))
-    } else if let Some(rgba) = value.strip_prefix("rgba(") {
-        let cleaned: &str = rgba.strip_suffix(")").unwrap_or(rgba);
-        let parts: Vec<&str> = cleaned.split(",").collect();
-        if parts.len() != 4 {
-            panic!("Invalid RGBA string: {}", cleaned);
+    } else if let Some(raw) = value.strip_prefix("rgba(").or(value.strip_prefix("rgb(")) {
+        let cleaned: &str = raw.strip_suffix(")").unwrap_or(raw);
+        let (rgba, mut alpha) = if let Some((rgba, alpha)) = cleaned.split_once("/") {
+            (rgba.trim(), Some(alpha.trim()))
+        } else {
+            (cleaned.trim(), None)
+        };
+        let mut parts: Vec<&str> = rgba.split([',', ' ']).collect();
+        match parts.len() {
+            3 => {},
+            4 => {
+                alpha = Some(parts[3]);
+                parts = parts[..3].to_vec();
+            },
+            _ => panic!("Invalid RGBA string: {}", rgba),
         }
         let parsed_parts: Vec<u8> = parts
             .iter()
             .take(3)
             .filter_map(|part| part.trim().parse::<u8>().ok())
             .collect();
-        let alpha = (parts[3].trim().parse::<f32>()?.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let alpha = if let Some(alpha) = alpha {
+            (alpha.parse::<f32>()?.clamp(0.0, 1.0) * 255.0).round() as u8
+        } else {
+            255
+        };
         if parsed_parts.len() != 3 {
-            panic!("Invalid RGBA string: {}", cleaned);
+            panic!("Invalid RGBA string: {}", rgba);
         }
         let hex = rgba_to_hex((parsed_parts[0], parsed_parts[1], parsed_parts[2], alpha));
-        Ok(StyleBackground::Hex(hex))
-    } else if let Some(rgb) = value.strip_prefix("rgb(") {
-        let cleaned: &str = rgb.strip_suffix(")").unwrap_or(rgb);
-        let parts: Vec<&str> = cleaned.split(",").collect();
-        if parts.len() != 3 {
-            panic!("Invalid RGB string: {}", cleaned);
-        }
-        let parsed_parts: Vec<u8> = parts
-            .iter()
-            .filter_map(|part| part.trim().parse::<u8>().ok())
-            .collect();
-        if parsed_parts.len() != 3 {
-            panic!("Invalid RGBA string: {}", cleaned);
-        }
-        let hex = rgba_to_hex((parsed_parts[0], parsed_parts[1], parsed_parts[2], 255));
         Ok(StyleBackground::Hex(hex))
     } else if value == "transparent" || value == "none" {
         Ok(StyleBackground::Transparent)
@@ -782,98 +804,76 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
     out
 }
 
-fn apply_node_variables_dependencies(collected_variables: &mut HashMap<usize, String>, css_nodes: &Vec<Node>, variable_dependence: &mut HashMap<&str, Vec<usize>>, var_idx: usize, value: String) {
-    collected_variables.insert(var_idx, value.clone());
-    let name = match &css_nodes[var_idx] {
-        Node::Variable(variable) => &variable.variable,
-        _ => panic!(),
-    };
-    let Some(dependent) = variable_dependence.get(name.as_str()).cloned() else {
-        return;
-    };
-    for idx in dependent.iter() {
-        apply_node_variables_dependencies(collected_variables, css_nodes, variable_dependence, *idx, value.clone());
-    }
-    variable_dependence.remove(name.as_str());
-}
-
 fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &[usize]) -> Vec<usize> {
     let mut idxs = idxs.clone();
     idxs.sort_by(|a, b| {
-        let a_rank = css_node_ranking[**a];
-        let b_rank = css_node_ranking[**b];
+        let a_rank = if **a == usize::MAX { usize::MAX } else { css_node_ranking[**a] };
+        let b_rank = if **b == usize::MAX { usize::MAX } else { css_node_ranking[**b] };
         a_rank.cmp(&b_rank)
     });
 
     idxs.into_iter().copied().collect()
 }
 
+fn resolve_node_variable(value: &PropertyValue, map: &HashMap<String, PropertyValue>, parent_variables: &Rc<HashMap<String, String>>) -> Option<String> {
+    match value {
+        PropertyValue::Raw(value) => {
+            return Some(value.clone());
+        },
+        PropertyValue::VariableTemplate(template) => {
+            // TODO: Handle multi variable dependence
+            if template.len() == 1 {
+                if let VariableTemplatePart::Var(var) = &template[0] {
+                    if let Some(resolved) = map.get(var) {
+                        return resolve_node_variable(resolved, map, parent_variables);
+                    }
+                    if let Some(resolved) = parent_variables.get(var) {
+                        return resolve_node_variable(&PropertyValue::Raw(resolved.to_string()), map, parent_variables);
+                    }
+                }
+            }
+        },
+        _ => {},
+    };
+    None
+}
+
 fn apply_node_variables(
-    nodes: &Vec<(usize, Node)>,
+    nodes: &[(usize, Cow<'_, Node>)],
     variables: &Rc<HashMap<String, String>>,
-    css_nodes: &Vec<Node>,
     css_node_ranking: &[usize],
 ) -> Rc<HashMap<String, String>> {
     let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
-        .filter_map(|(idx, node)| match node {
+        .filter_map(|(idx, node)| match node.as_ref() {
             Node::Variable(variable) => {
                 Some((*idx, variable))
             }
             _ => None
         })
         .collect();
-
-    let mut variable_dependence: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut no_dependence = vec![];
-    for (idx, var) in variables_to_parse.iter() {
-        if let PropertyValue::VariableTemplate(template) = &var.value {
-            // TODO: Handle multi variable dependence
-            if template.len() == 1 {
-                if let VariableTemplatePart::Var(var) = &template[0] {
-                    variable_dependence.entry(var).or_default().push(*idx);
-                    continue;
-                }
-            }
-        }
-        no_dependence.push(*idx);
-    }
-
-    let mut collected_variables: HashMap<usize, String> = HashMap::new();
-    for idx in no_dependence {
-        // Ignore fake idxs
-        if idx == usize::MAX {
-            continue;
-        }
-        let value = match &css_nodes[idx] {
-            Node::Variable(variable) => &variable.value,
-            _ => panic!(),
-        };
-        if let PropertyValue::Raw(value) = value {
-            apply_node_variables_dependencies(&mut collected_variables, css_nodes, &mut variable_dependence, idx, value.clone());
-        }
-    }
-    for (variable, idxs) in variable_dependence.clone() {
-        let Some(resolved) = variables.get(variable).cloned() else {
-            continue;
-        };
-
-        for idx in idxs {
-            apply_node_variables_dependencies(&mut collected_variables, css_nodes, &mut variable_dependence, idx, resolved.clone());
-        }
-    }
-    if collected_variables.len() == 0 {
+    if variables_to_parse.len() == 0 {
         return Rc::clone(variables);
     }
-    let unordered_collected_idxs = collected_variables.keys().collect::<Vec<&usize>>();
+
+    let unordered_collected_idxs = variables_to_parse.keys().collect::<Vec<&usize>>();
     let ordered_idxs = order_variables(&unordered_collected_idxs, css_node_ranking);
 
-    let mut new_variables = (**variables).clone();
-    for idx in ordered_idxs {
-        let value = collected_variables.get(&idx).unwrap();
-        let var = variables_to_parse.get(&idx).unwrap();
-        new_variables.insert(var.variable.clone(), value.to_string());
+    let mut map = HashMap::new();
+    for idx in ordered_idxs.iter() {
+        let var = variables_to_parse.get(idx).unwrap();
+        map.insert(var.variable.clone(), var.value.clone());
     }
+
+    let mut new_variables = (**variables).clone();
+
+    for idx in ordered_idxs {
+        let var = variables_to_parse.get(&idx).unwrap();
+        if let Some(resolved) = resolve_node_variable(&var.value, &map, variables) {
+            new_variables.insert(var.variable.clone(), resolved);
+        }
+    }
+
     Rc::new(new_variables)
 }
 
@@ -885,10 +885,17 @@ fn resolve_variable_template(template: &Vec<VariableTemplatePart>, resolved_vari
                 out += text;
             },
             VariableTemplatePart::Var(var) => {
-                if let Some(value) = resolved_variables.get(var) {
+                // TODO: This split should probably happen when parsing
+                let (name, default) = if let Some((name, default)) = var.split_once(",") {
+                    (name.trim(), Some(default.trim()))
+                } else {
+                    (var.as_str(), None)
+                };
+
+                if let Some(value) = resolved_variables.get(name) {
                     out += value;
                 } else {
-                    out += var;
+                    out += default.unwrap_or(var);
                 }
             }
         };
@@ -896,26 +903,38 @@ fn resolve_variable_template(template: &Vec<VariableTemplatePart>, resolved_vari
     out
 }
 
-pub fn resolve_node_variables<'a>(
-    nodes: &'a mut Vec<(usize, Node)>,
+pub fn resolve_node_variables<'nodes, 'css>(
+    nodes: &'nodes mut [(usize, Cow<'css, Node>)],
     variables: &Rc<HashMap<String, String>>,
-    css_nodes: &Vec<Node>,
     css_node_ranking: &[usize],
-) -> (Vec<&'a mut Property>, Rc<HashMap<String, String>>) {
-    let resolved_variables = apply_node_variables(nodes, variables, css_nodes, css_node_ranking);
+) -> (Vec<&'nodes Property>, Rc<HashMap<String, String>>) {
+    let resolved_variables = apply_node_variables(nodes, variables, css_node_ranking);
+
+    for (_, node) in nodes.iter_mut() {
+        let parsed_value = match node.as_ref() {
+            Node::Property(property) => match &property.value {
+                PropertyValue::VariableTemplate(template) => {
+                    let value = resolve_variable_template(template, &resolved_variables);
+                    parse_property_value(property.property.clone(), value)
+                        .map(|(parsed, _)| parsed)
+                        .ok()
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let Some(parsed_value) = parsed_value {
+            if let Node::Property(property) = node.to_mut() {
+                property.value = parsed_value;
+            }
+        }
+    }
 
     let properties = nodes
-        .iter_mut()
-        .filter_map(|(_, node)| match node {
-            Node::Property(property) => {
-                if let PropertyValue::VariableTemplate(template) = &property.value {
-                    let value = resolve_variable_template(template, &resolved_variables);
-                    if let Ok((parsed, _)) = parse_property_value(property.property.clone(), value) {
-                        property.value = parsed;
-                    }
-                }
-                Some(property)
-            }
+        .iter()
+        .filter_map(|(_, node)| match node.as_ref() {
+            Node::Property(property) => Some(property),
             _ => None,
         })
         .collect();
@@ -925,7 +944,7 @@ pub fn resolve_node_variables<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, rc::Rc};
+    use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
     use crate::{css::{Node, Property, PropertyValue, Variable}, style::{parse_property_value, resolve_variable_template}};
 
@@ -944,9 +963,13 @@ mod tests {
 
         let mut already_resolved = HashMap::new();
         already_resolved.insert("--test".to_string(), "16px".to_string());
-        let mut nodes_to_parse = nodes.clone().into_iter().enumerate().collect();
+        let mut nodes_to_parse: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, node)| (idx, Cow::Borrowed(node)))
+            .collect();
         let css_node_ranking = vec![0; nodes.len()];
-        let (properties, _) = resolve_node_variables(&mut nodes_to_parse, &mut Rc::new(already_resolved), &nodes, &css_node_ranking);
+        let (properties, _) = resolve_node_variables(&mut nodes_to_parse, &mut Rc::new(already_resolved), &css_node_ranking);
 
         assert_eq!(
             properties[0].value,
@@ -1102,6 +1125,7 @@ fn parse_overflow(value: String) -> Result<PropertyValue> {
     match value.as_str() {
         "hidden" => Ok(PropertyValue::Overflow(Overflow::Hidden)),
         "visible" => Ok(PropertyValue::Overflow(Overflow::Visible)),
+        "auto" => Ok(PropertyValue::Overflow(Overflow::Auto)),
         _ => Err(anyhow!("Failed to parse overflow value: {}", value))
     }
 }
@@ -1141,6 +1165,8 @@ fn parse_background(value: String) -> Result<PropertyValue> {
                     //
                 }
             }
+        } else if let Ok(value) = parse_color(part) {
+            background = value;
         }
     }
     Ok(PropertyValue::ComplexBackground(StyleComplexBackground { background }))
@@ -1203,33 +1229,53 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             _ => None
         }.with_context(|| "Failed to parse text-align")?),
         "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
+        "flex-basis" => PropertyValue::Size(parse_style_size(value)?),
         "flex" => {
             let parts: Vec<&str> = value.split(" ").collect();
             let mut grow = None;
             let mut shrink = None;
-            // Flex-basis ignored for now
-            match parts.len() {
-                1 => {
-                    // If it can be parsed as a u32, it refers to grow
-                    if let Ok(value) = parts[0].parse::<u32>() {
-                        grow = Some(value);
+            let mut basis = None;
+            if value == "none" {
+                grow = Some(0);
+                shrink = Some(0);
+                basis = Some(StyleSize::Auto);
+            } else if value == "auto" {
+                grow = Some(1);
+                shrink = Some(1);
+                basis = Some(StyleSize::Auto);
+            } else if value == "initial" {
+                grow = Some(0);
+                shrink = Some(1);
+                basis = Some(StyleSize::Auto);
+            } else {
+                match parts.len() {
+                    1 => {
+                        if let Ok(value) = parts[0].parse::<u32>() {
+                            grow = Some(value);
+                            shrink = Some(1);
+                            basis = Some(StyleSize::Percent(0.));
+                        } else {
+                            basis = Some(parse_style_size(parts[0].to_string())?);
+                        }
                     }
-                    // Otherwise it refers to the flex-basis, which we don't yet handle
-                }
-                2 => {
-                    grow = Some(parts[0].parse::<u32>()?);
-                    if let Ok(value) = parts[1].parse::<u32>() {
-                        shrink = Some(value);
+                    2 => {
+                        grow = Some(parts[0].parse::<u32>()?);
+                        if let Ok(value) = parts[1].parse::<u32>() {
+                            shrink = Some(value);
+                        } else {
+                            shrink = Some(1);
+                            basis = Some(parse_style_size(parts[1].to_string())?);
+                        }
                     }
-                    // Otherwise it refers to the flex-basis, which we don't yet handle
+                    3 => {
+                        grow = Some(parts[0].parse::<u32>()?);
+                        shrink = Some(parts[1].parse::<u32>()?);
+                        basis = Some(parse_style_size(parts[2].to_string())?);
+                    }
+                    _ => {}
                 }
-                3 => {
-                    grow = Some(parts[0].parse::<u32>()?);
-                    shrink = Some(parts[1].parse::<u32>()?);
-                }
-                _ => {}
             }
-            PropertyValue::Flex { grow, shrink }
+            PropertyValue::Flex { grow, shrink, basis }
         },
         "justify-content" | "align-items" | "align-self" =>
             PropertyValue::JustifyContent(parse_justify_content(value.as_str())),
@@ -1265,8 +1311,9 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "border-left" | "border-top" | "border-right" | "border-bottom" | "border" =>
             PropertyValue::BorderSide(parse_border_side_value(value)?),
         "grid-template-columns" => parse_grid_template_columns_value(value)?,
-        "overflow" => parse_overflow(value)?,
+        "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
         "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
+        "initial-value" | "syntax" | "inherits" => PropertyValue::Raw(value),
         _ => {
             // println!("Failed to parse style \"{}\"", property);
             PropertyValue::Raw(value)
@@ -1419,12 +1466,18 @@ pub fn apply_style_property(
         ("flex-grow", PropertyValue::Int(value)) => {
             style.flex_grow = value;
         }
-        ("flex", PropertyValue::Flex { grow, shrink }) => {
+        ("flex-basis", PropertyValue::Size(value)) => {
+            style.flex_basis = value;
+        }
+        ("flex", PropertyValue::Flex { grow, shrink, basis }) => {
             if let Some(grow) = grow {
                 style.flex_grow = grow;
             }
             if let Some(shrink) = shrink {
                 style.flex_shrink = shrink;
+            }
+            if let Some(basis) = basis {
+                style.flex_basis = basis;
             }
         }
         ("justify-content", PropertyValue::JustifyContent(value)) => {
@@ -1521,7 +1574,14 @@ pub fn apply_style_property(
             style.grid_template_columns = columns;
         },
         ("overflow", PropertyValue::Overflow(overflow)) => {
-            style.overflow = overflow;
+            style.overflow_x = overflow.clone();
+            style.overflow_y = overflow;
+        },
+        ("overflow-x", PropertyValue::Overflow(overflow)) => {
+            style.overflow_x = overflow;
+        },
+        ("overflow-y", PropertyValue::Overflow(overflow)) => {
+            style.overflow_y = overflow;
         },
         ("z-index", PropertyValue::ZIndex(value)) => {
             style.z_index = value;
@@ -1582,7 +1642,7 @@ pub fn get_chain_order(a_chain: &Vec<usize>, b_chain: &Vec<usize>) -> Ordering {
 
 pub fn parse_style(
     node_idx: usize,
-    element: &HtmlElement,
+    node: &HtmlNode,
     css_nodes: &Vec<Node>,
     parent_style: Option<&Style>,
     parent_variables: &Rc<HashMap<String, String>>,
@@ -1590,22 +1650,26 @@ pub fn parse_style(
     css_children_index: &HashMap<usize, Vec<usize>>,
     css_node_ranking: &[usize],
 ) -> Result<Style> {
-    let mut style = get_base_style(&HtmlNode::Element(element.clone()), parent_style);
+    let mut style = get_base_style(node, parent_style);
 
-    let inline_nodes = get_inline_nodes(&element)?;
-
-    let applicable_class_nodes = collected_css_nodes.get(&node_idx).cloned().unwrap_or_default();
+    let inline_nodes = if let HtmlNode::Element(element) = node {
+        get_inline_nodes(&element)?
+    } else {
+        vec![]
+    };
 
     let mut applicable_class_properties = vec![];
-    for class_node in applicable_class_nodes {
-        let children = css_children_index.get(&class_node).unwrap();
-        for c in children {
-            let would = match css_nodes[*c] {
-                Node::Property(_) | Node::Variable(_) => true,
-                _ => false,
-            };
-            if would {
-                applicable_class_properties.push(c);
+    if let Some(applicable_class_nodes) = collected_css_nodes.get(&node_idx) {
+        for class_node in applicable_class_nodes.iter() {
+            let children = css_children_index.get(&class_node).unwrap();
+            for c in children {
+                let would = match css_nodes[*c] {
+                    Node::Property(_) | Node::Variable(_) => true,
+                    _ => false,
+                };
+                if would {
+                    applicable_class_properties.push(c);
+                }
             }
         }
     }
@@ -1616,18 +1680,20 @@ pub fn parse_style(
         a_rank.cmp(&b_rank)
     });
 
-    let mut nodes: Vec<(usize, Node)> = applicable_class_properties
+    let mut nodes: Vec<(usize, Cow<'_, Node>)> = applicable_class_properties
         .iter()
-        .map(|idx| (**idx, css_nodes[**idx].clone()))
+        .map(|idx| (**idx, Cow::Borrowed(&css_nodes[**idx])))
         .collect();
     // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
-    nodes.append(&mut inline_nodes.into_iter().map(|node| (usize::MAX, node)).collect());
+    nodes.extend(inline_nodes.into_iter().map(|node| {
+        (usize::MAX, Cow::Owned(node))
+    }));
 
-    let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_nodes, css_node_ranking);
+    let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_node_ranking);
     style.variables = resolved_variables;
 
     for property in properties {
-        if let Err(result) = apply_style_property(&mut style, &property) {
+        if let Err(result) = apply_style_property(&mut style, property) {
             println!(
                 "Failed to apply property {:?} due to: {:?}",
                 property, result
