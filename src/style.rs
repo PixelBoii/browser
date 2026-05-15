@@ -6,6 +6,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
+use crate::VariableDefinitions;
 use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, VariableTemplatePart, unquote};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
@@ -167,7 +168,7 @@ pub struct Style {
     pub top: StyleSize,
     pub bottom: StyleSize,
     pub text_align: StyleAlign,
-    pub variables: Rc<HashMap<String, String>>,
+    pub variables: Rc<HashMap<usize, String>>,
     pub font_size: StyleSize,
     pub align_self: StyleJustifyContent,
     pub border_left: StyleSizeAndColor,
@@ -815,7 +816,12 @@ fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &[usize]) -> Vec<usize>
     idxs.into_iter().copied().collect()
 }
 
-fn resolve_node_variable(value: &PropertyValue, map: &HashMap<String, PropertyValue>, parent_variables: &Rc<HashMap<String, String>>) -> Option<String> {
+fn resolve_node_variable(
+    value: &PropertyValue,
+    map: &HashMap<String, PropertyValue>,
+    parent_variables: &Rc<HashMap<usize, String>>,
+    variable_definitions: &VariableDefinitions,
+) -> Option<String> {
     match value {
         PropertyValue::Raw(value) => {
             return Some(value.clone());
@@ -825,10 +831,10 @@ fn resolve_node_variable(value: &PropertyValue, map: &HashMap<String, PropertyVa
             if template.len() == 1 {
                 if let VariableTemplatePart::Var(var) = &template[0] {
                     if let Some(resolved) = map.get(var) {
-                        return resolve_node_variable(resolved, map, parent_variables);
+                        return resolve_node_variable(resolved, map, parent_variables, variable_definitions);
                     }
-                    if let Some(resolved) = parent_variables.get(var) {
-                        return resolve_node_variable(&PropertyValue::Raw(resolved.to_string()), map, parent_variables);
+                    if let Some(resolved) = variable_definitions.variable_to_idx.get(var).and_then(|var| parent_variables.get(var)) {
+                        return resolve_node_variable(&PropertyValue::Raw(resolved.to_string()), map, parent_variables, variable_definitions);
                     }
                 }
             }
@@ -840,9 +846,10 @@ fn resolve_node_variable(value: &PropertyValue, map: &HashMap<String, PropertyVa
 
 fn apply_node_variables(
     nodes: &[(usize, Cow<'_, Node>)],
-    variables: &Rc<HashMap<String, String>>,
+    variables: &Rc<HashMap<usize, String>>,
     css_node_ranking: &[usize],
-) -> Rc<HashMap<String, String>> {
+    variable_definitions: &VariableDefinitions,
+) -> Rc<HashMap<usize, String>> {
     let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
         .filter_map(|(idx, node)| match node.as_ref() {
@@ -869,15 +876,21 @@ fn apply_node_variables(
 
     for idx in ordered_idxs {
         let var = variables_to_parse.get(&idx).unwrap();
-        if let Some(resolved) = resolve_node_variable(&var.value, &map, variables) {
-            new_variables.insert(var.variable.clone(), resolved);
+        if let Some(resolved) = resolve_node_variable(&var.value, &map, variables, variable_definitions) {
+            if let Some(def_idx) = variable_definitions.variable_to_idx.get(&var.variable) {
+                new_variables.insert(*def_idx, resolved);
+            }
         }
     }
 
     Rc::new(new_variables)
 }
 
-fn resolve_variable_template(template: &Vec<VariableTemplatePart>, resolved_variables: &Rc<HashMap<String, String>>) -> String {
+fn resolve_variable_template(
+    template: &Vec<VariableTemplatePart>,
+    resolved_variables: &Rc<HashMap<usize, String>>,
+    variable_definitions: &VariableDefinitions,
+) -> String {
     let mut out = String::new();
     for el in template.iter() {
         match el {
@@ -892,7 +905,7 @@ fn resolve_variable_template(template: &Vec<VariableTemplatePart>, resolved_vari
                     (var.as_str(), None)
                 };
 
-                if let Some(value) = resolved_variables.get(name) {
+                if let Some(value) = variable_definitions.variable_to_idx.get(name).and_then(|name| resolved_variables.get(name)) {
                     out += value;
                 } else {
                     out += default.unwrap_or(var);
@@ -905,16 +918,18 @@ fn resolve_variable_template(template: &Vec<VariableTemplatePart>, resolved_vari
 
 pub fn resolve_node_variables<'nodes, 'css>(
     nodes: &'nodes mut [(usize, Cow<'css, Node>)],
-    variables: &Rc<HashMap<String, String>>,
+    variables: &Rc<HashMap<usize, String>>,
     css_node_ranking: &[usize],
-) -> (Vec<&'nodes Property>, Rc<HashMap<String, String>>) {
-    let resolved_variables = apply_node_variables(nodes, variables, css_node_ranking);
+    variable_definitions: &VariableDefinitions,
+) -> (Vec<&'nodes Property>, Rc<HashMap<usize, String>>) {
+    // TODO: Might make sense for the variables to just be represented by idx references instead so that we dont have to clone expensive hashmaps
+    let resolved_variables = apply_node_variables(nodes, variables, css_node_ranking, variable_definitions);
 
     for (_, node) in nodes.iter_mut() {
         let parsed_value = match node.as_ref() {
             Node::Property(property) => match &property.value {
                 PropertyValue::VariableTemplate(template) => {
-                    let value = resolve_variable_template(template, &resolved_variables);
+                    let value = resolve_variable_template(template, &resolved_variables, variable_definitions);
                     parse_property_value(property.property.clone(), value)
                         .map(|(parsed, _)| parsed)
                         .ok()
@@ -945,8 +960,7 @@ pub fn resolve_node_variables<'nodes, 'css>(
 #[cfg(test)]
 mod tests {
     use std::{borrow::Cow, collections::HashMap, rc::Rc};
-
-    use crate::{css::{Node, Property, PropertyValue, Variable}, style::{parse_property_value, resolve_variable_template}};
+    use crate::{ParsedPropertyDefinition, VariableDefinitions, css::{Node, Property, PropertyValue, Variable}, style::{parse_property_value, resolve_variable_template}};
 
     use super::{resolve_node_variables, split_ignoring_parentheses, StyleSize};
 
@@ -961,15 +975,21 @@ mod tests {
             Node::Property(Property { property: "gap".into(), value: parse_property_value("gap".into(), "var(--another-one)".into())?.0, parent: None, important: false }),
         ];
 
+        let mut variable_definitions = VariableDefinitions::new();
+        variable_definitions.insert_definition(ParsedPropertyDefinition {
+            property: "--test".to_string(),
+            syntax: None,
+            initial_value: None,
+        });
         let mut already_resolved = HashMap::new();
-        already_resolved.insert("--test".to_string(), "16px".to_string());
+        already_resolved.insert(variable_definitions.cursor, "16px".to_string());
         let mut nodes_to_parse: Vec<_> = nodes
             .iter()
             .enumerate()
             .map(|(idx, node)| (idx, Cow::Borrowed(node)))
             .collect();
         let css_node_ranking = vec![0; nodes.len()];
-        let (properties, _) = resolve_node_variables(&mut nodes_to_parse, &mut Rc::new(already_resolved), &css_node_ranking);
+        let (properties, _) = resolve_node_variables(&mut nodes_to_parse, &mut Rc::new(already_resolved), &css_node_ranking, &variable_definitions);
 
         assert_eq!(
             properties[0].value,
@@ -989,7 +1009,13 @@ mod tests {
     #[test]
     fn resolves_variable_values_embedded_in_strings() -> anyhow::Result<()> {
         let (value, _) = parse_property_value("margin-left".to_string(), "calc(var(--size) * 2)".to_string())?;
-        let variables = HashMap::from([("--size".to_string(), "12px".to_string())]);
+        let mut variable_definitions = VariableDefinitions::new();
+        variable_definitions.insert_definition(ParsedPropertyDefinition {
+            property: "--size".to_string(),
+            syntax: None,
+            initial_value: None,
+        });
+        let variables = HashMap::from([(variable_definitions.cursor, "12px".to_string())]);
 
         let value = match value {
             PropertyValue::VariableTemplate(template) => template,
@@ -997,7 +1023,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_variable_template(&value, &Rc::new(variables)),
+            resolve_variable_template(&value, &Rc::new(variables), &variable_definitions),
             "calc(12px * 2)"
         );
         Ok(())
@@ -1645,10 +1671,11 @@ pub fn parse_style(
     node: &HtmlNode,
     css_nodes: &Vec<Node>,
     parent_style: Option<&Style>,
-    parent_variables: &Rc<HashMap<String, String>>,
+    parent_variables: &Rc<HashMap<usize, String>>,
     collected_css_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     css_node_ranking: &[usize],
+    variable_definitions: &VariableDefinitions,
 ) -> Result<Style> {
     let mut style = get_base_style(node, parent_style);
 
@@ -1689,7 +1716,7 @@ pub fn parse_style(
         (usize::MAX, Cow::Owned(node))
     }));
 
-    let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_node_ranking);
+    let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_node_ranking, variable_definitions);
     style.variables = resolved_variables;
 
     for property in properties {

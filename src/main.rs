@@ -231,6 +231,7 @@ struct Renderer {
     animations: Vec<Animation>,
     cached_text_buffers: HashMap<(String, u32), (Pixmap, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
+    variable_definitions: VariableDefinitions,
 }
 
 #[derive(Debug, Clone)]
@@ -728,17 +729,18 @@ fn compute_node_style(
     children_index: &HashMap<usize, Vec<usize>>,
     css_nodes: &Vec<CssNode>,
     parent_style: Option<usize>,
-    parent_variables: &Rc<HashMap<String, String>>,
+    parent_variables: &Rc<HashMap<usize, String>>,
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     window_size: &PhysicalSize<u32>,
     css_node_ranking: &[usize],
+    variable_definitions: &VariableDefinitions,
 ) {
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
     let node = &nodes.get(&node_idx).unwrap();
     let mut style = if matches!(node, Node::Element(_)) {
-        parse_style(node_idx, node, css_nodes, parent_style, parent_variables, collected_class_nodes, css_children_index, css_node_ranking).unwrap()
+        parse_style(node_idx, node, css_nodes, parent_style, parent_variables, collected_class_nodes, css_children_index, css_node_ranking, variable_definitions).unwrap()
     } else {
         get_base_style(node, parent_style)
     };
@@ -771,6 +773,7 @@ fn compute_node_style(
             css_children_index,
             window_size,
             css_node_ranking,
+            variable_definitions,
         );
     }
 }
@@ -1302,9 +1305,11 @@ fn get_css_nodes(
     parsed_css_nodes
 }
 
+#[derive(Debug)]
 struct ParsedPropertyDefinition {
     property: String,
-    syntax: String,
+    #[allow(dead_code)]
+    syntax: Option<String>,
     initial_value: Option<String>,
 }
 
@@ -1331,11 +1336,49 @@ fn get_parsed_property_definitions(nodes: &Vec<CssNode>, css_children_index: &Ha
                 initial_value = Some(value.clone());
             }
         }
-        if let Some(syntax) = syntax {
-            definitions.push(ParsedPropertyDefinition {
-                property: definition.name.clone(),
-                syntax,
-                initial_value,
+        definitions.push(ParsedPropertyDefinition {
+            property: definition.name.clone(),
+            syntax,
+            initial_value,
+        });
+    }
+    definitions
+}
+
+#[derive(Debug)]
+struct VariableDefinitions {
+    cursor: usize,
+    data: HashMap<usize, ParsedPropertyDefinition>,
+    variable_to_idx: HashMap<String, usize>,
+}
+
+impl VariableDefinitions {
+    pub fn new() -> Self {
+        VariableDefinitions {
+            cursor: 0,
+            data: HashMap::new(),
+            variable_to_idx: HashMap::new(),
+        }
+    }
+
+    pub fn insert_definition(&mut self, def: ParsedPropertyDefinition) {
+        self.variable_to_idx.insert(def.property.clone(), self.cursor);
+        self.data.insert(self.cursor, def);
+        self.cursor += 1;
+    }
+}
+
+fn build_definitions_map(parsed_definitions: Vec<ParsedPropertyDefinition>, css_nodes: &Vec<CssNode>) -> VariableDefinitions {
+    let mut definitions = VariableDefinitions::new();
+    for def in parsed_definitions {
+        definitions.insert_definition(def);
+    }
+    for node in css_nodes.iter() {
+        if let CssNode::Variable(var) = node && !definitions.variable_to_idx.contains_key(&var.variable) {
+            definitions.insert_definition(ParsedPropertyDefinition {
+                property: var.variable.clone(),
+                syntax: None,
+                initial_value: None
             });
         }
     }
@@ -1351,7 +1394,7 @@ fn compute_node_styles(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
-) -> (HashMap<usize, Style>, HashMap<usize, u32>) {
+) -> (HashMap<usize, Style>, HashMap<usize, u32>, VariableDefinitions) {
     let start = Instant::now();
     let parsed_css_nodes = get_css_nodes(base_url, tokio, network_fetch, nodes, node_idxs, dom_indexes, css_parse_cache);
     println!("Retrieved parsed css nodes in {}ms", Instant::now().duration_since(start).as_millis());
@@ -1367,9 +1410,10 @@ fn compute_node_styles(
 
     let mut default_variables = HashMap::new();
     let parsed_definitions = get_parsed_property_definitions(&parsed_css_nodes, &css_children_index);
-    for definition in parsed_definitions {
-        if let Some(initial) = definition.initial_value {
-            default_variables.insert(definition.property, initial);
+    let definitions_map = build_definitions_map(parsed_definitions, &parsed_css_nodes);
+    for (idx, definition) in definitions_map.data.iter() {
+        if let Some(initial) = &definition.initial_value {
+            default_variables.insert(*idx, initial.to_string());
         }
     }
 
@@ -1389,9 +1433,10 @@ fn compute_node_styles(
         &css_children_index,
         window_size,
         &css_node_ranking,
+        &definitions_map,
     );
     println!("computing styles took {}ms", Instant::now().duration_since(start).as_millis());
-    (node_styles, resolved_font_sizes)
+    (node_styles, resolved_font_sizes, definitions_map)
 }
 
 #[derive(Debug, Clone)]
@@ -2149,7 +2194,7 @@ impl Renderer {
 
         let mut css_parse_cache = HashMap::new();
 
-        let (node_styles, resolved_font_sizes) = compute_node_styles(&url, &tokio, &network_fetch, &nodes_table, &nodes_idxs, &window_size, &dom_indexes, &mut css_parse_cache);
+        let (node_styles, resolved_font_sizes, variable_definitions) = compute_node_styles(&url, &tokio, &network_fetch, &nodes_table, &nodes_idxs, &window_size, &dom_indexes, &mut css_parse_cache);
 
         let node_idx_cursor = nodes_idxs.len();
 
@@ -2184,6 +2229,7 @@ impl Renderer {
             animations: vec![],
             cached_text_buffers: HashMap::new(),
             css_parse_cache,
+            variable_definitions,
         }
     }
 
@@ -2566,13 +2612,14 @@ impl Renderer {
         layout_roots
     }
 
-    fn inject_css_variables_into_str(&self, str: &mut String, variables: &HashMap<String, String>) {
+    fn inject_css_variables_into_str(&self, str: &mut String, variables: &HashMap<usize, String>) {
         // Return early if string doesn't need any vars
         if !str.contains("var(") {
             return;
         }
         for (variable, value) in variables.iter() {
-            *str = str.replace(&format!("var({})", variable), value);
+            let variable = self.variable_definitions.data.get(variable).unwrap();
+            *str = str.replace(&format!("var({})", variable.property), value);
         }
     }
 
@@ -4130,7 +4177,7 @@ impl Renderer {
 
     pub fn recompute_nodes(&mut self) {
         self.recompute_dom_indexes();
-        (self.node_styles, self.resolved_font_sizes) = compute_node_styles(&self.url, &self.tokio, &self.network_fetch, &self.nodes, &self.nodes_idxs, &self.window_size, &self.dom_indexes, &mut self.css_parse_cache);
+        (self.node_styles, self.resolved_font_sizes, self.variable_definitions) = compute_node_styles(&self.url, &self.tokio, &self.network_fetch, &self.nodes, &self.nodes_idxs, &self.window_size, &self.dom_indexes, &mut self.css_parse_cache);
     }
 
     pub fn get_paddings(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
@@ -5268,7 +5315,7 @@ mod tests {
     use crate::style::{
         GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, StyleZIndex, parse_style
     };
-    use crate::{FontHandler, HtmlParser, NetworkFetch, Renderer, get_dom_indexes, sorted_node_idxs};
+    use crate::{FontHandler, HtmlParser, NetworkFetch, Renderer, VariableDefinitions, get_dom_indexes, sorted_node_idxs};
     use anyhow::{Context, Result};
     use winit::dpi::PhysicalSize;
     use std::cell::RefCell;
@@ -5337,6 +5384,7 @@ mod tests {
             &mut HashMap::new(),
             &HashMap::new(),
             &[],
+            &VariableDefinitions::new(),
         )?;
 
         assert_eq!(
