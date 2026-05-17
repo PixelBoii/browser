@@ -204,7 +204,6 @@ class HtmlElement extends BaseNode {
         super()
         this.tag = tag
         this.namespaceURI = "http://www.w3.org/1999/xhtml"
-        this.__attributes = {}
         if (autoRegisterNode) {
             this.registerInBackend()
         }
@@ -277,30 +276,20 @@ class HtmlElement extends BaseNode {
     }
 
     getAttribute(attr) {
-        return this.hasAttribute(attr) ? this.__attributes[attr] : null
+        return core.ops.op_get_attribute(this.__node_idx, attr)
     }
 
     setAttribute(attr, value) {
-        this.__attributes[attr] = value
-        if (this.__node_idx != null) {
-            // TODO: This should probably not stringify all values
-            core.ops.op_update_attributes(this.__node_idx, { [attr]: String(value) })
-        }
+        // TODO: This should probably not stringify all values
+        core.ops.op_update_attributes(this.__node_idx, { [attr]: String(value) })
     }
 
     removeAttribute(attr) {
-        this.__attributes[attr] = undefined
-        if (this.__node_idx != null) {
-            core.ops.op_remove_attribute(this.__node_idx, attr)
-        }
+        core.ops.op_remove_attribute(this.__node_idx, attr)
     }
 
     hasAttribute(attr) {
-        return Object.hasOwn(this.__attributes, attr) && this.__attributes[attr] !== undefined
-    }
-
-    getAttributeNames() {
-        return Object.keys(this.__attributes).filter(attr => this.__attributes[attr] !== undefined)
+        return !!this.getAttribute(attr)
     }
 
     remove() {
@@ -356,18 +345,18 @@ class HtmlElement extends BaseNode {
     }
 
     get classList() {
-        return new ClassList(this.__attributes.class, this)
+        return new ClassList(this.getAttribute('class'), this)
     }
 
     get style() {
-        return new CSSStyleDeclaration(this.__attributes.style, this)
+        return new CSSStyleDeclaration(this.getAttribute('style'), this)
     }
 
     set style(value) {
         if (!value instanceof CSSStyleDeclaration) {
             throw new TypeError("Unsupported style value (for now)")
         }
-        this.__attributes.style = value
+        this.setAttribute('style', value)
     }
 
     get href() {
@@ -396,7 +385,7 @@ class HtmlElement extends BaseNode {
     }
 
     get src() {
-        return this.getAttribute('src')
+        return this.getAttribute('src') ?? ""
     }
 
     set src(value) {
@@ -456,7 +445,8 @@ class HtmlElement extends BaseNode {
     }
 
     get dataset() {
-        let data = Object.entries(this.__attributes)
+        const attributes = core.ops.op_get_attributes(this.__node_idx)
+        let data = Object.entries(attributes)
             .filter(([key, value]) => key.startsWith('data-'))
             .map(([key, value]) => [camelize(key.replace('data-', '')).replaceAll('-', ''), value])
         return Object.fromEntries(data)
@@ -734,9 +724,6 @@ function nodeToElement(pair) {
     if (node.kind === "element") {
         const elementClass = tagToElement(node.tag)
         element = withoutAutoRegisterNode(() => new elementClass(node.tag))
-        for (const [key, value] of Object.entries(node.attributes)) {
-            element.setAttribute(key, value)
-        }
     } else if (node.kind === "comment") {
         element = withoutAutoRegisterNode(() => new CommentNode(node.comment))
     } else if (node.kind === "text") {
@@ -1200,6 +1187,10 @@ class XMLHttpRequest {
     }
 
     send() {
+        //
+    }
+
+    open() {
         //
     }
 }

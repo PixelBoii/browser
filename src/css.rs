@@ -178,6 +178,23 @@ impl Node {
             Node::PropertyDefinition(element) => element.parent,
         }
     }
+
+    pub fn set_parent(&mut self, parent: Option<usize>) {
+        match self {
+            Node::ClassName(element) => element.parent = parent,
+            Node::Variable(element) => element.parent = parent,
+            Node::Property(element) => element.parent = parent,
+            Node::MediaQuery(element) => element.parent = parent,
+            Node::Layer(element) => element.parent = parent,
+            Node::PropertyDefinition(element) => element.parent = parent,
+        }
+    }
+
+    pub fn offset_parent(&mut self, offset: usize) {
+        if let Some(parent) = self.get_parent() {
+            self.set_parent(Some(parent + offset));
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
