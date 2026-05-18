@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
@@ -109,6 +109,7 @@ enum LayoutKind {
     Element,
     PixMap((tiny_skia::Pixmap, bool)),
     Text(tiny_skia::Pixmap),
+    Iframe,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +202,33 @@ impl Animation {
 }
 
 #[derive(Debug)]
+enum FrameCommand {
+    Render,
+    UserEvent(UserEvent),
+}
+
+#[derive(Debug)]
+struct FrameHandle {
+    surface: Arc<Mutex<Vec<u32>>>,
+}
+
+#[derive(Debug, Clone)]
+enum RendererProxy {
+    WindowLoop(EventLoopProxy<UserEvent>),
+    FrameLoop(std::sync::mpsc::Sender<FrameCommand>)
+}
+
+impl RendererProxy {
+    fn fire_user_event(&self, event: UserEvent) -> Result<()> {
+        match self {
+            RendererProxy::FrameLoop(tx) => tx.send(FrameCommand::UserEvent(event))?,
+            RendererProxy::WindowLoop(proxy) => proxy.send_event(event)?,
+        };
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
     node_idx_cursor: usize,
@@ -234,8 +262,9 @@ struct Renderer {
     cached_text_buffers: HashMap<(String, u32), (Pixmap, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     variable_definitions: VariableDefinitions,
-    event_loop_proxy: Option<EventLoopProxy<UserEvent>>,
+    event_loop_proxy: Option<RendererProxy>,
     hovering_impact: HashSet<usize>,
+    frames: HashMap<usize, FrameHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -1521,12 +1550,14 @@ enum UserNavigateUrl {
 enum UserEvent {
     DomUpdated,
     Navigate((UserNavigateUrl, bool)),
+    FrameUpdated,
+    ChildMessage(String),
 }
 
 #[derive(Debug, Clone)]
 struct JsHostState {
     renderer: Rc<RefCell<Renderer>>,
-    proxy: EventLoopProxy<UserEvent>
+    proxy: RendererProxy
 }
 
 #[op2]
@@ -1542,7 +1573,7 @@ fn op_tls_peer_certificate<'s>(
 fn op_set_location_href(state: &mut OpState, #[string] href: String, reload: bool) -> Result<(), JsError> {
     let host = state.borrow::<JsHostState>();
 
-    host.proxy.send_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), reload))).unwrap();
+    host.proxy.fire_user_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), reload))).unwrap();
 
     Ok(())
 }
@@ -1614,6 +1645,13 @@ fn op_get_attribute(state: &mut OpState, #[number] node_idx: usize, #[string] at
         })
         .cloned();
     Ok(value)
+}
+
+#[op2(fast)]
+fn op_post_message_to_parent(state: &mut OpState, #[string] message: String) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    host.proxy.fire_user_event(UserEvent::ChildMessage(message)).unwrap();
+    Ok(())
 }
 
 #[op2]
@@ -2101,6 +2139,7 @@ extension!(
     op_get_closest,
     op_get_attribute,
     op_get_attributes,
+    op_post_message_to_parent,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js", "runtime_fetch.js"],
@@ -2327,6 +2366,46 @@ fn is_supported_form_element(element: &Element, node_idx: usize, submitted_by: O
     false
 }
 
+fn blit_rgb_buffer(
+    dst: &mut [u32],
+    dst_width: u32,
+    dst_height: u32,
+    src: &[u32],
+    src_width: u32,
+    src_height: u32,
+    dst_x: i32,
+    dst_y: i32,
+) {
+    if dst_width == 0 || dst_height == 0 || src_width == 0 || src_height == 0 {
+        return;
+    }
+
+    let src_x0 = (-dst_x).max(0) as u32;
+    let src_y0 = (-dst_y).max(0) as u32;
+    let dst_x0 = dst_x.max(0) as u32;
+    let dst_y0 = dst_y.max(0) as u32;
+
+    if src_x0 >= src_width || src_y0 >= src_height {
+        return;
+    }
+    if dst_x0 >= dst_width || dst_y0 >= dst_height {
+        return;
+    }
+
+    let copy_width = (src_width - src_x0).min(dst_width - dst_x0);
+    let copy_height = (src_height - src_y0).min(dst_height - dst_y0);
+
+    for row in 0..copy_height {
+        let src_start = ((src_y0 + row) * src_width + src_x0) as usize;
+        let dst_start = ((dst_y0 + row) * dst_width + dst_x0) as usize;
+
+        let src_row = &src[src_start..src_start + copy_width as usize];
+        let dst_row = &mut dst[dst_start..dst_start + copy_width as usize];
+
+        dst_row.copy_from_slice(src_row);
+    }
+}
+
 impl Renderer {
     fn new(url: String, tokio: Rc<RefCell<tokio::runtime::Runtime>>, nodes_table: HashMap<usize, Node>, window_size: PhysicalSize<u32>, font_handler: Rc<FontHandler>, network_fetch: Rc<RefCell<NetworkFetch>>, dom_indexes: DomIndexes, nodes_idxs: Vec<usize>) -> Self {
         let request_cache = HashMap::new();
@@ -2379,6 +2458,7 @@ impl Renderer {
             focusable: None,
             event_loop_proxy: None,
             hovering_impact,
+            frames: HashMap::new(),
         }
     }
 
@@ -2613,7 +2693,7 @@ impl Renderer {
         };
 
         let proxy = self.event_loop_proxy.as_ref().unwrap();
-        proxy.send_event(UserEvent::Navigate((
+        proxy.fire_user_event(UserEvent::Navigate((
             UserNavigateUrl::Parsed(parsed_url),
             true
         ))).unwrap();
@@ -2659,11 +2739,12 @@ impl Renderer {
         clear_buffer(buffer, 0xFF_FF_FF_FF);
 
         if rebuild_layout {
+            self.clear_layout_state();
             self.layout_roots = self.build_layout(width, height);
             self.apply_overflow_constraints();
         }
         let mut new_rendered_nodes_ordered = vec![];
-        for layout_box_idx in self.layout_roots.iter() {
+        for layout_box_idx in self.layout_roots.clone().iter() {
             let scroll_y = self.scroll_y.get(&self.layout_to_node_idx(&layout_box_idx)).cloned().unwrap_or(0);
             self.paint_layout_box(*layout_box_idx, buffer, width, height, scroll_y, &mut new_rendered_nodes_ordered);
         }
@@ -3130,6 +3211,37 @@ impl Renderer {
                         content_height: height,
                         z_index,
                     }, save_as_final))
+                } else if element.tag == "iframe" {
+                    let height = element.attributes.get("height").and_then(|v| v.parse::<f32>().ok()).unwrap_or(150.) as u32;
+                    let width = element.attributes.get("width").and_then(|v| v.parse::<f32>().ok()).unwrap_or(300.) as u32;
+                    let Some(url) = element.attributes.get("src") else {
+                        return None;
+                    };
+                    let style = self.node_styles.get(&node_idx).unwrap();
+                    let z_index = match style.z_index {
+                        StyleZIndex::Auto => 0,
+                        StyleZIndex::Number(value) => value,
+                    };
+                    if !self.frames.contains_key(&node_idx) {
+                        let handle = self.spawn_frame(url.clone(), PhysicalSize { width, height });
+                        self.frames.insert(node_idx, handle);
+                    }
+                    Some(self.register_layout_box(LayoutBox {
+                        rect: Rect {
+                            x: cursor.x,
+                            y: cursor.y,
+                            width,
+                            height,
+                            background: StyleBackground::Transparent,
+                            border: RectBorder { left: None, top: None, right: None, bottom: None },
+                        },
+                        kind: LayoutKind::Iframe,
+                        children: vec![],
+                        node_idx,
+                        allow_overflow: false,
+                        content_height: height,  
+                        z_index,
+                    }, save_as_final))
                 } else {
                     let layout = match self.node_styles.get(&node_idx).unwrap().display {
                         StyleDisplay::Block | StyleDisplay::InlineBlock | StyleDisplay::Inline => self.layout_block(
@@ -3213,6 +3325,61 @@ impl Renderer {
                     }
                 }
             }
+        }
+    }
+
+    fn spawn_frame(&mut self, url: String, size: PhysicalSize<u32>) -> FrameHandle {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
+        let bitmap_for_thread = Arc::clone(&latest_bitmap);
+        let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
+        tx.send(FrameCommand::Render).unwrap();
+        let tx_proxy = RendererProxy::FrameLoop(tx);
+        std::thread::spawn(move || {
+            let mut browser = Browser::new(url.to_string(), false);
+
+            browser.open(Some(tx_proxy), Some(PhysicalSize::new(size.width, size.height)), true).unwrap();
+
+            let start = Instant::now();
+            let js_result = browser.run_js();
+            println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
+
+            loop {
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        FrameCommand::Render | FrameCommand::UserEvent(UserEvent::DomUpdated) => {
+                            if browser
+                                .renderer
+                                .as_ref()
+                                .is_some_and(|renderer| renderer.borrow().pending_dom_update)
+                            {
+                                browser.process_dom_update();
+                            }
+
+                            let mut pixels = vec![0; (size.width * size.height) as usize];
+                            browser
+                                .renderer
+                                .as_ref()
+                                .unwrap()
+                                .borrow_mut()
+                                .render_into(&mut pixels, size.width, size.height, true);
+
+                            *bitmap_for_thread.lock().unwrap() = pixels;
+
+                            let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+                        },
+                        FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
+                            let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
+                        },
+                        _ => {},
+                    }
+                }
+
+                let _ = browser.pump_js_event_loop_once();
+            }
+        });
+        FrameHandle {
+            surface: latest_bitmap,
         }
     }
 
@@ -3621,12 +3788,12 @@ impl Renderer {
         let children_idxs: Vec<usize> = self.dom_indexes.children_index.get(&node_idx).unwrap().clone();
 
         let immediate_children: Vec<&usize> = children_idxs.iter().filter(|c| {
-            let style = &self.node_styles.get(*c).unwrap();
-            !style.position.is_free()
+            let style = &self.node_styles.get(*c);
+            style.is_some_and(|style| !style.position.is_free())
         }).collect();
         let free_children: Vec<&usize> = children_idxs.iter().filter(|c| {
-            let style = &self.node_styles.get(*c).unwrap();
-            style.position.is_free()
+            let style = &self.node_styles.get(*c);
+            style.is_some_and(|style| style.position.is_free())
         }).collect();
 
         if style.position == StylePosition::Relative {
@@ -4293,7 +4460,7 @@ impl Renderer {
     }
 
     fn paint_layout_box(
-        &self,
+        &mut self,
         layout_box_idx: usize,
         buffer: &mut [u32],
         width: u32,
@@ -4363,9 +4530,25 @@ impl Renderer {
             LayoutKind::PixMap((pixmap_buffer, opaque)) => {
                 self.apply_pixmap_on_buffer(layout_box, buffer, width, height, container_start_y, pixmap_buffer, *opaque);
             }
+            LayoutKind::Iframe => {
+                if let Some(handle) = self.frames.get_mut(&self.layout_to_node_idx(&layout_box_idx)) {
+                    blit_rgb_buffer(
+                        buffer,
+                        width,
+                        height,
+                        handle.surface.lock().unwrap().as_ref(),
+                        layout_box.rect.width,
+                        layout_box.rect.height,
+                        layout_box.rect.x,
+                        container_start_y,
+                    );
+                } else {
+                    println!("Failed to find iframe frame");
+                }
+            },
         }
 
-        for &child in &layout_box.children {
+        for child in layout_box.children.clone() {
             self.paint_layout_box(child, buffer, width, height, offset_y, rendered_nodes_ordered);
         }
     }
@@ -4534,7 +4717,7 @@ impl Renderer {
 
     pub fn schedule_dom_update(&mut self) {
         if !self.pending_dom_update && let Some(proxy) = &self.event_loop_proxy {
-            proxy.send_event(UserEvent::DomUpdated).unwrap();
+            proxy.fire_user_event(UserEvent::DomUpdated).unwrap();
             self.pending_dom_update = true;
         }
     }
@@ -4584,6 +4767,7 @@ impl NetworkFetch {
     }
 }
 
+#[derive(Debug)]
 struct ExecutedScripts {
     links: Vec<String>,
     nodes: Vec<usize>,
@@ -4612,6 +4796,26 @@ struct Browser {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     document_id: u64,
     hover_debugging: bool,
+}
+
+impl std::fmt::Debug for Browser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Browser")
+            .field("url", &self.url)
+            .field("renderer", &self.renderer)
+            .field("window", &self.window)
+            .field("js_runtime", &self.js_runtime.is_some())
+            .field("tokio", &self.tokio)
+            .field("html_parser", &self.html_parser)
+            .field("font_handler", &self.font_handler)
+            .field("layout_dirty", &self.layout_dirty)
+            .field("layout_booted", &self.layout_booted)
+            .field("executed_scripts", &self.executed_scripts)
+            .field("network_fetch", &self.network_fetch)
+            .field("document_id", &self.document_id)
+            .field("hover_debugging", &self.hover_debugging)
+            .finish()
+    }
 }
 
 impl Browser {
@@ -4718,7 +4922,9 @@ impl Browser {
 
     async fn execute_js(&mut self, scripts: Vec<Script>) -> Result<()> {
         let document_id = self.document_id;
-        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+        let Some(mut runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) else {
+            return Ok(());
+        };
         for (idx, js) in scripts.iter().enumerate() {
             if let ScriptContent::Link(link) = &js.content {
                 if self.executed_scripts.links.contains(&link) {
@@ -4887,15 +5093,32 @@ impl Browser {
         Ok(())
     }
 
-    pub fn open(&mut self) -> Result<()> {
+    pub fn open(&mut self, existing_event_loop: Option<RendererProxy>, existing_size: Option<PhysicalSize<u32>>, install_js: bool) -> Result<()> {
         self.register_tokio_runtime()?;
         self.navigate(self.url.clone())?;
-        self.install_js_host();
+        if install_js {
+            self.install_js_host();
+        }
         let nodes_table = self.html_parser.as_mut().unwrap().nodes.clone().into_iter().enumerate().collect();
         let nodes_idxs = sorted_node_idxs(&nodes_table);
         let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
         self.detect_html_redirect(&dom_indexes);
-        self.start_event_loop(nodes_table, dom_indexes, nodes_idxs)
+        if let Some(proxy) = existing_event_loop {
+            self.refresh_renderer(nodes_table, dom_indexes, nodes_idxs, existing_size.unwrap());
+
+            self.renderer.as_mut().unwrap().borrow_mut().event_loop_proxy = Some(proxy.clone());
+
+            if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
+                js_runtime.op_state().borrow_mut().put(JsHostState {
+                    renderer: self.renderer.as_mut().cloned().unwrap(),
+                    proxy: proxy,
+                });
+            }
+
+            self.setup_js_dom()
+        } else {
+            self.start_event_loop(nodes_table, dom_indexes, nodes_idxs)
+        }
     }
 
     fn on_click(&mut self) -> Result<()> {
@@ -5041,8 +5264,7 @@ impl Browser {
         Ok(())
     }
 
-    fn refresh_renderer(&mut self, nodes_table: HashMap<usize, Node>, dom_indexes: DomIndexes, nodes_idxs: Vec<usize>) {
-        let size = self.window.as_ref().unwrap().inner_size();
+    fn refresh_renderer(&mut self, nodes_table: HashMap<usize, Node>, dom_indexes: DomIndexes, nodes_idxs: Vec<usize>, size: PhysicalSize<u32>) {
         self.renderer = Some(Rc::new(RefCell::new(Renderer::new(
             self.url.clone(),
             self.tokio.as_ref().unwrap().clone(),
@@ -5100,21 +5322,25 @@ impl Browser {
         }
     }
 
-    fn execute_dom_update(&mut self) {
+    fn process_dom_update(&mut self) {
         println!("DOM UPDATED");
-        let window = self.window.as_ref().unwrap();
         self.renderer.as_ref().unwrap().borrow_mut().pending_dom_update = false;
         self.renderer.as_ref().unwrap().borrow_mut().recompute_nodes();
         self.layout_dirty = true;
-        window.request_redraw();
         let start = Instant::now();
         let js_result = self.run_js();
         println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
 
         // If the JS caused another update, execute it immediately
         if self.renderer.as_ref().unwrap().borrow_mut().pending_dom_update {
-            self.execute_dom_update();
+            self.process_dom_update();
         }
+    }
+
+    fn execute_dom_update(&mut self) {
+        self.process_dom_update();
+        let window = self.window.as_ref().unwrap();
+        window.request_redraw();
     }
 
     fn apply_debug_hover(&mut self, hovering_layout_idx: usize) {
@@ -5162,13 +5388,13 @@ impl Browser {
         let mut surf = Surface::new(&ctx, window.window_handle().expect("Window handle"))
                 .expect("Softbuffer surface failed");
 
-        self.refresh_renderer(nodes_table, dom_indexes, nodes_idxs);
+        self.refresh_renderer(nodes_table, dom_indexes, nodes_idxs, self.window.as_ref().unwrap().inner_size());
 
-        self.renderer.as_mut().unwrap().borrow_mut().event_loop_proxy = Some(event_loop.create_proxy());
+        self.renderer.as_mut().unwrap().borrow_mut().event_loop_proxy = Some(RendererProxy::WindowLoop(event_loop.create_proxy()));
 
         self.js_runtime.as_mut().unwrap().borrow_mut().op_state().borrow_mut().put(JsHostState {
             renderer: self.renderer.as_mut().cloned().unwrap(),
-            proxy: event_loop.create_proxy(),
+            proxy: RendererProxy::WindowLoop(event_loop.create_proxy()),
         });
 
         self.setup_js_dom()?;
@@ -5179,9 +5405,21 @@ impl Browser {
             .run(move |event, elwt| {
                 let window = self.window.as_ref().unwrap();
                 match event {
+                    Event::UserEvent(UserEvent::FrameUpdated) => {
+                        self.render_loop(&mut surf, &size, &cursor);
+                    },
                     Event::UserEvent(UserEvent::DomUpdated) => {
                         self.execute_dom_update()
                     },
+                    Event::UserEvent(UserEvent::ChildMessage(message)) => {
+                        let code = format!(r#"
+                        (() => {{
+                            const event = new MessageEvent("{}")
+                            runEventListeners('window:message', event)
+                        }})()
+                        "#, message);
+                        self.execute_host_script("child message handler", code).unwrap();
+                    }
                     Event::UserEvent(UserEvent::Navigate((href, reload))) => {
                         let resolved_url = match href {
                             UserNavigateUrl::Parsed(parsed) => parsed,
@@ -5330,11 +5568,11 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://vite.dev".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    // let mut browser = Browser::new("file:///home/pontus/browser/pages/attribute-elements-benchmark.html".to_string());
+    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging);
 
-    browser.open()
+    browser.open(None, None, true)
 }
 
 fn clear_buffer(buffer: &mut [u32], color: u32) {

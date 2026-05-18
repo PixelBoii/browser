@@ -1295,5 +1295,43 @@ Object.defineProperty(globalThis, "MutationObserver", {
     writable: true,
 })
 
+// Ideally this would be of the same structure as document, but that's a much larger change that will happen later on
+const parent = {
+    postMessage(message) {
+        core.ops.op_post_message_to_parent(message)
+    }
+}
+
+Object.defineProperty(globalThis, "parent", {
+    value: parent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+function postMessage(message) {
+    runEventListeners("window:message", new MessageEvent(message))
+}
+
+Object.defineProperty(globalThis, "postMessage", {
+    value: postMessage,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class MessageEvent {
+    constructor(data) {
+        this.data = data
+    }
+}
+
+Object.defineProperty(globalThis, "MessageEvent", {
+    value: MessageEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 globalThis.window = globalThis
 globalThis.self = globalThis
