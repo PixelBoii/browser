@@ -42,7 +42,7 @@ use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use crate::css::{ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery, Node as CssNode, Overflow, PropertyValue, PseudoClass, parse_media_query_parts, selector_to_parts};
 use crate::loader::HttpModuleLoader;
 use crate::parser::{CommentElement, TextElement};
-use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StyleSizeAndColor, StyleZIndex, build_css_children_index, element_matched_attributes, get_chain_order, get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches};
+use crate::style::{CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StylePointerEvents, StyleSizeAndColor, StyleZIndex, build_css_children_index, element_matched_attributes, get_chain_order, get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
@@ -236,12 +236,6 @@ struct Renderer {
     variable_definitions: VariableDefinitions,
     event_loop_proxy: Option<EventLoopProxy<UserEvent>>,
     hovering_impact: HashSet<usize>,
-}
-
-#[derive(Debug, Clone)]
-struct LayoutDumpInfo {
-    kind: &'static str,
-    rect: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -1518,9 +1512,15 @@ fn compute_node_styles(
 }
 
 #[derive(Debug, Clone)]
+enum UserNavigateUrl {
+    Raw(String),
+    Parsed(ReqwestUrl),
+}
+
+#[derive(Debug, Clone)]
 enum UserEvent {
     DomUpdated,
-    Navigate((String, bool)),
+    Navigate((UserNavigateUrl, bool)),
 }
 
 #[derive(Debug, Clone)]
@@ -1542,7 +1542,7 @@ fn op_tls_peer_certificate<'s>(
 fn op_set_location_href(state: &mut OpState, #[string] href: String, reload: bool) -> Result<(), JsError> {
     let host = state.borrow::<JsHostState>();
 
-    host.proxy.send_event(UserEvent::Navigate((href, reload))).unwrap();
+    host.proxy.send_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), reload))).unwrap();
 
     Ok(())
 }
@@ -1740,7 +1740,6 @@ fn op_get_elements_by_tag_name(state: &mut OpState, #[string] tag: String) -> Re
 fn op_query_selector(state: &mut OpState, #[string] selector: String, #[number] required_parent: Option<usize>) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    println!("op_query_selector {:?}", selector);
     let mut node_idxs: Vec<usize> = query_selector_all(&filter_to_elements(&renderer.nodes), selector_to_parts(&selector), &renderer.window_size, &renderer.dom_indexes, &renderer.get_hover_chain());
     if let Some(required_parent) = required_parent {
         node_idxs = node_idxs.into_iter().filter(|idx| has_parent(&renderer.nodes, *idx, required_parent)).collect();
@@ -1875,7 +1874,7 @@ fn op_get_child_nodes(state: &mut OpState, #[number] node_idx: usize) -> Result<
 fn op_get_parent_node(state: &mut OpState, #[number] node_idx: usize) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
-    let parent_idx = if let Some(parent) = renderer.nodes.get(&node_idx).unwrap().get_parent() {
+    let parent_idx = if let Some(parent) = renderer.nodes.get(&node_idx).and_then(|v| v.get_parent()) {
         parent
     } else {
         return Ok(None);
@@ -2311,6 +2310,23 @@ pub enum HtmlEvent {
 
 const FOCUSABLE_ELEMENTS: [&'static str; 2] = ["input", "textarea"];
 
+fn is_supported_form_element(element: &Element, node_idx: usize, submitted_by: Option<usize>) -> bool {
+    if element.attributes.contains_key("disabled") {
+        return false;
+    }
+    if element.tag == "textarea" && element.attributes.contains_key("name") {
+        return true;
+    }
+    if element.tag == "input" && element.attributes.contains_key("name") {
+        return match element.attributes.get("type").and_then(|v| Some(v.as_str())) {
+            // If type="submit", only include its value if it was clicked
+            Some("submit") => submitted_by.is_some_and(|v| v == node_idx),
+            _ => true,
+        };
+    }
+    false
+}
+
 impl Renderer {
     fn new(url: String, tokio: Rc<RefCell<tokio::runtime::Runtime>>, nodes_table: HashMap<usize, Node>, window_size: PhysicalSize<u32>, font_handler: Rc<FontHandler>, network_fetch: Rc<RefCell<NetworkFetch>>, dom_indexes: DomIndexes, nodes_idxs: Vec<usize>) -> Self {
         let request_cache = HashMap::new();
@@ -2553,16 +2569,56 @@ impl Renderer {
         None
     }
 
-    pub fn submit_form(&mut self, form: usize) {
+    fn submit_form_walk(&self, inputs: &mut Vec<usize>, node_idx: usize, submitted_by: Option<usize>) {
+        if let Some(node) = self.nodes.get(&node_idx) {
+            if let Node::Element(element) = node && is_supported_form_element(element, node_idx, submitted_by) {
+                inputs.push(node_idx);
+            }
+
+            if let Some(children) = self.dom_indexes.children_index.get(&node_idx) {
+                for c in children {
+                    self.submit_form_walk(inputs, *c, submitted_by);
+                }
+            }
+        }
+    }
+
+    pub fn submit_form(&mut self, form: usize, submitted_by: Option<usize>) -> Result<()> {
         let Some(Node::Element(element)) = self.nodes.get(&form) else {
-            return;
+            return Err(anyhow!("Failed to get form node"));
         };
         let Some(action) = element.attributes.get("action") else {
-            return;
+            return Err(anyhow!("No action found on form"));
+        };
+        let mut inputs = vec![];
+        self.submit_form_walk(&mut inputs, form, submitted_by);
+
+        let base_url = ReqwestUrl::parse(&self.url)?;
+        let mut parsed_url = resolve_url(action, Some(&base_url))?;
+
+        {
+            let mut query_parms = parsed_url.query_pairs_mut();
+            for input in inputs {
+                let Some(Node::Element(element)) = self.nodes.get(&input) else {
+                    continue;
+                };
+                let Some(name) = element.attributes.get("name") else {
+                    continue;
+                };
+                let Some(value) = element.attributes.get("value") else {
+                    continue;
+                };
+                query_parms.append_pair(name, value);
+            }
         };
 
         let proxy = self.event_loop_proxy.as_ref().unwrap();
-        proxy.send_event(UserEvent::Navigate((action.to_string(), true))).unwrap();
+        proxy.send_event(UserEvent::Navigate((
+            UserNavigateUrl::Parsed(parsed_url),
+            true
+        ))).unwrap();
+
+        Ok(())
     }
 
     fn apply_overflow_constraints_inner(&mut self, layout_box_id: usize, mut overflow_box: Option<(u32, u32, u32, u32)>) {
@@ -3915,7 +3971,7 @@ impl Renderer {
                         }
                     },
                     StyleFlexDirection::Row => {
-                        if child_style.height == StyleSize::Auto {
+                        if child_style.height == StyleSize::Auto && has_definite_height {
                             item.cross_size = cross_available_size as f32;
                         }
                     },
@@ -4122,6 +4178,13 @@ impl Renderer {
             .iter()
             .rev()
             .find(|idx| {
+                let node_idx = self.layout_to_node_idx(*idx);
+                let Some(style) = self.node_styles.get(&node_idx) else {
+                    return false;
+                };
+                if style.pointer_events == StylePointerEvents::None {
+                    return false;
+                }
                 let layout_box = self.layout_table.get(*idx).unwrap();
                 let end_x = layout_box.rect.x + layout_box.rect.width as i32;
                 let end_y = layout_box.rect.y + layout_box.rect.height as i32;
@@ -4548,10 +4611,11 @@ struct Browser {
     executed_scripts: ExecutedScripts,
     network_fetch: Rc<RefCell<NetworkFetch>>,
     document_id: u64,
+    hover_debugging: bool,
 }
 
 impl Browser {
-    fn new(url: String) -> Self {
+    fn new(url: String, hover_debugging: bool) -> Self {
         let font_handler = Rc::new(FontHandler::new().unwrap());
 
         Self {
@@ -4567,6 +4631,7 @@ impl Browser {
             layout_booted: false,
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
             document_id: 0,
+            hover_debugging,
         }
     }
 
@@ -4582,59 +4647,6 @@ impl Browser {
             let url = resp.url().to_string();
             let text = resp.text().await?;
             Ok((text, url))
-        }
-    }
-
-    pub fn dump_tree(&mut self) -> Result<()> {
-        self.register_tokio_runtime()?;
-        self.navigate(self.url.clone())?;
-        self.install_js_host();
-        let event_loop = EventLoopBuilder::with_user_event().build().expect("Failed to create event loop");
-        let nodes_table = self.html_parser.as_ref().unwrap().nodes.clone().into_iter().enumerate().collect();
-        let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
-        self.renderer = Some(Rc::new(RefCell::new(Renderer::new(
-            self.url.clone(),
-            self.tokio.as_ref().unwrap().clone(),
-            nodes_table,
-            PhysicalSize { width: WINDOW_WIDTH, height: WINDOW_HEIGHT },
-            Rc::clone(&self.font_handler),
-            Rc::clone(&self.network_fetch),
-            dom_indexes,
-            nodes_idxs,
-        ))));
-        self.js_runtime.as_mut().unwrap().borrow_mut().op_state().borrow_mut().put(JsHostState {
-            renderer: self.renderer.as_mut().cloned().unwrap(),
-            proxy: event_loop.create_proxy(),
-        });
-        self.setup_js_dom()?;
-
-        let start = Instant::now();
-        let js_result = self.run_js();
-        println!("Finished running JS code in {}ms: {:?}", Instant::now().duration_since(start).as_millis(), js_result);
-
-        self.pump_js_event_loop_until_done(100)?;
-
-        self.renderer.as_ref().unwrap().borrow_mut().recompute_nodes();
-
-        print!("{}", format_tree(&mut self.renderer.as_mut().unwrap().borrow_mut(), WINDOW_WIDTH, WINDOW_HEIGHT));
-        Ok(())
-    }
-
-    fn pump_js_event_loop_until_done(&mut self, max: i32) -> Result<()> {
-        if max <= 0 {
-            return Ok(());
-        }
-        match self.pump_js_event_loop_once() {
-            Ok(js_pending) => {
-                if js_pending {
-                    println!("pump_js_event_loop_until_done");
-                    self.pump_js_event_loop_until_done(max - 1)
-                } else {
-                    Ok(())
-                }
-            },
-            Err(err) => Err(err)
         }
     }
 
@@ -4893,7 +4905,11 @@ impl Browser {
             if let Some(hovering) = hovering {
                 // Run event listeners
                 let hovering_node_idx = renderer.layout_to_node_idx(&hovering);
-                println!("Clicked on {}", hovering_node_idx);
+                println!(
+                    "Clicked on {} {:?}",
+                    hovering_node_idx,
+                    get_node_text_representation(hovering_node_idx, &renderer.nodes, &renderer.node_layout_mapping, &renderer.layout_table, &renderer.node_styles),
+                );
                 let parents = renderer.get_parents(hovering_node_idx);
                 let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
                 let code = format!(r#"
@@ -4940,8 +4956,6 @@ impl Browser {
                 });
                 renderer.focusable = focusable;
 
-                println!("{:?}", renderer.layout_table.get(&hovering));
-
                 let submittable_input = renderer.walk_node_upwards(hovering_node_idx, |node| {
                     let Node::Element(element) = node else {
                         return false;
@@ -4957,7 +4971,7 @@ impl Browser {
                     });
 
                     if let Some(form) = form {
-                        renderer.submit_form(form);
+                        renderer.submit_form(form, Some(submittable_input))?;
                     }
                 }
 
@@ -5103,8 +5117,15 @@ impl Browser {
         }
     }
 
+    fn apply_debug_hover(&mut self, hovering_layout_idx: usize) {
+        let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+        let hovering_node_idx = renderer.layout_to_node_idx(&hovering_layout_idx);
+        let style = renderer.node_styles.get_mut(&hovering_node_idx).unwrap();
+        style.background = StyleBackground::Hex(0x32_a8_52_FF);
+    }
+
     fn apply_hovering(&mut self, cursor: &Position) {
-        let should_re_render = {
+        let (should_re_render, hovering) = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             let old_value = renderer.hovering.clone();
             renderer.compute_hovering(*cursor);
@@ -5114,11 +5135,14 @@ impl Browser {
             }) || old_value.is_some_and(|idx| {
                 renderer.hovering_impact.contains(&renderer.layout_to_node_idx(&idx))
             });
-            new_value != old_value && one_has_hovering_impact
+            (new_value != old_value && one_has_hovering_impact, new_value)
         };
-        if should_re_render {
+        if should_re_render || self.hover_debugging {
             self.layout_dirty = true;
             self.renderer.as_mut().unwrap().borrow_mut().recompute_nodes();
+            if let Some(hovering) = hovering && self.hover_debugging {
+                self.apply_debug_hover(hovering);
+            }
             self.window.as_mut().unwrap().request_redraw();
         }
     }
@@ -5159,8 +5183,14 @@ impl Browser {
                         self.execute_dom_update()
                     },
                     Event::UserEvent(UserEvent::Navigate((href, reload))) => {
-                        let current_url = url::Url::parse(&self.url).unwrap();
-                        let resolved_url = current_url.join(&href).unwrap();
+                        let resolved_url = match href {
+                            UserNavigateUrl::Parsed(parsed) => parsed,
+                            UserNavigateUrl::Raw(raw) => {
+                                let current_url = url::Url::parse(&self.url).unwrap();
+                                let resolved_url = current_url.join(&raw).unwrap();
+                                resolved_url
+                            },
+                        };
                         if reload {
                             if let Err(err) = self.navigate(resolved_url.to_string()) {
                                 eprintln!("Navigation failed: {err:?}");
@@ -5299,16 +5329,12 @@ impl Browser {
 fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let dump_tree = env::args().any(|arg| arg == "--dump-tree");
-    let mut browser = Browser::new("https://vite.dev".to_string());
+    let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
+    let mut browser = Browser::new("https://vite.dev".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/attribute-elements-benchmark.html".to_string());
 
-    if dump_tree {
-        browser.dump_tree()
-    } else {
-        browser.open()
-    }
+    browser.open()
 }
 
 fn clear_buffer(buffer: &mut [u32], color: u32) {
@@ -5335,92 +5361,33 @@ fn build_children_index(nodes: &HashMap<usize, Node>, node_idxs: &Vec<usize>) ->
     children_index
 }
 
-fn format_tree(renderer: &mut Renderer, width: u32, height: u32) -> String {
-    let layout_roots = renderer.build_layout(width, height);
-    let mut layout_info = HashMap::new();
-    collect_layout_info(&layout_roots, &mut layout_info, &renderer.layout_table);
-    let mut out = String::new();
-
-    write_tree(
-        &renderer.nodes,
-        &renderer.dom_indexes.children_index,
-        &renderer.node_styles,
-        &renderer.node_layout_mapping,
-        &layout_info,
-        renderer.dom_indexes.root_indice,
-        0,
-        &mut out,
-    );
-
-    out
-}
-
-fn collect_layout_info(layout_boxes: &[usize], layout_info: &mut HashMap<usize, LayoutDumpInfo>, layout_table: &HashMap<usize, LayoutBox>) {
-    for layout_box_idx in layout_boxes {
-        if let Some(layout_box) = layout_table.get(&layout_box_idx) {
-            layout_info.insert(*layout_box_idx, LayoutDumpInfo {
-                kind: layout_kind_label(&layout_box.kind),
-                rect: layout_box.rect.clone(),
-            });
-            collect_layout_info(&layout_box.children, layout_info, layout_table);
-        }
-    }
-}
-
-fn layout_kind_label(kind: &LayoutKind) -> &'static str {
-    match kind {
-        LayoutKind::Element => "element",
-        LayoutKind::PixMap(_) => "pixmap",
-        LayoutKind::Text(_) => "text",
-    }
-}
-
-fn write_tree(
-    nodes: &HashMap<usize, Node>,
-    children_index: &HashMap<usize, Vec<usize>>,
-    node_styles: &HashMap<usize, Style>,
-    layout_node_mapping: &HashMap<usize, usize>,
-    layout_info: &HashMap<usize, LayoutDumpInfo>,
+fn get_node_text_representation(
     node_idx: usize,
-    depth: usize,
-    out: &mut String,
-) {
+    nodes: &HashMap<usize, Node>,
+    layout_node_mapping: &HashMap<usize, usize>,
+    layout_table: &HashMap<usize, LayoutBox>,
+    node_styles: &HashMap<usize, Style>,
+) -> String {
     let mut label = match &nodes.get(&node_idx).unwrap() {
         Node::Element(element) => format_element_tree_label(element),
         Node::Text(text) => match collapse_whitespace(&text.text) {
             Some(text) => format!("Node::Text \"{text}\""),
-            None => return,
+            None => format!("Node::Text EMPTY"),
         },
         Node::Comment(element) => format!("Node::Comment \"{}\"", element.comment),
     };
     label.push_str(&format!(" [idx={}]", node_idx));
-    match layout_node_mapping.get(&node_idx).and_then(|idx| layout_info.get(idx).and_then(|layout| Some((idx, layout)))) {
+    match layout_node_mapping.get(&node_idx).and_then(|idx| layout_table.get(idx).and_then(|layout| Some((idx, layout)))) {
         Some((layout_idx, info)) => {
             label.push_str(&format!(
-                " [layout_idx={} layout={} x={} y={} width={} height={}]",
+                " [layout_idx={} layout={:?} x={} y={} width={} height={}]",
                 layout_idx, info.kind, info.rect.x, info.rect.y, info.rect.width, info.rect.height
             ));
         }
         None => label.push_str(" [layout=none]"),
     }
     label.push_str(&format!(" [style={:?}]", node_styles.get(&node_idx).unwrap()));
-
-    out.push_str(&"  ".repeat(depth));
-    out.push_str(&label);
-    out.push('\n');
-
-    for &child_idx in children_index.get(&node_idx).unwrap() {
-        write_tree(
-            nodes,
-            children_index,
-            node_styles,
-            layout_node_mapping,
-            layout_info,
-            child_idx,
-            depth + 1,
-            out,
-        );
-    }
+    label
 }
 
 fn format_element_tree_label(element: &Element) -> String {
@@ -5586,7 +5553,7 @@ mod tests {
     use crate::css::{CssParser, Node as CssNode, Overflow};
     use crate::parser::{Element, Node};
     use crate::style::{
-        GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition, StyleSize, StyleSizeAndColor, StyleZIndex, parse_style
+        GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize, StyleSizeAndColor, StyleZIndex, parse_style
     };
     use crate::{FontHandler, HtmlParser, NetworkFetch, Renderer, VariableDefinitions, get_dom_indexes, sorted_node_idxs};
     use anyhow::{Context, Result};
@@ -5718,6 +5685,7 @@ mod tests {
                 overflow_x: Overflow::Auto,
                 overflow_y: Overflow::Auto,
                 z_index: StyleZIndex::Auto,
+                pointer_events: StylePointerEvents::Auto,
             },
             parsed
         );

@@ -137,6 +137,12 @@ pub enum StyleZIndex {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StylePointerEvents {
+    None,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     pub width: StyleSize,
     pub height: StyleSize,
@@ -179,6 +185,7 @@ pub struct Style {
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub z_index: StyleZIndex,
+    pub pointer_events: StylePointerEvents,
 }
 
 impl Style {
@@ -225,6 +232,7 @@ impl Style {
             overflow_x: self.overflow_x.clone(),
             overflow_y: self.overflow_y.clone(),
             z_index: self.z_index.clone(),
+            pointer_events: self.pointer_events.clone(),
         }
     }
 }
@@ -370,7 +378,8 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         grid_template_columns: GridTemplateColumns::None,
         overflow_x: Overflow::Auto,
         overflow_y: Overflow::Auto,
-        z_index: StyleZIndex::Auto
+        z_index: StyleZIndex::Auto,
+        pointer_events: StylePointerEvents::Auto
     }
 }
 
@@ -384,6 +393,14 @@ fn parse_z_index(value: String) -> Result<StyleZIndex> {
     }
 
     Err(anyhow!("Failed to parse z-index: {}", value))
+}
+
+fn parse_poiner_events(value: String) -> Result<StylePointerEvents> {
+    match value.as_str() {
+        "auto" => Ok(StylePointerEvents::Auto),
+        "none" => Ok(StylePointerEvents::None),
+        _ => Err(anyhow!("Failed to parse pointer-events: {}", value))
+    }
 }
 
 fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
@@ -1339,6 +1356,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
         "grid-template-columns" => parse_grid_template_columns_value(value)?,
         "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
         "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
+        "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
         "initial-value" | "syntax" | "inherits" => PropertyValue::Raw(value),
         _ => {
             // println!("Failed to parse style \"{}\"", property);
@@ -1611,6 +1629,9 @@ pub fn apply_style_property(
         },
         ("z-index", PropertyValue::ZIndex(value)) => {
             style.z_index = value;
+        },
+        ("pointer-events", PropertyValue::PointerEvents(value)) => {
+            style.pointer_events = value;
         },
         (_, PropertyValue::Raw(_)) => {}
         (_, value) => {

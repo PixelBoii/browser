@@ -222,6 +222,23 @@ class HtmlElement extends BaseNode {
         this.addEventListener('load', cb)
     }
 
+    prepend(...elements) {
+        if (this.__node_idx == null) {
+            throw new Error("Item has not been registered on rust backend yet")
+        }
+
+        for (const element of elements) {
+            if (!element) {
+                throw new TypeError("Element is not an object")
+            }
+
+            // TODO: Optimize this
+            let childNodes = this.childNodes
+            core.ops.op_append_child(this.__node_idx, element.__node_idx, childNodes.length ? childNodes[0].__node_idx : null)
+            return element
+        }
+    }
+
     appendChild(element) {
         if (!element) {
             throw new TypeError("Element is not an object")
@@ -785,6 +802,9 @@ globalThis.document = {
     set cookie(newValue) {
         core.ops.op_set_cookie(globalThis.location.href, String(newValue))
     },
+    get scripts() {
+        return document.querySelectorAll('script')
+    },
     referrer: "",
     fonts: documentFonts,
     createElementNS(ns, tag) {
@@ -878,12 +898,12 @@ class Location {
         console.log('reload!')
     }
 
-    replace() {
-        console.log('replace!')
+    replace(value) {
+        core.ops.op_set_location_href(value, true)
     }
 
-    assign() {
-        console.log('assign!')
+    assign(value) {
+        core.ops.op_set_location_href(value, true)
     }
 
     get href() {
@@ -1172,6 +1192,58 @@ Object.defineProperty(globalThis, "Crypto", {
 
 Object.defineProperty(globalThis, "SubtleCrypto", {
   value: crypto.SubtleCrypto,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "TextDecoder", {
+  value: encoding.TextDecoder,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "TextEncoder", {
+  value: encoding.TextEncoder,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "TextDecoderStream", {
+  value: encoding.TextDecoderStream,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "TextEncoderStream", {
+  value: encoding.TextEncoderStream,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "MessageChannel", {
+  value: messagePort.MessageChannel,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "MessagePort", {
+  value: messagePort.MessagePort,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+// TODO: Fill this out
+const frames = {}
+
+Object.defineProperty(globalThis, "frames", {
+  value: frames,
   enumerable: false,
   configurable: true,
   writable: true,
