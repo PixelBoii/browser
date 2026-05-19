@@ -68,6 +68,13 @@ function setIntervalImpl(callback, delay = 0, ...args) {
     return createTimer(callback, delay, args, true)
 }
 
+function clearAllTimers() {
+    for (const timer of activeTimers.values()) {
+        core.cancelTimer(timer)
+    }
+    activeTimers.clear()
+}
+
 globalThis.__EVENT_LISTENERS = {}
 
 class SVGAnimatedString {
@@ -796,6 +803,8 @@ const documentFonts = {
 }
 
 globalThis.document = {
+    hidden: false,
+    visibilityState: "visible",
     get cookie() {
         return core.ops.op_get_cookie(globalThis.location.href)
     },
@@ -849,7 +858,10 @@ globalThis.document = {
     },
     createDocumentFragment() {
         return this.createElement("fragment")
-    }
+    },
+    hasFocus() {
+        return true
+    },
 };
 
 Object.defineProperty(globalThis, "setTimeout", {
@@ -880,6 +892,13 @@ Object.defineProperty(globalThis, "clearInterval", {
   writable: true,
 });
 
+Object.defineProperty(globalThis, "__clear_all_timers", {
+  value: clearAllTimers,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
 function initLocation(href) {
     Object.defineProperty(globalThis, "location", {
         value: new Location(href),
@@ -895,7 +914,7 @@ class Location {
     }
 
     reload() {
-        console.log('reload!')
+        core.ops.op_set_location_href(this.href, true)
     }
 
     replace(value) {

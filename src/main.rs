@@ -1723,6 +1723,7 @@ fn op_append_child(state: &mut OpState, #[number] parent_idx: usize, #[number] n
             renderer.nodes_idxs.insert(before_pos, idx);
         }
     }
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -1738,7 +1739,10 @@ fn op_get_inner_html(state: &mut OpState, #[number] node_idx: usize) -> Result<S
 #[op2(fast)]
 fn op_remove_child(state: &mut OpState, #[number] child_idx: usize) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
-    host.renderer.borrow_mut().remove_node(child_idx, true);
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.remove_node(child_idx, true);
+    renderer.recompute_dom_indexes();
+    renderer.schedule_dom_update();
     Ok(())
 }
 
@@ -1870,6 +1874,7 @@ fn op_set_text_content(state: &mut OpState, #[number] node_idx: usize, #[string]
         },
     }
 
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -1934,6 +1939,7 @@ fn op_update_attributes(state: &mut OpState, #[number] node_idx: usize, #[serde]
         },
         _ => {},
     };
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -1948,6 +1954,7 @@ fn op_remove_attribute(state: &mut OpState, #[number] node_idx: usize, #[string]
         },
         _ => {},
     };
+    renderer.recompute_dom_indexes();
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -4901,7 +4908,7 @@ impl Browser {
     fn reset_js_document_state(&mut self) -> Result<()> {
         self.execute_host_script(
             "document navigation reset",
-            "globalThis.__EVENT_LISTENERS = {}; history.state = null;".to_string(),
+            "globalThis.__clear_all_timers?.(); globalThis.__EVENT_LISTENERS = {}; history.state = null;".to_string(),
         )?;
         Ok(())
     }
@@ -5793,7 +5800,7 @@ mod tests {
     use crate::style::{
         GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize, StyleSizeAndColor, StyleZIndex, parse_style
     };
-    use crate::{FontHandler, HtmlParser, NetworkFetch, Renderer, VariableDefinitions, get_dom_indexes, sorted_node_idxs};
+    use crate::{Browser, FontHandler, HtmlParser, NetworkFetch, Renderer, RendererProxy, VariableDefinitions, get_dom_indexes, sorted_node_idxs};
     use anyhow::{Context, Result};
     use winit::dpi::PhysicalSize;
     use std::cell::RefCell;
@@ -5940,6 +5947,248 @@ mod tests {
         parser.parse().expect("Failed to parse");
 
         println!("{:?}", parser.nodes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_attribute_updates_refresh_dom_indexes() -> Result<()> {
+        let input = r#"
+            <html>
+                <head></head>
+                <body>
+                    <script>
+                        (function() {
+                            var cssId = 'yvlrue';
+                            var style = document.createElement('style');
+                            style.setAttribute('id', cssId);
+                            document.head.appendChild(style);
+                            document.getElementById(cssId).setAttribute('data-ready', '1');
+                        })();
+                    </script>
+                </body>
+            </html>
+        "#;
+        let path = std::env::temp_dir().join(format!("browser-dom-index-{}.html", std::process::id()));
+        fs::write(&path, input)?;
+
+        let mut browser = Browser::new(format!("file://{}", path.to_string_lossy()), false);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
+        browser.run_js()?;
+
+        let has_updated_style = browser
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .nodes
+            .values()
+            .any(|node| match node {
+                Node::Element(element) => {
+                    element.tag == "style"
+                        && element.attributes.get("id").is_some_and(|id| id == "yvlrue")
+                        && element.attributes.get("data-ready").is_some_and(|value| value == "1")
+                },
+                _ => false,
+            });
+
+        let _ = fs::remove_file(path);
+        assert!(has_updated_style);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_timer_can_find_later_element_by_id() -> Result<()> {
+        let input = r#"
+            <html>
+                <head></head>
+                <body>
+                    <script>
+                        (function() {
+                            var cssId = 'yvlrue';
+                            setTimeout(function() {
+                                document.getElementById(cssId).setAttribute("style", "");
+                            }, 1);
+                        })();
+                    </script>
+                    <div id="yvlrue" style="display:none"></div>
+                </body>
+            </html>
+        "#;
+        let path = std::env::temp_dir().join(format!("browser-timer-dom-index-{}.html", std::process::id()));
+        fs::write(&path, input)?;
+
+        let mut browser = Browser::new(format!("file://{}", path.to_string_lossy()), false);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
+        browser.run_js()?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        browser.pump_js_event_loop_once()?;
+
+        let has_visible_trouble_div = browser
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .nodes
+            .values()
+            .any(|node| match node {
+                Node::Element(element) => {
+                    element.tag == "div"
+                        && element.attributes.get("id").is_some_and(|id| id == "yvlrue")
+                        && element.attributes.get("style").is_some_and(|value| value.is_empty())
+                },
+                _ => false,
+            });
+
+        let _ = fs::remove_file(path);
+        assert!(has_visible_trouble_div);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_navigation_clears_previous_document_timers() -> Result<()> {
+        let old_page = r#"
+            <html>
+                <head></head>
+                <body>
+                    <script>
+                        setTimeout(function() {
+                            document.getElementById('yvlrue')?.remove();
+                        }, 1);
+                    </script>
+                </body>
+            </html>
+        "#;
+        let new_page = r#"
+            <html>
+                <head></head>
+                <body>
+                    <script>
+                        setTimeout(function() {
+                            document.getElementById('yvlrue').setAttribute("style", "");
+                        }, 5);
+                    </script>
+                    <div id="yvlrue" style="display:none"></div>
+                </body>
+            </html>
+        "#;
+        let old_path = std::env::temp_dir().join(format!("browser-old-timer-{}.html", std::process::id()));
+        let new_path = std::env::temp_dir().join(format!("browser-new-timer-{}.html", std::process::id()));
+        fs::write(&old_path, old_page)?;
+        fs::write(&new_path, new_page)?;
+
+        let mut browser = Browser::new(format!("file://{}", old_path.to_string_lossy()), false);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
+        browser.run_js()?;
+        browser.navigate(format!("file://{}", new_path.to_string_lossy()))?;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for _ in 0..3 {
+            browser.pump_js_event_loop_once()?;
+            if browser.renderer.as_ref().unwrap().borrow().pending_dom_update {
+                browser.process_dom_update();
+            }
+        }
+
+        let has_visible_trouble_div = browser
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .nodes
+            .values()
+            .any(|node| match node {
+                Node::Element(element) => {
+                    element.tag == "div"
+                        && element.attributes.get("id").is_some_and(|id| id == "yvlrue")
+                        && element.attributes.get("style").is_some_and(|value| value.is_empty())
+                },
+                _ => false,
+            });
+
+        let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(new_path);
+        assert!(has_visible_trouble_div);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_document_reports_visible_to_scripts() -> Result<()> {
+        let input = r#"
+            <html>
+                <head></head>
+                <body>
+                    <script>
+                        if (document.hidden == 0 && document.visibilityState === "visible" && document.hasFocus()) {
+                            document.body.setAttribute("data-visible", "1");
+                        }
+                    </script>
+                </body>
+            </html>
+        "#;
+        let path = std::env::temp_dir().join(format!("browser-visible-document-{}.html", std::process::id()));
+        fs::write(&path, input)?;
+
+        let mut browser = Browser::new(format!("file://{}", path.to_string_lossy()), false);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
+        browser.run_js()?;
+
+        let body_reports_visible = browser
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .nodes
+            .values()
+            .any(|node| match node {
+                Node::Element(element) => {
+                    element.tag == "body"
+                        && element.attributes.get("data-visible").is_some_and(|value| value == "1")
+                },
+                _ => false,
+            });
+
+        let _ = fs::remove_file(path);
+        assert!(body_reports_visible);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_location_reload_requests_current_document_navigation() -> Result<()> {
+        let input = r#"
+            <html>
+                <head></head>
+                <body>
+                    <script>
+                        location.reload();
+                    </script>
+                </body>
+            </html>
+        "#;
+        let path = std::env::temp_dir().join(format!("browser-location-reload-{}.html", std::process::id()));
+        fs::write(&path, input)?;
+
+        let href = format!("file://{}", path.to_string_lossy());
+        let mut browser = Browser::new(href.clone(), false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
+        browser.run_js()?;
+
+        let saw_reload_navigation = rx.try_iter().any(|cmd| match cmd {
+            crate::FrameCommand::UserEvent(crate::UserEvent::Navigate((crate::UserNavigateUrl::Raw(raw), true))) => raw == href,
+            _ => false,
+        });
+
+        let _ = fs::remove_file(path);
+        assert!(saw_reload_navigation);
 
         Ok(())
     }

@@ -407,12 +407,12 @@ const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 3] = [
     (MediaQueryCriteriaComparison::LessOrEqual, "<="),
 ];
 
-pub fn parse_media_query_parts(mut name: &str) -> Vec<MediaQueryCriteria> {
-    name = name.strip_prefix("(").unwrap_or(&name);
-    name = name.strip_suffix(")").unwrap_or(&name);
+pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
     let criterias: Vec<MediaQueryCriteria> = name
-        .split(",")
-        .filter_map(|l| {
+        .split("and")
+        .filter_map(|mut l| {
+            l = l.strip_prefix("(").unwrap_or(&l);
+            l = l.strip_suffix(")").unwrap_or(&l);
             let trimmed = l.trim().to_string();
             for (comparison, separator) in MEDIA_QUERY_SEPARATORS {
                 let parts: Vec<&str> = trimmed.split(separator).collect();
