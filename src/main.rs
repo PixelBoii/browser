@@ -3829,8 +3829,12 @@ impl Renderer {
             StylePosition::Absolute | StylePosition::Fixed => Some(containing_node_idx),
             StylePosition::Relative | StylePosition::Static => self.nodes.get(&node_idx).unwrap().get_parent(),
         };
-        let containing_block_height = containing_block.and_then(|idx| self.resolved_heights.get(&idx).or(self.resolved_specified_heights.get(&idx).and_then(|v| *v).as_ref()).cloned());
-        let containing_block_width = containing_block.and_then(|idx| self.resolved_widths.get(&idx).or(self.resolved_specified_widths.get(&idx).and_then(|v| *v).as_ref()).cloned());
+        let containing_block_height = containing_block
+            .and_then(|idx| self.resolved_heights.get(&idx).or(self.resolved_specified_heights.get(&idx).and_then(|v| *v).as_ref()).cloned())
+            .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.height));
+        let containing_block_width = containing_block
+            .and_then(|idx| self.resolved_widths.get(&idx).or(self.resolved_specified_widths.get(&idx).and_then(|v| *v).as_ref()).cloned())
+            .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.width));
 
         (containing_block_height, containing_block_width)
     }
@@ -4542,11 +4546,12 @@ impl Renderer {
         let pixels = pixmap_buffer.pixels();
         let pixmap_width = layout_box.rect.width.min(pixmap_buffer.width());
         let pixmap_height = layout_box.rect.height.min(pixmap_buffer.height());
+        let pixmap_stride = pixmap_buffer.width();
         let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
         let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
         let start_y = (-container_start_y).max(0) as u32;
         for pixel_y in start_y..end_y {
-            let src_start = (pixel_y * pixmap_width) as usize;
+            let src_start = (pixel_y * pixmap_stride) as usize;
             let src_row = &pixels[src_start..src_start + pixmap_width as usize];
             let dst_start = (container_start_y * width as i32 + layout_box.rect.x + pixel_y as i32 * width as i32) as usize;
             let dst_row = &mut buffer[dst_start..(dst_start + pixmap_width as usize)];
@@ -4573,6 +4578,9 @@ impl Renderer {
         let offset_y = parent_offset_y + self.scroll_y.get(&self.layout_to_node_idx(&layout_box_idx)).cloned().unwrap_or(0);
         rendered_nodes_ordered.push(RenderedNode { layout_box_idx, offset_y });
         let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
+        if self.node_styles.get(&layout_box.node_idx).is_some_and(|style| style.opacity == 0.0) {
+            return;
+        }
         let container_start_y = layout_box.rect.y + offset_y;
         let container_end_y = container_start_y + layout_box.content_height as i32;
         // If outside viewport, don't render

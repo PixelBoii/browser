@@ -186,6 +186,7 @@ pub struct Style {
     pub overflow_y: Overflow,
     pub z_index: StyleZIndex,
     pub pointer_events: StylePointerEvents,
+    pub opacity: f32,
 }
 
 impl Style {
@@ -233,6 +234,7 @@ impl Style {
             overflow_y: self.overflow_y.clone(),
             z_index: self.z_index.clone(),
             pointer_events: self.pointer_events.clone(),
+            opacity: self.opacity,
         }
     }
 }
@@ -379,7 +381,8 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         overflow_x: Overflow::Auto,
         overflow_y: Overflow::Auto,
         z_index: StyleZIndex::Auto,
-        pointer_events: StylePointerEvents::Auto
+        pointer_events: StylePointerEvents::Auto,
+        opacity: parent_style.map(|v| v.opacity).unwrap_or(1.0),
     }
 }
 
@@ -1548,6 +1551,16 @@ pub fn apply_style_property(
         ("pointer-events", PropertyValue::PointerEvents(value)) => {
             style.pointer_events = value;
         },
+        ("opacity", PropertyValue::Raw(value)) => {
+            if let Ok(value) = value.parse::<f32>() {
+                style.opacity = value.clamp(0.0, 1.0);
+            }
+        }
+        ("visibility", PropertyValue::Raw(value)) => {
+            if value == "hidden" || value == "collapse" {
+                style.opacity = 0.0;
+            }
+        }
         (_, PropertyValue::Raw(_)) => {}
         (_, value) => {
             println!("Failed to apply style \"{}\" with value {:?}", property.property, value);
