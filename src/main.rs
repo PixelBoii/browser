@@ -1294,6 +1294,34 @@ fn element_matches_class_part(
                     hovering_has_impact.insert(element);
                     hovering_chain.contains(&element)
                 }
+                PseudoClass::FirstChild => html_nodes
+                    .get(&element)
+                    .and_then(|node| node.get_parent())
+                    .and_then(|parent| dom_indexes.children_index.get(&parent))
+                    .is_some_and(|siblings| siblings.first().is_some_and(|idx| *idx == element)),
+                PseudoClass::LastChild => html_nodes
+                    .get(&element)
+                    .and_then(|node| node.get_parent())
+                    .and_then(|parent| dom_indexes.children_index.get(&parent))
+                    .is_some_and(|siblings| siblings.last().is_some_and(|idx| *idx == element)),
+                PseudoClass::OnlyChild => html_nodes
+                    .get(&element)
+                    .and_then(|node| node.get_parent())
+                    .and_then(|parent| dom_indexes.children_index.get(&parent))
+                    .is_some_and(|siblings| siblings.len() == 1 && siblings[0] == element),
+                PseudoClass::Empty => dom_indexes
+                    .children_index
+                    .get(&element)
+                    .is_none_or(|children| children.is_empty()),
+                PseudoClass::Link => match html_nodes.get(&element).unwrap() {
+                    Node::Element(el) => el.tag == "a" && el.attributes.contains_key("href"),
+                    _ => false,
+                },
+                PseudoClass::Visited => false,
+                PseudoClass::Disabled => match html_nodes.get(&element).unwrap() {
+                    Node::Element(el) => el.attributes.contains_key("disabled"),
+                    _ => false,
+                },
                 _ => false,
             }
         }

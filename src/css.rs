@@ -20,6 +20,13 @@ pub enum PseudoClass {
     Hover,
     Active,
     Focus,
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    Empty,
+    Link,
+    Visited,
+    Disabled,
     Before,
     After,
     Host,
@@ -289,6 +296,27 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     }
     if value == "focus" {
         return Some(PseudoClass::Focus);
+    }
+    if value == "first-child" {
+        return Some(PseudoClass::FirstChild);
+    }
+    if value == "last-child" {
+        return Some(PseudoClass::LastChild);
+    }
+    if value == "only-child" {
+        return Some(PseudoClass::OnlyChild);
+    }
+    if value == "empty" {
+        return Some(PseudoClass::Empty);
+    }
+    if value == "link" {
+        return Some(PseudoClass::Link);
+    }
+    if value == "visited" {
+        return Some(PseudoClass::Visited);
+    }
+    if value == "disabled" {
+        return Some(PseudoClass::Disabled);
     }
     if value == "host" {
         return Some(PseudoClass::Host);
