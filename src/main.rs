@@ -556,7 +556,13 @@ fn rasterize_svg(cached_rasterizations: &mut CachedRasterizations, svg_str: &Str
     let tree = if let Some(cached) = cached_rasterizations.decoded_svgs.get(&key) {
         cached
     } else {
-        let svg_data = svg_str.as_bytes();
+        let normalized_svg;
+        let svg_data = if svg_str.contains("viewbox=") {
+            normalized_svg = svg_str.replace("viewbox=", "viewBox=");
+            normalized_svg.as_bytes()
+        } else {
+            svg_str.as_bytes()
+        };
         let mut opt = usvg::Options::default();
         opt.style_sheet = Some(format!("svg {{ color: #{:08X}; fill: currentColor }}", color_hex).into());
 
@@ -3201,8 +3207,12 @@ impl Renderer {
                     }
                     let container_size = self.get_container_sizes(node_idx, &OptionalSize { height: None, width: None }, &style, &available_size);
                     let (containing_block_height, containing_block_width) = self.get_containing_block_size(containing_node_idx, node_idx, &style);
-                    let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None, &self.window_size).unwrap_or(available_size.height as i32) as u32;
-                    let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None, &self.window_size).unwrap_or(available_size.width as i32) as u32;
+                    let max_h = get_specified_size(resolved_font_size as u32, &style.max_height, containing_block_height, None, &self.window_size)
+                        .map(|height| height as u32)
+                        .unwrap_or(container_size.container_height_non_filling.unwrap_or(available_size.height));
+                    let max_w = get_specified_size(resolved_font_size as u32, &style.max_width, containing_block_width, None, &self.window_size)
+                        .map(|width| width as u32)
+                        .unwrap_or(container_size.container_width_non_filling.unwrap_or(available_size.width));
                     let (pixmap, height, width, opaque) = match element.tag.as_str() {
                         "canvas" => {
                             let (Some(canvas_width), Some(canvas_height)) = (match self.nodes.get(&node_idx).unwrap() {
