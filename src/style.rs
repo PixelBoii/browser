@@ -152,6 +152,7 @@ pub struct Style {
     pub flex_grow: u32,
     pub flex_basis: StyleSize,
     pub justify_content: StyleJustifyContent,
+    pub justify_items: StyleJustifyContent,
     pub align_items: StyleJustifyContent,
     pub flex_direction: StyleFlexDirection,
     pub gap: StyleSize,
@@ -200,6 +201,7 @@ impl Style {
             flex_grow: self.flex_grow,
             flex_basis: self.flex_basis.clone(),
             justify_content: self.justify_content,
+            justify_items: self.justify_items,
             align_items: self.align_items,
             flex_direction: self.flex_direction,
             gap: self.gap.clone(),
@@ -315,6 +317,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         flex_grow: 0,
         flex_basis: StyleSize::Auto,
         justify_content: StyleJustifyContent::FlexStart,
+        justify_items: StyleJustifyContent::Stretch,
         align_items: StyleJustifyContent::Stretch,
         flex_direction: StyleFlexDirection::Row,
         gap: StyleSize::Px(0.),
@@ -1238,7 +1241,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             }
             PropertyValue::Flex { grow, shrink, basis }
         },
-        "justify-content" | "align-items" | "align-self" =>
+        "justify-content" | "justify-items" | "align-items" | "align-self" =>
             PropertyValue::JustifyContent(parse_justify_content(value.as_str())),
         "place-content" => {
             let parts: Vec<&str> = value.split(" ").collect();
@@ -1444,6 +1447,9 @@ pub fn apply_style_property(
         }
         ("justify-content", PropertyValue::JustifyContent(value)) => {
             style.justify_content = value;
+        }
+        ("justify-items", PropertyValue::JustifyContent(value)) => {
+            style.justify_items = value;
         }
         ("align-items", PropertyValue::JustifyContent(value)) => {
             style.align_items = value;

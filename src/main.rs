@@ -3745,9 +3745,12 @@ impl Renderer {
             }
         }
         let dynamic_space_to_give = width_to_distribute - definitely_used_width as u32;
+        let justify_items = style.justify_items;
+        let align_items = style.align_items;
         // Inline-block doesn't fill the width, so instruct children to not do that either
         let child_allow_fill = match style.display {
             StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
+            StyleDisplay::Grid if justify_items != StyleJustifyContent::Stretch => false,
             _ => allow_fill,
         };
         let grid_template_columns = style.grid_template_columns.clone();
@@ -3786,7 +3789,7 @@ impl Renderer {
                     },
                 }
             } else {
-                available_size.width as i32
+                container_sizes.inner_width as i32
             };
             if let Some(child) = self.layout_node(
                 *child_idx,
@@ -3805,10 +3808,25 @@ impl Renderer {
                 mode,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
+                let child_width = child_box.rect.width as i32;
+                let child_height = child_box.rect.height as i32;
+                let free_x = (specified_column_size - child_width).max(0);
+                let free_y = (container_sizes.inner_height as i32 - child_height).max(0);
+                let offset_x = match justify_items {
+                    StyleJustifyContent::Center => free_x / 2,
+                    StyleJustifyContent::FlexEnd => free_x,
+                    _ => 0,
+                };
+                let offset_y = match align_items {
+                    StyleJustifyContent::Center => free_y / 2,
+                    StyleJustifyContent::FlexEnd => free_y,
+                    _ => 0,
+                };
+                self.move_entire_box(child, offset_x, offset_y);
                 content_position.x += specified_column_size;
                 longest_row_width = longest_row_width.max(content_position.x - original_content_position.x);
                 current_column += 1;
-                max_child_height = max_child_height.max(child_box.rect.height as i32);
+                max_child_height = max_child_height.max(child_height);
                 children.push(child);
             }
         }
