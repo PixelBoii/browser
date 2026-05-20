@@ -1074,8 +1074,8 @@ pub fn resolve_node_variables<'nodes, 'css>(
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
     match value {
         "auto" => StyleJustifyContent::Auto,
-        "flex-start" => StyleJustifyContent::FlexStart,
-        "flex-end" => StyleJustifyContent::FlexEnd,
+        "normal" | "start" | "flex-start" => StyleJustifyContent::FlexStart,
+        "end" | "flex-end" => StyleJustifyContent::FlexEnd,
         "center" => StyleJustifyContent::Center,
         "space-between" => StyleJustifyContent::SpaceBetween,
         "stretch" => StyleJustifyContent::Stretch,
@@ -1348,9 +1348,9 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             ),
             "text-align" => PropertyValue::Align(
                 match value.as_str().trim() {
-                    "left" => Some(StyleAlign::Left),
+                    "left" | "start" => Some(StyleAlign::Left),
                     "center" => Some(StyleAlign::Center),
-                    "right" => Some(StyleAlign::Right),
+                    "right" | "end" => Some(StyleAlign::Right),
                     _ => None,
                 }
                 .with_context(|| "Failed to parse text-align")?,
