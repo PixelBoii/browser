@@ -1,0 +1,6 @@
+- The goal of this project is to work for most sites, not all. So while you should aim to follow the HTML, CSS and JS spec, prioritize the things that matter for the sites you are testing.
+- CSS and HTML parsing should not misrepresent data. If the position is set to sticky, it should be saved as sticky, not something else just because it behaves "mostly the same". If they behave mostly the same, update the layout and painting to treat them the same.
+- This is a standalone browser, so do not parse or webkit specific CSS or similar.
+- Snapshot tests fetch live sites and may be nondeterministic. Treat a visually near-identical mismatch cautiously; do not churn snapshots unless the change is intentional and inspected.
+- When a fix changes a snapshot, inspect the generated `.invalid.png` before accepting it as the new baseline.
+- Keep NOTES.md as the place for known rendering gaps that are larger than a small targeted change.

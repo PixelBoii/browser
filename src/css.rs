@@ -91,6 +91,8 @@ pub enum Overflow {
     Hidden,
     Visible,
     Auto,
+    Scroll,
+    Clip,
 }
 
 impl Overflow {

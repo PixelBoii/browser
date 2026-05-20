@@ -3456,7 +3456,10 @@ impl Renderer {
         } else {
             false
         };
-        if style.is_some_and(|style| style.overflow_y == Overflow::Auto) && allow_scroll {
+        if style.is_some_and(|style| {
+            style.overflow_y == Overflow::Auto || style.overflow_y == Overflow::Scroll
+        }) && allow_scroll
+        {
             Some(node_idx)
         } else if let Some(parent) = self.nodes.get(&node_idx).and_then(|n| n.get_parent()) {
             self.get_scrollable_node_idx_inner(parent)
@@ -4914,7 +4917,7 @@ impl Renderer {
         let style = self.node_styles.get(&node_idx).unwrap();
         let container_sizes =
             self.get_container_sizes(node_idx, &forced_size, style, &available_size);
-        if style.position == StylePosition::Relative {
+        if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
@@ -5106,7 +5109,7 @@ impl Renderer {
         // This is the parent which this node uses for % sizing, and possibly more later on
         let containing_block = match style.position {
             StylePosition::Absolute | StylePosition::Fixed => Some(containing_node_idx),
-            StylePosition::Relative | StylePosition::Static => {
+            StylePosition::Relative | StylePosition::Static | StylePosition::Sticky => {
                 self.nodes.get(&node_idx).unwrap().get_parent()
             }
         };
@@ -5218,7 +5221,7 @@ impl Renderer {
             })
             .collect();
 
-        if style.position == StylePosition::Relative {
+        if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {

@@ -90,6 +90,7 @@ pub enum StylePosition {
     Relative,
     Absolute,
     Fixed,
+    Sticky,
 }
 
 impl StylePosition {
@@ -791,6 +792,7 @@ fn rgba_to_hex((r, g, b, a): (u8, u8, u8, u8)) -> u32 {
 }
 
 fn parse_color(value: String) -> Result<StyleBackground> {
+    let value = value.trim();
     if value.starts_with("#") {
         let code_str = value
             .strip_prefix("#")
@@ -845,7 +847,17 @@ fn parse_color(value: String) -> Result<StyleBackground> {
     } else if value == "transparent" || value == "none" {
         Ok(StyleBackground::Transparent)
     } else {
-        Err(anyhow!("Failed to parse color \"{}\"", value))
+        match value.to_ascii_lowercase().as_str() {
+            "black" | "buttontext" | "canvastext" | "linktext" => {
+                Ok(StyleBackground::Hex(0x00_00_00_FF))
+            }
+            "white" | "buttonface" | "selecteditemtext" => Ok(StyleBackground::Hex(0xFF_FF_FF_FF)),
+            "gray" | "grey" | "graytext" | "buttonborder" => {
+                Ok(StyleBackground::Hex(0x80_80_80_FF))
+            }
+            "highlight" | "selecteditem" => Ok(StyleBackground::Hex(0x33_99_FF_FF)),
+            _ => Err(anyhow!("Failed to parse color \"{}\"", value)),
+        }
     }
 }
 
@@ -1179,6 +1191,8 @@ fn parse_overflow(value: String) -> Result<PropertyValue> {
         "hidden" => Ok(PropertyValue::Overflow(Overflow::Hidden)),
         "visible" => Ok(PropertyValue::Overflow(Overflow::Visible)),
         "auto" => Ok(PropertyValue::Overflow(Overflow::Auto)),
+        "scroll" => Ok(PropertyValue::Overflow(Overflow::Scroll)),
+        "clip" => Ok(PropertyValue::Overflow(Overflow::Clip)),
         _ => Err(anyhow!("Failed to parse overflow value: {}", value)),
     }
 }
@@ -1324,6 +1338,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                     "relative" => Some(StylePosition::Relative),
                     "absolute" => Some(StylePosition::Absolute),
                     "fixed" => Some(StylePosition::Fixed),
+                    "sticky" => Some(StylePosition::Sticky),
                     _ => {
                         println!("Failed to parse style position \"{}\"", value);
                         None
