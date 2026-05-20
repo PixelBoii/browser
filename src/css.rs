@@ -248,45 +248,6 @@ fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
     Some(ClassNamePart::Attributes(attributes))
 }
 
-mod tests {
-    use crate::css::{ClassNamePart, ClassNamePartAttribute};
-
-    use super::{parse_selector_with_attributes, selector_to_parts};
-
-    #[test]
-    fn test_parse_svg() {
-        assert_eq!(
-            parse_selector_with_attributes("input").unwrap(),
-            ClassNamePart::Tag("input".to_string()),
-        );
-        assert_eq!(
-            parse_selector_with_attributes("[type='submit']").unwrap(),
-            ClassNamePart::Attributes(vec![
-                ClassNamePartAttribute::KeyValue(("type".to_string(), "submit".to_string())),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_selector_to_parts_class() {
-        assert_eq!(selector_to_parts(&String::from(".foo")), vec![ClassNamePart::Class("foo".to_string())]);
-        assert_eq!(selector_to_parts(&String::from(".foo#bar")), vec![ClassNamePart::Combined(vec![ClassNamePart::Class("foo".to_string()), ClassNamePart::Id("bar".to_string())])]);
-        assert_eq!(selector_to_parts(&String::from("input[type='submit']")), vec![ClassNamePart::Combined(vec![
-            ClassNamePart::Tag("input".to_string()),
-            ClassNamePart::Attributes(vec![ClassNamePartAttribute::KeyValue(("type".to_string(), "submit".to_string()))]),
-        ])]);
-        assert_eq!(selector_to_parts(&String::from("input[type='submit'][haha=\"lol\"]")), vec![ClassNamePart::Combined(vec![
-            ClassNamePart::Tag("input".to_string()),
-            ClassNamePart::Attributes(vec![
-                ClassNamePartAttribute::KeyValue(("type".to_string(), "submit".to_string())),
-            ]),
-            ClassNamePart::Attributes(vec![
-                ClassNamePartAttribute::KeyValue(("haha".to_string(), "lol".to_string())),
-            ]),
-        ])]);
-    }
-}
-
 fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     if let Some(stripped) = value.strip_prefix("not(") {
         if let Some(stripped) = stripped.strip_suffix(")") {

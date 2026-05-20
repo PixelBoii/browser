@@ -15,7 +15,7 @@ use style::{
     StyleSize, get_base_style, parse_style,
 };
 
-use std::cell::{RefCell};
+use std::cell::{Ref, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -229,6 +229,12 @@ impl RendererProxy {
 }
 
 #[derive(Debug)]
+struct RenderedNode {
+    layout_box_idx: usize,
+    offset_y: i32,
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
     node_idx_cursor: usize,
@@ -239,7 +245,7 @@ struct Renderer {
     node_layout_mapping: HashMap<usize, usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
     request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
-    rendered_nodes_ordered: Vec<usize>,
+    rendered_nodes_ordered: Vec<RenderedNode>,
     pub hovering: Option<usize>,
     pub focusable: Option<usize>,
     tokio: Rc<RefCell<tokio::runtime::Runtime>>,
@@ -352,11 +358,22 @@ impl ContainingNode {
             let margin_right = get_specified_size(font_size, &style.margin_right, Some(waiter.available_size.width), None, &renderer.window_size);
             let margin_left = get_specified_size(font_size, &style.margin_left, Some(waiter.available_size.width), None, &renderer.window_size);
 
-            if style.position == StylePosition::Absolute && style.width == StyleSize::Auto && left.is_some() && right.is_some() {
-                forced_size.width = Some((width as i32 - left.unwrap() - right.unwrap()) as u32);
+            let positioning_width = if style.position == StylePosition::Fixed {
+                waiter.available_size.width
+            } else {
+                width
+            };
+            let positioning_height = if style.position == StylePosition::Fixed {
+                waiter.available_size.height
+            } else {
+                height
+            };
+
+            if style.position.is_free() && style.width == StyleSize::Auto && left.is_some() && right.is_some() {
+                forced_size.width = Some((positioning_width as i32 - left.unwrap() - right.unwrap()) as u32);
             }
-            if style.position == StylePosition::Absolute && style.height == StyleSize::Auto && top.is_some() && bottom.is_some() {
-                forced_size.height = Some((height as i32 - top.unwrap() - bottom.unwrap()) as u32);
+            if style.position.is_free() && style.height == StyleSize::Auto && top.is_some() && bottom.is_some() {
+                forced_size.height = Some((positioning_height as i32 - top.unwrap() - bottom.unwrap()) as u32);
             }
 
             if let Some(layout_idx) = renderer.layout_node(
@@ -371,17 +388,17 @@ impl ContainingNode {
             ) {
                 let waiter_layout_box = renderer.layout_table.get(&layout_idx).unwrap().clone();
 
-                if style.position == StylePosition::Absolute {
+                if style.position.is_free() {
                     if style.width == StyleSize::Auto && left.is_some() && right.is_some() {
                         // Width is taken care of above, so just move by left
                         renderer.move_entire_box(layout_idx, left.unwrap(), 0);
                     } else if right.is_some() {
-                        let move_by = width as i32 - waiter_layout_box.rect.width as i32 - right.unwrap() - margin_right.unwrap_or(0);
+                        let move_by = positioning_width as i32 - waiter_layout_box.rect.width as i32 - right.unwrap() - margin_right.unwrap_or(0);
                         renderer.move_entire_box(layout_idx, move_by, 0);
                     } else if left.is_some() {
                         renderer.move_entire_box(layout_idx, left.unwrap() - margin_left.unwrap_or(0), 0);
                     } else if style.margin_left == StyleSize::Auto && style.margin_right == StyleSize::Auto {
-                        let free_space = width.saturating_sub(waiter_layout_box.rect.width);
+                        let free_space = positioning_width.saturating_sub(waiter_layout_box.rect.width);
                         renderer.move_entire_box(layout_idx, (free_space / 2) as i32, 0);
                     }
 
@@ -391,7 +408,7 @@ impl ContainingNode {
                     } else if top.is_some() {
                         renderer.move_entire_box(layout_idx, 0, top.unwrap());
                     } else if bottom.is_some() {
-                        let move_by = height as i32 - waiter_layout_box.rect.height as i32 - bottom.unwrap();
+                        let move_by = positioning_height as i32 - waiter_layout_box.rect.height as i32 - bottom.unwrap();
                         renderer.move_entire_box(layout_idx, 0, move_by);
                     }
                 }
@@ -966,7 +983,7 @@ fn element_matches_class_part(
         },
         ClassNamePart::Tag(tag) => {
             match html_nodes.get(&element).unwrap() {
-                Node::Element(walk_element) => walk_element.tag == *tag,
+                Node::Element(walk_element) => tag == "*" || walk_element.tag == *tag,
                 _ => false,
             }
         },
@@ -1171,6 +1188,13 @@ fn search_elements_for_css_nodes(
                     }
                     let last_part = parts.last().unwrap();
                     let node_specificity = get_specificity_tuple(parts);
+                    let all_elements = || {
+                        html_nodes
+                            .iter()
+                            .map(|(idx, _)| idx)
+                            .cloned()
+                            .collect::<FixedBitSet>()
+                    };
 
                     let elements: Option<FixedBitSet> = match last_part {
                         ClassNamePart::Class(class) => class_elements.get(class).cloned(),
@@ -1190,15 +1214,27 @@ fn search_elements_for_css_nodes(
                                 _ => None,
                             }
                         },
-                        ClassNamePart::Tag(tag) => tag_elements.get(tag).cloned(),
+                        ClassNamePart::Tag(tag) => {
+                            if tag == "*" {
+                                Some(all_elements())
+                            } else {
+                                tag_elements.get(tag).cloned()
+                            }
+                        },
                         ClassNamePart::Combined(combined) => {
                             let last_part_combined = combined.last().unwrap();
                             let (indexed, base_elements) = match last_part_combined {
-                                ClassNamePart::Tag(tag) => (true, tag_elements.get(tag).cloned()),
+                                ClassNamePart::Tag(tag) => {
+                                    if tag == "*" {
+                                        (true, Some(all_elements()))
+                                    } else {
+                                        (true, tag_elements.get(tag).cloned())
+                                    }
+                                },
                                 ClassNamePart::Class(class) => (true, class_elements.get(class).cloned()),
                                 ClassNamePart::Id(id) => (true, id_elements.get(id).cloned()),
                                 ClassNamePart::Attributes(attributes) => (true, Some(get_base_elements_by_attributes(html_nodes, dom_indexes, attributes))),
-                                _ => (false, Some(html_nodes.iter().map(|(idx, _)| idx).cloned().collect::<FixedBitSet>())),
+                                _ => (false, Some(all_elements())),
                             };
                             let rules_to_apply = if indexed { &combined[..combined.len() - 1].to_vec() } else { combined };
 
@@ -1654,6 +1690,26 @@ fn op_post_message_to_parent(state: &mut OpState, #[string] message: String) -> 
     Ok(())
 }
 
+fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_offset: i32) -> i32 {
+    if let Some(scroll_y) = renderer.scroll_y.get(&node_idx) {
+        parent_offset += scroll_y;
+    }
+
+    if let Some(parent) = renderer.nodes.get(&node_idx).and_then(|node| node.get_parent()) {
+        get_offset_y_walk(renderer, parent, parent_offset)
+    } else {
+        parent_offset
+    }
+}
+
+#[op2(fast)]
+fn op_get_offset_y(state: &mut OpState, #[number] node_idx: usize) -> Result<i32, JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let offset_y = get_offset_y_walk(&renderer, node_idx, 0);
+    Ok(offset_y)
+}
+
 #[op2]
 #[serde]
 fn op_get_attributes(state: &mut OpState, #[number] node_idx: usize) -> Result<Option<HashMap<String, String>>, JsError> {
@@ -2098,6 +2154,28 @@ fn op_canvas_path_stroke(
     Ok(())
 }
 
+#[op2]
+#[serde]
+fn op_collect_data_for_form(state: &mut OpState, #[number] form_node_idx: usize) -> HashMap<String, String> {
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let inputs = renderer.collect_inputs_in_form(form_node_idx, None);
+    let mut data = HashMap::new();
+    for input in inputs.iter() {
+        let Some(Node::Element(element)) = renderer.nodes.get(&input) else {
+            continue;
+        };
+        let Some(name) = element.attributes.get("name") else {
+            continue;
+        };
+        let Some(value) = element.attributes.get("value") else {
+            continue;
+        };
+        data.insert(name.clone(), value.clone());
+    }
+    data
+}
+
 // This should walk the tree to be fully correct I think
 fn query_selector_all(nodes_table: &HashMap<usize, &Node>, selector: Vec<ClassNamePart>, window_size: &PhysicalSize<u32>, dom_indexes: &DomIndexes, hovering_chain: &Vec<usize>) -> Vec<usize> {
     let class = CssNode::ClassName(ClassName {
@@ -2147,6 +2225,8 @@ extension!(
     op_get_attribute,
     op_get_attributes,
     op_post_message_to_parent,
+    op_get_offset_y,
+    op_collect_data_for_form,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js", "runtime_fetch.js"],
@@ -2355,6 +2435,7 @@ pub enum HtmlEvent {
 }
 
 const FOCUSABLE_ELEMENTS: [&'static str; 2] = ["input", "textarea"];
+const FOCUSABLE_INPUT_TYPES: [&'static str; 2] = ["text", "password"];
 
 fn is_supported_form_element(element: &Element, node_idx: usize, submitted_by: Option<usize>) -> bool {
     if element.attributes.contains_key("disabled") {
@@ -2670,15 +2751,20 @@ impl Renderer {
         }
     }
 
+    pub fn collect_inputs_in_form(&self, form: usize, submitted_by: Option<usize>) -> Vec<usize> {
+        let mut inputs = vec![];
+        self.submit_form_walk(&mut inputs, form, submitted_by);
+        inputs
+    }
+
     pub fn submit_form(&mut self, form: usize, submitted_by: Option<usize>) -> Result<()> {
         let Some(Node::Element(element)) = self.nodes.get(&form) else {
             return Err(anyhow!("Failed to get form node"));
         };
         let Some(action) = element.attributes.get("action") else {
-            return Err(anyhow!("No action found on form"));
+            return Ok(());
         };
-        let mut inputs = vec![];
-        self.submit_form_walk(&mut inputs, form, submitted_by);
+        let inputs = self.collect_inputs_in_form(form, submitted_by);
 
         let base_url = ReqwestUrl::parse(&self.url)?;
         let mut parsed_url = resolve_url(action, Some(&base_url))?;
@@ -3230,7 +3316,7 @@ impl Renderer {
                         StyleZIndex::Number(value) => value,
                     };
                     if !self.frames.contains_key(&node_idx) {
-                        let handle = self.spawn_frame(url.clone(), PhysicalSize { width, height });
+                        let handle = self.spawn_frame(url.clone(), PhysicalSize { width, height }).ok()?;
                         self.frames.insert(node_idx, handle);
                     }
                     Some(self.register_layout_box(LayoutBox {
@@ -3335,7 +3421,7 @@ impl Renderer {
         }
     }
 
-    fn spawn_frame(&mut self, url: String, size: PhysicalSize<u32>) -> FrameHandle {
+    fn spawn_frame(&mut self, url: String, size: PhysicalSize<u32>) -> Result<FrameHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
         let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
         let bitmap_for_thread = Arc::clone(&latest_bitmap);
@@ -3345,7 +3431,18 @@ impl Renderer {
         std::thread::spawn(move || {
             let mut browser = Browser::new(url.to_string(), false);
 
-            browser.open(Some(tx_proxy), Some(PhysicalSize::new(size.width, size.height)), true).unwrap();
+            let browser_result = browser.open();
+            match browser_result {
+                Ok(params) => {
+                    let _ = browser
+                        .set_up_without_event_loop(params, PhysicalSize::new(size.width, size.height), tx_proxy)
+                        .inspect_err(|err| eprintln!("Failed to start iframe renderer: {:?}", err));
+                },
+                Err(err) => {
+                    eprintln!("Failed to boot iframe browser: {:?}", err);
+                    return;
+                },
+            }
 
             let start = Instant::now();
             let js_result = browser.run_js();
@@ -3385,9 +3482,9 @@ impl Renderer {
                 let _ = browser.pump_js_event_loop_once();
             }
         });
-        FrameHandle {
+        Ok(FrameHandle {
             surface: latest_bitmap,
-        }
+        })
     }
 
     fn resolve_background_data_url(&mut self, node_idx: usize, format: &String, data: &String, container_size: &ContainerSizes, mode: &LayoutMode) -> Result<()> {
@@ -3919,14 +4016,13 @@ impl Renderer {
         self.divide_free_space_for_margin(&children_rows, width as i32 - padding_left_size - padding_right_size, free_space_y);
 
         for child_idx in free_children {
-            let containing_node = self.containing_nodes
-                .get_mut(&containing_node_idx)
-                .unwrap();
-
-            containing_node
-                .waiters
-                // Note: We use the cursor here rather than content_position as free children are not affected by padding
-                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size: Size { height, width }, cursor: cursor.clone() });
+            self.queue_free_child_for_layout(
+                containing_node_idx,
+                node_idx,
+                *child_idx,
+                Size { height, width },
+                cursor.clone(),
+            );
         }
 
         if containing_node_idx == node_idx {
@@ -4324,14 +4420,13 @@ impl Renderer {
         self.resolved_widths.insert(node_idx, width);
 
         for child_idx in free_children {
-            let containing_node = self.containing_nodes
-                .get_mut(&containing_node_idx)
-                .unwrap();
-
-            containing_node
-                .waiters
-                // Note: We use the cursor here rather than content_position as free children are not affected by padding
-                .push(ResumableNode { parent_idx: node_idx, node_idx: *child_idx, available_size: Size { height, width }, cursor: cursor.clone() });
+            self.queue_free_child_for_layout(
+                containing_node_idx,
+                node_idx,
+                *child_idx,
+                Size { height, width },
+                cursor.clone(),
+            );
         }
 
         if containing_node_idx == node_idx {
@@ -4351,25 +4446,25 @@ impl Renderer {
         let hovering = self.rendered_nodes_ordered
             .iter()
             .rev()
-            .find(|idx| {
-                let node_idx = self.layout_to_node_idx(*idx);
+            .find(|renderer_node| {
+                let node_idx = self.layout_to_node_idx(&renderer_node.layout_box_idx);
                 let Some(style) = self.node_styles.get(&node_idx) else {
                     return false;
                 };
                 if style.pointer_events == StylePointerEvents::None {
                     return false;
                 }
-                let layout_box = self.layout_table.get(*idx).unwrap();
+                let layout_box = self.layout_table.get(&renderer_node.layout_box_idx).unwrap();
                 let end_x = layout_box.rect.x + layout_box.rect.width as i32;
                 let end_y = layout_box.rect.y + layout_box.rect.height as i32;
-                let scroll_y = self.scroll_y.get(*idx).unwrap_or(&0);
+                let scroll_y = renderer_node.offset_y;
 
                 position.x > layout_box.rect.x &&
                     position.x < end_x &&
                     position.y > layout_box.rect.y + scroll_y &&
                     position.y < end_y + scroll_y
             });
-        self.hovering = hovering.copied();
+        self.hovering = hovering.and_then(|v| Some(v.layout_box_idx));
     }
 
     fn paint_borders(
@@ -4473,10 +4568,10 @@ impl Renderer {
         width: u32,
         height: u32,
         parent_offset_y: i32,
-        rendered_nodes_ordered: &mut Vec<usize>,
+        rendered_nodes_ordered: &mut Vec<RenderedNode>,
     ) {
-        rendered_nodes_ordered.push(layout_box_idx);
         let offset_y = parent_offset_y + self.scroll_y.get(&self.layout_to_node_idx(&layout_box_idx)).cloned().unwrap_or(0);
+        rendered_nodes_ordered.push(RenderedNode { layout_box_idx, offset_y });
         let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
         let container_start_y = layout_box.rect.y + offset_y;
         let container_end_y = container_start_y + layout_box.content_height as i32;
@@ -4632,6 +4727,39 @@ impl Renderer {
     pub fn recompute_nodes(&mut self) {
         self.recompute_dom_indexes();
         self.recompute_styles();
+    }
+
+    fn queue_free_child_for_layout(
+        &mut self,
+        containing_node_idx: usize,
+        parent_idx: usize,
+        child_idx: usize,
+        available_size: Size,
+        cursor: Position,
+    ) {
+        let child_style = self.node_styles.get(&child_idx).unwrap();
+        let (containing_node_idx, parent_idx, available_size, cursor) = if child_style.position == StylePosition::Fixed {
+            (
+                self.dom_indexes.root_indice,
+                self.dom_indexes.root_indice,
+                Size {
+                    height: self.window_size.height,
+                    width: self.window_size.width,
+                },
+                Position { x: 0, y: 0 },
+            )
+        } else {
+            (containing_node_idx, parent_idx, available_size, cursor)
+        };
+
+        let containing_node = self.containing_nodes
+            .get_mut(&containing_node_idx)
+            .unwrap();
+
+        containing_node
+            .waiters
+            // Note: We use the cursor here rather than content_position as free children are not affected by padding
+            .push(ResumableNode { parent_idx, node_idx: child_idx, available_size, cursor });
     }
 
     pub fn get_paddings(&self, node_idx: usize, style: &Style, available_size: Size) -> (i32, i32, i32, i32) {
@@ -4805,6 +4933,12 @@ struct Browser {
     hover_debugging: bool,
 }
 
+struct BootParams {
+    nodes_idxs: Vec<usize>,
+    nodes: HashMap<usize, parser::Node>,
+    dom_indexes: DomIndexes,
+}
+
 impl std::fmt::Debug for Browser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Browser")
@@ -4844,6 +4978,10 @@ impl Browser {
             document_id: 0,
             hover_debugging,
         }
+    }
+
+    pub fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
+        self.renderer.as_ref().unwrap().borrow_mut().render_into(buffer, width, height, rebuild_layout);
     }
 
     async fn get_html(&self, url: String) -> Result<(String, String)> {
@@ -5100,155 +5238,167 @@ impl Browser {
         Ok(())
     }
 
-    pub fn open(&mut self, existing_event_loop: Option<RendererProxy>, existing_size: Option<PhysicalSize<u32>>, install_js: bool) -> Result<()> {
+    pub fn set_up_without_event_loop(&mut self, params: BootParams, size: PhysicalSize<u32>, proxy: RendererProxy) -> Result<()> {
+        self.refresh_renderer(params.nodes, params.dom_indexes, params.nodes_idxs, size);
+
+        self.renderer.as_mut().unwrap().borrow_mut().event_loop_proxy = Some(proxy.clone());
+
+        if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
+            js_runtime.op_state().borrow_mut().put(JsHostState {
+                renderer: self.renderer.as_mut().cloned().unwrap(),
+                proxy: proxy,
+            });
+        }
+        self.setup_js_dom()?;
+
+        Ok(())
+    }
+
+    pub fn open(&mut self) -> Result<BootParams> {
         self.register_tokio_runtime()?;
         self.navigate(self.url.clone())?;
-        if install_js {
-            self.install_js_host();
-        }
+        self.install_js_host();
         let nodes_table = self.html_parser.as_mut().unwrap().nodes.clone().into_iter().enumerate().collect();
         let nodes_idxs = sorted_node_idxs(&nodes_table);
         let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
         self.detect_html_redirect(&dom_indexes);
-        if let Some(proxy) = existing_event_loop {
-            self.refresh_renderer(nodes_table, dom_indexes, nodes_idxs, existing_size.unwrap());
-
-            self.renderer.as_mut().unwrap().borrow_mut().event_loop_proxy = Some(proxy.clone());
-
-            if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
-                js_runtime.op_state().borrow_mut().put(JsHostState {
-                    renderer: self.renderer.as_mut().cloned().unwrap(),
-                    proxy: proxy,
-                });
-            }
-
-            self.setup_js_dom()
-        } else {
-            self.start_event_loop(nodes_table, dom_indexes, nodes_idxs)
-        }
+        Ok(BootParams {
+            nodes: nodes_table,
+            nodes_idxs,
+            dom_indexes
+        })
     }
 
     fn on_click(&mut self) -> Result<()> {
-        let (href, link_node_idx, code, implicit_event_code): (Option<String>, Option<usize>, Option<String>, Vec<String>) = {
-            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-            let hovering = renderer.hovering;
-            if let Some(hovering) = hovering {
-                // Run event listeners
-                let hovering_node_idx = renderer.layout_to_node_idx(&hovering);
+        let hovering = self.renderer.as_ref().unwrap().borrow().hovering;
+        if let Some(hovering) = hovering {
+            // Run event listeners
+            let hovering_node_idx = self.renderer
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .layout_to_node_idx(&hovering);
+            {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
                 println!(
                     "Clicked on {} {:?}",
                     hovering_node_idx,
                     get_node_text_representation(hovering_node_idx, &renderer.nodes, &renderer.node_layout_mapping, &renderer.layout_table, &renderer.node_styles),
                 );
-                let parents = renderer.get_parents(hovering_node_idx);
-                let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
-                let code = format!(r#"
-                    (() => {{
-                        const event = new MouseEvent("click")
-                        for (const idx of [{}]) {{
-                            event.target = __elementFromNodeIdx(idx)
-                            event.target.__node_idx = idx
-                            runEventListeners(`${{idx}}:click`, event)
-                        }}
-                        return event.defaultPrevented
-                    }})()
-                "#, parents_strs.join(", "));
+            }
+            let parents = self.renderer.as_ref().unwrap().borrow().get_parents(hovering_node_idx);
+            let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
+            let code = format!(
+                "__dispatchClickFromNodeIdx({}, [{}])",
+                hovering_node_idx,
+                parents_strs.join(", ")
+            );
 
-                let mut implicit_event_code = vec![];
-                for p in parents.iter() {
-                    for (implicit, event) in renderer.get_implicit_click_events(*p) {
-                        let Some(code) = (match event {
-                            HtmlEvent::Change => {
-                                Some(format!(r#"
-                                    (() => {{
-                                        const event = new Event("change")
-                                        const idx = {}
-                                        event.target = __elementFromNodeIdx(idx)
-                                        event.target.__node_idx = idx
-                                        runEventListeners(`${{idx}}:change`, event)
-                                        return event.defaultPrevented
-                                    }})()
-                                "#, implicit.to_string()))
-                            },
-                            _ => None,
-                        }) else {
-                            continue;
-                        };
-                        implicit_event_code.push(code);
-                    }
+            let default_prevented = {
+                let value = self.execute_host_script("click handler", code)?;
+                let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+
+                deno_core::scope!(scope, &mut *runtime);
+                let value = deno_core::v8::Local::new(scope, value);
+                value.boolean_value(scope)
+            };
+
+            for p in parents.iter() {
+                let implicit_events = self.renderer.as_ref().unwrap().borrow().get_implicit_click_events(*p);
+                for (implicit, event) in implicit_events {
+                    let Some(code) = (match event {
+                        HtmlEvent::Change => {
+                            Some(format!(r#"
+                                (() => {{
+                                    const event = new Event("change")
+                                    const idx = {}
+                                    event.target = __elementFromNodeIdx(idx)
+                                    event.target.__node_idx = idx
+                                    runEventListeners(`${{idx}}:change`, event)
+                                    return event.defaultPrevented
+                                }})()
+                            "#, implicit.to_string()))
+                        },
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    self.execute_host_script("implicit event handler", code)?;
+                    let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+                    let future = runtime.run_event_loop(Default::default());
+                    self.tokio.as_ref().unwrap().clone().borrow_mut().block_on(future)?;
                 }
+            }
 
+            {
+                let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
                 let focusable = renderer.walk_node_upwards(hovering_node_idx, |node| {
                     let Node::Element(element) = node else {
                         return false;
                     };
-                    FOCUSABLE_ELEMENTS.contains(&element.tag.as_str()) && element.attributes.get("type").is_none_or(|v| v == "text")
+                    FOCUSABLE_ELEMENTS.contains(&element.tag.as_str()) && element.attributes.get("type").is_none_or(|v| FOCUSABLE_INPUT_TYPES.contains(&v.as_str()))
                 });
                 renderer.focusable = focusable;
-
-                let submittable_input = renderer.walk_node_upwards(hovering_node_idx, |node| {
-                    let Node::Element(element) = node else {
-                        return false;
-                    };
-                    element.tag == "input" && element.attributes.get("type").is_some_and(|v| v == "submit")
-                });
-                if let Some(submittable_input) = submittable_input {
-                    let form = renderer.walk_node_upwards(submittable_input, |node| {
-                        let Node::Element(element) = node else {
-                            return false;
-                        };
-                        element.tag == "form"
-                    });
-
-                    if let Some(form) = form {
-                        renderer.submit_form(form, Some(submittable_input))?;
-                    }
-                }
-
-                let parent_link = renderer.walk_node_upwards(hovering_node_idx, |node| {
-                    let Node::Element(element) = node else {
-                        return false;
-                    };
-                    element.tag == "a"
-                });
-                if let Some(parent) = parent_link {
-                    match &renderer.nodes.get(&parent).unwrap() {
-                        Node::Element(element) => (element.attributes.get("href").cloned(), Some(parent), Some(code), implicit_event_code),
-                        _ => (None, Some(parent), Some(code), implicit_event_code),
-                    }
-                } else {
-                    (None, None, Some(code), implicit_event_code)
-                }
-            } else {
-                (None, None, None, vec![])
             }
-        };
 
-        let default_prevented = if let Some(code) = code {
-            let value = self.execute_host_script("click handler", code)?;
-            let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+            let submittable_input = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(hovering_node_idx, |node| {
+                let Node::Element(element) = node else {
+                    return false;
+                };
+                ["input", "button"].contains(&element.tag.as_str()) && element.attributes.get("type").is_some_and(|v| v == "submit")
+            });
+            if let Some(submittable_input) = submittable_input {
+                let form = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(submittable_input, |node| {
+                    let Node::Element(element) = node else {
+                        return false;
+                    };
+                    element.tag == "form"
+                });
 
-            deno_core::scope!(scope, &mut *runtime);
-            let value = deno_core::v8::Local::new(scope, value);
-            value.boolean_value(scope)
-        } else {
-            false
-        };
+                if let Some(form) = form {
+                    let default_prevented = {
+                        let value = self.execute_host_script("submit event handler", format!(r#"
+                        (() => {{
+                            const event = new Event("submit", {{
+                                bubbles: false,
+                            }})
+                            __elementFromNodeIdx({}).dispatchEvent(event)
+                            return event.defaultPrevented
+                        }})()
+                        "#, form))?;
+                        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
 
-        println!("default prevented {}", default_prevented);
+                        deno_core::scope!(scope, &mut *runtime);
+                        let value = deno_core::v8::Local::new(scope, value);
+                        value.boolean_value(scope)
+                    };
+                    if !default_prevented {
+                        self.renderer
+                            .as_mut()
+                            .unwrap()
+                            .borrow_mut()
+                            .submit_form(form, Some(submittable_input))?;
+                    }
+                }
+            }
 
-        for code in implicit_event_code {
-            self.execute_host_script("implicit event handler", code)?;
-            let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
-            let future = runtime.run_event_loop(Default::default());
-            self.tokio.as_ref().unwrap().clone().borrow_mut().block_on(future)?;
-        }
-
-        if let (Some(href), Some(_link_node_idx)) = (href, link_node_idx) {
-            if !default_prevented {
-                let current_url = url::Url::parse(&self.url)?;
-                let resolved_url = current_url.join(&href)?;
-                self.navigate(resolved_url.to_string()).unwrap();
+            let parent_link = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(hovering_node_idx, |node| {
+                let Node::Element(element) = node else {
+                    return false;
+                };
+                element.tag == "a"
+            });
+            if let Some(parent) = parent_link {
+                let parent_href = if let Some(Node::Element(element)) = self.renderer.as_ref().unwrap().borrow().nodes.get(&parent) {
+                    element.attributes.get("href").cloned()
+                } else {
+                    None
+                };
+                if let Some(href) = parent_href && !default_prevented {
+                    let current_url = url::Url::parse(&self.url)?;
+                    let resolved_url = current_url.join(&href)?;
+                    self.navigate(resolved_url.to_string()).unwrap();
+                }
             }
         }
 
@@ -5260,6 +5410,7 @@ impl Browser {
             document.documentElement = document.querySelector("html");
             document.body = document.querySelector("body");
             document.head = document.querySelector("head");
+            document.activeElement = document.body;
 
             navigator.userAgent = "{}";
 
@@ -5346,8 +5497,9 @@ impl Browser {
 
     fn execute_dom_update(&mut self) {
         self.process_dom_update();
-        let window = self.window.as_ref().unwrap();
-        window.request_redraw();
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 
     fn apply_debug_hover(&mut self, hovering_layout_idx: usize) {
@@ -5380,7 +5532,32 @@ impl Browser {
         }
     }
 
-    fn start_event_loop(&mut self, nodes_table: HashMap<usize, Node>, dom_indexes: DomIndexes, nodes_idxs: Vec<usize>) -> Result<()> {
+    pub fn pump_with_limit(&mut self, latest_end: Instant) -> Result<()> {
+        match self.pump_js_event_loop_once() {
+            Ok(js_pending) => {
+                let dom_pending = self.renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .pending_dom_update;
+
+                if dom_pending {
+                    self.execute_dom_update();
+                }
+
+                if js_pending && Instant::now().le(&latest_end) {
+                    self.pump_with_limit(latest_end)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(err) => {
+                Err(err)
+            }
+        }
+    }
+
+    pub fn start_event_loop(&mut self, params: BootParams) -> Result<()> {
         let event_loop = EventLoopBuilder::with_user_event().build().expect("Failed to create event loop");
         let window = Arc::new(WindowBuilder::new()
             .with_title("XML demo")
@@ -5395,7 +5572,7 @@ impl Browser {
         let mut surf = Surface::new(&ctx, window.window_handle().expect("Window handle"))
                 .expect("Softbuffer surface failed");
 
-        self.refresh_renderer(nodes_table, dom_indexes, nodes_idxs, self.window.as_ref().unwrap().inner_size());
+        self.refresh_renderer(params.nodes, params.dom_indexes, params.nodes_idxs, self.window.as_ref().unwrap().inner_size());
 
         self.renderer.as_mut().unwrap().borrow_mut().event_loop_proxy = Some(RendererProxy::WindowLoop(event_loop.create_proxy()));
 
@@ -5560,12 +5737,30 @@ impl Browser {
     }
 
     fn handle_keyup(&mut self, event: KeyEvent) {
-        let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-        if let Some(focusable) = renderer.focusable && let Some(text) = event.text {
-            if let Some(Node::Element(element)) = renderer.nodes.get_mut(&focusable) {
-                let entry = element.attributes.entry("value".to_string()).or_default();
-                *entry += text.as_str();
-                renderer.schedule_dom_update();
+        let focusable = self.renderer.as_ref().unwrap().borrow().focusable;
+        if let Some(focusable) = focusable && let Some(text) = event.text {
+            let new_text = {
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                if let Some(Node::Element(element)) = renderer.nodes.get_mut(&focusable) {
+                    let entry = element.attributes.entry("value".to_string()).or_default();
+                    *entry += text.as_str();
+                    Some(entry.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(text) = new_text {
+                self.renderer.as_ref().unwrap().borrow_mut().schedule_dom_update();
+
+                self.execute_host_script("input event handler", format!(r#"
+                (() => {{
+                    const event = new InputEvent("{}")
+                    __elementFromNodeIdx({}).dispatchEvent(event)
+                    return event.defaultPrevented
+                }})()
+                "#, text, focusable))
+                .unwrap();
             }
         }
     }
@@ -5575,11 +5770,13 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://pixel-time-tracker.pages.dev/".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging);
 
-    browser.open(None, None, true)
+    let params = browser.open()?;
+    browser.start_event_loop(params)?;
+    Ok(())
 }
 
 fn clear_buffer(buffer: &mut [u32], color: u32) {
@@ -5759,6 +5956,44 @@ fn rgba_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
     bytes
 }
 
+fn rgb_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
+    let [_, r, g, b] = src.to_be_bytes();
+    let a = 255;
+    let r = (r as u32 * a as u32 / 255) as u8;
+    let g = (g as u32 * a as u32 / 255) as u8;
+    let b = (b as u32 * a as u32 / 255) as u8;
+    (r, g, b, a)
+}
+
+#[allow(dead_code)]
+fn rgb_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(buffer.len() * 4);
+
+    for pixel in buffer {
+        let (r, g, b, a) = rgb_to_premul_tuple(*pixel);
+
+        bytes.extend_from_slice(&[r, g, b, a]);
+    }
+
+    bytes
+}
+
+#[allow(dead_code)]
+fn pixmaps_are_equal(first: &Pixmap, second: &Pixmap) -> bool {
+    if first.width() != second.width() {
+        return false;
+    }
+    if first.height() != second.height() {
+        return false;
+    }
+    for (px_one, px_two) in first.data().iter().zip(second.data()) {
+        if px_one != px_two {
+            return false;
+        }
+    }
+    true
+}
+
 fn draw_rect_filled(
     buffer: &mut [u32],
     buffer_rgba: bool,
@@ -5793,541 +6028,69 @@ fn draw_rect_filled(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_with_ratio, flatten_css_chunks, parse_css_nodes};
-
-    use crate::css::{CssParser, Node as CssNode, Overflow};
-    use crate::parser::{Element, Node};
-    use crate::style::{
-        GridTemplateColumns, Style, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize, StyleSizeAndColor, StyleZIndex, parse_style
-    };
-    use crate::{Browser, FontHandler, HtmlParser, NetworkFetch, Renderer, RendererProxy, VariableDefinitions, get_dom_indexes, sorted_node_idxs};
-    use anyhow::{Context, Result};
+    use std::{ops::Add, path::Path, time::{Duration, Instant}};
+    use anyhow::{Context, Result, anyhow};
+    use resvg::tiny_skia::{IntSize, Pixmap};
     use winit::dpi::PhysicalSize;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use std::fs;
-    use std::rc::Rc;
 
-    const SAMPLE_PAGE_PATH: &str = "pages/google_real.html";
+    use crate::{Browser, RendererProxy, pixmaps_are_equal, rgb_buffer_to_premul_bytes, style::split_ignoring_parentheses};
 
-    #[test]
-    fn clamps_with_ratio() {
-        assert_eq!(clamp_with_ratio(200, 100, 80), (100, 40));
-    }
-
-    #[test]
-    fn rebases_css_parent_indices_when_flattening_chunks() -> Result<()> {
-        let first = parse_css_nodes(&vec![".a{color:#fff}".to_string()])?;
-        let second = parse_css_nodes(&vec![".b{display:flex}".to_string()])?;
-
-        let flattened = flatten_css_chunks(vec![(1, second), (0, first)]);
-
-        assert_eq!(flattened[0].get_parent(), None);
-        assert_eq!(flattened[1].get_parent(), Some(0));
-        assert_eq!(flattened[2].get_parent(), None);
-        assert_eq!(flattened[3].get_parent(), Some(2));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_svg() -> Result<()> {
-        let svg_input = r#"<svg class="lnXdpd" aria-label="Google" height="92" role="img" viewBox="0 0 272 92" width="272" xmlns="http://www.w3.org/2000/svg"><path d="M115.75 47.18c0 12.77-9.99 22.18-22.25 22.18s-22.25-9.41-22.25-22.18C71.25 34.32 81.24 25 93.5 25s22.25 9.32 22.25 22.18zm-9.74 0c0-7.98-5.79-13.44-12.51-13.44S80.99 39.2 80.99 47.18c0 7.9 5.79 13.44 12.51 13.44s12.51-5.55 12.51-13.44zm57.74 0c0 12.77-9.99 22.18-22.25 22.18s-22.25-9.41-22.25-22.18c0-12.85 9.99-22.18 22.25-22.18s22.25 9.32 22.25 22.18zm-9.74 0c0-7.98-5.79-13.44-12.51-13.44s-12.51 5.46-12.51 13.44c0 7.9 5.79 13.44 12.51 13.44s12.51-5.55 12.51-13.44zm55.74-20.84v39.82c0 16.38-9.66 23.07-21.08 23.07-10.75 0-17.22-7.19-19.66-13.07l8.48-3.53c1.51 3.61 5.21 7.87 11.17 7.87 7.31 0 11.84-4.51 11.84-13v-3.19h-.34c-2.18 2.69-6.38 5.04-11.68 5.04-11.09 0-21.25-9.66-21.25-22.09 0-12.52 10.16-22.26 21.25-22.26 5.29 0 9.49 2.35 11.68 4.96h.34v-3.61h9.25zm-8.56 20.92c0-7.81-5.21-13.52-11.84-13.52-6.72 0-12.35 5.71-12.35 13.52 0 7.73 5.63 13.36 12.35 13.36 6.63 0 11.84-5.63 11.84-13.36zM225 3v65h-9.5V3h9.5zm37.02 51.48l7.56 5.04c-2.44 3.61-8.32 9.83-18.48 9.83-12.6 0-22.01-9.74-22.01-22.18 0-13.19 9.49-22.18 20.92-22.18 11.51 0 17.14 9.16 18.98 14.11l1.01 2.52-29.65 12.28c2.27 4.45 5.8 6.72 10.75 6.72 4.96 0 8.4-2.44 10.92-6.14zm-23.27-7.98l19.82-8.23c-1.09-2.77-4.37-4.7-8.23-4.7-4.95 0-11.84 4.37-11.59 12.93zM35.29 41.41V32H67c.31 1.64.47 3.58.47 5.68 0 7.06-1.93 15.79-8.15 22.01-6.05 6.3-13.78 9.66-24.02 9.66C16.32 69.35.36 53.89.36 34.91.36 15.93 16.32.47 35.3.47c10.5 0 17.98 4.12 23.6 9.49l-6.64 6.64c-4.03-3.78-9.49-6.72-16.97-6.72-13.86 0-24.7 11.17-24.7 25.03 0 13.86 10.84 25.03 24.7 25.03 8.99 0 14.11-3.61 17.39-6.89 2.66-2.66 4.41-6.46 5.1-11.65l-22.49.01z" fill="\#FFF"></path></svg>"#;
-        let input = format!(
-            r#"<html style="width:100%;height:100%;background-color:#FFFFFF;">{}</html>"#,
-            svg_input
-        );
-        let mut parser: HtmlParser = HtmlParser::new(input.to_string());
-        parser.parse().expect("Failed to parse");
-
-        let tokio = Rc::new(RefCell::new(tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()
-            .with_context(|| "Failed to construct tokio")?));
-
-        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
-        let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
-        let renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes, nodes_idxs);
-        assert_eq!(renderer.get_element_html(1), svg_input);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_self_closing() {
-        let input = r#"<html><img src="test.png"><p>Haha</p></html>"#;
-        let mut parser: HtmlParser = HtmlParser::new(input.to_string());
-        parser.parse().expect("Failed to parse");
-
-        println!("{:?}", parser.nodes);
-    }
-
-    #[test]
-    fn test_parse_style() -> Result<()> {
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "style".to_string(),
-            "width:100%;height:100%;background-color:#FFFFFF;".to_string(),
-        );
-        let parsed = parse_style(
-            0,
-            &Node::Element(Element {
-                tag: "div".to_string(),
-                attributes,
-                parent: None,
-            }),
-            &vec![],
-            None,
-            &Rc::new(HashMap::new()),
-            &mut HashMap::new(),
-            &HashMap::new(),
-            &[],
-            &VariableDefinitions::new(),
-        )?;
-
-        assert_eq!(
-            Style {
-                width: StyleSize::Percent(100.),
-                height: StyleSize::Percent(100.),
-                background: StyleBackground::Hex(0x00_FF_FF_FF),
-                display: StyleDisplay::Block,
-                flex_shrink: 1,
-                flex_grow: 0,
-                flex_basis: StyleSize::Auto,
-                justify_content: StyleJustifyContent::FlexStart,
-                align_items: StyleJustifyContent::FlexStart,
-                flex_direction: StyleFlexDirection::Row,
-                gap: StyleSize::Px(0.),
-                margin_left: StyleSize::Px(0.),
-                margin_right: StyleSize::Px(0.),
-                margin_top: StyleSize::Px(0.),
-                margin_bottom: StyleSize::Px(0.),
-                padding_left: StyleSize::Px(0.),
-                padding_right: StyleSize::Px(0.),
-                padding_top: StyleSize::Px(0.),
-                padding_bottom: StyleSize::Px(0.),
-                left: StyleSize::Auto,
-                right: StyleSize::Auto,
-                top: StyleSize::Auto,
-                bottom: StyleSize::Auto,
-                color: StyleBackground::Transparent,
-                min_height: StyleSize::Auto,
-                max_height: StyleSize::Auto,
-                min_width: StyleSize::Auto,
-                max_width: StyleSize::Auto,
-                position: StylePosition::Static,
-                text_align: StyleAlign::Left,
-                variables: Rc::new(HashMap::new()),
-                font_size: StyleSize::Px(16.),
-                align_self: StyleJustifyContent::Auto,
-                border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-                border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-                border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-                border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_00_00), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-                grid_template_columns: GridTemplateColumns::None,
-                overflow_x: Overflow::Auto,
-                overflow_y: Overflow::Auto,
-                z_index: StyleZIndex::Auto,
-                pointer_events: StylePointerEvents::Auto,
+    fn ensure_snapshot_matches(buffer: &[u32], name: &'static str, width: u32, height: u32) -> Result<()> {
+        let snapshot_path = format!("snapshots/{}.png", name);
+        let snapshot_path = Path::new(&snapshot_path);
+        let pixmap = Pixmap::from_vec(
+            rgb_buffer_to_premul_bytes(&buffer),
+            IntSize::from_wh(width, height).with_context(|| "Failed to create IntSize")?
+        ).with_context(|| "Failed to create pixmap")?;
+        match Path::exists(snapshot_path) {
+            true => {
+                let snapshot = Pixmap::load_png(snapshot_path)?;
+                if pixmaps_are_equal(&pixmap, &snapshot) {
+                    Ok(())
+                } else {
+                    Err(anyhow!("Pixmap did not match saved snapshot"))
+                }
             },
-            parsed
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_google() -> Result<()> {
-        let input = fs::read_to_string(SAMPLE_PAGE_PATH)
-            .with_context(|| format!("Failed to read sample page at {SAMPLE_PAGE_PATH}"))?;
-
-        let mut parser: HtmlParser = HtmlParser::new(input.to_string());
-        parser.parse().expect("Failed to parse");
-
-        println!("{:?}", parser.nodes);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_dynamic_attribute_updates_refresh_dom_indexes() -> Result<()> {
-        let input = r#"
-            <html>
-                <head></head>
-                <body>
-                    <script>
-                        (function() {
-                            var cssId = 'yvlrue';
-                            var style = document.createElement('style');
-                            style.setAttribute('id', cssId);
-                            document.head.appendChild(style);
-                            document.getElementById(cssId).setAttribute('data-ready', '1');
-                        })();
-                    </script>
-                </body>
-            </html>
-        "#;
-        let path = std::env::temp_dir().join(format!("browser-dom-index-{}.html", std::process::id()));
-        fs::write(&path, input)?;
-
-        let mut browser = Browser::new(format!("file://{}", path.to_string_lossy()), false);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
-        browser.run_js()?;
-
-        let has_updated_style = browser
-            .renderer
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .nodes
-            .values()
-            .any(|node| match node {
-                Node::Element(element) => {
-                    element.tag == "style"
-                        && element.attributes.get("id").is_some_and(|id| id == "yvlrue")
-                        && element.attributes.get("data-ready").is_some_and(|value| value == "1")
-                },
-                _ => false,
-            });
-
-        let _ = fs::remove_file(path);
-        assert!(has_updated_style);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_timer_can_find_later_element_by_id() -> Result<()> {
-        let input = r#"
-            <html>
-                <head></head>
-                <body>
-                    <script>
-                        (function() {
-                            var cssId = 'yvlrue';
-                            setTimeout(function() {
-                                document.getElementById(cssId).setAttribute("style", "");
-                            }, 1);
-                        })();
-                    </script>
-                    <div id="yvlrue" style="display:none"></div>
-                </body>
-            </html>
-        "#;
-        let path = std::env::temp_dir().join(format!("browser-timer-dom-index-{}.html", std::process::id()));
-        fs::write(&path, input)?;
-
-        let mut browser = Browser::new(format!("file://{}", path.to_string_lossy()), false);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
-        browser.run_js()?;
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        browser.pump_js_event_loop_once()?;
-
-        let has_visible_trouble_div = browser
-            .renderer
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .nodes
-            .values()
-            .any(|node| match node {
-                Node::Element(element) => {
-                    element.tag == "div"
-                        && element.attributes.get("id").is_some_and(|id| id == "yvlrue")
-                        && element.attributes.get("style").is_some_and(|value| value.is_empty())
-                },
-                _ => false,
-            });
-
-        let _ = fs::remove_file(path);
-        assert!(has_visible_trouble_div);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_navigation_clears_previous_document_timers() -> Result<()> {
-        let old_page = r#"
-            <html>
-                <head></head>
-                <body>
-                    <script>
-                        setTimeout(function() {
-                            document.getElementById('yvlrue')?.remove();
-                        }, 1);
-                    </script>
-                </body>
-            </html>
-        "#;
-        let new_page = r#"
-            <html>
-                <head></head>
-                <body>
-                    <script>
-                        setTimeout(function() {
-                            document.getElementById('yvlrue').setAttribute("style", "");
-                        }, 5);
-                    </script>
-                    <div id="yvlrue" style="display:none"></div>
-                </body>
-            </html>
-        "#;
-        let old_path = std::env::temp_dir().join(format!("browser-old-timer-{}.html", std::process::id()));
-        let new_path = std::env::temp_dir().join(format!("browser-new-timer-{}.html", std::process::id()));
-        fs::write(&old_path, old_page)?;
-        fs::write(&new_path, new_page)?;
-
-        let mut browser = Browser::new(format!("file://{}", old_path.to_string_lossy()), false);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
-        browser.run_js()?;
-        browser.navigate(format!("file://{}", new_path.to_string_lossy()))?;
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        for _ in 0..3 {
-            browser.pump_js_event_loop_once()?;
-            if browser.renderer.as_ref().unwrap().borrow().pending_dom_update {
-                browser.process_dom_update();
-            }
+            false => {
+                pixmap.save_png(snapshot_path)?;
+                Err(anyhow!("No snapshot existed. Created one now."))
+            },
         }
-
-        let has_visible_trouble_div = browser
-            .renderer
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .nodes
-            .values()
-            .any(|node| match node {
-                Node::Element(element) => {
-                    element.tag == "div"
-                        && element.attributes.get("id").is_some_and(|id| id == "yvlrue")
-                        && element.attributes.get("style").is_some_and(|value| value.is_empty())
-                },
-                _ => false,
-            });
-
-        let _ = fs::remove_file(old_path);
-        let _ = fs::remove_file(new_path);
-        assert!(has_visible_trouble_div);
-
-        Ok(())
     }
 
     #[test]
-    fn test_document_reports_visible_to_scripts() -> Result<()> {
-        let input = r#"
-            <html>
-                <head></head>
-                <body>
-                    <script>
-                        if (document.hidden == 0 && document.visibilityState === "visible" && document.hasFocus()) {
-                            document.body.setAttribute("data-visible", "1");
-                        }
-                    </script>
-                </body>
-            </html>
-        "#;
-        let path = std::env::temp_dir().join(format!("browser-visible-document-{}.html", std::process::id()));
-        fs::write(&path, input)?;
-
-        let mut browser = Browser::new(format!("file://{}", path.to_string_lossy()), false);
+    fn renders_google() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
-        browser.run_js()?;
-
-        let body_reports_visible = browser
-            .renderer
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .nodes
-            .values()
-            .any(|node| match node {
-                Node::Element(element) => {
-                    element.tag == "body"
-                        && element.attributes.get("data-visible").is_some_and(|value| value == "1")
-                },
-                _ => false,
-            });
-
-        let _ = fs::remove_file(path);
-        assert!(body_reports_visible);
-
-        Ok(())
+        let mut browser = Browser::new("https://www.google.com".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(params, PhysicalSize::new(1920, 1080), RendererProxy::FrameLoop(tx))?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        browser.render_into(&mut buffer, 1920, 1080, true);
+        ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
     }
 
     #[test]
-    fn test_location_reload_requests_current_document_navigation() -> Result<()> {
-        let input = r#"
-            <html>
-                <head></head>
-                <body>
-                    <script>
-                        location.reload();
-                    </script>
-                </body>
-            </html>
-        "#;
-        let path = std::env::temp_dir().join(format!("browser-location-reload-{}.html", std::process::id()));
-        fs::write(&path, input)?;
-
-        let href = format!("file://{}", path.to_string_lossy());
-        let mut browser = Browser::new(href.clone(), false);
-        let (tx, rx) = std::sync::mpsc::channel();
-        browser.open(Some(RendererProxy::FrameLoop(tx)), Some(PhysicalSize::new(800, 600)), true)?;
-        browser.run_js()?;
-
-        let saw_reload_navigation = rx.try_iter().any(|cmd| match cmd {
-            crate::FrameCommand::UserEvent(crate::UserEvent::Navigate((crate::UserNavigateUrl::Raw(raw), true))) => raw == href,
-            _ => false,
-        });
-
-        let _ = fs::remove_file(path);
-        assert!(saw_reload_navigation);
-
-        Ok(())
+    fn render_vite_dev() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut browser = Browser::new("https://vite.dev".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(params, PhysicalSize::new(1920, 4320), RendererProxy::FrameLoop(tx))?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 4320];
+        browser.render_into(&mut buffer, 1920, 4320, true);
+        ensure_snapshot_matches(&buffer, "vitedev", 1920, 4320)
     }
 
     #[test]
-    fn test_parse_css() -> Result<()> {
-        let input = r#"
-.test {
-    display: block;
-    background-color: #D2E3FC;
-}
-
-.haha {
-    display: block;
-    background-color: #FFF;
-}
-
-.hmm, .lol {
-    display: 'flex';
-    background-color: #D2E3FC;
-}
-
-.Qwbd3:hover {
-    background:rgba(136,170,187,0.04);
-    color:rgb(210,227,252);
-    border:1px solid rgb(60,64,67)
-}
-
-.lJ9FBc input[type="submit"],.gbqfba{background-color:#303134;border:1px solid #303134;border-radius:8px;}
-"#;
-        let mut parser: CssParser = CssParser::new(&input);
-        parser.parse().expect("Failed to parse");
-
-        println!("{:?}", parser.nodes);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_complex_css() -> Result<()> {
-        let input = fs::read_to_string("pages/complex.css")
-            .with_context(|| format!("Failed to read complex css at pages/complex.css"))?;
-
-        let mut parser: CssParser = CssParser::new(&input);
-        parser.parse().expect("Failed to parse");
-
-        let body_css = parser
-            .nodes
-            .iter()
-            .filter(|n| match n {
-                CssNode::ClassName(class) => class.name.contains(&"body".to_string()),
-                _ => false,
-            })
-            .collect::<Vec<&CssNode>>();
-
-        println!("{:?}", parser.nodes);
-        assert!(body_css.len() > 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_inline_style() -> Result<()> {
-        let input = r#"<g-snackbar jsname="PWj1Zb" jscontroller="OZLguc" style="display:none" jsshadow="" id="ow15" __is_owner="true"></g-snackbar>"#;
-        let mut parser: HtmlParser = HtmlParser::new(input.to_string());
-        parser.parse().expect("Failed to parse");
-
-        let tokio = Rc::new(RefCell::new(tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()
-            .with_context(|| "Failed to construct tokio")?));
-
-        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
-        let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
-        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes, nodes_idxs);
-        let width = 1280;
-        let height = 720;
-        let mut buffer = vec![0; width * height];
-        renderer.render_into(&mut buffer, width as u32, height as u32, true);
-
-        // Ensure all white, meaning nothing was painted
-        assert!(buffer.iter().all(|p| *p == 0xFF_FF_FF_FF));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_complex_css_selelctor() -> Result<()> {
-        let input = r#"<html><style>.test input[type="submit"] { background-color: #ff0000; width: 100%; height: 100%; }</style><input class="test" type="submit"></html>"#;
-        let mut parser: HtmlParser = HtmlParser::new(input.to_string());
-        parser.parse().expect("Failed to parse");
-
-        let tokio = Rc::new(RefCell::new(tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()
-            .with_context(|| "Failed to construct tokio")?));
-
-        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
-        let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
-        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes, nodes_idxs);
-        let width = 1280;
-        let height = 720;
-        let mut buffer = vec![0; width * height];
-        renderer.render_into(&mut buffer, width as u32, height as u32, true);
-
-        // Ensure all red, meaning nothing was painted
-        assert!(buffer.iter().all(|p| *p == 0xFF_00_00));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_css_links() -> Result<()> {
-        let input = r#"<html><head><link rel="stylesheet" href="https://pastebin.com/raw/rTDWxgsa"></head><input class="test" type="submit"></html>"#;
-        let mut parser: HtmlParser = HtmlParser::new(input.to_string());
-        parser.parse().expect("Failed to parse");
-
-        let tokio = Rc::new(RefCell::new(tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()
-            .with_context(|| "Failed to construct tokio")?));
-
-        let nodes_table = parser.nodes.clone().into_iter().enumerate().collect();
-        let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
-        let mut renderer = Renderer::new("http://localhost:5173".to_string(), tokio, nodes_table, PhysicalSize { width: 1920, height: 1080 }, Rc::new(FontHandler::new().unwrap()), Rc::new(RefCell::new(NetworkFetch::new())), dom_indexes, nodes_idxs);
-        let width = 1280;
-        let height = 720;
-        let mut buffer = vec![0; width * height];
-        renderer.render_into(&mut buffer, width as u32, height as u32, true);
-
-        // Ensure all red, meaning nothing was painted
-        assert!(buffer.iter().all(|p| *p == 0xFF_00_00));
-
-        Ok(())
+    fn splits_space_ignoring_parentheses() {
+        assert_eq!(
+            split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' ', &[]),
+            vec!["repeat(2, 1fr)", "20px"]
+        );
+        assert_eq!(
+            split_ignoring_parentheses("test>lol".into(), ' ', &['>']),
+            vec!["test", ">", "lol"]
+        );
     }
 }

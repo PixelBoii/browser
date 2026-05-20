@@ -5,7 +5,7 @@ import * as infra from "ext:deno_web/00_infra.js";
 import * as DOMException from "ext:deno_web/01_dom_exception.js";
 import * as broadcastChannel from "ext:deno_web/01_broadcast_channel.js";
 import * as mimesniff from "ext:deno_web/01_mimesniff.js";
-import * as event from "ext:deno_web/02_event.js";
+// import * as event from "ext:deno_web/02_event.js";
 import * as structuredClone from "ext:deno_web/02_structured_clone.js";
 import * as abortSignal from "ext:deno_web/03_abort_signal.js";
 import * as globalInterfaces from "ext:deno_web/04_global_interfaces.js";
@@ -75,7 +75,22 @@ function clearAllTimers() {
     activeTimers.clear()
 }
 
+function requestAnimationFrameImpl(callback) {
+    return setTimeoutImpl(() => callback(Date.now()), 16)
+}
+
+function cancelAnimationFrameImpl(timerId) {
+    clearTimeoutImpl(timerId)
+}
+
+function scrollToImpl(x = 0, y = 0) {
+    //
+}
+
 globalThis.__EVENT_LISTENERS = {}
+
+const DOCUMENT_EVENT_TARGET = "document"
+const WINDOW_EVENT_TARGET = "window"
 
 class SVGAnimatedString {
     //
@@ -91,6 +106,14 @@ Object.defineProperty(globalThis, "SVGAnimatedString", {
 class BaseNode {
     constructor() {
         this.__node_idx = null
+    }
+
+    get ownerDocument() {
+        return globalThis.document
+    }
+
+    get isConnected() {
+        return this.__node_idx != null && core.ops.op_get_node(this.__node_idx) != null
     }
 
     get parentNode() {
@@ -117,6 +140,32 @@ class BaseNode {
     get firstChild() {
         return this.childNodes.length > 0 ? this.childNodes[0] : null
     }
+
+    getRootNode() {
+        return globalThis.document
+    }
+
+    contains(other) {
+        if (!other) {
+            return false
+        }
+
+        let current = other
+        while (current) {
+            if (current.__node_idx != null && current.__node_idx === this.__node_idx) {
+                return true
+            }
+            current = current.parentNode
+        }
+        return false
+    }
+
+    compareDocumentPosition(other) {
+        if (other && other.__node_idx === this.__node_idx) {
+            return 0
+        }
+        return Node.DOCUMENT_POSITION_FOLLOWING
+    }
 }
 
 BaseNode.ELEMENT_NODE = 1
@@ -124,6 +173,8 @@ BaseNode.TEXT_NODE = 3
 BaseNode.COMMENT_NODE = 8
 BaseNode.DOCUMENT_NODE = 9
 BaseNode.DOCUMENT_FRAGMENT_NODE = 11
+BaseNode.DOCUMENT_POSITION_PRECEDING = 2
+BaseNode.DOCUMENT_POSITION_FOLLOWING = 4
 
 Object.defineProperty(globalThis, "Node", {
     value: BaseNode,
@@ -164,15 +215,47 @@ class TextNode extends BaseNode {
     }
 }
 
+Object.defineProperty(globalThis, "Text", {
+    value: TextNode,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class Event {
-    constructor(name) {
-        this.name = name
+    constructor(type, options = {}) {
+        this.type = String(type)
+        this.name = this.type
+        this.bubbles = options.bubbles ?? false
+        this.cancelable = options.cancelable ?? true
+        this.composed = options.composed ?? false
         this.target = null
+        this.currentTarget = null
         this.defaultPrevented = false
+        this.eventPhase = 0
+        this.timeStamp = Date.now()
+        this.__stopped = false
+        this.__immediateStopped = false
+        this.__path = []
     }
 
     preventDefault() {
-        this.defaultPrevented = true
+        if (this.cancelable) {
+            this.defaultPrevented = true
+        }
+    }
+
+    stopPropagation() {
+        this.__stopped = true
+    }
+
+    stopImmediatePropagation() {
+        this.__stopped = true
+        this.__immediateStopped = true
+    }
+
+    composedPath() {
+        return this.__path.slice()
     }
 }
 
@@ -183,10 +266,39 @@ Object.defineProperty(globalThis, "Event", {
     writable: true,
 });
 
-class MouseEvent extends Event {}
+class MouseEvent extends Event {
+    constructor(type, options = {}) {
+        super(type, options)
+        this.detail = options.detail ?? 0
+        this.clientX = options.clientX ?? 0
+        this.clientY = options.clientY ?? 0
+        this.screenX = options.screenX ?? this.clientX
+        this.screenY = options.screenY ?? this.clientY
+        this.button = options.button ?? 0
+        this.buttons = options.buttons ?? 0
+        this.ctrlKey = options.ctrlKey ?? false
+        this.shiftKey = options.shiftKey ?? false
+        this.altKey = options.altKey ?? false
+        this.metaKey = options.metaKey ?? false
+    }
+}
 
 Object.defineProperty(globalThis, "MouseEvent", {
     value: MouseEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
+class InputEvent extends Event {
+    constructor(data) {
+        super("input")
+        this.data = data
+    }
+}
+
+Object.defineProperty(globalThis, "InputEvent", {
+    value: InputEvent,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -223,6 +335,23 @@ class HtmlElement extends BaseNode {
     addEventListener(event, cb) {
         const key = `${this.__node_idx}:${event}`
         registerEventListener(key, cb)
+    }
+
+    removeEventListener(event, cb) {
+        removeEventListenerByKey(`${this.__node_idx}:${event}`, cb)
+    }
+
+    dispatchEvent(event) {
+        return dispatchEventToTarget(this, event)
+    }
+
+    click() {
+        return dispatchEventToTarget(this, new MouseEvent("click", {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            detail: 1,
+        }))
     }
 
     set onload(cb) {
@@ -338,6 +467,23 @@ class HtmlElement extends BaseNode {
     closest(selector) {
         const node = core.ops.op_get_closest(selector, this.__node_idx)
         return node ? nodeToElement(node) : null
+    }
+
+    matches(selector) {
+        const node = core.ops.op_get_closest(selector, this.__node_idx)
+        return node ? node[0] === this.__node_idx : false
+    }
+
+    focus() {
+        document.activeElement = this
+        dispatchEventToTarget(this, new Event("focus", { bubbles: false, cancelable: false }))
+    }
+
+    blur() {
+        if (document.activeElement?.__node_idx === this.__node_idx) {
+            document.activeElement = document.body
+        }
+        dispatchEventToTarget(this, new Event("blur", { bubbles: false, cancelable: false }))
     }
 
     get tagName() {
@@ -468,6 +614,49 @@ class HtmlElement extends BaseNode {
         this.setAttribute('width', value)
     }
 
+    get clientWidth() {
+        return Number.parseFloat(this.getAttribute("width")) || globalThis.innerWidth || 0
+    }
+
+    get clientHeight() {
+        return Number.parseFloat(this.getAttribute("height")) || globalThis.innerHeight || 0
+    }
+
+    get offsetWidth() {
+        return this.clientWidth
+    }
+
+    get offsetHeight() {
+        return this.clientHeight
+    }
+
+    get scrollWidth() {
+        return this.clientWidth
+    }
+
+    get scrollHeight() {
+        return this.clientHeight
+    }
+
+    getBoundingClientRect() {
+        const width = this.clientWidth
+        const height = this.clientHeight
+        return {
+            x: 0,
+            y: 0,
+            left: 0,
+            top: 0,
+            width,
+            height,
+            right: width,
+            bottom: height,
+        }
+    }
+
+    scrollIntoView() {}
+
+    select() {}
+
     get dataset() {
         const attributes = core.ops.op_get_attributes(this.__node_idx)
         let data = Object.entries(attributes)
@@ -543,6 +732,12 @@ class HtmlCanvasElement extends HtmlElement {
     }
 }
 
+class HTMLIFrameElement extends HtmlElement {
+    constructor() {
+        super("iframe")
+    }
+}
+
 Object.defineProperty(globalThis, "HTMLElement", {
     value: HtmlElement,
     enumerable: true,
@@ -557,6 +752,12 @@ Object.defineProperty(globalThis, "Element", {
 });
 Object.defineProperty(globalThis, "HTMLCanvasElement", {
     value: HtmlCanvasElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLIFrameElement", {
+    value: HTMLIFrameElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -596,6 +797,35 @@ Object.defineProperty(globalThis, "IntersectionObserver", {
     writable: true,
 });
 
+class ResizeObserver {
+    constructor(callback) {
+        if (typeof callback !== "function") {
+            throw new TypeError("ResizeObserver callback must be a function")
+        }
+        this.callback = callback
+        this.targets = new Set()
+    }
+
+    observe(target) {
+        this.targets.add(target)
+    }
+
+    unobserve(target) {
+        this.targets.delete(target)
+    }
+
+    disconnect() {
+        this.targets.clear()
+    }
+}
+
+Object.defineProperty(globalThis, "ResizeObserver", {
+    value: ResizeObserver,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
 class CSSStyleDeclaration {
     constructor(style, element) {
         this.__element = element
@@ -622,6 +852,10 @@ class CSSStyleDeclaration {
         return this.__properties[key]
     }
 
+    getPropertyValue(key) {
+        return this.__properties[key] ?? ""
+    }
+
     setProperty(key, value) {
         this.__properties[key] = value
         this.sync()
@@ -635,7 +869,6 @@ class CSSStyleDeclaration {
             out += `${key}:${value};`
         }
 
-        console.log(out)
         this.__element.__style = out
         core.ops.op_update_attributes(this.__element.__node_idx, { style: out })
     }
@@ -697,6 +930,13 @@ class CommentNode extends BaseNode {
         return 8
     }
 }
+
+Object.defineProperty(globalThis, "Comment", {
+    value: CommentNode,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 class ClassList {
     constructor(str, element) {
@@ -781,9 +1021,11 @@ function tagToElement(tag) {
         SVGElement :
         tag === "template" ?
             TemplateElement :
-            tag === "canvas" ?
-                HtmlCanvasElement :
-                HtmlElement
+        tag === "canvas" ?
+            HtmlCanvasElement :
+            tag === "iframe" ?
+                HTMLIFrameElement :
+                    HtmlElement
 }
 
 const documentFonts = {
@@ -803,8 +1045,12 @@ const documentFonts = {
 }
 
 globalThis.document = {
+    nodeType: Node.DOCUMENT_NODE,
     hidden: false,
     visibilityState: "visible",
+    readyState: "complete",
+    activeElement: null,
+    defaultView: globalThis,
     get cookie() {
         return core.ops.op_get_cookie(globalThis.location.href)
     },
@@ -847,10 +1093,13 @@ globalThis.document = {
         return nodes.map(nodeToElement)
     },
     addEventListener(event, cb) {
-        // TODO: Implement this
+        registerEventListener(`${DOCUMENT_EVENT_TARGET}:${event}`, cb)
     },
     removeEventListener(event, cb) {
-        // TODO: Implement this
+        removeEventListenerByKey(`${DOCUMENT_EVENT_TARGET}:${event}`, cb)
+    },
+    dispatchEvent(event) {
+        return dispatchEventToTarget(this, event)
     },
     createTextNode(text) {
         const element = new TextNode(text)
@@ -878,6 +1127,20 @@ Object.defineProperty(globalThis, "clearTimeout", {
   writable: true,
 });
 
+Object.defineProperty(globalThis, "requestAnimationFrame", {
+  value: requestAnimationFrameImpl,
+  enumerable: true,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "cancelAnimationFrame", {
+  value: cancelAnimationFrameImpl,
+  enumerable: true,
+  configurable: true,
+  writable: true,
+});
+
 Object.defineProperty(globalThis, "setInterval", {
   value: setIntervalImpl,
   enumerable: true,
@@ -892,12 +1155,50 @@ Object.defineProperty(globalThis, "clearInterval", {
   writable: true,
 });
 
+Object.defineProperties(globalThis, {
+  innerWidth: { value: 1024, enumerable: true, configurable: true, writable: true },
+  innerHeight: { value: 768, enumerable: true, configurable: true, writable: true },
+  pageXOffset: { value: 0, enumerable: true, configurable: true, writable: true },
+  pageYOffset: { value: 0, enumerable: true, configurable: true, writable: true },
+  scrollTo: {
+    value: scrollToImpl,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  },
+});
+
+Object.defineProperty(globalThis, "scrollX", {
+    get() {
+        return 0
+    },
+    enumerable: true,
+    configurable: true,
+})
+
+Object.defineProperty(globalThis, "scrollY", {
+    get() {
+        let nodeIdx = document.body.__node_idx
+        if (nodeIdx == null) {
+            return 0
+        } else {
+            return -core.ops.op_get_offset_y(nodeIdx)
+        }
+    },
+    enumerable: true,
+    configurable: true,
+})
+
 Object.defineProperty(globalThis, "__clear_all_timers", {
   value: clearAllTimers,
   enumerable: false,
   configurable: true,
   writable: true,
 });
+
+function resolveBrowserUrl(value) {
+    return new URL(value, globalThis.location?.href ?? "about:blank").href
+}
 
 function initLocation(href) {
     Object.defineProperty(globalThis, "location", {
@@ -978,9 +1279,16 @@ Object.defineProperty(globalThis, "__init_location", {
     writable: true
 })
 
-// TODO: Implement this
+// TODO: Fill this out from the resolved style table.
 function getComputedStyle() {
-    return {}
+    return {
+        transitionDuration: "0s",
+        transitionDelay: "0s",
+        scrollBehavior: "auto",
+        getPropertyValue() {
+            return ""
+        },
+    }
 }
 
 Object.defineProperty(globalThis, "getComputedStyle", {
@@ -1078,12 +1386,102 @@ function registerEventListener(key, cb) {
     globalThis.__EVENT_LISTENERS[key].push(cb)
 }
 
-function runEventListeners(event_key, event) {
-    if (__EVENT_LISTENERS[event_key]) {
-        __EVENT_LISTENERS[event_key]?.forEach(cb => {
-            cb(event)
-        })
+function removeEventListenerByKey(key, cb) {
+    const listeners = globalThis.__EVENT_LISTENERS[key]
+    if (!listeners) {
+        return
     }
+
+    const idx = listeners.indexOf(cb)
+    if (idx !== -1) {
+        listeners.splice(idx, 1)
+    }
+}
+
+function runEventListeners(event_key, event) {
+    const listeners = globalThis.__EVENT_LISTENERS[event_key]
+    if (!listeners) {
+        return event?.defaultPrevented ?? false
+    }
+
+    for (const cb of listeners.slice()) {
+        cb.call(event.currentTarget ?? event.target ?? globalThis, event)
+        if (event.__immediateStopped) {
+            break
+        }
+    }
+    return event?.defaultPrevented ?? false
+}
+
+function eventKeyForTarget(target, type) {
+    if (target === globalThis || target === globalThis.window) {
+        return `${WINDOW_EVENT_TARGET}:${type}`
+    }
+    if (target === globalThis.document) {
+        return `${DOCUMENT_EVENT_TARGET}:${type}`
+    }
+    return `${target.__node_idx}:${type}`
+}
+
+function eventPathForTarget(target) {
+    if (target === globalThis) {
+        return [globalThis]
+    }
+    if (target === globalThis.document) {
+        return [globalThis.document, globalThis]
+    }
+
+    const path = []
+    let current = target
+    while (current) {
+        path.push(current)
+        current = current.parentNode
+    }
+    path.push(globalThis.document, globalThis)
+    return path
+}
+
+function dispatchEventToPath(path, event, target = null) {
+    if (!(event instanceof Event)) {
+        throw new TypeError("dispatchEvent expects an Event")
+    }
+
+    const eventTarget = target ?? path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? path[0] ?? null
+    event.target = event.target ?? eventTarget
+    event.__path = path.slice()
+
+    for (const currentTarget of path) {
+        event.currentTarget = currentTarget
+        runEventListeners(eventKeyForTarget(currentTarget, event.type), event)
+        if (event.__stopped) {
+            break
+        }
+    }
+
+    event.currentTarget = null
+    return !event.defaultPrevented
+}
+
+function dispatchEventToTarget(target, event) {
+    return dispatchEventToPath(eventPathForTarget(target), event, target)
+}
+
+function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
+    const path = pathNodeIdxs
+        .map(idx => __elementFromNodeIdx(idx))
+        .filter(Boolean)
+    path.push(globalThis.document, globalThis)
+
+    const target = path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? __elementFromNodeIdx(targetNodeIdx)
+    const event = new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        detail: 1,
+    })
+
+    dispatchEventToPath(path, event, target)
+    return event.defaultPrevented
 }
 
 Object.defineProperty(globalThis, "runEventListeners", {
@@ -1094,11 +1492,40 @@ Object.defineProperty(globalThis, "runEventListeners", {
 })
 
 function addEventListener(event, cb) {
-    registerEventListener(`window:${event}`, cb)
+    registerEventListener(`${WINDOW_EVENT_TARGET}:${event}`, cb)
+}
+
+function removeEventListener(event, cb) {
+    removeEventListenerByKey(`${WINDOW_EVENT_TARGET}:${event}`, cb)
+}
+
+function dispatchEvent(event) {
+    return dispatchEventToTarget(globalThis, event)
 }
 
 Object.defineProperty(globalThis, "addEventListener", {
     value: addEventListener,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "removeEventListener", {
+    value: removeEventListener,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "dispatchEvent", {
+    value: dispatchEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "__dispatchClickFromNodeIdx", {
+    value: dispatchClickFromNodeIdx,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -1138,15 +1565,35 @@ Object.defineProperty(globalThis, "history", {
 // Set up the callback for Wasm streaming ops
 Deno.core.setWasmStreamingCallback(fetch.handleWasmStreaming);
 
+function resolveFetchInput(input) {
+    if (typeof input === "string") {
+        return resolveBrowserUrl(input)
+    }
+    if (input instanceof URL) {
+        return input.href
+    }
+    return input
+}
+
+class BrowserRequest extends request.Request {
+    constructor(input, init) {
+        super(resolveFetchInput(input), init)
+    }
+}
+
+function browserFetch(input, init) {
+    return fetch.fetch(resolveFetchInput(input), init)
+}
+
 Object.defineProperty(globalThis, "fetch", {
-  value: fetch.fetch,
+  value: browserFetch,
   enumerable: true,
   configurable: true,
   writable: true,
 });
 
 Object.defineProperty(globalThis, "Request", {
-  value: request.Request,
+  value: BrowserRequest,
   enumerable: false,
   configurable: true,
   writable: true,
@@ -1347,6 +1794,34 @@ class MessageEvent {
 
 Object.defineProperty(globalThis, "MessageEvent", {
     value: MessageEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class FormData {
+    constructor(formElement = null) {
+        if (formElement instanceof Node) {
+            this.data = core.ops.op_collect_data_for_form(formElement.__node_idx)
+        } else {
+            this.data = {}
+        }
+    }
+
+    [Symbol.iterator]() {
+        return Object.entries(this.data)[Symbol.iterator]()
+    }
+}
+
+Object.defineProperty(globalThis, "FormData", {
+    value: FormData,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "structuredClone", {
+    value: structuredClone.structuredClone,
     enumerable: true,
     configurable: true,
     writable: true,
