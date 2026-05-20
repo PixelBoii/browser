@@ -311,7 +311,7 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                     escaped = true;
                     continue;
                 }
-                if buffer.len() > 0 && new_statement.contains(&char) && parentheses_depth == 0 && !escaped {
+                if buffer.len() > 0 && new_statement.contains(&char) && parentheses_depth == 0 && !escaped && !(buffer == ":" && char == ':') {
                     conditions.push(buffer.clone());
                     buffer.clear();
                 }
@@ -330,7 +330,8 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                     '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
                     '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
                     ':' => {
-                        let parsed = parse_pseudo_class(chars.as_str());
+                        let pseudo_class = chars.as_str().strip_prefix(':').unwrap_or(chars.as_str());
+                        let parsed = parse_pseudo_class(pseudo_class);
                         match parsed {
                             Some(parsed) => Some(ClassNamePart::PseudoClass(parsed)),
                             None => {
