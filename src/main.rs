@@ -6048,7 +6048,10 @@ mod tests {
                 if pixmaps_are_equal(&pixmap, &snapshot) {
                     Ok(())
                 } else {
-                    Err(anyhow!("Pixmap did not match saved snapshot"))
+                    let invalid_path = format!("snapshots/{}.invalid.png", name);
+                    let invalid_path = Path::new(&invalid_path);
+                    pixmap.save_png(invalid_path)?;
+                    Err(anyhow!("Pixmap did not match saved snapshot. Saved invalid file in {:?}", invalid_path))
                 }
             },
             false => {
