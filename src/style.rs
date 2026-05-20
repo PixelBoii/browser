@@ -1267,11 +1267,15 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             | "margin-top"
             | "margin-right"
             | "margin-bottom"
+            | "margin-inline-start"
+            | "margin-inline-end"
             | "font-size"
             | "left"
             | "top"
             | "right"
             | "bottom"
+            | "inset-inline-start"
+            | "inset-inline-end"
             | "padding-left"
             | "padding-top"
             | "padding-right"
@@ -1487,6 +1491,12 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         ("margin-right", PropertyValue::Size(value)) => {
             style.margin_right = value;
         }
+        ("margin-inline-start", PropertyValue::Size(value)) => {
+            style.margin_left = value;
+        }
+        ("margin-inline-end", PropertyValue::Size(value)) => {
+            style.margin_right = value;
+        }
         ("margin-top", PropertyValue::Size(value)) => {
             style.margin_top = value;
         }
@@ -1531,6 +1541,12 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
             style.left = value;
         }
         ("right", PropertyValue::Size(value)) => {
+            style.right = value;
+        }
+        ("inset-inline-start", PropertyValue::Size(value)) => {
+            style.left = value;
+        }
+        ("inset-inline-end", PropertyValue::Size(value)) => {
             style.right = value;
         }
         ("top", PropertyValue::Size(value)) => {
