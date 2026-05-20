@@ -7,7 +7,11 @@ use anyhow::{Context, Result, anyhow};
 use winit::dpi::PhysicalSize;
 
 use crate::VariableDefinitions;
-use crate::css::{BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, VariableTemplatePart, unquote};
+use crate::css::{
+    BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison,
+    MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground,
+    Variable, VariableTemplatePart, unquote,
+};
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,7 +61,9 @@ pub enum StyleDisplay {
 
 impl StyleDisplay {
     pub fn is_inline(self) -> bool {
-        self == StyleDisplay::InlineBlock || self == StyleDisplay::InlineFlex || self == StyleDisplay::Inline
+        self == StyleDisplay::InlineBlock
+            || self == StyleDisplay::InlineFlex
+            || self == StyleDisplay::Inline
     }
 }
 
@@ -376,10 +382,26 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             .unwrap_or(StyleSize::Px(16.)),
         align_self: StyleJustifyContent::Auto,
         // TODO: This should default to currentColor
-        border_left: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-        border_top: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-        border_right: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
-        border_bottom: StyleSizeAndColor { color: StyleBackground::Hex(0xFF_FF_FF_FF), size: StyleSize::Px(3.), style: StyleBorderStyle::None },
+        border_left: StyleSizeAndColor {
+            color: StyleBackground::Hex(0xFF_FF_FF_FF),
+            size: StyleSize::Px(3.),
+            style: StyleBorderStyle::None,
+        },
+        border_top: StyleSizeAndColor {
+            color: StyleBackground::Hex(0xFF_FF_FF_FF),
+            size: StyleSize::Px(3.),
+            style: StyleBorderStyle::None,
+        },
+        border_right: StyleSizeAndColor {
+            color: StyleBackground::Hex(0xFF_FF_FF_FF),
+            size: StyleSize::Px(3.),
+            style: StyleBorderStyle::None,
+        },
+        border_bottom: StyleSizeAndColor {
+            color: StyleBackground::Hex(0xFF_FF_FF_FF),
+            size: StyleSize::Px(3.),
+            style: StyleBorderStyle::None,
+        },
         grid_template_columns: GridTemplateColumns::None,
         overflow_x: Overflow::Auto,
         overflow_y: Overflow::Auto,
@@ -405,7 +427,7 @@ fn parse_poiner_events(value: String) -> Result<StylePointerEvents> {
     match value.as_str() {
         "auto" => Ok(StylePointerEvents::Auto),
         "none" => Ok(StylePointerEvents::None),
-        _ => Err(anyhow!("Failed to parse pointer-events: {}", value))
+        _ => Err(anyhow!("Failed to parse pointer-events: {}", value)),
     }
 }
 
@@ -416,22 +438,13 @@ fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
         .collect::<Result<Vec<StyleSize>>>()?;
 
     match values.len() {
-        1 => Ok((
-            values[0].clone(),
-            values[0].clone(),
-        )),
-        2 => Ok((
-            values[0].clone(),
-            values[1].clone(),
-        )),
+        1 => Ok((values[0].clone(), values[0].clone())),
+        2 => Ok((values[0].clone(), values[1].clone())),
         _ => Err(anyhow!("Failed to parse inline size {}", value)),
     }
 }
 
-fn parse_combined_style<T, F>(
-    value: String,
-    parse: F,
-) -> Result<(T, T, T, T)>
+fn parse_combined_style<T, F>(value: String, parse: F) -> Result<(T, T, T, T)>
 where
     T: Clone,
     F: Fn(String) -> Result<T>,
@@ -503,7 +516,9 @@ fn parse_calc(value: &str) -> Result<StyleSize> {
     value.retain(|c| !c.is_whitespace());
     let mut last_numberish = false;
     for char in value.chars() {
-        if let Some(operator) = extract_operator(char) && last_numberish {
+        if let Some(operator) = extract_operator(char)
+            && last_numberish
+        {
             flush_calc_value(&mut buffer, &mut parts)?;
             parts.push(operator);
             last_numberish = false;
@@ -650,17 +665,24 @@ fn get_inline_nodes(element: &HtmlElement) -> Result<Vec<Node>> {
     }
 }
 
-pub fn element_matched_attributes(element: &HtmlElement, attributes: &Vec<ClassNamePartAttribute>) -> bool {
+pub fn element_matched_attributes(
+    element: &HtmlElement,
+    attributes: &Vec<ClassNamePartAttribute>,
+) -> bool {
     for attribute in attributes.iter() {
         match attribute {
             ClassNamePartAttribute::Key(key) => {
                 if !element.attributes.contains_key(key) {
                     return false;
                 }
-            },
+            }
             ClassNamePartAttribute::KeyValue((key, value)) => {
                 if let Some(stripped) = key.strip_suffix('*') {
-                    if element.attributes.get(stripped).is_none_or(|v| !v.contains(value)) {
+                    if element
+                        .attributes
+                        .get(stripped)
+                        .is_none_or(|v| !v.contains(value))
+                    {
                         return false;
                     }
                 } else {
@@ -701,14 +723,40 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
         // Media queries REM are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
         match (q.property.as_str(), q.comparison.clone(), q.value.clone()) {
             // Default to dark mode
-            ("prefers-color-scheme", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::String(value)) => value == "dark",
-            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => window_size.width >= px as u32,
-            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Rem(rem)) => window_size.width >= rem as u32 * 16,
-            ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => window_size.width < px as u32,
-            ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Px(px)) => window_size.width >= px as u32,
-            ("width", MediaQueryCriteriaComparison::MoreOrEqual, MediaQueryCriteriaValue::Rem(rem)) => window_size.width >= rem as u32 * 16,
-            ("width", MediaQueryCriteriaComparison::LessOrEqual, MediaQueryCriteriaValue::Px(px)) => window_size.width <= px as u32,
-            ("width", MediaQueryCriteriaComparison::LessOrEqual, MediaQueryCriteriaValue::Rem(rem)) => window_size.width <= rem as u32 * 16,
+            (
+                "prefers-color-scheme",
+                MediaQueryCriteriaComparison::Is,
+                MediaQueryCriteriaValue::String(value),
+            ) => value == "dark",
+            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
+                window_size.width >= px as u32
+            }
+            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Rem(rem)) => {
+                window_size.width >= rem as u32 * 16
+            }
+            ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
+                window_size.width < px as u32
+            }
+            (
+                "width",
+                MediaQueryCriteriaComparison::MoreOrEqual,
+                MediaQueryCriteriaValue::Px(px),
+            ) => window_size.width >= px as u32,
+            (
+                "width",
+                MediaQueryCriteriaComparison::MoreOrEqual,
+                MediaQueryCriteriaValue::Rem(rem),
+            ) => window_size.width >= rem as u32 * 16,
+            (
+                "width",
+                MediaQueryCriteriaComparison::LessOrEqual,
+                MediaQueryCriteriaValue::Px(px),
+            ) => window_size.width <= px as u32,
+            (
+                "width",
+                MediaQueryCriteriaComparison::LessOrEqual,
+                MediaQueryCriteriaValue::Rem(rem),
+            ) => window_size.width <= rem as u32 * 16,
             (_, _, _) => {
                 // println!("Unsupported media query property: {} {:?} {:?}", p, c, v);
                 false
@@ -772,11 +820,11 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         };
         let mut parts: Vec<&str> = rgba.split([',', ' ']).collect();
         match parts.len() {
-            3 => {},
+            3 => {}
             4 => {
                 alpha = Some(parts[3]);
                 parts = parts[..3].to_vec();
-            },
+            }
             _ => panic!("Invalid RGBA string: {}", rgba),
         }
         let parsed_parts: Vec<u8> = parts
@@ -831,8 +879,16 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
 fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &[usize]) -> Vec<usize> {
     let mut idxs = idxs.clone();
     idxs.sort_by(|a, b| {
-        let a_rank = if **a == usize::MAX { usize::MAX } else { css_node_ranking[**a] };
-        let b_rank = if **b == usize::MAX { usize::MAX } else { css_node_ranking[**b] };
+        let a_rank = if **a == usize::MAX {
+            usize::MAX
+        } else {
+            css_node_ranking[**a]
+        };
+        let b_rank = if **b == usize::MAX {
+            usize::MAX
+        } else {
+            css_node_ranking[**b]
+        };
         a_rank.cmp(&b_rank)
     });
 
@@ -848,21 +904,35 @@ fn resolve_node_variable(
     match value {
         PropertyValue::Raw(value) => {
             return Some(value.clone());
-        },
+        }
         PropertyValue::VariableTemplate(template) => {
             // TODO: Handle multi variable dependence
             if template.len() == 1 {
                 if let VariableTemplatePart::Var(var) = &template[0] {
                     if let Some(resolved) = map.get(var) {
-                        return resolve_node_variable(resolved, map, parent_variables, variable_definitions);
+                        return resolve_node_variable(
+                            resolved,
+                            map,
+                            parent_variables,
+                            variable_definitions,
+                        );
                     }
-                    if let Some(resolved) = variable_definitions.variable_to_idx.get(var).and_then(|var| parent_variables.get(var)) {
-                        return resolve_node_variable(&PropertyValue::Raw(resolved.to_string()), map, parent_variables, variable_definitions);
+                    if let Some(resolved) = variable_definitions
+                        .variable_to_idx
+                        .get(var)
+                        .and_then(|var| parent_variables.get(var))
+                    {
+                        return resolve_node_variable(
+                            &PropertyValue::Raw(resolved.to_string()),
+                            map,
+                            parent_variables,
+                            variable_definitions,
+                        );
                     }
                 }
             }
-        },
-        _ => {},
+        }
+        _ => {}
     };
     None
 }
@@ -876,10 +946,8 @@ fn apply_node_variables(
     let variables_to_parse: HashMap<usize, &Variable> = nodes
         .iter()
         .filter_map(|(idx, node)| match node.as_ref() {
-            Node::Variable(variable) => {
-                Some((*idx, variable))
-            }
-            _ => None
+            Node::Variable(variable) => Some((*idx, variable)),
+            _ => None,
         })
         .collect();
     if variables_to_parse.len() == 0 {
@@ -899,7 +967,9 @@ fn apply_node_variables(
 
     for idx in ordered_idxs {
         let var = variables_to_parse.get(&idx).unwrap();
-        if let Some(resolved) = resolve_node_variable(&var.value, &map, variables, variable_definitions) {
+        if let Some(resolved) =
+            resolve_node_variable(&var.value, &map, variables, variable_definitions)
+        {
             if let Some(def_idx) = variable_definitions.variable_to_idx.get(&var.variable) {
                 new_variables.insert(*def_idx, resolved);
             }
@@ -919,7 +989,7 @@ fn resolve_variable_template(
         match el {
             VariableTemplatePart::Text(text) => {
                 out += text;
-            },
+            }
             VariableTemplatePart::Var(var) => {
                 // TODO: This split should probably happen when parsing
                 let (name, default) = if let Some((name, default)) = var.split_once(",") {
@@ -928,7 +998,11 @@ fn resolve_variable_template(
                     (var.as_str(), None)
                 };
 
-                if let Some(value) = variable_definitions.variable_to_idx.get(name).and_then(|name| resolved_variables.get(name)) {
+                if let Some(value) = variable_definitions
+                    .variable_to_idx
+                    .get(name)
+                    .and_then(|name| resolved_variables.get(name))
+                {
                     out += value;
                 } else {
                     out += default.unwrap_or(var);
@@ -946,13 +1020,18 @@ pub fn resolve_node_variables<'nodes, 'css>(
     variable_definitions: &VariableDefinitions,
 ) -> (Vec<&'nodes Property>, Rc<HashMap<usize, String>>) {
     // TODO: Might make sense for the variables to just be represented by idx references instead so that we dont have to clone expensive hashmaps
-    let resolved_variables = apply_node_variables(nodes, variables, css_node_ranking, variable_definitions);
+    let resolved_variables =
+        apply_node_variables(nodes, variables, css_node_ranking, variable_definitions);
 
     for (_, node) in nodes.iter_mut() {
         let parsed_value = match node.as_ref() {
             Node::Property(property) => match &property.value {
                 PropertyValue::VariableTemplate(template) => {
-                    let value = resolve_variable_template(template, &resolved_variables, variable_definitions);
+                    let value = resolve_variable_template(
+                        template,
+                        &resolved_variables,
+                        variable_definitions,
+                    );
                     parse_property_value(property.property.clone(), value)
                         .map(|(parsed, _)| parsed)
                         .ok()
@@ -1021,7 +1100,11 @@ fn parse_border_side_value(value: String) -> Result<BorderSideValue> {
     }
 }
 
-pub fn split_ignoring_parentheses(value: String, split_char: char, break_chars: &[char]) -> Vec<String> {
+pub fn split_ignoring_parentheses(
+    value: String,
+    split_char: char,
+    break_chars: &[char],
+) -> Vec<String> {
     let mut parentheses_depth = 0;
     let mut buffer = String::new();
     let mut result = vec![];
@@ -1066,7 +1149,11 @@ pub fn split_ignoring_parentheses(value: String, split_char: char, break_chars: 
     result
 }
 
-fn strip_prefix_and_suffix<'a>(value: &'a str, prefix: &'a str, suffix: &'a str) -> Option<&'a str> {
+fn strip_prefix_and_suffix<'a>(
+    value: &'a str,
+    prefix: &'a str,
+    suffix: &'a str,
+) -> Option<&'a str> {
     if let Some(stripped) = value.strip_prefix(prefix) {
         stripped.strip_suffix(suffix)
     } else {
@@ -1076,7 +1163,9 @@ fn strip_prefix_and_suffix<'a>(value: &'a str, prefix: &'a str, suffix: &'a str)
 
 fn parse_grid_template_columns_inner_value(value: String) -> Result<GridTemplateColumnsValue> {
     if let Some(stripped) = strip_prefix_and_suffix(&value, "minmax(", ")") {
-        let (min, max) = stripped.split_once(",").with_context(|| "Failed to split minmax value")?;
+        let (min, max) = stripped
+            .split_once(",")
+            .with_context(|| "Failed to split minmax value")?;
         let parsed_min = parse_grid_size(min.trim().to_string())?;
         let parsed_max = parse_grid_size(max.trim().to_string())?;
         Ok(GridTemplateColumnsValue::MinMax((parsed_min, parsed_max)))
@@ -1090,7 +1179,7 @@ fn parse_overflow(value: String) -> Result<PropertyValue> {
         "hidden" => Ok(PropertyValue::Overflow(Overflow::Hidden)),
         "visible" => Ok(PropertyValue::Overflow(Overflow::Visible)),
         "auto" => Ok(PropertyValue::Overflow(Overflow::Auto)),
-        _ => Err(anyhow!("Failed to parse overflow value: {}", value))
+        _ => Err(anyhow!("Failed to parse overflow value: {}", value)),
     }
 }
 
@@ -1100,19 +1189,27 @@ fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
     let mut parsed: Vec<GridTemplateColumnsValue> = vec![];
     for p in parts {
         if let Some(stripped) = strip_prefix_and_suffix(&p, "repeat(", ")") {
-            let (count, sizes) = stripped.split_once(",").with_context(|| format!("Failed to parse repeat: {}", stripped))?;
-            let parsed_count = count.parse::<i32>().with_context(|| format!("Failed to parse count: {}", count))?;
+            let (count, sizes) = stripped
+                .split_once(",")
+                .with_context(|| format!("Failed to parse repeat: {}", stripped))?;
+            let parsed_count = count
+                .parse::<i32>()
+                .with_context(|| format!("Failed to parse count: {}", count))?;
             let sizes_split: Vec<&str> = sizes.trim().split(" ").collect();
             for _ in 0..parsed_count {
                 for size in sizes_split.iter() {
-                    parsed.push(parse_grid_template_columns_inner_value(size.trim().to_string())?);
+                    parsed.push(parse_grid_template_columns_inner_value(
+                        size.trim().to_string(),
+                    )?);
                 }
             }
             continue;
         }
         parsed.push(parse_grid_template_columns_inner_value(p)?);
     }
-    Ok(PropertyValue::GridTemplateColumns(GridTemplateColumns::Values(parsed)))
+    Ok(PropertyValue::GridTemplateColumns(
+        GridTemplateColumns::Values(parsed),
+    ))
 }
 
 fn parse_background(value: String) -> Result<PropertyValue> {
@@ -1123,7 +1220,9 @@ fn parse_background(value: String) -> Result<PropertyValue> {
             if let Some(stripped) = stripped.strip_suffix(")") {
                 let stripped = unquote(stripped);
                 if let Some(data) = stripped.strip_prefix("data:") {
-                    let (format, data) = data.split_once(',').with_context(|| "Failed to parse data url")?;
+                    let (format, data) = data
+                        .split_once(',')
+                        .with_context(|| "Failed to parse data url")?;
                     background = StyleBackground::DataUrl((format.to_string(), data.to_string()));
                 } else {
                     //
@@ -1133,157 +1232,212 @@ fn parse_background(value: String) -> Result<PropertyValue> {
             background = value;
         }
     }
-    Ok(PropertyValue::ComplexBackground(StyleComplexBackground { background }))
+    Ok(PropertyValue::ComplexBackground(StyleComplexBackground {
+        background,
+    }))
 }
 
 pub fn parse_property_value(property: String, value: String) -> Result<(PropertyValue, bool)> {
     if let Some(stripped) = value.strip_suffix("!important") {
-        return parse_property_value(property, stripped.trim().to_string()).and_then(|(value, _)| Ok((value, true)));
+        return parse_property_value(property, stripped.trim().to_string())
+            .and_then(|(value, _)| Ok((value, true)));
     }
 
     if value.contains("var(") {
-        return Ok((PropertyValue::VariableTemplate(parse_variable_template(&value)), false));
+        return Ok((
+            PropertyValue::VariableTemplate(parse_variable_template(&value)),
+            false,
+        ));
     }
 
     if property.starts_with("--") {
         return Ok((PropertyValue::Raw(value), false));
     }
 
-    Ok((match property.as_str() {
-        "width" | "height" | "min-height" | "max-height" | "min-width" | "max-width" | "gap" |
-        "margin-left" | "margin-top" | "margin-right" | "margin-bottom" | "font-size" | "left" |
-        "top" | "right" | "bottom" | "padding-left" | "padding-top" | "padding-right" | "padding-bottom" |
-        "border-left-width" | "border-top-width" | "border-right-width" | "border-bottom-width" |
-        "border-width" | "padding-block-start" | "padding-block-end" | "padding-inline-start" | "padding-inline-end" =>
-            PropertyValue::Size(parse_style_size(value)?),
-        "margin" | "padding" | "inset" =>
-            PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?),
-        "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
-        "padding-block" => PropertyValue::VerticalCombinedSize(parse_two_axis_size(value)?),
-        "padding-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
-        "background" => parse_background(value)?,
-        "background-color" | "color" |
-        "border-left-color" | "border-top-color" | "border-right-color" | "border-bottom-color" =>
-            PropertyValue::Color(parse_color(value)?),
-        "border-color" => PropertyValue::CombinedColor(parse_combined_style(value, parse_color)?),
-        "display" => PropertyValue::Display(match value.as_str().trim() {
-            "block" => Some(StyleDisplay::Block),
-            "inline-block" => Some(StyleDisplay::InlineBlock),
-            "inline" => Some(StyleDisplay::Inline),
-            "flex" => Some(StyleDisplay::Flex),
-            "inline-flex" => Some(StyleDisplay::InlineFlex),
-            "grid" => Some(StyleDisplay::Grid),
-            "none" => Some(StyleDisplay::None),
-            _ => None
-        }.with_context(|| "Failed to parse display")?),
-        "position" => PropertyValue::Position(match value.as_str().trim() {
-            "static" => Some(StylePosition::Static),
-            "relative" => Some(StylePosition::Relative),
-            "absolute" => Some(StylePosition::Absolute),
-            "fixed" => Some(StylePosition::Fixed),
-            _ => {
-                println!("Failed to parse style position \"{}\"", value);
-                None
+    Ok((
+        match property.as_str() {
+            "width"
+            | "height"
+            | "min-height"
+            | "max-height"
+            | "min-width"
+            | "max-width"
+            | "gap"
+            | "margin-left"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "font-size"
+            | "left"
+            | "top"
+            | "right"
+            | "bottom"
+            | "padding-left"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "border-left-width"
+            | "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-width"
+            | "padding-block-start"
+            | "padding-block-end"
+            | "padding-inline-start"
+            | "padding-inline-end" => PropertyValue::Size(parse_style_size(value)?),
+            "margin" | "padding" | "inset" => {
+                PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?)
             }
-        }.with_context(|| "Failed to parse position")?),
-        "text-align" => PropertyValue::Align(match value.as_str().trim() {
-            "left" => Some(StyleAlign::Left),
-            "center" => Some(StyleAlign::Center),
-            "right" => Some(StyleAlign::Right),
-            _ => None
-        }.with_context(|| "Failed to parse text-align")?),
-        "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
-        "flex-basis" => PropertyValue::Size(parse_style_size(value)?),
-        "flex" => {
-            let parts: Vec<&str> = value.split(" ").collect();
-            let mut grow = None;
-            let mut shrink = None;
-            let mut basis = None;
-            if value == "none" {
-                grow = Some(0);
-                shrink = Some(0);
-                basis = Some(StyleSize::Auto);
-            } else if value == "auto" {
-                grow = Some(1);
-                shrink = Some(1);
-                basis = Some(StyleSize::Auto);
-            } else if value == "initial" {
-                grow = Some(0);
-                shrink = Some(1);
-                basis = Some(StyleSize::Auto);
-            } else {
-                match parts.len() {
-                    1 => {
-                        if let Ok(value) = parts[0].parse::<u32>() {
-                            grow = Some(value);
-                            shrink = Some(1);
-                            basis = Some(StyleSize::Percent(0.));
-                        } else {
-                            basis = Some(parse_style_size(parts[0].to_string())?);
+            "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
+            "padding-block" => PropertyValue::VerticalCombinedSize(parse_two_axis_size(value)?),
+            "padding-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
+            "background" => parse_background(value)?,
+            "background-color"
+            | "color"
+            | "border-left-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color" => PropertyValue::Color(parse_color(value)?),
+            "border-color" => {
+                PropertyValue::CombinedColor(parse_combined_style(value, parse_color)?)
+            }
+            "display" => PropertyValue::Display(
+                match value.as_str().trim() {
+                    "block" => Some(StyleDisplay::Block),
+                    "inline-block" => Some(StyleDisplay::InlineBlock),
+                    "inline" => Some(StyleDisplay::Inline),
+                    "flex" => Some(StyleDisplay::Flex),
+                    "inline-flex" => Some(StyleDisplay::InlineFlex),
+                    "grid" => Some(StyleDisplay::Grid),
+                    "none" => Some(StyleDisplay::None),
+                    _ => None,
+                }
+                .with_context(|| "Failed to parse display")?,
+            ),
+            "position" => PropertyValue::Position(
+                match value.as_str().trim() {
+                    "static" => Some(StylePosition::Static),
+                    "relative" => Some(StylePosition::Relative),
+                    "absolute" => Some(StylePosition::Absolute),
+                    "fixed" => Some(StylePosition::Fixed),
+                    _ => {
+                        println!("Failed to parse style position \"{}\"", value);
+                        None
+                    }
+                }
+                .with_context(|| "Failed to parse position")?,
+            ),
+            "text-align" => PropertyValue::Align(
+                match value.as_str().trim() {
+                    "left" => Some(StyleAlign::Left),
+                    "center" => Some(StyleAlign::Center),
+                    "right" => Some(StyleAlign::Right),
+                    _ => None,
+                }
+                .with_context(|| "Failed to parse text-align")?,
+            ),
+            "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
+            "flex-basis" => PropertyValue::Size(parse_style_size(value)?),
+            "flex" => {
+                let parts: Vec<&str> = value.split(" ").collect();
+                let mut grow = None;
+                let mut shrink = None;
+                let mut basis = None;
+                if value == "none" {
+                    grow = Some(0);
+                    shrink = Some(0);
+                    basis = Some(StyleSize::Auto);
+                } else if value == "auto" {
+                    grow = Some(1);
+                    shrink = Some(1);
+                    basis = Some(StyleSize::Auto);
+                } else if value == "initial" {
+                    grow = Some(0);
+                    shrink = Some(1);
+                    basis = Some(StyleSize::Auto);
+                } else {
+                    match parts.len() {
+                        1 => {
+                            if let Ok(value) = parts[0].parse::<u32>() {
+                                grow = Some(value);
+                                shrink = Some(1);
+                                basis = Some(StyleSize::Percent(0.));
+                            } else {
+                                basis = Some(parse_style_size(parts[0].to_string())?);
+                            }
                         }
-                    }
-                    2 => {
-                        grow = Some(parts[0].parse::<u32>()?);
-                        if let Ok(value) = parts[1].parse::<u32>() {
-                            shrink = Some(value);
-                        } else {
-                            shrink = Some(1);
-                            basis = Some(parse_style_size(parts[1].to_string())?);
+                        2 => {
+                            grow = Some(parts[0].parse::<u32>()?);
+                            if let Ok(value) = parts[1].parse::<u32>() {
+                                shrink = Some(value);
+                            } else {
+                                shrink = Some(1);
+                                basis = Some(parse_style_size(parts[1].to_string())?);
+                            }
                         }
+                        3 => {
+                            grow = Some(parts[0].parse::<u32>()?);
+                            shrink = Some(parts[1].parse::<u32>()?);
+                            basis = Some(parse_style_size(parts[2].to_string())?);
+                        }
+                        _ => {}
                     }
-                    3 => {
-                        grow = Some(parts[0].parse::<u32>()?);
-                        shrink = Some(parts[1].parse::<u32>()?);
-                        basis = Some(parse_style_size(parts[2].to_string())?);
-                    }
-                    _ => {}
+                }
+                PropertyValue::Flex {
+                    grow,
+                    shrink,
+                    basis,
                 }
             }
-            PropertyValue::Flex { grow, shrink, basis }
+            "justify-content" | "justify-items" | "align-items" | "align-self" => {
+                PropertyValue::JustifyContent(parse_justify_content(value.as_str()))
+            }
+            "place-content" => {
+                let parts: Vec<&str> = value.split(" ").collect();
+                // align-content ignored for now
+                match parts.len() {
+                    1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
+                    2 => PropertyValue::JustifyContent(parse_justify_content(parts[1].trim())),
+                    _ => PropertyValue::Raw(value),
+                }
+            }
+            "place-items" => {
+                let parts: Vec<&str> = value.split(" ").collect();
+                // justify-items ignored for now
+                match parts.len() {
+                    1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
+                    2 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
+                    _ => PropertyValue::Raw(value),
+                }
+            }
+            "flex-direction" => PropertyValue::FlexDirection(match value.as_str() {
+                "row" => StyleFlexDirection::Row,
+                "column" => StyleFlexDirection::Column,
+                _ => Err(anyhow!(
+                    "Failed to parse style flex-direction \"{}\"",
+                    value
+                ))?,
+            }),
+            "border-left-style"
+            | "border-top-style"
+            | "border-right-style"
+            | "border-bottom-style"
+            | "border-style" => PropertyValue::BorderStyle(parse_border_style(value)?),
+            "border-left" | "border-top" | "border-right" | "border-bottom" | "border" => {
+                PropertyValue::BorderSide(parse_border_side_value(value)?)
+            }
+            "grid-template-columns" => parse_grid_template_columns_value(value)?,
+            "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
+            "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
+            "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
+            "initial-value" | "syntax" | "inherits" => PropertyValue::Raw(value),
+            _ => {
+                // println!("Failed to parse style \"{}\"", property);
+                PropertyValue::Raw(value)
+            }
         },
-        "justify-content" | "justify-items" | "align-items" | "align-self" =>
-            PropertyValue::JustifyContent(parse_justify_content(value.as_str())),
-        "place-content" => {
-            let parts: Vec<&str> = value.split(" ").collect();
-            // align-content ignored for now
-            match parts.len() {
-                1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
-                2 => PropertyValue::JustifyContent(parse_justify_content(parts[1].trim())),
-                _ => PropertyValue::Raw(value),
-            }
-        }
-        "place-items" => {
-            let parts: Vec<&str> = value.split(" ").collect();
-            // justify-items ignored for now
-            match parts.len() {
-                1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
-                2 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
-                _ => PropertyValue::Raw(value),
-            }
-        }
-        "flex-direction" => PropertyValue::FlexDirection(match value.as_str() {
-            "row" => StyleFlexDirection::Row,
-            "column" => StyleFlexDirection::Column,
-            _ => Err(anyhow!(
-                "Failed to parse style flex-direction \"{}\"",
-                value
-            ))?,
-        }),
-        "border-left-style" | "border-top-style" | "border-right-style" | "border-bottom-style" |
-        "border-style" =>
-            PropertyValue::BorderStyle(parse_border_style(value)?),
-        "border-left" | "border-top" | "border-right" | "border-bottom" | "border" =>
-            PropertyValue::BorderSide(parse_border_side_value(value)?),
-        "grid-template-columns" => parse_grid_template_columns_value(value)?,
-        "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
-        "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
-        "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
-        "initial-value" | "syntax" | "inherits" => PropertyValue::Raw(value),
-        _ => {
-            // println!("Failed to parse style \"{}\"", property);
-            PropertyValue::Raw(value)
-        }
-    }, false))
+        false,
+    ))
 }
 
 fn apply_parsed_border_side(side: &mut StyleSizeAndColor, value: BorderSideValue) {
@@ -1298,10 +1452,7 @@ fn apply_parsed_border_side(side: &mut StyleSizeAndColor, value: BorderSideValue
     }
 }
 
-pub fn apply_style_property(
-    style: &mut Style,
-    property: &Property,
-) -> Result<()> {
+pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()> {
     match (property.property.as_str(), property.value.clone()) {
         ("width", PropertyValue::Size(value)) => {
             style.width = value;
@@ -1346,27 +1497,27 @@ pub fn apply_style_property(
         ("margin-inline", PropertyValue::HorizontalCombinedSize((left, right))) => {
             style.margin_left = left;
             style.margin_right = right;
-        },
+        }
         ("padding-block", PropertyValue::VerticalCombinedSize((top, bottom))) => {
             style.padding_top = top;
             style.padding_bottom = bottom;
-        },
+        }
         ("padding-block-start", PropertyValue::Size(value)) => {
             style.padding_top = value;
-        },
+        }
         ("padding-block-end", PropertyValue::Size(value)) => {
             style.padding_bottom = value;
-        },
+        }
         ("padding-inline", PropertyValue::HorizontalCombinedSize((left, right))) => {
             style.padding_left = left;
             style.padding_right = right;
-        },
+        }
         ("padding-inline-start", PropertyValue::Size(value)) => {
             style.padding_left = value;
-        },
+        }
         ("padding-inline-end", PropertyValue::Size(value)) => {
             style.padding_right = value;
-        },
+        }
         ("font-size", PropertyValue::Size(value)) => {
             style.font_size = value;
         }
@@ -1409,7 +1560,7 @@ pub fn apply_style_property(
         ("background", PropertyValue::ComplexBackground(background)) => {
             style.background = background.background;
             // TODO: Add more attribute mappings here
-        },
+        }
         ("background" | "background-color", PropertyValue::Color(value)) => {
             style.background = value;
         }
@@ -1434,7 +1585,14 @@ pub fn apply_style_property(
         ("flex-basis", PropertyValue::Size(value)) => {
             style.flex_basis = value;
         }
-        ("flex", PropertyValue::Flex { grow, shrink, basis }) => {
+        (
+            "flex",
+            PropertyValue::Flex {
+                grow,
+                shrink,
+                basis,
+            },
+        ) => {
             if let Some(grow) = grow {
                 style.flex_grow = grow;
             }
@@ -1540,23 +1698,23 @@ pub fn apply_style_property(
         }
         ("grid-template-columns", PropertyValue::GridTemplateColumns(columns)) => {
             style.grid_template_columns = columns;
-        },
+        }
         ("overflow", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow.clone();
             style.overflow_y = overflow;
-        },
+        }
         ("overflow-x", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow;
-        },
+        }
         ("overflow-y", PropertyValue::Overflow(overflow)) => {
             style.overflow_y = overflow;
-        },
+        }
         ("z-index", PropertyValue::ZIndex(value)) => {
             style.z_index = value;
-        },
+        }
         ("pointer-events", PropertyValue::PointerEvents(value)) => {
             style.pointer_events = value;
-        },
+        }
         ("opacity", PropertyValue::Raw(value)) => {
             if let Ok(value) = value.parse::<f32>() {
                 style.opacity = value.clamp(0.0, 1.0);
@@ -1569,7 +1727,10 @@ pub fn apply_style_property(
         }
         (_, PropertyValue::Raw(_)) => {}
         (_, value) => {
-            println!("Failed to apply style \"{}\" with value {:?}", property.property, value);
+            println!(
+                "Failed to apply style \"{}\" with value {:?}",
+                property.property, value
+            );
         }
     };
     Ok(())
@@ -1592,7 +1753,7 @@ pub fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<
         if let Node::Layer(_) = nodes[parent].1 {
             return Some(parent);
         } else {
-            return get_parent_layer(nodes, parent)
+            return get_parent_layer(nodes, parent);
         }
     }
     None
@@ -1601,10 +1762,10 @@ pub fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<
 pub fn get_specificity_order(a_specificity: &[i32; 3], b_specificity: &[i32; 3]) -> Ordering {
     for idx in 0usize..3usize {
         if a_specificity[idx] > b_specificity[idx] {
-            return Ordering::Greater; 
+            return Ordering::Greater;
         }
         if a_specificity[idx] < b_specificity[idx] {
-            return Ordering::Less; 
+            return Ordering::Less;
         }
     }
     Ordering::Equal
@@ -1667,11 +1828,18 @@ pub fn parse_style(
         .map(|idx| (**idx, Cow::Borrowed(&css_nodes[**idx])))
         .collect();
     // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
-    nodes.extend(inline_nodes.into_iter().map(|node| {
-        (usize::MAX, Cow::Owned(node))
-    }));
+    nodes.extend(
+        inline_nodes
+            .into_iter()
+            .map(|node| (usize::MAX, Cow::Owned(node))),
+    );
 
-    let (properties, resolved_variables) = resolve_node_variables(&mut nodes, parent_variables, css_node_ranking, variable_definitions);
+    let (properties, resolved_variables) = resolve_node_variables(
+        &mut nodes,
+        parent_variables,
+        css_node_ranking,
+        variable_definitions,
+    );
     style.variables = resolved_variables;
 
     for property in properties {

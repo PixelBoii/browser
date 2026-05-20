@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 
-use crate::style::{GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize, StyleZIndex, parse_property_value, split_ignoring_parentheses};
+use crate::style::{
+    GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay,
+    StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize,
+    StyleZIndex, parse_property_value, split_ignoring_parentheses,
+};
 
 const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
 
@@ -120,7 +124,14 @@ pub enum PropertyValue {
     BorderStyle(StyleBorderStyle),
     BorderSide(BorderSideValue),
     CombinedSize((StyleSize, StyleSize, StyleSize, StyleSize)),
-    CombinedColor((StyleBackground, StyleBackground, StyleBackground, StyleBackground)),
+    CombinedColor(
+        (
+            StyleBackground,
+            StyleBackground,
+            StyleBackground,
+            StyleBackground,
+        ),
+    ),
     VerticalCombinedSize((StyleSize, StyleSize)),
     HorizontalCombinedSize((StyleSize, StyleSize)),
     GridTemplateColumns(GridTemplateColumns),
@@ -238,7 +249,10 @@ fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
             let mut value = split[1];
             value = unquote(value.trim());
 
-            attributes.push(ClassNamePartAttribute::KeyValue((key.to_string(), value.to_string())));
+            attributes.push(ClassNamePartAttribute::KeyValue((
+                key.to_string(),
+                value.to_string(),
+            )));
         } else if split.len() == 1 {
             let key = split[0];
             attributes.push(ClassNamePartAttribute::Key(key.to_string()));
@@ -311,7 +325,12 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                     escaped = true;
                     continue;
                 }
-                if buffer.len() > 0 && new_statement.contains(&char) && parentheses_depth == 0 && !escaped && !(buffer == ":" && char == ':') {
+                if buffer.len() > 0
+                    && new_statement.contains(&char)
+                    && parentheses_depth == 0
+                    && !escaped
+                    && !(buffer == ":" && char == ':')
+                {
                     conditions.push(buffer.clone());
                     buffer.clear();
                 }
@@ -330,7 +349,8 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                     '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
                     '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
                     ':' => {
-                        let pseudo_class = chars.as_str().strip_prefix(':').unwrap_or(chars.as_str());
+                        let pseudo_class =
+                            chars.as_str().strip_prefix(':').unwrap_or(chars.as_str());
                         let parsed = parse_pseudo_class(pseudo_class);
                         match parsed {
                             Some(parsed) => Some(ClassNamePart::PseudoClass(parsed)),
@@ -339,9 +359,9 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                                 // This intentionally returns the entire function
                                 // If we fail to parse pseudo class, consider the whole class invalid
                                 return None;
-                            },
+                            }
                         }
-                    },
+                    }
                     '[' => parse_selector_with_attributes(chars.as_str()),
                     '>' => Some(ClassNamePart::ArrowRight),
                     '&' => Some(ClassNamePart::Ampersand),
@@ -429,20 +449,13 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_media_query_from_state(&mut self) {
-        if let Some(stripped) = self
-            .label
-            .trim()
-            .strip_prefix("@property")
-        {
-            self.nodes.push(Node::PropertyDefinition(PropertyDefinition {
-                name: stripped.trim().to_string(),
-                parent: self.node,
-            }));
-        } else if let Some(stripped) = self
-            .label
-            .trim()
-            .strip_prefix("@layer")
-        {
+        if let Some(stripped) = self.label.trim().strip_prefix("@property") {
+            self.nodes
+                .push(Node::PropertyDefinition(PropertyDefinition {
+                    name: stripped.trim().to_string(),
+                    parent: self.node,
+                }));
+        } else if let Some(stripped) = self.label.trim().strip_prefix("@layer") {
             self.nodes.push(Node::Layer(Layer {
                 name: stripped.trim().to_string(),
                 parent: self.node,
@@ -485,7 +498,11 @@ impl<'a> CssParser<'a> {
     }
 
     fn create_property_from_state(&mut self) {
-        let parts: (&str, &str) = self.label.split_once(":").with_context(|| format!("Failed to parse property: {}", self.label)).unwrap();
+        let parts: (&str, &str) = self
+            .label
+            .split_once(":")
+            .with_context(|| format!("Failed to parse property: {}", self.label))
+            .unwrap();
         let mut value = parts.1;
         value = value.trim();
         value = value.strip_prefix("'").unwrap_or(value);
@@ -511,7 +528,7 @@ impl<'a> CssParser<'a> {
                         important,
                     }));
                 }
-            },
+            }
             Err(err) => println!("Failed to parse property value: {}", err),
         };
 
@@ -617,26 +634,22 @@ impl<'a> CssParser<'a> {
                         _ => {}
                     };
                 }
-                '(' => {
-                    match self.stage {
-                        CssBuildPhase::Specifier => {
-                            self.label.push(char);
-                            if self.label.ends_with("url(") {
-                                self.in_url = true;
-                            }
+                '(' => match self.stage {
+                    CssBuildPhase::Specifier => {
+                        self.label.push(char);
+                        if self.label.ends_with("url(") {
+                            self.in_url = true;
                         }
-                        _ => {}
                     }
-                }
-                ')' => {
-                    match self.stage {
-                        CssBuildPhase::Specifier => {
-                            self.in_url = false;
-                            self.label.push(char);
-                        }
-                        _ => {}
+                    _ => {}
+                },
+                ')' => match self.stage {
+                    CssBuildPhase::Specifier => {
+                        self.in_url = false;
+                        self.label.push(char);
                     }
-                }
+                    _ => {}
+                },
                 _ => {
                     match self.stage {
                         CssBuildPhase::Start => {

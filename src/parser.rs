@@ -1,6 +1,6 @@
 use anyhow::Context;
 use deno_core::{ToV8, v8};
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 const SELF_CLOSING_TAGS: [&str; 6] = ["br", "input", "meta", "link", "img", "hr"];
@@ -312,11 +312,7 @@ impl HtmlParser {
     }
 
     pub fn get_context(&self) -> String {
-        format!(
-            "{} {:?}",
-            self.tag,
-            self.stage,
-        )
+        format!("{} {:?}", self.tag, self.stage,)
     }
 
     pub fn parse(&mut self) -> anyhow::Result<()> {
@@ -418,7 +414,7 @@ impl HtmlParser {
                         self.create_comment_from_state()?;
                         self.stage = BuildPhase::Start;
                         self.tag.clear();
-                    },
+                    }
                     _ => {}
                 },
                 '=' => match self.stage {
@@ -433,7 +429,7 @@ impl HtmlParser {
                 ' ' | '\n' => match self.stage {
                     BuildPhase::Start => {
                         self.tag.push(char);
-                    },
+                    }
                     BuildPhase::Tag => {
                         self.create_node_from_state()?;
 
