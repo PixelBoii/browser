@@ -553,48 +553,61 @@ fn get_specified_size(
         StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
-        // TODO: Make this handle order of operations
         StyleSize::Calc(calc) => {
-            let mut value = match &calc[0] {
-                CalcExpression::Size(size) => {
-                    get_specified_size(font_size, &size, available_size, auto_size, window_size)?
-                }
-                _ => panic!("Expected first calc expression to be value"),
-            };
-            let mut exp_idx = 1;
-            while exp_idx < calc.len() {
-                let loop_operator = match &calc[exp_idx] {
-                    CalcExpression::Operator(operator) => operator,
-                    _ => panic!("Expected calc expression to be operator"),
-                };
-                let loop_value = match &calc[exp_idx + 1] {
-                    CalcExpression::Size(size) => get_specified_size(
-                        font_size,
-                        &size,
-                        available_size,
-                        auto_size,
-                        window_size,
-                    )?,
-                    _ => panic!(
-                        "Expected calc expression to be size. Got: {:?} [{}]",
-                        calc,
-                        exp_idx + 1
-                    ),
-                };
-                value = match loop_operator {
-                    StyleCalcOperator::Plus => value + loop_value,
-                    StyleCalcOperator::Minus => value - loop_value,
-                    StyleCalcOperator::Divide => value / loop_value,
-                    StyleCalcOperator::Multiply => value * loop_value,
-                };
-                exp_idx += 2;
-            }
-            Some(value)
+            solve_calc(calc, font_size, available_size, auto_size, window_size)
         }
         StyleSize::Em(em) => Some((*em * font_size as f32) as i32),
         // TODO: This should actually be the font-size of the root element, so figure that out
         StyleSize::Rem(rem) => Some((*rem * 16 as f32) as i32),
     }
+}
+
+// TODO: Make this handle order of operations
+fn solve_calc(
+    calc: &Vec<CalcExpression>,
+    font_size: u32,
+    available_size: Option<u32>,
+    auto_size: Option<i32>,
+    window_size: &PhysicalSize<u32>,
+) -> Option<i32> {
+    let mut value = match &calc[0] {
+        CalcExpression::Size(size) => {
+            get_specified_size(font_size, &size, available_size, auto_size, window_size)?
+        }
+        _ => panic!("Expected first calc expression to be value"),
+    };
+    let mut exp_idx = 1;
+    while exp_idx < calc.len() {
+        let loop_operator = match &calc[exp_idx] {
+            CalcExpression::Operator(operator) => operator,
+            _ => panic!("Expected calc expression to be operator"),
+        };
+        let loop_value = match &calc[exp_idx + 1] {
+            CalcExpression::Size(size) => get_specified_size(
+                font_size,
+                &size,
+                available_size,
+                auto_size,
+                window_size,
+            )?,
+            CalcExpression::Nesting(nesting) => {
+                solve_calc(nesting, font_size, available_size, auto_size, window_size)?
+            },
+            _ => panic!(
+                "Expected calc expression to be size. Got: {:?} [{}]",
+                calc,
+                exp_idx + 1
+            ),
+        };
+        value = match loop_operator {
+            StyleCalcOperator::Plus => value + loop_value,
+            StyleCalcOperator::Minus => value - loop_value,
+            StyleCalcOperator::Divide => value / loop_value,
+            StyleCalcOperator::Multiply => value * loop_value,
+        };
+        exp_idx += 2;
+    }
+    Some(value)
 }
 
 fn infer_image_size(base_size: Size, input_w: Option<u32>, input_h: Option<u32>) -> (u32, u32) {
@@ -1102,19 +1115,17 @@ fn move_up_ancestor_chain(
     let parent = css_node.get_parent();
     if let Some(parent) = parent {
         let parent_node = css_nodes[parent].1;
-        // Media queries should not cause a walk up a HTML parent
-        // I think this happens at the right time, but might be worth double-checking later
-        let walk_up_html_parent_immediately =
-            walk_up_parent && !matches!(parent_node, CssNode::MediaQuery(_) | CssNode::Layer(_));
         if let CssNode::ClassName(parent_node_class) = parent_node {
             let mut is_match = false;
-            let el = if walk_up_html_parent_immediately {
-                get_parent_html_idx(element, html_nodes)
-            } else {
-                Some(element)
-            };
-            if let Some(el) = el {
-                for (name_part_idx, _) in parent_node_class.name_parts.iter().enumerate() {
+            for (name_part_idx, _) in parent_node_class.name_parts.iter().enumerate() {
+                let nested_parts = &parent_node_class.name_parts[name_part_idx];
+                let next_class_part = &nested_parts[nested_parts.len() - 1];
+                let el = if walk_up_parent && walk_into_part(next_class_part) {
+                    get_parent_html_idx(element, html_nodes)
+                } else {
+                    Some(element)
+                };
+                if let Some(el) = el {
                     is_match |= narrow_elements_by_ancestors(
                         el,
                         css_nodes,
@@ -1133,29 +1144,22 @@ fn move_up_ancestor_chain(
             }
             return is_match;
         } else {
-            let el = if walk_up_html_parent_immediately {
-                get_parent_html_idx(element, html_nodes)
-            } else {
-                Some(element)
-            };
-            if let Some(el) = el {
-                return narrow_elements_by_ancestors(
-                    el,
-                    css_nodes,
-                    html_nodes,
-                    class_elements,
-                    parent,
-                    0,
-                    0,
-                    window_size,
-                    require_immediate_match,
-                    dom_indexes,
-                    hovering_chain,
-                    hovering_has_impact,
-                );
-            } else {
-                return false;
-            }
+            // Media queries and layers should not cause a walk up a HTML parent
+            // I think this happens at the right time, but might be worth double-checking later
+            return narrow_elements_by_ancestors(
+                element,
+                css_nodes,
+                html_nodes,
+                class_elements,
+                parent,
+                0,
+                0,
+                window_size,
+                require_immediate_match,
+                dom_indexes,
+                hovering_chain,
+                hovering_has_impact,
+            );
         }
     } else {
         // If no parent, we've reached the end and are done
@@ -1196,7 +1200,13 @@ fn move_up_class_part(
             hovering_has_impact,
         );
     } else {
-        let walk_el = if walk_up_parent {
+        let class_name = match node {
+            CssNode::ClassName(class_name) => class_name,
+            _ => unreachable!(),
+        };
+        let nested_parts = &class_name.name_parts[name_part_idx];
+        let next_class_part = &nested_parts[nested_parts.len() - 1 - (nested_part_idx + 1)];
+        let walk_el = if walk_up_parent && walk_into_part(next_class_part) {
             get_parent_html_idx(element, html_nodes)
         } else {
             Some(element)
@@ -1272,7 +1282,7 @@ fn element_matches_class_part(
                 .is_some_and(|el_id| *el_id == *id),
             _ => false,
         },
-        ClassNamePart::ArrowRight | ClassNamePart::Ampersand => true,
+        ClassNamePart::ArrowRight | ClassNamePart::Ampersand | ClassNamePart::Tilde => true,
         ClassNamePart::PseudoClass(class) => {
             match class {
                 // All elements are children of root
@@ -1371,6 +1381,39 @@ fn narrow_elements_by_ancestors(
         CssNode::ClassName(classes) => {
             let parts = &classes.name_parts[name_part_idx];
             let part = &parts[parts.len() - 1 - nested_part_idx];
+            if let ClassNamePart::Tilde = part {
+                let Some(parent) = html_nodes.get(&element).and_then(|v| v.get_parent()) else {
+                    return false;
+                };
+                let Some(siblings) = dom_indexes.children_index.get(&parent) else {
+                    return false;
+                };
+                let Some(pos) = siblings.iter().position(|sibling| *sibling == element) else {
+                    return false;
+                };
+                return siblings
+                    .iter()
+                    .enumerate()
+                    .filter(|idx| *idx.1 != element && html_nodes.contains_key(idx.1))
+                    .any(|(sibling_pos, sibling_idx)| {
+                        sibling_pos < pos && move_up_class_part(
+                            *sibling_idx,
+                            css_nodes,
+                            html_nodes,
+                            class_elements,
+                            parts,
+                            css_node,
+                            nested_part_idx,
+                            name_part_idx,
+                            window_size,
+                            false,
+                            false,
+                            dom_indexes,
+                            hovering_chain,
+                            hovering_has_impact,
+                        )
+                    })
+            };
             let walk_result = walk_for_html_match(
                 element,
                 html_nodes,
@@ -1394,6 +1437,7 @@ fn narrow_elements_by_ancestors(
                 | ClassNamePart::Tag(_)
                 | ClassNamePart::Attributes(_)
                 | ClassNamePart::Combined(_) => (true, false),
+                ClassNamePart::Tilde => (false, false),
                 ClassNamePart::Ampersand => (false, require_immediate_match),
                 ClassNamePart::ArrowRight => (false, true),
             };
@@ -1588,6 +1632,10 @@ fn get_base_elements_by_attributes(
     filtered_elements
 }
 
+fn walk_into_part(part: &ClassNamePart) -> bool {
+    *part != ClassNamePart::Tilde
+}
+
 // It is assumed that html_nodes only contains Node::Element here
 fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
@@ -1639,6 +1687,28 @@ fn search_elements_for_css_nodes(
                                         .iter()
                                         .filter(|(_, node)| node.get_parent().is_none())
                                         .map(|(idx, _)| idx)
+                                        .cloned()
+                                        .collect::<FixedBitSet>();
+                                    Some(elements)
+                                }
+                                // TODO: This looks quite inefficient, should probably try and improve this
+                                PseudoClass::Not(selector) => {
+                                    let (negative_matches, _, _) = {
+                                        let mut to_resolve = HashSet::new();
+                                        to_resolve.insert(0);
+                                        let class = CssNode::ClassName(ClassName {
+                                            name: vec![],
+                                            name_parts: vec![selector.clone()],
+                                            parent: None,
+                                        });
+                                        let css_nodes = vec![class];
+                                        let css_nodes = css_nodes.iter().enumerate().collect();
+                                        search_elements_for_css_nodes(to_resolve, &css_nodes, html_nodes, window_size, dom_indexes, hovering_chain)
+                                    };
+                                    let elements = html_nodes
+                                        .iter()
+                                        .map(|(idx, _)| idx)
+                                        .filter(|idx| !negative_matches.contains_key(idx))
                                         .cloned()
                                         .collect::<FixedBitSet>();
                                     Some(elements)
@@ -1739,9 +1809,11 @@ fn search_elements_for_css_nodes(
                                     &mut hovering_has_impact,
                                 )
                             } else {
-                                if let Some(parent_el) = get_parent_html_idx(el, &html_nodes) {
+                                let next_class_part = &parts[parts.len() - 2];
+                                let next_el = if walk_into_part(next_class_part) { get_parent_html_idx(el, &html_nodes) } else { Some(el) };
+                                if let Some(next_el) = next_el {
                                     narrow_elements_by_ancestors(
-                                        parent_el,
+                                        next_el,
                                         css_nodes,
                                         &html_nodes,
                                         &class_elements,
@@ -8044,7 +8116,7 @@ mod tests {
 
     use crate::{
         Browser, RendererProxy, pixmaps_are_equal, rgb_buffer_to_premul_bytes,
-        style::split_ignoring_parentheses,
+        style::{CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses},
     };
 
     fn ensure_snapshot_matches(
@@ -8140,5 +8212,21 @@ mod tests {
             split_ignoring_parentheses("test>lol".into(), ' ', &['>']),
             vec!["test", ">", "lol"]
         );
+    }
+
+    #[test]
+    fn test_parse_calc() -> Result<()> {
+        assert_eq!(parse_calc("15px * 4rem + (4px + 2em)")?, StyleSize::Calc(vec![
+            CalcExpression::Size(StyleSize::Px(15.)),
+            CalcExpression::Operator(StyleCalcOperator::Multiply),
+            CalcExpression::Size(StyleSize::Rem(4.)),
+            CalcExpression::Operator(StyleCalcOperator::Plus),
+            CalcExpression::Nesting(vec![
+                CalcExpression::Size(StyleSize::Px(4.)),
+                CalcExpression::Operator(StyleCalcOperator::Plus),
+                CalcExpression::Size(StyleSize::Em(2.)),
+            ]),
+        ]));
+        Ok(())
     }
 }

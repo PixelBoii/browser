@@ -26,6 +26,7 @@ pub enum StyleCalcOperator {
 pub enum CalcExpression {
     Size(StyleSize),
     Operator(StyleCalcOperator),
+    Nesting(Vec<CalcExpression>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -498,30 +499,49 @@ fn extract_operator(char: char) -> Option<CalcExpression> {
     }
 }
 
-fn flush_calc_value(buffer: &mut String, parts: &mut Vec<CalcExpression>) -> Result<()> {
+fn add_part_to_calc(parts: &mut Vec<CalcExpression>, part: CalcExpression, nesting: i32) {
+    if nesting > 0 {
+        match parts.last_mut() {
+            Some(CalcExpression::Nesting(parts)) => parts.push(part),
+            _ => parts.push(part),
+        };
+    } else {
+        parts.push(part);
+    }
+}
+
+fn flush_calc_value(buffer: &mut String, parts: &mut Vec<CalcExpression>, nesting: i32) -> Result<()> {
     if buffer.len() > 0 {
         let size = parse_style_size(buffer.clone())?;
         buffer.clear();
-        parts.push(CalcExpression::Size(size));
+        add_part_to_calc(parts, CalcExpression::Size(size), nesting);
     }
     Ok(())
 }
 
 const CALC_NUMBER_CHARS: [char; 11] = ['.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
-fn parse_calc(value: &str) -> Result<StyleSize> {
+pub fn parse_calc(value: &str) -> Result<StyleSize> {
     let mut parts: Vec<CalcExpression> = vec![];
     let mut buffer = String::new();
     // Remove whitespace
     let mut value = value.to_string();
     value.retain(|c| !c.is_whitespace());
     let mut last_numberish = false;
+    let mut nesting = 0;
     for char in value.chars() {
-        if let Some(operator) = extract_operator(char)
+        if char == '(' {
+            nesting += 1;
+            flush_calc_value(&mut buffer, &mut parts, nesting)?;
+            add_part_to_calc(&mut parts, CalcExpression::Nesting(vec![]), nesting);
+        } else if char == ')' {
+            flush_calc_value(&mut buffer, &mut parts, nesting)?;
+            nesting -= 1;
+        } else if let Some(operator) = extract_operator(char)
             && last_numberish
         {
-            flush_calc_value(&mut buffer, &mut parts)?;
-            parts.push(operator);
+            flush_calc_value(&mut buffer, &mut parts, nesting)?;
+            add_part_to_calc(&mut parts, operator, nesting);
             last_numberish = false;
         } else {
             if char != ' ' && CALC_NUMBER_CHARS.contains(&char) {
@@ -530,7 +550,7 @@ fn parse_calc(value: &str) -> Result<StyleSize> {
             buffer.push(char);
         }
     }
-    flush_calc_value(&mut buffer, &mut parts)?;
+    flush_calc_value(&mut buffer, &mut parts, nesting)?;
     Ok(StyleSize::Calc(parts))
 }
 

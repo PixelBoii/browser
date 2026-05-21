@@ -43,6 +43,7 @@ pub enum ClassNamePart {
     Tag(String),
     Combined(Vec<ClassNamePart>),
     ArrowRight,
+    Tilde,
     Ampersand,
 }
 
@@ -328,7 +329,7 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
 }
 
 pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
-    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>']);
+    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>', '~']);
     nested_parts
         .into_iter()
         .filter_map(|p| -> Option<ClassNamePart> {
@@ -337,7 +338,7 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
             }
             let mut conditions = vec![];
             let mut buffer = String::new();
-            let new_statement = ['.', '#', '[', '>', ':'];
+            let new_statement = ['.', '#', '[', '>', '~', ':'];
             let mut parentheses_depth = 0;
             let mut escaped = false;
             for char in p.chars() {
@@ -394,8 +395,9 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
                     }
                     '[' => parse_selector_with_attributes(chars.as_str()),
                     '>' => Some(ClassNamePart::ArrowRight),
+                    '~' => Some(ClassNamePart::Tilde),
                     '&' => Some(ClassNamePart::Ampersand),
-                    _ => Some(ClassNamePart::Tag(cond.clone())),
+                    _ => Some(ClassNamePart::Tag(cond.trim().to_string())),
                 };
                 match parsed {
                     Some(parsed) => parsed_conditions.push(parsed),
