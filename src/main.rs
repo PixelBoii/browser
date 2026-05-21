@@ -7735,11 +7735,17 @@ impl Browser {
             {
                 let target_scroll =
                     (existing_animation.end as f32 + y).min(0.).max(-max_scroll) as i32;
+                if target_scroll == scroll_y {
+                    return;
+                }
                 existing_animation.start_at = SystemTime::now();
                 existing_animation.start = scroll_y;
                 existing_animation.end = target_scroll;
             } else {
                 let target_scroll = (scroll_y as f32 + y).min(0.).max(-max_scroll) as i32;
+                if target_scroll == scroll_y {
+                    return;
+                }
                 renderer
                     .animations
                     .push(Animation::ScrollAnimation(ScrollAnimation {
