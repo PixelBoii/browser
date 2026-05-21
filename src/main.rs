@@ -8115,6 +8115,22 @@ mod tests {
     }
 
     #[test]
+    fn render_time_tracker() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut browser = Browser::new("https://pixel-time-tracker.pages.dev/".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(
+            params,
+            PhysicalSize::new(1920, 1080),
+            RendererProxy::FrameLoop(tx),
+        )?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        browser.render_into(&mut buffer, 1920, 1080, true);
+        ensure_snapshot_matches(&buffer, "pixeltimetracker", 1920, 1080)
+    }
+
+    #[test]
     fn splits_space_ignoring_parentheses() {
         assert_eq!(
             split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' ', &[]),
