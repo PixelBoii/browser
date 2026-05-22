@@ -6914,8 +6914,11 @@ impl Browser {
                                 .await?
                                 .text()
                                 .await?;
-                            runtime.execute_script(url.to_string(), code)?;
-                            Self::drain_microtasks(&mut runtime);
+                            let result = runtime.execute_script(url.to_string(), code);
+                            match result {
+                                Ok(_) => Self::drain_microtasks(&mut runtime),
+                                Err(err) => eprintln!("Failed to execute JS at {} with error: {:?}", link, err),
+                            };
                         }
                         ScriptType::Module => {
                             let module_id = if document_id == 0 {
@@ -6939,9 +6942,10 @@ impl Browser {
                                     .await?
                             };
                             let result = runtime.mod_evaluate(module_id);
-                            runtime
+                            let _ = runtime
                                 .with_event_loop_promise(result, Default::default())
-                                .await?;
+                                .await
+                                .inspect_err(|err| eprintln!("Failed to execute JS at {} with error: {:?}", url, err));
                         }
                     }
                 }
@@ -7821,7 +7825,7 @@ fn main() -> Result<()> {
 
     let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
     let mut browser = Browser::new(
-        "https://pixel-time-tracker.pages.dev/".to_string(),
+        "https://slack.com/".to_string(),
         hover_debugging,
     );
     // let mut browser = Browser::new("http://localhost:5173".to_string());
