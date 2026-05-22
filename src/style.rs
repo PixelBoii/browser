@@ -51,6 +51,7 @@ pub enum StyleSize {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleBackground {
     Transparent,
+    CurrentColor,
     Hex(u32),
     DataUrl((String, String)),
 }
@@ -928,8 +929,6 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         }
         let hex = rgba_to_hex((parsed_parts[0], parsed_parts[1], parsed_parts[2], alpha));
         Ok(StyleBackground::Hex(hex))
-    } else if value == "transparent" || value == "none" {
-        Ok(StyleBackground::Transparent)
     } else {
         match value.to_ascii_lowercase().as_str() {
             "black" | "buttontext" | "canvastext" | "linktext" => {
@@ -940,6 +939,8 @@ fn parse_color(value: String) -> Result<StyleBackground> {
                 Ok(StyleBackground::Hex(0x80_80_80_FF))
             }
             "highlight" | "selecteditem" => Ok(StyleBackground::Hex(0x33_99_FF_FF)),
+            "transparent" | "none" => Ok(StyleBackground::Transparent),
+            "currentcolor" => Ok(StyleBackground::CurrentColor),
             _ => Err(anyhow!("Failed to parse color \"{}\"", value)),
         }
     }
@@ -997,6 +998,22 @@ fn resolve_node_variable(
     parent_variables: &Rc<HashMap<usize, String>>,
     variable_definitions: &VariableDefinitions,
 ) -> Option<String> {
+    resolve_node_variable_inner(
+        value,
+        map,
+        parent_variables,
+        variable_definitions,
+        &mut HashSet::new(),
+    )
+}
+
+fn resolve_node_variable_inner(
+    value: &PropertyValue,
+    map: &HashMap<String, PropertyValue>,
+    parent_variables: &Rc<HashMap<usize, String>>,
+    variable_definitions: &VariableDefinitions,
+    resolving: &mut HashSet<String>,
+) -> Option<String> {
     match value {
         PropertyValue::Raw(value) => {
             return Some(value.clone());
@@ -1005,26 +1022,36 @@ fn resolve_node_variable(
             // TODO: Handle multi variable dependence
             if template.len() == 1 {
                 if let VariableTemplatePart::Var(var) = &template[0] {
-                    if let Some(resolved) = map.get(var) {
-                        return resolve_node_variable(
+                    if !resolving.insert(var.clone()) {
+                        return None;
+                    }
+
+                    let resolved = if let Some(resolved) = map.get(var) {
+                        resolve_node_variable_inner(
                             resolved,
                             map,
                             parent_variables,
                             variable_definitions,
-                        );
-                    }
-                    if let Some(resolved) = variable_definitions
+                            resolving,
+                        )
+                    } else if let Some(resolved) = variable_definitions
                         .variable_to_idx
                         .get(var)
                         .and_then(|var| parent_variables.get(var))
                     {
-                        return resolve_node_variable(
+                        resolve_node_variable_inner(
                             &PropertyValue::Raw(resolved.to_string()),
                             map,
                             parent_variables,
                             variable_definitions,
-                        );
-                    }
+                            resolving,
+                        )
+                    } else {
+                        None
+                    };
+
+                    resolving.remove(var);
+                    return resolved;
                 }
             }
         }
@@ -1153,6 +1180,31 @@ pub fn resolve_node_variables<'nodes, 'css>(
         .collect();
 
     (properties, resolved_variables)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_referential_variable_does_not_recurse_forever() {
+        let mut map = HashMap::new();
+        map.insert(
+            "--color".to_string(),
+            PropertyValue::VariableTemplate(vec![VariableTemplatePart::Var(
+                "--color".to_string(),
+            )]),
+        );
+
+        let resolved = resolve_node_variable(
+            map.get("--color").unwrap(),
+            &map,
+            &Rc::new(HashMap::new()),
+            &VariableDefinitions::new(),
+        );
+
+        assert_eq!(resolved, None);
+    }
 }
 
 fn parse_justify_content(value: &str) -> StyleJustifyContent {

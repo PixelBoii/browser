@@ -3,6 +3,7 @@ mod loader;
 mod parser;
 mod style;
 
+use deno_error::JsErrorBox;
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use fixedbitset::FixedBitSet;
 use image::{DynamicImage, ImageReader};
@@ -15,7 +16,7 @@ use style::{
     StyleSize, get_base_style, parse_style,
 };
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -28,7 +29,7 @@ use std::{env, fs, u32};
 use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use deno_core::error::JsError;
+use deno_core::error::{JsError};
 use deno_core::{JsRuntime, OpState, extension, op2, v8};
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle};
 use reqwest::Url as ReqwestUrl;
@@ -67,6 +68,7 @@ struct RectBorderSide {
 impl RectBorderSide {
     pub fn parse_from_style(
         style: &StyleSizeAndColor,
+        node_style: &Style,
         font_size: u32,
         available_size: &Size,
         window_size: &PhysicalSize<u32>,
@@ -85,7 +87,13 @@ impl RectBorderSide {
                     StyleBackground::Transparent => 0xFF_FF_FF_00,
                     StyleBackground::DataUrl(_) => {
                         return None;
-                    }
+                    },
+                    StyleBackground::CurrentColor => match node_style.color {
+                        StyleBackground::Hex(hex) => hex,
+                        _ => {
+                            return None;
+                        },
+                    },
                 },
             }),
             StyleBorderStyle::None => None,
@@ -2368,6 +2376,38 @@ fn op_get_attribute(
     Ok(value)
 }
 
+// TODO: Maybe we want to copy the text children no matter what the deep parameter says, but idk
+fn clone_node(renderer: &mut RefMut<'_, Renderer>, node_idx: usize, new_parent: Option<usize>, deep: bool) -> Result<usize> {
+    let mut node = renderer
+        .nodes
+        .get(&node_idx)
+        .with_context(|| "Could not find node by idx")?
+        .clone();
+    node.set_parent(new_parent);
+    renderer.push_node(node);
+    let new_node_idx = renderer.node_idx_cursor;
+    if deep {
+        let old_children = renderer.dom_indexes.children_index.get(&node_idx).unwrap().clone();
+        for c in old_children {
+            clone_node(renderer, c, Some(new_node_idx), true)?;
+        }
+    }
+    Ok(new_node_idx)
+}
+
+#[op2(fast)]
+fn op_clone_node(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    deep: bool,
+) -> Result<u32, JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let new_node_idx = clone_node(&mut renderer, node_idx, None, deep).or_else(|err| Err(JsErrorBox::generic(err.root_cause().to_string())))?;
+    renderer.recompute_dom_indexes();
+    Ok(new_node_idx as u32)
+}
+
 #[op2(fast)]
 fn op_post_message_to_parent(
     state: &mut OpState,
@@ -3140,6 +3180,7 @@ extension!(
     op_post_message_to_parent,
     op_get_offset_y,
     op_collect_data_for_form,
+    op_clone_node,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js", "runtime_fetch.js"],
@@ -4575,24 +4616,28 @@ impl Renderer {
                         let border = RectBorder {
                             left: RectBorderSide::parse_from_style(
                                 &style.border_left,
+                                &style,
                                 resolved_font_size as u32,
                                 &available_size,
                                 &self.window_size,
                             ),
                             top: RectBorderSide::parse_from_style(
                                 &style.border_top,
+                                &style,
                                 resolved_font_size as u32,
                                 &available_size,
                                 &self.window_size,
                             ),
                             right: RectBorderSide::parse_from_style(
                                 &style.border_right,
+                                &style,
                                 resolved_font_size as u32,
                                 &available_size,
                                 &self.window_size,
                             ),
                             bottom: RectBorderSide::parse_from_style(
                                 &style.border_bottom,
+                                &style,
                                 resolved_font_size as u32,
                                 &available_size,
                                 &self.window_size,
@@ -6950,11 +6995,17 @@ impl Browser {
             match &js.content {
                 ScriptContent::Code(code) => {
                     let code_context: String = code.chars().take(40).collect();
-                    runtime.execute_script(
+                    let result = runtime.execute_script(
                         format!("injected code {} ({})", idx, code_context),
                         code.clone(),
-                    )?;
-                    Self::drain_microtasks(&mut runtime);
+                    );
+                    match result {
+                        Ok(_) => Self::drain_microtasks(&mut runtime),
+                        Err(err) => eprintln!(
+                            "Failed to execute JS with error: {}",
+                            err
+                        ),
+                    };
                 }
                 ScriptContent::Link(link) => {
                     let base = ReqwestUrl::parse(&self.url)?;
@@ -6974,7 +7025,7 @@ impl Browser {
                             match result {
                                 Ok(_) => Self::drain_microtasks(&mut runtime),
                                 Err(err) => eprintln!(
-                                    "Failed to execute JS at {} with error: {:?}",
+                                    "Failed to execute JS at {} with error: {}",
                                     link, err
                                 ),
                             };
@@ -7006,7 +7057,7 @@ impl Browser {
                                 .await
                                 .inspect_err(|err| {
                                     eprintln!(
-                                        "Failed to execute JS at {} with error: {:?}",
+                                        "Failed to execute JS at {} with error: {}",
                                         url, err
                                     )
                                 });
@@ -7888,7 +7939,7 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://slack.com/".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://nodejs.org/en".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging);
 
@@ -8289,6 +8340,22 @@ mod tests {
         let mut buffer = vec![0; 1920 * 2160];
         browser.render_into(&mut buffer, 1920, 2160, true);
         ensure_snapshot_matches(&buffer, "slackcom", 1920, 2160)
+    }
+
+    #[test]
+    fn render_nodejs() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut browser = Browser::new("https://nodejs.org/en".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(
+            params,
+            PhysicalSize::new(1920, 2160),
+            RendererProxy::FrameLoop(tx),
+        )?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 2160];
+        browser.render_into(&mut buffer, 1920, 2160, true);
+        ensure_snapshot_matches(&buffer, "nodejsorg", 1920, 2160)
     }
 
     #[test]

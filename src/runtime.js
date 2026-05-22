@@ -145,6 +145,15 @@ class BaseNode {
         return globalThis.document
     }
 
+    cloneNode(deep = false) {
+        let newNodeIdx = core.ops.op_clone_node(this.__node_idx, deep)
+        return elementFromNodeIdx(newNodeIdx)
+    }
+
+    registerInBackend() {
+        throw new Error("registerInBackend is not implemented for this node", this)
+    }
+
     contains(other) {
         if (!other) {
             return false
@@ -394,6 +403,14 @@ class HtmlElement extends BaseNode {
 
     get children() {
         return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
+    }
+
+    get firstChild() {
+        return this.childNodes.at(0)
+    }
+
+    get lastChild() {
+        return this.childNodes.at(-1)
     }
 
     hasChildNodes() {
@@ -895,6 +912,13 @@ Object.defineProperty(globalThis, "Image", {
     writable: true,
 })
 
+Object.defineProperty(globalThis, "HTMLImageElement", {
+    value: Image,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class TemplateElement extends HtmlElement {
     // TODO: Actually return a fragment of children here
     get content() {
@@ -1111,6 +1135,15 @@ globalThis.document = {
     hasFocus() {
         return true
     },
+    implementation: {
+        createHTMLDocument() {
+            const element = new HTMLIFrameElement()
+            element.setAttribute('src', 'about:blank')
+
+            // TODO: This should return the document inside of this iframe
+            // A little unsure of how to make that work though
+        }
+    }
 };
 
 Object.defineProperty(globalThis, "setTimeout", {
@@ -1770,6 +1803,14 @@ const parent = {
 
 Object.defineProperty(globalThis, "parent", {
     value: parent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+// TODO: Actually implement this
+Object.defineProperty(globalThis, "top", {
+    value: document,
     enumerable: true,
     configurable: true,
     writable: true,

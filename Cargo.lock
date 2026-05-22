@@ -537,6 +537,7 @@ dependencies = [
  "bytes",
  "deno_core",
  "deno_crypto",
+ "deno_error",
  "deno_fetch",
  "deno_net",
  "deno_permissions",
