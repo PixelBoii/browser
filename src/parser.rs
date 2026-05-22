@@ -394,8 +394,12 @@ impl HtmlParser {
                         self.tag = "".to_string();
                     }
                     BuildPhase::TagClosing => {
-                        let curr_node = self.curr_node()?;
-                        self.node = curr_node.get_parent();
+                        let trimmed = self.tag.trim();
+                        // If self closing tags include this tag, it's already been closed, so avoid closing it again
+                        if !SELF_CLOSING_TAGS.contains(&trimmed) {
+                            let curr_node = self.curr_node()?;
+                            self.node = curr_node.get_parent();
+                        }
                         self.stage = BuildPhase::Start;
                         self.tag = "".to_string();
                     }
@@ -481,7 +485,7 @@ impl HtmlParser {
                             self.value.push(char);
                         }
                     }
-                    BuildPhase::Text | BuildPhase::CommentOpen => {
+                    BuildPhase::Text | BuildPhase::CommentOpen | BuildPhase::TagClosing => {
                         self.tag.push(char);
                     }
                     _ => {}
