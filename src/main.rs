@@ -8258,13 +8258,13 @@ mod tests {
         let params = browser.open()?;
         browser.set_up_without_event_loop(
             params,
-            PhysicalSize::new(1920, 1080),
+            PhysicalSize::new(1920, 2160),
             RendererProxy::FrameLoop(tx),
         )?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        let mut buffer = vec![0; 1920 * 1080];
-        browser.render_into(&mut buffer, 1920, 1080, true);
-        ensure_snapshot_matches(&buffer, "slackcom", 1920, 1080)
+        let mut buffer = vec![0; 1920 * 2160];
+        browser.render_into(&mut buffer, 1920, 2160, true);
+        ensure_snapshot_matches(&buffer, "slackcom", 1920, 2160)
     }
 
     #[test]
