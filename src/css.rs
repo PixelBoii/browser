@@ -63,6 +63,11 @@ pub struct MediaQuery {
 }
 
 #[derive(Debug, Clone)]
+pub struct Supports {
+    pub parent: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub enum MediaQueryCriteriaComparison {
     Is,
     MoreOrEqual,
@@ -89,6 +94,7 @@ pub enum MediaQueryCriteria {
     Screen,
     Print,
     All,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +202,8 @@ pub enum Node {
     Variable(Variable),
     Property(Property),
     PropertyDefinition(PropertyDefinition),
+    Supports(Supports),
+    SupportsNot(Supports),
 }
 
 impl Node {
@@ -207,6 +215,8 @@ impl Node {
             Node::MediaQuery(element) => element.parent,
             Node::Layer(element) => element.parent,
             Node::PropertyDefinition(element) => element.parent,
+            Node::SupportsNot(element) => element.parent,
+            Node::Supports(element) => element.parent,
         }
     }
 
@@ -218,6 +228,8 @@ impl Node {
             Node::MediaQuery(element) => element.parent = parent,
             Node::Layer(element) => element.parent = parent,
             Node::PropertyDefinition(element) => element.parent = parent,
+            Node::SupportsNot(element) => element.parent = parent,
+            Node::Supports(element) => element.parent = parent,
         }
     }
 
@@ -517,7 +529,15 @@ impl<'a> CssParser<'a> {
                 name: stripped.trim().to_string(),
                 parent: self.node,
             }));
-        } else {
+        } else if self.label.trim().starts_with("@supports not") {
+            self.nodes.push(Node::SupportsNot(Supports {
+                parent: self.node,
+            }));
+        } else if self.label.trim().starts_with("@supports") {
+            self.nodes.push(Node::Supports(Supports {
+                parent: self.node,
+            }));
+        } else if self.label.trim().starts_with("@media") {
             let name = self
                 .label
                 .trim()
@@ -529,6 +549,11 @@ impl<'a> CssParser<'a> {
 
             self.nodes.push(Node::MediaQuery(MediaQuery {
                 criterias,
+                parent: self.node,
+            }));
+        } else {
+            self.nodes.push(Node::MediaQuery(MediaQuery {
+                criterias: vec![MediaQueryCriteria::Unsupported],
                 parent: self.node,
             }));
         }

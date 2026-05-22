@@ -129,6 +129,7 @@ pub struct StyleSizeAndColor {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridColumnSize {
     Px(i32),
+    Rem(f32),
     Percent(f32),
     Fraction(i32),
 }
@@ -698,6 +699,13 @@ fn parse_grid_size(value: String) -> Result<GridColumnSize> {
             .trim();
         return Ok(GridColumnSize::Px(parse_size_number(px)? as i32));
     }
+    if value.ends_with("rem") {
+        let rem = value
+            .strip_suffix("rem")
+            .with_context(|| "Failed to strip rem")?
+            .trim();
+        return Ok(GridColumnSize::Rem(parse_size_number(rem)?));
+    }
     if value.ends_with("fr") {
         let fr = value
             .strip_suffix("fr")
@@ -833,6 +841,7 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
             MediaQueryCriteria::Screen => true,
             MediaQueryCriteria::Print => false,
             MediaQueryCriteria::All => true,
+            MediaQueryCriteria::Unsupported => false,
         }
     })
 }
@@ -1145,8 +1154,8 @@ pub fn resolve_node_variables<'nodes, 'css>(
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
     match value {
         "auto" => StyleJustifyContent::Auto,
-        "normal" | "start" | "left" | "flex-start" => StyleJustifyContent::FlexStart,
-        "end" | "right" | "flex-end" => StyleJustifyContent::FlexEnd,
+        "normal" | "start" | "left" | "self-start" | "flex-start" => StyleJustifyContent::FlexStart,
+        "end" | "right" | "self-end" | "flex-end" => StyleJustifyContent::FlexEnd,
         "center" => StyleJustifyContent::Center,
         "space-between" => StyleJustifyContent::SpaceBetween,
         "space-around" => StyleJustifyContent::SpaceAround,

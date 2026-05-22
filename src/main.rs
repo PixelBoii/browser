@@ -1485,8 +1485,8 @@ fn narrow_elements_by_ancestors(
                 return false;
             }
         }
-        // Layers always pass through, they just affect sorting
-        CssNode::Layer(_) => {
+        // Layers and supports always pass through, they just affect sorting
+        CssNode::Layer(_) | CssNode::Supports(_) => {
             return move_up_ancestor_chain(
                 element,
                 html_nodes,
@@ -1887,8 +1887,8 @@ fn search_elements_for_css_nodes(
                     }
                 }
             }
-            // Layers always pass through, they just affect sorting
-            CssNode::Layer(_) => {
+            // Layers and supports always pass through, they just affect sorting
+            CssNode::Layer(_) | CssNode::Supports(_) => {
                 let elements: Vec<&usize> = html_nodes
                     .iter()
                     .filter_map(|(idx, node)| match node {
@@ -4234,7 +4234,11 @@ impl Renderer {
                 ))
             }
             Node::Element(element) => {
-                if element.tag == "svg" || element.tag == "img" || element.tag == "canvas" {
+                if element.tag == "svg"
+                    || element.tag == "img"
+                    || element.tag == "video"
+                    || element.tag == "canvas"
+                {
                     let style = self.node_styles.get(&node_idx).unwrap().clone();
                     if let StyleDisplay::None = style.display {
                         return None;
@@ -4335,8 +4339,12 @@ impl Renderer {
                                 Ok(res) => res,
                             }
                         }
-                        "img" => {
-                            let src = element.attributes.get("src")?;
+                        "img" | "video" => {
+                            let src = if element.tag == "video" {
+                                element.attributes.get("poster")?
+                            } else {
+                                element.attributes.get("src")?
+                            };
                             if src.starts_with("data:") {
                                 if let Some(data) = src.strip_prefix("data:image/svg+xml,") {
                                     let mut decoded = percent_encoding::percent_decode_str(data)
@@ -4397,6 +4405,8 @@ impl Renderer {
                                             max_h,
                                         )
                                         .unwrap();
+                                        let (target_h, target_w) =
+                                            (target_h.max(1), target_w.max(1));
                                         if *mode == LayoutMode::Complete {
                                             let pixmap = rasterize_jpeg(
                                                 &mut self.cached_rasterizations,
@@ -5091,6 +5101,7 @@ impl Renderer {
                     GridTemplateColumnsValue::Size(size) => {
                         definitely_used_width += match size {
                             GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Rem(rem) => (rem * 16.) as i32,
                             GridColumnSize::Percent(percent) => {
                                 (container_sizes.inner_width as f32 * (*percent / 100.)) as i32
                             }
@@ -5136,6 +5147,7 @@ impl Renderer {
                     match &template_columns[current_column as usize] {
                         GridTemplateColumnsValue::Size(size) => match size {
                             GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Rem(rem) => (rem * 16.) as i32,
                             GridColumnSize::Percent(percent) => {
                                 (width_to_distribute as f32 * (*percent / 100.)) as i32
                             }
@@ -5148,6 +5160,7 @@ impl Renderer {
                         GridTemplateColumnsValue::MinMax((min, max)) => {
                             let min_parsed = match min {
                                 GridColumnSize::Px(px) => *px,
+                                GridColumnSize::Rem(rem) => (rem * 16.) as i32,
                                 GridColumnSize::Percent(percent) => {
                                     (width_to_distribute as f32 * (*percent / 100.)) as i32
                                 }
@@ -5155,6 +5168,7 @@ impl Renderer {
                             };
                             let max_parsed = match max {
                                 GridColumnSize::Px(px) => *px,
+                                GridColumnSize::Rem(rem) => (rem * 16.) as i32,
                                 GridColumnSize::Percent(percent) => {
                                     (width_to_distribute as f32 * (*percent / 100.)) as i32
                                 }
