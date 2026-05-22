@@ -437,6 +437,7 @@ const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 3] = [
 ];
 
 pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
+    let name = name.trim().strip_prefix("only ").unwrap_or(name.trim());
     let criterias: Vec<MediaQueryCriteria> = name
         .split("and")
         .filter_map(|mut l| {
@@ -615,6 +616,9 @@ impl<'a> CssParser<'a> {
         for char in chars {
             match char {
                 '@' => match self.stage {
+                    CssBuildPhase::Specifier if self.in_url => {
+                        self.label.push(char);
+                    }
                     CssBuildPhase::Start | CssBuildPhase::Specifier => {
                         self.label.push(char);
                         self.stage = CssBuildPhase::MediaQuery;
@@ -629,7 +633,9 @@ impl<'a> CssParser<'a> {
                             self.stage = CssBuildPhase::Specifier;
                             self.label.push(char);
                         }
-                        _ => {}
+                        CssBuildPhase::MediaQuery => {
+                            self.label.push(char);
+                        }
                     };
                 }
                 ' ' => {

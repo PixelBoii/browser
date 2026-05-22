@@ -8,7 +8,9 @@ use winit::dpi::PhysicalSize;
 
 use crate::VariableDefinitions;
 use crate::css::{
-    BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteria, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, VariableTemplatePart, unquote
+    BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteria,
+    MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue,
+    StyleComplexBackground, Variable, VariableTemplatePart, unquote,
 };
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
@@ -37,6 +39,11 @@ pub enum StyleSize {
     Vh(i32),
     Svh(i32),
     Vw(i32),
+    Clamp {
+        min: Box<StyleSize>,
+        value: Box<StyleSize>,
+        max: Box<StyleSize>,
+    },
     Calc(Vec<CalcExpression>),
 }
 
@@ -73,6 +80,7 @@ pub enum StyleJustifyContent {
     FlexEnd,
     Center,
     SpaceBetween,
+    SpaceAround,
     Stretch,
     SpaceEvenly,
 }
@@ -121,6 +129,7 @@ pub struct StyleSizeAndColor {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridColumnSize {
     Px(i32),
+    Percent(f32),
     Fraction(i32),
 }
 
@@ -508,7 +517,11 @@ fn add_part_to_calc(parts: &mut Vec<CalcExpression>, part: CalcExpression, nesti
     }
 }
 
-fn flush_calc_value(buffer: &mut String, parts: &mut Vec<CalcExpression>, nesting: i32) -> Result<()> {
+fn flush_calc_value(
+    buffer: &mut String,
+    parts: &mut Vec<CalcExpression>,
+    nesting: i32,
+) -> Result<()> {
     if buffer.len() > 0 {
         let size = parse_style_size(buffer.clone())?;
         buffer.clear();
@@ -558,9 +571,28 @@ fn parse_size_number(value: &str) -> Result<f32> {
         .with_context(|| format!("Failed to parse size value: {}", value))?)
 }
 
+fn parse_clamp_size_part(value: &str) -> Result<StyleSize> {
+    let value = value.trim();
+    if value.contains(' ') || value.contains('+') || value.contains('*') || value.contains('/') {
+        parse_calc(value)
+    } else {
+        parse_style_size(value.to_string())
+    }
+}
+
 fn parse_style_size(value: String) -> Result<StyleSize> {
     if value == "auto" {
         return Ok(StyleSize::Auto);
+    }
+    if let Some(value) = strip_prefix_and_suffix(&value, "clamp(", ")") {
+        let parts = split_ignoring_parentheses(value.to_string(), ',', &[]);
+        if parts.len() == 3 {
+            return Ok(StyleSize::Clamp {
+                min: Box::new(parse_clamp_size_part(&parts[0])?),
+                value: Box::new(parse_clamp_size_part(&parts[1])?),
+                max: Box::new(parse_clamp_size_part(&parts[2])?),
+            });
+        }
     }
     if let Some(value) = value.strip_prefix("calc(") {
         if let Some(value) = value.strip_suffix(")") {
@@ -652,6 +684,13 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
 }
 
 fn parse_grid_size(value: String) -> Result<GridColumnSize> {
+    if value.ends_with("%") {
+        let percentage = value
+            .strip_suffix("%")
+            .with_context(|| "Failed to strip percentage")?
+            .trim();
+        return Ok(GridColumnSize::Percent(parse_size_number(percentage)?));
+    }
     if value.ends_with("px") {
         let px = value
             .strip_suffix("px")
@@ -740,22 +779,32 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
     query.criterias.iter().all(|q| {
         match q {
             // Media queries REM are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
-            MediaQueryCriteria::Feature(feature) => match (feature.property.as_str(), feature.comparison.clone(), feature.value.clone()) {
+            MediaQueryCriteria::Feature(feature) => match (
+                feature.property.as_str(),
+                feature.comparison.clone(),
+                feature.value.clone(),
+            ) {
                 // Default to dark mode
                 (
                     "prefers-color-scheme",
                     MediaQueryCriteriaComparison::Is,
                     MediaQueryCriteriaValue::String(value),
                 ) => value == "dark",
-                ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
-                    window_size.width >= px as u32
-                }
-                ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Rem(rem)) => {
-                    window_size.width >= rem as u32 * 16
-                }
-                ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
-                    window_size.width < px as u32
-                }
+                (
+                    "min-width",
+                    MediaQueryCriteriaComparison::Is,
+                    MediaQueryCriteriaValue::Px(px),
+                ) => window_size.width >= px as u32,
+                (
+                    "min-width",
+                    MediaQueryCriteriaComparison::Is,
+                    MediaQueryCriteriaValue::Rem(rem),
+                ) => window_size.width >= rem as u32 * 16,
+                (
+                    "max-width",
+                    MediaQueryCriteriaComparison::Is,
+                    MediaQueryCriteriaValue::Px(px),
+                ) => window_size.width < px as u32,
                 (
                     "width",
                     MediaQueryCriteriaComparison::MoreOrEqual,
@@ -783,7 +832,7 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
             },
             MediaQueryCriteria::Screen => true,
             MediaQueryCriteria::Print => false,
-            MediaQueryCriteria::All => true
+            MediaQueryCriteria::All => true,
         }
     })
 }
@@ -1096,10 +1145,11 @@ pub fn resolve_node_variables<'nodes, 'css>(
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
     match value {
         "auto" => StyleJustifyContent::Auto,
-        "normal" | "start" | "flex-start" => StyleJustifyContent::FlexStart,
-        "end" | "flex-end" => StyleJustifyContent::FlexEnd,
+        "normal" | "start" | "left" | "flex-start" => StyleJustifyContent::FlexStart,
+        "end" | "right" | "flex-end" => StyleJustifyContent::FlexEnd,
         "center" => StyleJustifyContent::Center,
         "space-between" => StyleJustifyContent::SpaceBetween,
+        "space-around" => StyleJustifyContent::SpaceAround,
         "stretch" => StyleJustifyContent::Stretch,
         "space-evenly" => StyleJustifyContent::SpaceEvenly,
         _ => {

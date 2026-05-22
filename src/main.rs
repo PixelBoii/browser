@@ -553,6 +553,13 @@ fn get_specified_size(
         StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
+        StyleSize::Clamp { min, value, max } => {
+            let min = get_specified_size(font_size, min, available_size, auto_size, window_size)?;
+            let value =
+                get_specified_size(font_size, value, available_size, auto_size, window_size)?;
+            let max = get_specified_size(font_size, max, available_size, auto_size, window_size)?;
+            Some(value.min(max).max(min))
+        }
         StyleSize::Calc(calc) => {
             solve_calc(calc, font_size, available_size, auto_size, window_size)
         }
@@ -583,16 +590,12 @@ fn solve_calc(
             _ => panic!("Expected calc expression to be operator"),
         };
         let loop_value = match &calc[exp_idx + 1] {
-            CalcExpression::Size(size) => get_specified_size(
-                font_size,
-                &size,
-                available_size,
-                auto_size,
-                window_size,
-            )?,
+            CalcExpression::Size(size) => {
+                get_specified_size(font_size, &size, available_size, auto_size, window_size)?
+            }
             CalcExpression::Nesting(nesting) => {
                 solve_calc(nesting, font_size, available_size, auto_size, window_size)?
-            },
+            }
             _ => panic!(
                 "Expected calc expression to be size. Got: {:?} [{}]",
                 calc,
@@ -1396,23 +1399,24 @@ fn narrow_elements_by_ancestors(
                     .enumerate()
                     .filter(|idx| *idx.1 != element && html_nodes.contains_key(idx.1))
                     .any(|(sibling_pos, sibling_idx)| {
-                        sibling_pos < pos && move_up_class_part(
-                            *sibling_idx,
-                            css_nodes,
-                            html_nodes,
-                            class_elements,
-                            parts,
-                            css_node,
-                            nested_part_idx,
-                            name_part_idx,
-                            window_size,
-                            false,
-                            false,
-                            dom_indexes,
-                            hovering_chain,
-                            hovering_has_impact,
-                        )
-                    })
+                        sibling_pos < pos
+                            && move_up_class_part(
+                                *sibling_idx,
+                                css_nodes,
+                                html_nodes,
+                                class_elements,
+                                parts,
+                                css_node,
+                                nested_part_idx,
+                                name_part_idx,
+                                window_size,
+                                false,
+                                false,
+                                dom_indexes,
+                                hovering_chain,
+                                hovering_has_impact,
+                            )
+                    });
             };
             let walk_result = walk_for_html_match(
                 element,
@@ -1703,7 +1707,14 @@ fn search_elements_for_css_nodes(
                                         });
                                         let css_nodes = vec![class];
                                         let css_nodes = css_nodes.iter().enumerate().collect();
-                                        search_elements_for_css_nodes(to_resolve, &css_nodes, html_nodes, window_size, dom_indexes, hovering_chain)
+                                        search_elements_for_css_nodes(
+                                            to_resolve,
+                                            &css_nodes,
+                                            html_nodes,
+                                            window_size,
+                                            dom_indexes,
+                                            hovering_chain,
+                                        )
                                     };
                                     let elements = html_nodes
                                         .iter()
@@ -1810,7 +1821,11 @@ fn search_elements_for_css_nodes(
                                 )
                             } else {
                                 let next_class_part = &parts[parts.len() - 2];
-                                let next_el = if walk_into_part(next_class_part) { get_parent_html_idx(el, &html_nodes) } else { Some(el) };
+                                let next_el = if walk_into_part(next_class_part) {
+                                    get_parent_html_idx(el, &html_nodes)
+                                } else {
+                                    Some(el)
+                                };
                                 if let Some(next_el) = next_el {
                                     narrow_elements_by_ancestors(
                                         next_el,
@@ -5076,6 +5091,9 @@ impl Renderer {
                     GridTemplateColumnsValue::Size(size) => {
                         definitely_used_width += match size {
                             GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Percent(percent) => {
+                                (container_sizes.inner_width as f32 * (*percent / 100.)) as i32
+                            }
                             GridColumnSize::Fraction(fraction) => {
                                 max_total_fractions += fraction;
                                 0
@@ -5118,6 +5136,9 @@ impl Renderer {
                     match &template_columns[current_column as usize] {
                         GridTemplateColumnsValue::Size(size) => match size {
                             GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Percent(percent) => {
+                                (width_to_distribute as f32 * (*percent / 100.)) as i32
+                            }
                             GridColumnSize::Fraction(fraction) => {
                                 (dynamic_space_to_give as f32
                                     * (*fraction as f32 / max_total_fractions as f32))
@@ -5127,10 +5148,16 @@ impl Renderer {
                         GridTemplateColumnsValue::MinMax((min, max)) => {
                             let min_parsed = match min {
                                 GridColumnSize::Px(px) => *px,
+                                GridColumnSize::Percent(percent) => {
+                                    (width_to_distribute as f32 * (*percent / 100.)) as i32
+                                }
                                 GridColumnSize::Fraction(_) => panic!(),
                             };
                             let max_parsed = match max {
                                 GridColumnSize::Px(px) => *px,
+                                GridColumnSize::Percent(percent) => {
+                                    (width_to_distribute as f32 * (*percent / 100.)) as i32
+                                }
                                 GridColumnSize::Fraction(fraction) => {
                                     (dynamic_space_to_give as f32
                                         * (*fraction as f32 / max_total_fractions as f32))
@@ -5138,8 +5165,7 @@ impl Renderer {
                                 }
                             };
 
-                            // TODO: Take min into account
-                            max_parsed
+                            max_parsed.max(min_parsed)
                         }
                     }
                 } else {
@@ -5521,6 +5547,7 @@ impl Renderer {
             StyleJustifyContent::FlexEnd => cross_free_space,
             StyleJustifyContent::Center => cross_free_space / 2,
             StyleJustifyContent::SpaceBetween => 0,
+            StyleJustifyContent::SpaceAround => 0,
             StyleJustifyContent::Stretch => 0,
             StyleJustifyContent::SpaceEvenly => 0,
         };
@@ -5810,6 +5837,11 @@ impl Renderer {
                 (0, main_free_space / (base_items.len() as u32 - 1))
             }
             StyleJustifyContent::SpaceBetween => (0, 0),
+            StyleJustifyContent::SpaceAround if !base_items.is_empty() => {
+                let slot = main_free_space / base_items.len() as u32;
+                (slot / 2, slot)
+            }
+            StyleJustifyContent::SpaceAround => (0, 0),
             StyleJustifyContent::SpaceEvenly if !base_items.is_empty() => {
                 let slot = main_free_space / (base_items.len() as u32 + 1);
                 (slot, slot)
@@ -6917,7 +6949,10 @@ impl Browser {
                             let result = runtime.execute_script(url.to_string(), code);
                             match result {
                                 Ok(_) => Self::drain_microtasks(&mut runtime),
-                                Err(err) => eprintln!("Failed to execute JS at {} with error: {:?}", link, err),
+                                Err(err) => eprintln!(
+                                    "Failed to execute JS at {} with error: {:?}",
+                                    link, err
+                                ),
                             };
                         }
                         ScriptType::Module => {
@@ -6945,7 +6980,12 @@ impl Browser {
                             let _ = runtime
                                 .with_event_loop_promise(result, Default::default())
                                 .await
-                                .inspect_err(|err| eprintln!("Failed to execute JS at {} with error: {:?}", url, err));
+                                .inspect_err(|err| {
+                                    eprintln!(
+                                        "Failed to execute JS at {} with error: {:?}",
+                                        url, err
+                                    )
+                                });
                         }
                     }
                 }
@@ -7824,10 +7864,7 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new(
-        "https://slack.com/".to_string(),
-        hover_debugging,
-    );
+    let mut browser = Browser::new("https://slack.com/".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging);
 
@@ -8126,7 +8163,9 @@ mod tests {
 
     use crate::{
         Browser, RendererProxy, pixmaps_are_equal, rgb_buffer_to_premul_bytes,
-        style::{CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses},
+        style::{
+            CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
+        },
     };
 
     fn ensure_snapshot_matches(
@@ -8213,6 +8252,22 @@ mod tests {
     }
 
     #[test]
+    fn render_slack() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut browser = Browser::new("https://slack.com/".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(
+            params,
+            PhysicalSize::new(1920, 1080),
+            RendererProxy::FrameLoop(tx),
+        )?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        browser.render_into(&mut buffer, 1920, 1080, true);
+        ensure_snapshot_matches(&buffer, "slackcom", 1920, 1080)
+    }
+
+    #[test]
     fn splits_space_ignoring_parentheses() {
         assert_eq!(
             split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' ', &[]),
@@ -8226,17 +8281,20 @@ mod tests {
 
     #[test]
     fn test_parse_calc() -> Result<()> {
-        assert_eq!(parse_calc("15px * 4rem + (4px + 2em)")?, StyleSize::Calc(vec![
-            CalcExpression::Size(StyleSize::Px(15.)),
-            CalcExpression::Operator(StyleCalcOperator::Multiply),
-            CalcExpression::Size(StyleSize::Rem(4.)),
-            CalcExpression::Operator(StyleCalcOperator::Plus),
-            CalcExpression::Nesting(vec![
-                CalcExpression::Size(StyleSize::Px(4.)),
+        assert_eq!(
+            parse_calc("15px * 4rem + (4px + 2em)")?,
+            StyleSize::Calc(vec![
+                CalcExpression::Size(StyleSize::Px(15.)),
+                CalcExpression::Operator(StyleCalcOperator::Multiply),
+                CalcExpression::Size(StyleSize::Rem(4.)),
                 CalcExpression::Operator(StyleCalcOperator::Plus),
-                CalcExpression::Size(StyleSize::Em(2.)),
-            ]),
-        ]));
+                CalcExpression::Nesting(vec![
+                    CalcExpression::Size(StyleSize::Px(4.)),
+                    CalcExpression::Operator(StyleCalcOperator::Plus),
+                    CalcExpression::Size(StyleSize::Em(2.)),
+                ]),
+            ])
+        );
         Ok(())
     }
 }
