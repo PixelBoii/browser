@@ -45,6 +45,7 @@ pub enum StyleSize {
         max: Box<StyleSize>,
     },
     Calc(Vec<CalcExpression>),
+    FitContent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -584,6 +585,9 @@ fn parse_clamp_size_part(value: &str) -> Result<StyleSize> {
 fn parse_style_size(value: String) -> Result<StyleSize> {
     if value == "auto" {
         return Ok(StyleSize::Auto);
+    }
+    if value == "fit-content" {
+        return Ok(StyleSize::FitContent);
     }
     if let Some(value) = strip_prefix_and_suffix(&value, "clamp(", ")") {
         let parts = split_ignoring_parentheses(value.to_string(), ',', &[]);

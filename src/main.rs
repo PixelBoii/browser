@@ -566,6 +566,7 @@ fn get_specified_size(
         StyleSize::Em(em) => Some((*em * font_size as f32) as i32),
         // TODO: This should actually be the font-size of the root element, so figure that out
         StyleSize::Rem(rem) => Some((*rem * 16 as f32) as i32),
+        StyleSize::FitContent => None,
     }
 }
 
@@ -4251,6 +4252,7 @@ impl Renderer {
                         },
                         &style,
                         &available_size,
+                        containing_node_idx,
                     );
                     let (containing_block_height, containing_block_width) =
                         self.get_containing_block_size(containing_node_idx, node_idx, &style);
@@ -4610,6 +4612,7 @@ impl Renderer {
                                 },
                                 &style,
                                 &available_size,
+                                containing_node_idx,
                             );
                             let _ = self
                                 .resolve_background_data_url(
@@ -4876,18 +4879,21 @@ impl Renderer {
         forced_size: &OptionalSize,
         style: &Style,
         available_size: &Size,
+        containing_node_idx: usize,
     ) -> ContainerSizes {
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
-            self.get_paddings(node_idx, style, *available_size);
+            self.get_paddings(node_idx, style, containing_node_idx);
         let (border_left_size, border_right_size, border_top_size, border_bottom_size) =
-            self.get_border_sizes(node_idx, style, *available_size);
+            self.get_border_sizes(node_idx, style, containing_node_idx);
 
+        let (containing_block_height, containing_block_width) =
+            self.get_containing_block_size(containing_node_idx, node_idx, &style);
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).unwrap();
 
         let min_height = get_specified_size(
             *resolved_font_size,
             &style.min_height,
-            Some(available_size.height),
+            containing_block_height,
             None,
             &self.window_size,
         )
@@ -4895,7 +4901,7 @@ impl Renderer {
         let max_height = get_specified_size(
             *resolved_font_size,
             &style.max_height,
-            Some(available_size.height),
+            containing_block_height,
             None,
             &self.window_size,
         )
@@ -4903,7 +4909,7 @@ impl Renderer {
         let min_width = get_specified_size(
             *resolved_font_size,
             &style.min_width,
-            Some(available_size.width),
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -4911,7 +4917,7 @@ impl Renderer {
         let max_width = get_specified_size(
             *resolved_font_size,
             &style.max_width,
-            Some(available_size.width),
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -4920,7 +4926,7 @@ impl Renderer {
         let specified_width = forced_size.width.or(get_specified_size(
             *resolved_font_size,
             &style.width,
-            Some(available_size.width),
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -4928,7 +4934,7 @@ impl Renderer {
         let specified_height = forced_size.height.or(get_specified_size(
             *resolved_font_size,
             &style.height,
-            Some(available_size.height),
+            containing_block_height,
             None,
             &self.window_size,
         )
@@ -5041,7 +5047,7 @@ impl Renderer {
     ) -> Option<(u32, u32, Vec<usize>, u32)> {
         let style = self.node_styles.get(&node_idx).unwrap();
         let container_sizes =
-            self.get_container_sizes(node_idx, &forced_size, style, &available_size);
+            self.get_container_sizes(node_idx, &forced_size, style, &available_size, containing_node_idx);
         if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
             self.containing_nodes.insert(
                 node_idx,
@@ -5054,7 +5060,7 @@ impl Renderer {
         }
         let mut children = vec![];
         let (padding_left_size, _, padding_top_size, _) =
-            self.get_paddings(node_idx, style, available_size);
+            self.get_paddings(node_idx, style, containing_node_idx);
         let mut content_position = Position {
             x: cursor.x + padding_left_size as i32,
             y: cursor.y + padding_top_size as i32,
@@ -5294,7 +5300,7 @@ impl Renderer {
     ) -> Option<(u32, u32, Vec<usize>, u32)> {
         let style = self.node_styles.get(&node_idx).unwrap();
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
-            self.get_paddings(node_idx, style, available_size);
+            self.get_paddings(node_idx, style, containing_node_idx);
 
         let mut content_position = Position {
             x: cursor.x + padding_left_size as i32,
@@ -5337,7 +5343,7 @@ impl Renderer {
         }
 
         let container_sizes =
-            self.get_container_sizes(node_idx, &forced_size, style, &available_size);
+            self.get_container_sizes(node_idx, &forced_size, style, &available_size, containing_node_idx);
 
         let children_idxs: Vec<usize> = self
             .dom_indexes
@@ -5613,7 +5619,7 @@ impl Renderer {
             .unwrap()
             .clone_without_variables();
         let (padding_left_size, padding_right_size, padding_top_size, padding_bottom_size) =
-            self.get_paddings(node_idx, &style, available_size);
+            self.get_paddings(node_idx, &style, containing_node_idx);
 
         let mut content_position = Position {
             x: cursor.x + padding_left_size as i32,
@@ -5626,7 +5632,7 @@ impl Renderer {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
         let container_sizes =
-            self.get_container_sizes(node_idx, &forced_size, &style, &available_size);
+            self.get_container_sizes(node_idx, &forced_size, &style, &available_size, containing_node_idx);
         let (containing_block_height, containing_block_width) =
             self.get_containing_block_size(containing_node_idx, node_idx, &style);
 
@@ -6513,13 +6519,15 @@ impl Renderer {
         &self,
         node_idx: usize,
         style: &Style,
-        available_size: Size,
+        containing_node_idx: usize,
     ) -> (i32, i32, i32, i32) {
+        let (containing_block_height, containing_block_width) =
+            self.get_containing_block_size(containing_node_idx, node_idx, &style);
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let padding_left_size = get_specified_size(
             font_size,
             &style.padding_left,
-            Some(available_size.width),
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -6527,7 +6535,7 @@ impl Renderer {
         let padding_right_size = get_specified_size(
             font_size,
             &style.padding_right,
-            Some(available_size.width),
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -6535,7 +6543,7 @@ impl Renderer {
         let padding_top_size = get_specified_size(
             font_size,
             &style.padding_top,
-            Some(available_size.height),
+            containing_block_height,
             None,
             &self.window_size,
         )
@@ -6543,7 +6551,7 @@ impl Renderer {
         let padding_bottom_size = get_specified_size(
             font_size,
             &style.padding_bottom,
-            Some(available_size.height),
+            containing_block_height,
             None,
             &self.window_size,
         )
@@ -6561,14 +6569,16 @@ impl Renderer {
         &self,
         node_idx: usize,
         style: &Style,
-        available_size: Size,
+        containing_node_idx: usize,
     ) -> (i32, i32, i32, i32) {
+        let (containing_block_height, containing_block_width) =
+            self.get_containing_block_size(containing_node_idx, node_idx, &style);
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let left_size = if style.border_left.style == StyleBorderStyle::Solid {
             get_specified_size(
                 font_size,
                 &style.border_left.size,
-                Some(available_size.width),
+                containing_block_width,
                 None,
                 &self.window_size,
             )
@@ -6580,7 +6590,7 @@ impl Renderer {
             get_specified_size(
                 font_size,
                 &style.border_right.size,
-                Some(available_size.width),
+                containing_block_width,
                 None,
                 &self.window_size,
             )
@@ -6592,7 +6602,7 @@ impl Renderer {
             get_specified_size(
                 font_size,
                 &style.border_top.size,
-                Some(available_size.height),
+                containing_block_height,
                 None,
                 &self.window_size,
             )
@@ -6604,7 +6614,7 @@ impl Renderer {
             get_specified_size(
                 font_size,
                 &style.border_bottom.size,
-                Some(available_size.height),
+                containing_block_height,
                 None,
                 &self.window_size,
             )
