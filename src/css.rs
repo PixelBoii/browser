@@ -77,10 +77,18 @@ pub enum MediaQueryCriteriaValue {
 }
 
 #[derive(Debug, Clone)]
-pub struct MediaQueryCriteria {
+pub struct MediaQueryCriteriaFeature {
     pub property: String,
     pub value: MediaQueryCriteriaValue,
     pub comparison: MediaQueryCriteriaComparison,
+}
+
+#[derive(Debug, Clone)]
+pub enum MediaQueryCriteria {
+    Feature(MediaQueryCriteriaFeature),
+    Screen,
+    Print,
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -432,6 +440,15 @@ pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
     let criterias: Vec<MediaQueryCriteria> = name
         .split("and")
         .filter_map(|mut l| {
+            if l.trim() == "all" {
+                return Some(MediaQueryCriteria::All);
+            }
+            if l.trim() == "screen" {
+                return Some(MediaQueryCriteria::Screen);
+            }
+            if l.trim() == "print" {
+                return Some(MediaQueryCriteria::Print);
+            }
             l = l.strip_prefix("(").unwrap_or(&l);
             l = l.strip_suffix(")").unwrap_or(&l);
             let trimmed = l.trim().to_string();
@@ -450,11 +467,11 @@ pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
                         }
                     }
 
-                    return Some(MediaQueryCriteria {
+                    return Some(MediaQueryCriteria::Feature(MediaQueryCriteriaFeature {
                         property: parts[0].trim().to_string(),
                         value,
                         comparison,
-                    });
+                    }));
                 }
             }
             println!("Invalid media query: {:?}", trimmed);

@@ -8,9 +8,7 @@ use winit::dpi::PhysicalSize;
 
 use crate::VariableDefinitions;
 use crate::css::{
-    BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteriaComparison,
-    MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground,
-    Variable, VariableTemplatePart, unquote,
+    BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteria, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue, StyleComplexBackground, Variable, VariableTemplatePart, unquote
 };
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
@@ -740,48 +738,52 @@ pub fn build_css_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, V
 
 pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) -> bool {
     query.criterias.iter().all(|q| {
-        // TODO: Implement more + handle q.comparison
-        // Media queries REM are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
-        match (q.property.as_str(), q.comparison.clone(), q.value.clone()) {
-            // Default to dark mode
-            (
-                "prefers-color-scheme",
-                MediaQueryCriteriaComparison::Is,
-                MediaQueryCriteriaValue::String(value),
-            ) => value == "dark",
-            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
-                window_size.width >= px as u32
-            }
-            ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Rem(rem)) => {
-                window_size.width >= rem as u32 * 16
-            }
-            ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
-                window_size.width < px as u32
-            }
-            (
-                "width",
-                MediaQueryCriteriaComparison::MoreOrEqual,
-                MediaQueryCriteriaValue::Px(px),
-            ) => window_size.width >= px as u32,
-            (
-                "width",
-                MediaQueryCriteriaComparison::MoreOrEqual,
-                MediaQueryCriteriaValue::Rem(rem),
-            ) => window_size.width >= rem as u32 * 16,
-            (
-                "width",
-                MediaQueryCriteriaComparison::LessOrEqual,
-                MediaQueryCriteriaValue::Px(px),
-            ) => window_size.width <= px as u32,
-            (
-                "width",
-                MediaQueryCriteriaComparison::LessOrEqual,
-                MediaQueryCriteriaValue::Rem(rem),
-            ) => window_size.width <= rem as u32 * 16,
-            (_, _, _) => {
-                // println!("Unsupported media query property: {} {:?} {:?}", p, c, v);
-                false
-            }
+        match q {
+            // Media queries REM are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16
+            MediaQueryCriteria::Feature(feature) => match (feature.property.as_str(), feature.comparison.clone(), feature.value.clone()) {
+                // Default to dark mode
+                (
+                    "prefers-color-scheme",
+                    MediaQueryCriteriaComparison::Is,
+                    MediaQueryCriteriaValue::String(value),
+                ) => value == "dark",
+                ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
+                    window_size.width >= px as u32
+                }
+                ("min-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Rem(rem)) => {
+                    window_size.width >= rem as u32 * 16
+                }
+                ("max-width", MediaQueryCriteriaComparison::Is, MediaQueryCriteriaValue::Px(px)) => {
+                    window_size.width < px as u32
+                }
+                (
+                    "width",
+                    MediaQueryCriteriaComparison::MoreOrEqual,
+                    MediaQueryCriteriaValue::Px(px),
+                ) => window_size.width >= px as u32,
+                (
+                    "width",
+                    MediaQueryCriteriaComparison::MoreOrEqual,
+                    MediaQueryCriteriaValue::Rem(rem),
+                ) => window_size.width >= rem as u32 * 16,
+                (
+                    "width",
+                    MediaQueryCriteriaComparison::LessOrEqual,
+                    MediaQueryCriteriaValue::Px(px),
+                ) => window_size.width <= px as u32,
+                (
+                    "width",
+                    MediaQueryCriteriaComparison::LessOrEqual,
+                    MediaQueryCriteriaValue::Rem(rem),
+                ) => window_size.width <= rem as u32 * 16,
+                (_, _, _) => {
+                    // println!("Unsupported media query property: {} {:?} {:?}", p, c, v);
+                    false
+                }
+            },
+            MediaQueryCriteria::Screen => true,
+            MediaQueryCriteria::Print => false,
+            MediaQueryCriteria::All => true
         }
     })
 }
