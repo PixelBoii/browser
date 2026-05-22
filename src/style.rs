@@ -843,6 +843,13 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
                     false
                 }
             },
+            MediaQueryCriteria::NotAllAnd(criterias) => !media_query_matches(
+                &MediaQuery {
+                    criterias: criterias.clone(),
+                    parent: None,
+                },
+                window_size,
+            ),
             MediaQueryCriteria::Screen => true,
             MediaQueryCriteria::Print => false,
             MediaQueryCriteria::All => true,

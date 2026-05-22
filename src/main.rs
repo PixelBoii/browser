@@ -1123,6 +1123,7 @@ fn move_up_ancestor_chain(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
 ) -> bool {
     let parent = css_node.get_parent();
     if let Some(parent) = parent {
@@ -1151,6 +1152,7 @@ fn move_up_ancestor_chain(
                         dom_indexes,
                         hovering_chain,
                         hovering_has_impact,
+                        precomputed_selectors,
                     );
                 }
             }
@@ -1171,6 +1173,7 @@ fn move_up_ancestor_chain(
                 dom_indexes,
                 hovering_chain,
                 hovering_has_impact,
+                precomputed_selectors,
             );
         }
     } else {
@@ -1194,6 +1197,7 @@ fn move_up_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>
 ) -> bool {
     let node = css_nodes[css_node].1;
     // If we've reached the beginning, that means this node is done, so move up the chain
@@ -1210,6 +1214,7 @@ fn move_up_class_part(
             dom_indexes,
             hovering_chain,
             hovering_has_impact,
+            precomputed_selectors,
         );
     } else {
         let class_name = match node {
@@ -1237,6 +1242,7 @@ fn move_up_class_part(
                 dom_indexes,
                 hovering_chain,
                 hovering_has_impact,
+                precomputed_selectors,
             );
         } else {
             return false;
@@ -1278,6 +1284,7 @@ fn element_matches_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
 ) -> bool {
     match part {
         ClassNamePart::Class(class) => {
@@ -1299,18 +1306,18 @@ fn element_matches_class_part(
             match class {
                 // All elements are children of root
                 PseudoClass::Root => true,
+                // TODO: Both the Not and Is logic can be heavily optimized by simply computing the query_selector_all once, not once per element
                 PseudoClass::Not(selector) => {
-                    let negative_matches = query_selector_all(
-                        &html_nodes,
-                        selector.clone(),
-                        &PhysicalSize {
-                            width: 0,
-                            height: 0,
-                        },
-                        dom_indexes,
-                        hovering_chain,
-                    );
+                    let negative_matches = precomputed_selectors.get(selector).unwrap();
                     !negative_matches.contains(&element)
+                }
+                PseudoClass::Is(selectors) | PseudoClass::Where(selectors) => {
+                    selectors.iter().any(|selector| {
+                        precomputed_selectors
+                        .get(selector)
+                        .unwrap()
+                        .contains(&element)
+                    })
                 }
                 PseudoClass::Hover => {
                     hovering_has_impact.insert(element);
@@ -1321,6 +1328,53 @@ fn element_matches_class_part(
                     .and_then(|node| node.get_parent())
                     .and_then(|parent| dom_indexes.children_index.get(&parent))
                     .is_some_and(|siblings| siblings.first().is_some_and(|idx| *idx == element)),
+                PseudoClass::NthChild(n) => n.parse::<usize>().ok().is_some_and(|target| {
+                    html_nodes
+                        .get(&element)
+                        .and_then(|node| node.get_parent())
+                        .and_then(|parent| dom_indexes.children_index.get(&parent))
+                        .and_then(|siblings| siblings.iter().position(|idx| *idx == element))
+                        .is_some_and(|pos| pos + 1 == target)
+                }),
+                PseudoClass::FirstOfType => html_nodes.get(&element).is_some_and(|node| {
+                    let Node::Element(element_node) = node else {
+                        return false;
+                    };
+                    node.get_parent()
+                        .and_then(|parent| dom_indexes.children_index.get(&parent))
+                        .and_then(|siblings| {
+                            siblings.iter().find(|idx| {
+                                matches!(html_nodes.get(idx), Some(Node::Element(sibling)) if sibling.tag == element_node.tag)
+                            })
+                        })
+                        .is_some_and(|idx| *idx == element)
+                }),
+                PseudoClass::NthOfType(n) => n.parse::<usize>().ok().is_some_and(|target| {
+                    let Some(Node::Element(element_node)) = html_nodes.get(&element) else {
+                        return false;
+                    };
+                    html_nodes
+                        .get(&element)
+                        .and_then(|node| node.get_parent())
+                        .and_then(|parent| dom_indexes.children_index.get(&parent))
+                        .and_then(|siblings| {
+                            siblings
+                                .iter()
+                                .filter(|idx| {
+                                    matches!(html_nodes.get(idx), Some(Node::Element(sibling)) if sibling.tag == element_node.tag)
+                                })
+                                .position(|idx| *idx == element)
+                        })
+                        .is_some_and(|pos| pos + 1 == target)
+                }),
+                PseudoClass::NthLastChild(n) => n.parse::<usize>().ok().is_some_and(|target| {
+                    html_nodes
+                        .get(&element)
+                        .and_then(|node| node.get_parent())
+                        .and_then(|parent| dom_indexes.children_index.get(&parent))
+                        .and_then(|siblings| siblings.iter().rev().position(|idx| *idx == element))
+                        .is_some_and(|pos| pos + 1 == target)
+                }),
                 PseudoClass::LastChild => html_nodes
                     .get(&element)
                     .and_then(|node| node.get_parent())
@@ -1364,6 +1418,7 @@ fn element_matches_class_part(
                 dom_indexes,
                 hovering_chain,
                 hovering_has_impact,
+                precomputed_selectors,
             )
         }),
     }
@@ -1382,6 +1437,7 @@ fn narrow_elements_by_ancestors(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
 ) -> bool {
     let walk_quota = if require_immediate_match {
         Some(1)
@@ -1424,6 +1480,7 @@ fn narrow_elements_by_ancestors(
                                 dom_indexes,
                                 hovering_chain,
                                 hovering_has_impact,
+                                precomputed_selectors,
                             )
                     });
             };
@@ -1439,6 +1496,7 @@ fn narrow_elements_by_ancestors(
                         dom_indexes,
                         hovering_chain,
                         hovering_has_impact,
+                        precomputed_selectors,
                     )
                 },
                 walk_quota,
@@ -1470,6 +1528,7 @@ fn narrow_elements_by_ancestors(
                     dom_indexes,
                     hovering_chain,
                     hovering_has_impact,
+                    precomputed_selectors,
                 );
             } else {
                 return false;
@@ -1489,6 +1548,7 @@ fn narrow_elements_by_ancestors(
                     dom_indexes,
                     hovering_chain,
                     hovering_has_impact,
+                    precomputed_selectors,
                 );
             } else {
                 return false;
@@ -1508,6 +1568,7 @@ fn narrow_elements_by_ancestors(
                 dom_indexes,
                 hovering_chain,
                 hovering_has_impact,
+                precomputed_selectors,
             );
         }
         _ => {
@@ -1649,6 +1710,43 @@ fn walk_into_part(part: &ClassNamePart) -> bool {
     *part != ClassNamePart::Tilde
 }
 
+fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &ClassNamePart) {
+    match part {
+        ClassNamePart::PseudoClass(pseudo_class) => match pseudo_class {
+            PseudoClass::Is(selectors) => {
+                for selector in selectors {
+                    collected_selectors.insert(selector.clone());
+                    for part in selector {
+                        walk_selectors(collected_selectors, part);
+                    }
+                }
+            },
+            // TODO: Consider whether this needs to be a vector of selectors instead
+            PseudoClass::Not(selector) => {
+                collected_selectors.insert(selector.clone());
+                for part in selector {
+                    walk_selectors(collected_selectors, part);
+                }
+            },
+            PseudoClass::Where(selectors) => {
+                for selector in selectors {
+                    collected_selectors.insert(selector.clone());
+                    for part in selector {
+                        walk_selectors(collected_selectors, part);
+                    }
+                }
+            },
+            _ => {},
+        },
+        ClassNamePart::Combined(combined) => {
+            for part in combined {
+                walk_selectors(collected_selectors, part);
+            }
+        },
+        _ => {},
+    }
+}
+
 // It is assumed that html_nodes only contains Node::Element here
 fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
@@ -1670,6 +1768,34 @@ fn search_elements_for_css_nodes(
     let mut specificity: HashMap<usize, [i32; 3]> = HashMap::new();
 
     let mut hovering_has_impact = HashSet::new();
+
+    let mut unique_selectors = HashSet::new();
+    for (idx, node) in css_nodes.iter() {
+        match node {
+            CssNode::ClassName(class) => {
+                for selector in &class.name_parts {
+                    for part in selector {
+                        walk_selectors(&mut unique_selectors, part);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut precomputed_selectors: HashMap<Vec<ClassNamePart>, Vec<usize>> = HashMap::new();
+    for selector in unique_selectors {
+        let results = query_selector_all(
+            &html_nodes,
+            selector.clone(),
+            &PhysicalSize {
+                width: 0,
+                height: 0,
+            },
+            dom_indexes,
+            hovering_chain,
+        );
+        precomputed_selectors.insert(selector, results);
+    }
 
     for css_node_idx in to_resolve {
         let node = css_nodes[css_node_idx].1;
@@ -1704,31 +1830,12 @@ fn search_elements_for_css_nodes(
                                         .collect::<FixedBitSet>();
                                     Some(elements)
                                 }
-                                // TODO: This looks quite inefficient, should probably try and improve this
                                 PseudoClass::Not(selector) => {
-                                    let (negative_matches, _, _) = {
-                                        let mut to_resolve = HashSet::new();
-                                        to_resolve.insert(0);
-                                        let class = CssNode::ClassName(ClassName {
-                                            name: vec![],
-                                            name_parts: vec![selector.clone()],
-                                            parent: None,
-                                        });
-                                        let css_nodes = vec![class];
-                                        let css_nodes = css_nodes.iter().enumerate().collect();
-                                        search_elements_for_css_nodes(
-                                            to_resolve,
-                                            &css_nodes,
-                                            html_nodes,
-                                            window_size,
-                                            dom_indexes,
-                                            hovering_chain,
-                                        )
-                                    };
+                                    let negative_matches = precomputed_selectors.get(selector).unwrap();
                                     let elements = html_nodes
                                         .iter()
                                         .map(|(idx, _)| idx)
-                                        .filter(|idx| !negative_matches.contains_key(idx))
+                                        .filter(|idx| !negative_matches.contains(idx))
                                         .cloned()
                                         .collect::<FixedBitSet>();
                                     Some(elements)
@@ -1790,6 +1897,7 @@ fn search_elements_for_css_nodes(
                                             dom_indexes,
                                             hovering_chain,
                                             &mut hovering_has_impact,
+                                            &precomputed_selectors,
                                         )
                                     });
                                     if matched_all {
@@ -1827,6 +1935,7 @@ fn search_elements_for_css_nodes(
                                     dom_indexes,
                                     hovering_chain,
                                     &mut hovering_has_impact,
+                                    &precomputed_selectors,
                                 )
                             } else {
                                 let next_class_part = &parts[parts.len() - 2];
@@ -1849,6 +1958,7 @@ fn search_elements_for_css_nodes(
                                         dom_indexes,
                                         hovering_chain,
                                         &mut hovering_has_impact,
+                                        &precomputed_selectors,
                                     )
                                 } else {
                                     false
@@ -1888,6 +1998,7 @@ fn search_elements_for_css_nodes(
                             dom_indexes,
                             hovering_chain,
                             &mut hovering_has_impact,
+                            &precomputed_selectors,
                         );
 
                         if is_match {
@@ -1920,6 +2031,7 @@ fn search_elements_for_css_nodes(
                         dom_indexes,
                         hovering_chain,
                         &mut hovering_has_impact,
+                        &precomputed_selectors,
                     );
 
                     if is_match {

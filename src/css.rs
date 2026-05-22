@@ -8,19 +8,20 @@ use crate::style::{
 
 const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClassNamePartAttribute {
     KeyValue((String, String)),
     Key(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PseudoClass {
     Root,
     Hover,
     Active,
     Focus,
     FirstChild,
+    FirstOfType,
     LastChild,
     OnlyChild,
     Empty,
@@ -30,12 +31,16 @@ pub enum PseudoClass {
     Before,
     After,
     Host,
+    Is(Vec<Vec<ClassNamePart>>),
+    Where(Vec<Vec<ClassNamePart>>),
     NthChild(String),
+    NthOfType(String),
+    NthLastChild(String),
     Has(Vec<ClassNamePart>),
     Not(Vec<ClassNamePart>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClassNamePart {
     Class(String),
     Id(String),
@@ -91,6 +96,7 @@ pub struct MediaQueryCriteriaFeature {
 #[derive(Debug, Clone)]
 pub enum MediaQueryCriteria {
     Feature(MediaQueryCriteriaFeature),
+    NotAllAnd(Vec<MediaQueryCriteria>),
     Screen,
     Print,
     All,
@@ -294,6 +300,24 @@ fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
 }
 
 fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
+    if let Some(stripped) = value.strip_prefix("is(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            let selectors = split_ignoring_parentheses(stripped.to_string(), ',', &[])
+                .into_iter()
+                .map(|s| selector_to_parts(&s.trim().to_string()))
+                .collect();
+            return Some(PseudoClass::Is(selectors));
+        }
+    }
+    if let Some(stripped) = value.strip_prefix("where(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            let selectors = split_ignoring_parentheses(stripped.to_string(), ',', &[])
+                .into_iter()
+                .map(|s| selector_to_parts(&s.trim().to_string()))
+                .collect();
+            return Some(PseudoClass::Where(selectors));
+        }
+    }
     if let Some(stripped) = value.strip_prefix("not(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
             return Some(PseudoClass::Not(selector_to_parts(&stripped.to_string())));
@@ -308,6 +332,16 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
         if let Some(stripped) = stripped.strip_suffix(")") {
             // TODO: Parse this into a CalcExpression and actually handle it
             return Some(PseudoClass::NthChild(stripped.to_string()));
+        }
+    }
+    if let Some(stripped) = value.strip_prefix("nth-of-type(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            return Some(PseudoClass::NthOfType(stripped.to_string()));
+        }
+    }
+    if let Some(stripped) = value.strip_prefix("nth-last-child(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            return Some(PseudoClass::NthLastChild(stripped.to_string()));
         }
     }
     if value == "hover" {
@@ -327,6 +361,9 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     }
     if value == "first-child" {
         return Some(PseudoClass::FirstChild);
+    }
+    if value == "first-of-type" {
+        return Some(PseudoClass::FirstOfType);
     }
     if value == "last-child" {
         return Some(PseudoClass::LastChild);
@@ -450,6 +487,9 @@ const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 3] = [
 
 pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
     let name = name.trim().strip_prefix("only ").unwrap_or(name.trim());
+    if let Some(rest) = name.strip_prefix("not all and ") {
+        return vec![MediaQueryCriteria::NotAllAnd(parse_media_query_parts(rest))];
+    }
     let criterias: Vec<MediaQueryCriteria> = name
         .split("and")
         .filter_map(|mut l| {
