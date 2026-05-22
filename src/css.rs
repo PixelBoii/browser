@@ -30,6 +30,7 @@ pub enum PseudoClass {
     Before,
     After,
     Host,
+    NthChild(String),
     Has(Vec<ClassNamePart>),
     Not(Vec<ClassNamePart>),
 }
@@ -281,6 +282,12 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     if let Some(stripped) = value.strip_prefix("has(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
             return Some(PseudoClass::Has(selector_to_parts(&stripped.to_string())));
+        }
+    }
+    if let Some(stripped) = value.strip_prefix("nth-child(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            // TODO: Parse this into a CalcExpression and actually handle it
+            return Some(PseudoClass::NthChild(stripped.to_string()));
         }
     }
     if value == "hover" {
