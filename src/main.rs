@@ -5293,14 +5293,14 @@ impl Renderer {
         };
         let grid_template_columns = style.grid_template_columns.clone();
         for child_idx in children_idxs.iter() {
-            let wrap =
-                if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
+            let wrap = match grid_template_columns {
+                GridTemplateColumns::Values(ref template_columns) => {
                     self.get_grid_column(current_column, &template_columns)
-                } else {
-                    false
-                };
+                }
+                GridTemplateColumns::None => current_column >= 1,
+            };
             if wrap {
-                content_position.x = 0;
+                content_position.x = original_content_position.x;
                 content_position.y += max_child_height;
                 max_child_height = 0;
                 current_column = 0;
