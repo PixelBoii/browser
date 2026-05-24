@@ -959,7 +959,13 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
     let mut inside = false;
     for char in value.trim().chars() {
         if inside && char == ')' {
-            out.push(VariableTemplatePart::Var(buffer.drain(..).collect()));
+            let collected: String = buffer.drain(..).collect();
+            let (name, default) = if let Some(collected) = collected.split_once(",") {
+                (collected.0.trim().to_owned(), Some(collected.1.trim().to_owned()))
+            } else {
+                (collected.trim().to_string(), None)
+            };
+            out.push(VariableTemplatePart::Var((name, default)));
             inside = false;
             buffer.clear();
             continue;
@@ -1028,7 +1034,7 @@ fn resolve_node_variable_inner(
         PropertyValue::VariableTemplate(template) => {
             // TODO: Handle multi variable dependence
             if template.len() == 1 {
-                if let VariableTemplatePart::Var(var) = &template[0] {
+                if let VariableTemplatePart::Var((var, _)) = &template[0] {
                     if !resolving.insert(var.clone()) {
                         return None;
                     }
@@ -1120,14 +1126,7 @@ fn resolve_variable_template(
             VariableTemplatePart::Text(text) => {
                 out += text;
             }
-            VariableTemplatePart::Var(var) => {
-                // TODO: This split should probably happen when parsing
-                let (name, default) = if let Some((name, default)) = var.split_once(",") {
-                    (name.trim(), Some(default.trim()))
-                } else {
-                    (var.as_str(), None)
-                };
-
+            VariableTemplatePart::Var((name, default)) => {
                 if let Some(value) = variable_definitions
                     .variable_to_idx
                     .get(name)
@@ -1135,7 +1134,7 @@ fn resolve_variable_template(
                 {
                     out += value;
                 } else {
-                    out += default.unwrap_or(var);
+                    out += default.clone().unwrap_or(name.to_string()).as_str();
                 }
             }
         };
@@ -1198,9 +1197,10 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "--color".to_string(),
-            PropertyValue::VariableTemplate(vec![VariableTemplatePart::Var(
+            PropertyValue::VariableTemplate(vec![VariableTemplatePart::Var((
                 "--color".to_string(),
-            )]),
+                None,
+            ))]),
         );
 
         let resolved = resolve_node_variable(
