@@ -8448,6 +8448,7 @@ mod tests {
             PhysicalSize::new(1920, 2160),
             RendererProxy::FrameLoop(tx),
         )?;
+        browser.run_js()?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
         browser.render_into(&mut buffer, 1920, 2160, true);
@@ -8464,6 +8465,7 @@ mod tests {
             PhysicalSize::new(1920, 2160),
             RendererProxy::FrameLoop(tx),
         )?;
+        browser.run_js()?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
         browser.render_into(&mut buffer, 1920, 2160, true);
