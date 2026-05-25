@@ -46,6 +46,8 @@ pub enum StyleSize {
     },
     Calc(Vec<CalcExpression>),
     FitContent,
+    MinContent,
+    MaxContent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -595,6 +597,12 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
     }
     if value == "fit-content" {
         return Ok(StyleSize::FitContent);
+    }
+    if value == "min-content" {
+        return Ok(StyleSize::MinContent);
+    }
+    if value == "max-content" {
+        return Ok(StyleSize::MaxContent);
     }
     if let Some(value) = strip_prefix_and_suffix(&value, "clamp(", ")") {
         let parts = split_ignoring_parentheses(value.to_string(), ',', &[]);

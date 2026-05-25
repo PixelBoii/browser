@@ -574,7 +574,7 @@ fn get_specified_size(
         StyleSize::Em(em) => Some((*em * font_size as f32) as i32),
         // TODO: This should actually be the font-size of the root element, so figure that out
         StyleSize::Rem(rem) => Some((*rem * 16 as f32) as i32),
-        StyleSize::FitContent => None,
+        StyleSize::FitContent | StyleSize::MinContent | StyleSize::MaxContent => None,
     }
 }
 
@@ -5537,13 +5537,19 @@ impl Renderer {
 
         let mut max_child_width: u32 = 0;
         let mut max_child_height: u32 = 0;
+        let mut row_height: u32 = 0;
         let mut child_width_buffer = 0;
 
         let mut children_rows = MarginRows::new();
 
         // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
-        let wants_to_fill =
-            style.display != StyleDisplay::InlineBlock && style.display != StyleDisplay::Inline;
+        let shrink_to_content_width = matches!(
+            &style.width,
+            StyleSize::FitContent | StyleSize::MinContent | StyleSize::MaxContent
+        );
+        let wants_to_fill = style.display != StyleDisplay::InlineBlock
+            && style.display != StyleDisplay::Inline
+            && !shrink_to_content_width;
 
         // Inline-block doesn't fill the width, so instruct children to not do that either
         let child_allow_fill = match style.display {
@@ -5585,6 +5591,8 @@ impl Renderer {
                 mode,
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
+                let child_width = child_box.rect.width;
+                let child_height = child_box.rect.height;
                 let prev_child_display: Option<StyleDisplay> =
                     prev_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
                 let next_child_display: Option<StyleDisplay> =
@@ -5593,24 +5601,41 @@ impl Renderer {
                     && prev_child_display.is_none_or(|v| v.is_inline())
                     && next_child_display.is_none_or(|v| v.is_inline())
                 {
-                    // TODO: This will need to support overflows
-                    content_position.x += child_box.rect.width as i32 + margin_right_size;
-                    child_width_buffer += child_box.rect.width as i32 + margin_right_size;
-                    children_rows.last_row(child, 0);
+                    let child_width_with_margin = child_width as i32 + margin_right_size;
+                    if child_width_buffer > 0
+                        && child_width_buffer + child_width_with_margin
+                            > container_sizes.inner_width as i32
+                    {
+                        self.move_entire_box(
+                            child,
+                            original_cursor.x - content_position.x,
+                            row_height as i32,
+                        );
+                        content_position.x = original_cursor.x + child_width_with_margin;
+                        content_position.y += row_height as i32;
+                        child_width_buffer = child_width_with_margin;
+                        children_rows.new_row(child, 0);
+                    } else {
+                        content_position.x += child_width_with_margin;
+                        child_width_buffer += child_width_with_margin;
+                        children_rows.last_row(child, 0);
+                    }
+                    row_height = row_height.max(child_height);
 
                     if !child_style.position.is_free() {
                         max_child_width = max_child_width.max(child_width_buffer as u32);
-                        max_child_height = max_child_height.max(child_box.rect.height);
+                        max_child_height = max_child_height.max(row_height);
                     }
                 } else {
                     // This is a wrap, so reset X
                     content_position.x = original_cursor.x;
-                    content_position.y += child_box.rect.height as i32 + margin_bottom_size;
+                    content_position.y += child_height as i32 + margin_bottom_size;
                     child_width_buffer = 0;
+                    row_height = 0;
                     children_rows.new_row(child, 0);
 
                     if !child_style.position.is_free() {
-                        max_child_width = max_child_width.max(child_box.rect.width);
+                        max_child_width = max_child_width.max(child_width);
                     }
                 }
                 children.push(child);
@@ -5815,7 +5840,7 @@ impl Renderer {
         self.resolved_specified_widths
             .insert(node_idx, specified_width);
 
-        if style.position == StylePosition::Relative {
+        if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
