@@ -311,23 +311,29 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             HtmlNode::Text(_) | HtmlNode::Comment(_) => StyleBackground::Transparent,
         },
         display: match node {
-            HtmlNode::Element(element) => match element.tag.as_str() {
-                "head" | "script" | "style" | "noscript" => StyleDisplay::None,
-                "button" | "input" => {
-                    if element
-                        .attributes
-                        .get("type")
-                        .is_some_and(|v| v == "hidden")
-                    {
-                        StyleDisplay::None
-                    } else {
-                        StyleDisplay::InlineBlock
+            HtmlNode::Element(element) => {
+                if element.attributes.contains_key("hidden") {
+                    StyleDisplay::None
+                } else {
+                    match element.tag.as_str() {
+                        "head" | "script" | "style" | "noscript" => StyleDisplay::None,
+                        "button" | "input" => {
+                            if element
+                                .attributes
+                                .get("type")
+                                .is_some_and(|v| v == "hidden")
+                            {
+                                StyleDisplay::None
+                            } else {
+                                StyleDisplay::InlineBlock
+                            }
+                        }
+                        "span" | "img" | "a" => StyleDisplay::InlineBlock,
+                        "br" => StyleDisplay::Inline,
+                        _ => StyleDisplay::Block,
                     }
                 }
-                "span" | "img" | "a" => StyleDisplay::InlineBlock,
-                "br" => StyleDisplay::Inline,
-                _ => StyleDisplay::Block,
-            },
+            }
             HtmlNode::Text(_) => StyleDisplay::Inline,
             HtmlNode::Comment(_) => StyleDisplay::None,
         },
@@ -1330,13 +1336,25 @@ fn parse_grid_template_columns_inner_value(value: String) -> Result<GridTemplate
     }
 }
 
+fn parse_overflow_value(value: &str) -> Result<Overflow> {
+    match value {
+        "hidden" => Ok(Overflow::Hidden),
+        "visible" => Ok(Overflow::Visible),
+        "auto" => Ok(Overflow::Auto),
+        "scroll" => Ok(Overflow::Scroll),
+        "clip" => Ok(Overflow::Clip),
+        _ => Err(anyhow!("Failed to parse overflow value: {}", value)),
+    }
+}
+
 fn parse_overflow(value: String) -> Result<PropertyValue> {
-    match value.as_str() {
-        "hidden" => Ok(PropertyValue::Overflow(Overflow::Hidden)),
-        "visible" => Ok(PropertyValue::Overflow(Overflow::Visible)),
-        "auto" => Ok(PropertyValue::Overflow(Overflow::Auto)),
-        "scroll" => Ok(PropertyValue::Overflow(Overflow::Scroll)),
-        "clip" => Ok(PropertyValue::Overflow(Overflow::Clip)),
+    let values = split_ignoring_parentheses(value.clone(), ' ', &[]);
+    match values.as_slice() {
+        [overflow] => Ok(PropertyValue::Overflow(parse_overflow_value(overflow)?)),
+        [x, y] => Ok(PropertyValue::OverflowXY((
+            parse_overflow_value(x)?,
+            parse_overflow_value(y)?,
+        ))),
         _ => Err(anyhow!("Failed to parse overflow value: {}", value)),
     }
 }
@@ -1533,6 +1551,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                             grow = Some(parts[0].parse::<u32>()?);
                             if let Ok(value) = parts[1].parse::<u32>() {
                                 shrink = Some(value);
+                                basis = Some(StyleSize::Percent(0.));
                             } else {
                                 shrink = Some(1);
                                 basis = Some(parse_style_size(parts[1].to_string())?);
@@ -1877,6 +1896,10 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         ("overflow", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow.clone();
             style.overflow_y = overflow;
+        }
+        ("overflow", PropertyValue::OverflowXY((x, y))) => {
+            style.overflow_x = x;
+            style.overflow_y = y;
         }
         ("overflow-x", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow;

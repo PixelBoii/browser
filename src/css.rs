@@ -168,6 +168,7 @@ pub enum PropertyValue {
     GridTemplateColumns(GridTemplateColumns),
     ComplexBackground(StyleComplexBackground),
     Overflow(Overflow),
+    OverflowXY((Overflow, Overflow)),
     VariableTemplate(Vec<VariableTemplatePart>),
     ZIndex(StyleZIndex),
     PointerEvents(StylePointerEvents),
