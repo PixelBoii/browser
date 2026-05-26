@@ -4343,6 +4343,10 @@ impl Renderer {
         mode: &LayoutMode,
     ) -> Option<usize> {
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
+        if *mode == LayoutMode::Complete {
+            self.resolved_widths.remove(&node_idx);
+            self.resolved_heights.remove(&node_idx);
+        }
 
         match self.nodes.get(&node_idx).unwrap().clone() {
             Node::Comment(_) => None,
@@ -5049,6 +5053,9 @@ impl Renderer {
 
         let (containing_block_height, containing_block_width) =
             self.get_containing_block_size(containing_node_idx, node_idx, &style);
+        let containing_block_width = containing_block_width
+            .filter(|width| *width > 0)
+            .or(Some(available_size.width));
         let resolved_font_size = self.resolved_font_sizes.get(&node_idx).unwrap();
 
         let min_height = get_specified_size(
@@ -5768,19 +5775,26 @@ impl Renderer {
         container_sizes: &ContainerSizes,
         has_definite_height: bool,
     ) -> Option<u32> {
-        if item_style.flex_basis == StyleSize::Auto {
-            return None;
-        }
-
         let available_size = match parent_style.flex_direction {
             StyleFlexDirection::Row => Some(container_sizes.inner_width),
             StyleFlexDirection::Column if has_definite_height => Some(container_sizes.inner_height),
             StyleFlexDirection::Column => None,
         };
+        let size = if item_style.flex_basis == StyleSize::Auto {
+            match parent_style.flex_direction {
+                StyleFlexDirection::Row => &item_style.width,
+                StyleFlexDirection::Column => &item_style.height,
+            }
+        } else {
+            &item_style.flex_basis
+        };
+        if *size == StyleSize::Auto {
+            return None;
+        }
 
         get_specified_size(
             font_size,
-            &item_style.flex_basis,
+            size,
             available_size,
             None,
             &self.window_size,
@@ -6075,6 +6089,9 @@ impl Renderer {
                     let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
                     let (margin_left_size, margin_right_size, margin_top_size, _) =
                         self.get_margins(item.node_idx, &child_style, available_size);
+                    let stretch_cross = child_style.align_self == StyleJustifyContent::Stretch
+                        || (child_style.align_self == StyleJustifyContent::Auto
+                            && style.align_items == StyleJustifyContent::Stretch);
                     // Re-compute cursor for each child so that align-self works
                     content_position.y =
                         original_content_cursor.y + cross_offset as i32 + margin_top_size;
@@ -6089,7 +6106,7 @@ impl Renderer {
                             height: container_sizes.inner_height,
                         },
                         OptionalSize {
-                            height: Some(item.cross_size as u32),
+                            height: stretch_cross.then_some(item.cross_size as u32),
                             width: Some(item.target_size as u32),
                         },
                         containing_node_idx,
@@ -6100,7 +6117,7 @@ impl Renderer {
                         let child_box = self.layout_table.get(&child).unwrap();
                         if !child_style.position.is_free() {
                             content_position.x += child_box.rect.width as i32 + margin_right_size;
-                            children_rows.last_row(child, cross_offset as i32);
+                            children_rows.last_row(child, 0);
                             // Don't add gap for last item
                             if !last {
                                 content_position.x += main_gap as i32;
