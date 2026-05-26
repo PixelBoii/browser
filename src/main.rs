@@ -294,7 +294,7 @@ struct Renderer {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
-    cached_text_buffers: HashMap<(String, u32), (Pixmap, u32, u32)>,
+    cached_text_buffers: HashMap<(String, u32, Option<u32>), (Pixmap, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     variable_definitions: VariableDefinitions,
     event_loop_proxy: Option<RendererProxy>,
@@ -2078,7 +2078,12 @@ fn compute_css_node_ranking(
                 let a_layer = get_parent_layer(&nodes, **a);
                 let b_layer = get_parent_layer(&nodes, **b);
 
-                let layer_ordering = a_layer.cmp(&b_layer);
+                let layer_ordering = match (a_layer, b_layer) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                    (None, None) => Ordering::Equal,
+                };
 
                 if layer_ordering != Ordering::Equal {
                     // TODO: Might want to flip this if both nodes have !important
@@ -4348,23 +4353,22 @@ impl Renderer {
                     StyleBackground::Hex(code) => Some(code),
                     _ => None,
                 }?;
-                let (buffer, width, height) = if let Some(cached) = self
-                    .cached_text_buffers
-                    .get(&(text.clone(), resolved_font_size))
-                {
-                    cached
-                } else {
-                    let result = text_to_buffer(
-                        &self.font_handler,
-                        text_hex,
-                        &text.clone(),
-                        resolved_font_size,
-                        Some(available_size.width),
-                    )?;
-                    self.cached_text_buffers
-                        .insert((text.clone(), resolved_font_size), result);
-                    self.cached_text_buffers.get(&(text, resolved_font_size))?
-                };
+                let max_width = Some(available_size.width);
+                let cache_key = (text.clone(), resolved_font_size, max_width);
+                let (buffer, width, height) =
+                    if let Some(cached) = self.cached_text_buffers.get(&cache_key) {
+                        cached
+                    } else {
+                        let result = text_to_buffer(
+                            &self.font_handler,
+                            text_hex,
+                            &text.clone(),
+                            resolved_font_size,
+                            max_width,
+                        )?;
+                        self.cached_text_buffers.insert(cache_key.clone(), result);
+                        self.cached_text_buffers.get(&cache_key)?
+                    };
 
                 Some(self.register_layout_box(
                     LayoutBox {
@@ -5146,18 +5150,18 @@ impl Renderer {
             _ => None,
         }
         .with_context(|| "No color was specified for text")?;
-        let (buffer, width, height) =
-            if let Some(cached) = self.cached_text_buffers.get(&(text.clone(), font_size)) {
-                cached
-            } else {
-                let result = text_to_buffer(&self.font_handler, text_hex, &text, font_size, None)
-                    .with_context(|| "Failed to build pixmap for input text")?;
-                self.cached_text_buffers
-                    .insert((text.clone(), font_size), result);
-                self.cached_text_buffers
-                    .get(&(text, font_size))
-                    .with_context(|| "Failed to build pixmap for input text")?
-            };
+        let cache_key = (text.clone(), font_size, None);
+        let (buffer, width, height) = if let Some(cached) = self.cached_text_buffers.get(&cache_key)
+        {
+            cached
+        } else {
+            let result = text_to_buffer(&self.font_handler, text_hex, &text, font_size, None)
+                .with_context(|| "Failed to build pixmap for input text")?;
+            self.cached_text_buffers.insert(cache_key.clone(), result);
+            self.cached_text_buffers
+                .get(&cache_key)
+                .with_context(|| "Failed to build pixmap for input text")?
+        };
 
         let layout_box = self.register_layout_box(
             LayoutBox {
