@@ -3873,7 +3873,7 @@ impl Renderer {
     }
 
     fn update_element_attributes(&mut self, node_idx: usize, attributes: Attributes) -> Result<()> {
-        let (mut id_dirty, mut class_dirty) = (false, false);
+        let (mut changed, mut id_dirty, mut class_dirty) = (false, false, false);
         match self
             .nodes
             .get_mut(&node_idx)
@@ -3881,6 +3881,14 @@ impl Renderer {
         {
             Node::Element(element) => {
                 for (key, value) in attributes.values {
+                    if element
+                        .attributes
+                        .values
+                        .get(&key)
+                        .is_some_and(|current| current == &value)
+                    {
+                        continue;
+                    }
                     if key == "id" {
                         id_dirty = true;
                     }
@@ -3888,10 +3896,14 @@ impl Renderer {
                         class_dirty = true;
                     }
                     element.attributes.insert(key, value);
+                    changed = true;
                 }
             }
             _ => {}
         };
+        if !changed {
+            return Ok(());
+        }
         self.dom_indexes.recompute_attribute_elements(&self.nodes, &self.nodes_idxs);
         if id_dirty {
             self.dom_indexes.recompute_id_elements(&self.nodes, &self.nodes_idxs);

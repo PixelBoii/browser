@@ -895,6 +895,9 @@ class CSSStyleDeclaration {
     }
 
     setProperty(key, value) {
+        if (this.__properties[key] === value) {
+            return
+        }
         this.__properties[key] = value
         this.sync()
     }
@@ -995,6 +998,9 @@ class ClassList {
     }
 
     add(str) {
+        if (this.list.has(str)) {
+            return
+        }
         this.list.add(str)
         this.sync()
     }
@@ -1013,6 +1019,9 @@ class ClassList {
     }
 
     remove(str) {
+        if (!this.list.has(str)) {
+            return
+        }
         this.list.delete(str)
         this.sync()
     }
