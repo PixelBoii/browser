@@ -29,8 +29,8 @@ use std::{env, fs, u32};
 use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use deno_core::error::{JsError};
-use deno_core::{JsRuntime, OpState, extension, op2, v8};
+use deno_core::error::JsError;
+use deno_core::{JsRuntime, OpState, ToV8, extension, op2, v8};
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle};
 use reqwest::Url as ReqwestUrl;
 use resvg::{tiny_skia, usvg};
@@ -45,7 +45,7 @@ use crate::css::{
     Overflow, PropertyValue, PseudoClass, parse_media_query_parts, selector_to_parts,
 };
 use crate::loader::HttpModuleLoader;
-use crate::parser::{CommentElement, TextElement};
+use crate::parser::{Attributes, CommentElement, TextElement};
 use crate::style::{
     CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign,
     StyleBorderStyle, StyleCalcOperator, StylePointerEvents, StyleSizeAndColor, StyleZIndex,
@@ -87,12 +87,12 @@ impl RectBorderSide {
                     StyleBackground::Transparent => 0xFF_FF_FF_00,
                     StyleBackground::DataUrl(_) => {
                         return None;
-                    },
+                    }
                     StyleBackground::CurrentColor => match node_style.color {
                         StyleBackground::Hex(hex) => hex,
                         _ => {
                             return None;
-                        },
+                        }
                     },
                 },
             }),
@@ -164,7 +164,7 @@ enum LayoutMode {
     Complete,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DomIndexes {
     class_elements: HashMap<String, FixedBitSet>,
     tag_elements: HashMap<String, FixedBitSet>,
@@ -172,6 +172,24 @@ struct DomIndexes {
     children_index: HashMap<usize, Vec<usize>>,
     attribute_elements: HashMap<String, FixedBitSet>,
     root_indice: usize,
+}
+
+impl DomIndexes {
+    pub fn recompute_class_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+        self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs);
+    }
+
+    pub fn recompute_attribute_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+        self.attribute_elements = get_dom_indexes_attributes(html_nodes, nodes_idxs);
+    }
+
+    pub fn recompute_id_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+        self.id_elements = get_dom_indexes_ids(html_nodes, nodes_idxs);
+    }
+
+    pub fn recompute_children(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+        self.children_index = build_children_index(html_nodes, nodes_idxs);
+    }
 }
 
 #[derive(Debug)]
@@ -231,14 +249,52 @@ impl Animation {
 }
 
 #[derive(Debug)]
+enum FrameDomCommand {
+    QuerySelector {
+        selector: String,
+        required_parent: Option<usize>,
+        reply: std::sync::mpsc::Sender<Result<Option<(usize, Node)>, String>>,
+    },
+    QuerySelectorAll {
+        selector: String,
+        required_parent: Option<usize>,
+        reply: std::sync::mpsc::Sender<Result<Vec<(usize, Node)>, String>>,
+    },
+    ReplaceInnerHtml {
+        node_idx: usize,
+        html: String,
+        reply: std::sync::mpsc::Sender<()>,
+    },
+    GetInnerHtml {
+        node_idx: usize,
+        reply: std::sync::mpsc::Sender<String>,
+    },
+    CreateElement {
+        tag: String,
+        reply: std::sync::mpsc::Sender<usize>,
+    },
+    GetElementsByTagName {
+        tag: String,
+        reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
+    },
+    UpdateElementAttributes {
+        node_idx: usize,
+        attributes: Attributes,
+        reply: std::sync::mpsc::Sender<Result<()>>,
+    },
+}
+
+#[derive(Debug)]
 enum FrameCommand {
     Render,
     UserEvent(UserEvent),
+    Dom(FrameDomCommand),
 }
 
 #[derive(Debug)]
 struct FrameHandle {
     surface: Arc<Mutex<Vec<u32>>>,
+    tx: std::sync::mpsc::Sender<FrameCommand>,
 }
 
 #[derive(Debug, Clone)]
@@ -775,7 +831,7 @@ fn pixmap_is_opaque(pixmap: &tiny_skia::Pixmap) -> bool {
 
 fn rasterize_png(
     cached_rasterizations: &mut CachedRasterizations,
-    src: &String,
+    src: &str,
     bytes: &[u8],
     input_w: Option<u32>,
     input_h: Option<u32>,
@@ -788,7 +844,7 @@ fn rasterize_png(
     } else {
         cached_rasterizations
             .decoded_pngs
-            .insert(src.clone(), tiny_skia::Pixmap::decode_png(bytes)?);
+            .insert(src.to_string(), tiny_skia::Pixmap::decode_png(bytes)?);
         cached_rasterizations.decoded_pngs.get(src).unwrap()
     };
     if input_w.is_some_and(|v| v == pixmap.width()) && input_h.is_some_and(|v| v == pixmap.height())
@@ -835,7 +891,7 @@ fn rasterize_png(
 
 fn prepare_jpeg(
     cached_rasterizations: &mut CachedRasterizations,
-    src: &String,
+    src: &str,
     bytes: &[u8],
     input_w: Option<u32>,
     input_h: Option<u32>,
@@ -849,7 +905,7 @@ fn prepare_jpeg(
         reader.set_format(image::ImageFormat::Jpeg);
         cached_rasterizations
             .decoded_jpegs
-            .insert(src.clone(), reader.decode()?);
+            .insert(src.to_string(), reader.decode()?);
         cached_rasterizations.decoded_jpegs.get(src).unwrap()
     };
 
@@ -869,12 +925,12 @@ fn prepare_jpeg(
 
 fn rasterize_jpeg(
     cached_rasterizations: &mut CachedRasterizations,
-    src: &String,
+    src: &str,
     target_w: u32,
     target_h: u32,
 ) -> Result<tiny_skia::Pixmap> {
     let decoded = cached_rasterizations.decoded_jpegs.get(src).unwrap();
-    let key = (src.clone(), target_h, target_w);
+    let key = (src.to_string(), target_h, target_w);
     let pixmap = if let Some(cached) = cached_rasterizations.jpegs.get(&key) {
         cached
     } else {
@@ -962,8 +1018,7 @@ fn get_expandable_css_nodes_walk(
     children_index: &HashMap<usize, Vec<usize>>,
     idx: usize,
 ) {
-    let node = &nodes.get(&idx).unwrap();
-    let Node::Element(element) = node else {
+    let Some(Node::Element(element)) = nodes.get(&idx) else {
         return;
     };
     if element.tag == "style" {
@@ -986,13 +1041,13 @@ fn get_expandable_css_nodes_walk(
         };
         expandable.push(ExpandableCssNode::Inline(text.text.clone()));
     } else if element.tag == "link"
-        && let Some(href) = element.attributes.get("href")
-        && element.attributes.get("rel").is_some_and(|v| {
+        && let Some(href) = element.attributes.get_str("href")
+        && element.attributes.get_str("rel").is_some_and(|v| {
             let rels: Vec<&str> = v.split(" ").collect();
             rels.contains(&"stylesheet")
         })
     {
-        expandable.push(ExpandableCssNode::Link(href.clone()));
+        expandable.push(ExpandableCssNode::Link(href.into_owned()));
     } else if element.tag != "noscript" {
         let children = &children_index.get(&idx).unwrap();
         for child in children.iter() {
@@ -1197,7 +1252,7 @@ fn move_up_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
 ) -> bool {
     let node = css_nodes[css_node].1;
     // If we've reached the beginning, that means this node is done, so move up the chain
@@ -1297,8 +1352,8 @@ fn element_matches_class_part(
         ClassNamePart::Id(id) => match html_nodes.get(&element).unwrap() {
             Node::Element(walk_element) => walk_element
                 .attributes
-                .get("id")
-                .is_some_and(|el_id| *el_id == *id),
+                .get_str("id")
+                .is_some_and(|el_id| el_id.as_ref() == id),
             _ => false,
         },
         ClassNamePart::ArrowRight | ClassNamePart::Ampersand | ClassNamePart::Tilde => true,
@@ -1720,14 +1775,14 @@ fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &
                         walk_selectors(collected_selectors, part);
                     }
                 }
-            },
+            }
             // TODO: Consider whether this needs to be a vector of selectors instead
             PseudoClass::Not(selector) => {
                 collected_selectors.insert(selector.clone());
                 for part in selector {
                     walk_selectors(collected_selectors, part);
                 }
-            },
+            }
             PseudoClass::Where(selectors) => {
                 for selector in selectors {
                     collected_selectors.insert(selector.clone());
@@ -1735,15 +1790,15 @@ fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &
                         walk_selectors(collected_selectors, part);
                     }
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         },
         ClassNamePart::Combined(combined) => {
             for part in combined {
                 walk_selectors(collected_selectors, part);
             }
-        },
-        _ => {},
+        }
+        _ => {}
     }
 }
 
@@ -1770,7 +1825,7 @@ fn search_elements_for_css_nodes(
     let mut hovering_has_impact = HashSet::new();
 
     let mut unique_selectors = HashSet::new();
-    for (idx, node) in css_nodes.iter() {
+    for (_, node) in css_nodes.iter() {
         match node {
             CssNode::ClassName(class) => {
                 for selector in &class.name_parts {
@@ -1793,6 +1848,7 @@ fn search_elements_for_css_nodes(
             },
             dom_indexes,
             hovering_chain,
+            None,
         );
         precomputed_selectors.insert(selector, results);
     }
@@ -1831,7 +1887,8 @@ fn search_elements_for_css_nodes(
                                     Some(elements)
                                 }
                                 PseudoClass::Not(selector) => {
-                                    let negative_matches = precomputed_selectors.get(selector).unwrap();
+                                    let negative_matches =
+                                        precomputed_selectors.get(selector).unwrap();
                                     let elements = html_nodes
                                         .iter()
                                         .map(|(idx, _)| idx)
@@ -2449,17 +2506,21 @@ fn op_get_cookie(state: &mut OpState, #[string] url: String) -> Result<String, J
     Ok(cookie)
 }
 
-#[op2(fast)]
-fn op_create_element(state: &mut OpState, #[string] tag: String) -> Result<i32, JsError> {
+#[op2]
+fn op_create_element(
+    state: &mut OpState,
+    #[string] tag: String,
+    #[number] frame_id: Option<usize>,
+) -> Result<i32, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    renderer.push_node(Node::Element(Element {
-        tag,
-        attributes: HashMap::new(),
-        parent: None,
-    }));
-    let node_idx = renderer.node_idx_cursor;
-    renderer.dom_indexes.children_index.insert(node_idx, vec![]);
+    let node_idx = if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply })
+        })?
+    } else {
+        renderer.create_element(tag)
+    };
     Ok(node_idx as i32)
 }
 
@@ -2474,27 +2535,48 @@ fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result
 }
 
 #[op2]
-#[string]
-fn op_get_attribute(
+fn op_get_attribute<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     #[number] node_idx: usize,
     #[string] attribute: String,
-) -> Result<Option<String>, JsError> {
+) -> Result<Option<v8::Local<'s, v8::Value>>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
         .get(&node_idx)
         .and_then(|node| match node {
-            Node::Element(element) => element.attributes.get(&attribute),
+            Node::Element(element) => element.attributes.values.get(&attribute),
             _ => None,
         })
-        .cloned();
+        .and_then(|v| v.clone().to_v8(scope).ok());
     Ok(value)
 }
 
+#[op2]
+#[string]
+fn op_spawn_frame(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[string] url: Option<String>,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let handle = renderer
+        .spawn_frame(url, PhysicalSize::new(300, 150))
+        .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
+    renderer.frames.insert(node_idx, handle);
+    Ok(())
+}
+
 // TODO: Maybe we want to copy the text children no matter what the deep parameter says, but idk
-fn clone_node(renderer: &mut RefMut<'_, Renderer>, node_idx: usize, new_parent: Option<usize>, deep: bool) -> Result<usize> {
+fn clone_node(
+    renderer: &mut RefMut<'_, Renderer>,
+    node_idx: usize,
+    new_parent: Option<usize>,
+    deep: bool,
+) -> Result<usize> {
     let mut node = renderer
         .nodes
         .get(&node_idx)
@@ -2504,7 +2586,12 @@ fn clone_node(renderer: &mut RefMut<'_, Renderer>, node_idx: usize, new_parent: 
     renderer.push_node(node);
     let new_node_idx = renderer.node_idx_cursor;
     if deep {
-        let old_children = renderer.dom_indexes.children_index.get(&node_idx).unwrap().clone();
+        let old_children = renderer
+            .dom_indexes
+            .children_index
+            .get(&node_idx)
+            .unwrap()
+            .clone();
         for c in old_children {
             clone_node(renderer, c, Some(new_node_idx), true)?;
         }
@@ -2520,7 +2607,8 @@ fn op_clone_node(
 ) -> Result<u32, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let new_node_idx = clone_node(&mut renderer, node_idx, None, deep).or_else(|err| Err(JsErrorBox::generic(err.root_cause().to_string())))?;
+    let new_node_idx = clone_node(&mut renderer, node_idx, None, deep)
+        .or_else(|err| Err(JsErrorBox::generic(err.root_cause().to_string())))?;
     renderer.recompute_dom_indexes();
     Ok(new_node_idx as u32)
 }
@@ -2562,11 +2650,10 @@ fn op_get_offset_y(state: &mut OpState, #[number] node_idx: usize) -> Result<i32
 }
 
 #[op2]
-#[serde]
 fn op_get_attributes(
     state: &mut OpState,
     #[number] node_idx: usize,
-) -> Result<Option<HashMap<String, String>>, JsError> {
+) -> Result<Option<Attributes>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
     let value = renderer
@@ -2661,16 +2748,27 @@ fn op_append_child(
             renderer.nodes_idxs.insert(before_pos, idx);
         }
     }
-    renderer.recompute_dom_indexes();
+    renderer.recompute_children_index();
     renderer.schedule_dom_update();
     Ok(())
 }
 
 #[op2]
 #[string]
-fn op_get_inner_html(state: &mut OpState, #[number] node_idx: usize) -> Result<String, JsError> {
+fn op_get_inner_html(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[number] frame_id: Option<usize>,
+) -> Result<String, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
-    let html = host.renderer.borrow_mut().get_element_inner_html(node_idx);
+    let renderer = host.renderer.borrow_mut();
+    let html = if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::GetInnerHtml { node_idx, reply })
+        })?
+    } else {
+        renderer.get_element_inner_html(node_idx)
+    };
     Ok(html)
 }
 
@@ -2678,8 +2776,8 @@ fn op_get_inner_html(state: &mut OpState, #[number] node_idx: usize) -> Result<S
 fn op_remove_child(state: &mut OpState, #[number] child_idx: usize) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    renderer.remove_node(child_idx, true);
-    renderer.recompute_dom_indexes();
+    renderer.detach_node(child_idx);
+    renderer.recompute_children_index();
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -2717,18 +2815,17 @@ fn op_get_element_by_id(
 fn op_get_elements_by_tag_name(
     state: &mut OpState,
     #[string] tag: String,
-) -> Result<Vec<(usize, Node)>, JsError> {
+    #[number] frame_id: Option<usize>,
+) -> Result<Vec<(usize, Node)>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs = renderer.dom_indexes.tag_elements.get(&tag);
-    let nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
-        idxs.ones()
-            .map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()))
-            .collect()
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply })
+        })
     } else {
-        vec![]
-    };
-    Ok(nodes)
+        Ok(renderer.get_elements_by_tag_name(&tag))
+    }
 }
 
 #[op2]
@@ -2736,27 +2833,22 @@ fn op_query_selector(
     state: &mut OpState,
     #[string] selector: String,
     #[number] required_parent: Option<usize>,
-) -> Result<Option<(usize, Node)>, JsError> {
+    #[number] frame_id: Option<usize>,
+) -> Result<Option<(usize, Node)>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow();
-    let mut node_idxs: Vec<usize> = query_selector_all(
-        &filter_to_elements(&renderer.nodes),
-        selector_to_parts(&selector),
-        &renderer.window_size,
-        &renderer.dom_indexes,
-        &renderer.get_hover_chain(),
-    );
-    if let Some(required_parent) = required_parent {
-        node_idxs = node_idxs
-            .into_iter()
-            .filter(|idx| has_parent(&renderer.nodes, *idx, required_parent))
-            .collect();
+    let renderer: Ref<'_, Renderer> = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::QuerySelector {
+                selector,
+                required_parent,
+                reply,
+            })
+        })?
+        .map_err(|err| JsErrorBox::generic(err))
+    } else {
+        Ok(renderer.query_selector_node(selector, required_parent))
     }
-    let node = node_idxs.first();
-    let owned = node
-        .cloned()
-        .map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()));
-    Ok(owned)
 }
 
 fn walk_closest(buffer: &mut Vec<usize>, nodes: &HashMap<usize, Node>, node_idx: usize) {
@@ -2780,6 +2872,7 @@ fn op_get_closest(
         &renderer.window_size,
         &renderer.dom_indexes,
         &renderer.get_hover_chain(),
+        None,
     );
     let mut allowed_idxs = vec![];
     walk_closest(&mut allowed_idxs, &renderer.nodes, node_idx);
@@ -2793,12 +2886,18 @@ fn op_get_closest(
     Ok(owned)
 }
 
-fn has_parent(nodes_table: &HashMap<usize, Node>, node_idx: usize, target_parent: usize) -> bool {
+fn has_parent<N>(nodes_table: &HashMap<usize, N>, node_idx: usize, target_parent: usize) -> bool
+where
+    N: std::borrow::Borrow<Node>,
+{
     if node_idx == target_parent {
         return true;
     }
 
-    if let Some(parent) = nodes_table.get(&node_idx).and_then(|v| v.get_parent()) {
+    if let Some(parent) = nodes_table
+        .get(&node_idx)
+        .and_then(|v| v.borrow().get_parent())
+    {
         has_parent(nodes_table, parent, target_parent)
     } else {
         false
@@ -2810,50 +2909,66 @@ fn op_query_selector_all(
     state: &mut OpState,
     #[string] selector: String,
     #[number] required_parent: Option<usize>,
-) -> Result<Vec<(usize, Node)>, JsError> {
+    #[number] frame_id: Option<usize>,
+) -> Result<Vec<(usize, Node)>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idxs: Vec<usize> = query_selector_all(
-        &filter_to_elements(&renderer.nodes),
-        selector_to_parts(&selector),
-        &renderer.window_size,
-        &renderer.dom_indexes,
-        &renderer.get_hover_chain(),
-    );
-    let mut owned: Vec<(usize, Node)> = node_idxs
-        .into_iter()
-        .map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()))
-        .collect();
-    if let Some(required_parent) = required_parent {
-        owned = owned
-            .into_iter()
-            .filter(|(idx, _)| has_parent(&renderer.nodes, *idx, required_parent))
-            .collect();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::QuerySelectorAll {
+                selector,
+                required_parent,
+                reply,
+            })
+        })?
+        .map_err(|err| JsErrorBox::generic(err))
+    } else {
+        Ok(renderer.query_selector_all_nodes(selector, required_parent))
     }
-    Ok(owned)
 }
 
-#[op2(fast)]
+fn js_send_onetime_to_frame<T>(
+    renderer: &Renderer,
+    frame_id: usize,
+    build_command: impl FnOnce(std::sync::mpsc::Sender<T>) -> FrameCommand,
+) -> Result<T, JsErrorBox> {
+    let handle = renderer
+        .frames
+        .get(&frame_id)
+        .ok_or_else(|| JsErrorBox::generic("Failed to get frame"))?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+    handle
+        .tx
+        .send(build_command(reply_tx))
+        .map_err(|err| JsErrorBox::generic(format!("Failed to query frame: {err}")))?;
+
+    reply_rx
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|err| JsErrorBox::generic(format!("Frame query timed out: {err}")))
+}
+
+#[op2]
 fn op_set_inner_html(
     state: &mut OpState,
     #[number] node_idx: usize,
     #[string] html: String,
-) -> Result<(), JsError> {
+    #[number] frame_id: Option<usize>,
+) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let children = renderer
-        .dom_indexes
-        .children_index
-        .get(&node_idx)
-        .unwrap_or(&vec![])
-        .clone();
-    for child in children {
-        renderer.remove_node(child, true);
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
+                node_idx,
+                html,
+                reply,
+            })
+        })
+    } else {
+        renderer.replace_inner_html(node_idx, html);
+        Ok(())
     }
-    renderer.create_children_from_html(node_idx, html);
-    renderer.recompute_dom_indexes();
-    renderer.schedule_dom_update();
-    Ok(())
 }
 
 #[op2(fast)]
@@ -2961,25 +3076,29 @@ fn op_get_parent_node(
 }
 
 #[op2]
-#[serde]
-fn op_update_attributes(
+fn op_update_attributes<'s>(
     state: &mut OpState,
     #[number] node_idx: usize,
     #[serde] attributes: HashMap<String, String>,
-) -> Result<(), JsError> {
+    #[number] frame_id: Option<usize>,
+) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    match renderer.nodes.get_mut(&node_idx).unwrap() {
-        Node::Element(element) => {
-            for (key, value) in attributes {
-                element.attributes.insert(key, value);
-            }
-        }
-        _ => {}
-    };
-    renderer.recompute_dom_indexes();
-    renderer.schedule_dom_update();
-    Ok(())
+    let attributes = Attributes::from_hash_map(attributes);
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
+                node_idx,
+                attributes,
+                reply,
+            })
+        })?
+        .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
+    } else {
+        renderer
+            .update_element_attributes(node_idx, attributes)
+            .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
+    }
 }
 
 #[op2(fast)]
@@ -3006,12 +3125,12 @@ fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
         Node::Element(element) => (
             element
                 .attributes
-                .get("width")
+                .get_str("width")
                 .and_then(|v| v.parse::<u32>().ok())
                 .or(Some(150)),
             element
                 .attributes
-                .get("height")
+                .get_str("height")
                 .and_then(|v| v.parse::<u32>().ok())
                 .or(Some(150)),
         ),
@@ -3222,13 +3341,13 @@ fn op_collect_data_for_form(
         let Some(Node::Element(element)) = renderer.nodes.get(&input) else {
             continue;
         };
-        let Some(name) = element.attributes.get("name") else {
+        let Some(name) = element.attributes.get_str("name") else {
             continue;
         };
-        let Some(value) = element.attributes.get("value") else {
+        let Some(value) = element.attributes.get_str("value") else {
             continue;
         };
-        data.insert(name.clone(), value.clone());
+        data.insert(name.into_owned(), value.into_owned());
     }
     data
 }
@@ -3240,6 +3359,7 @@ fn query_selector_all(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
+    required_parent: Option<usize>,
 ) -> Vec<usize> {
     let class = CssNode::ClassName(ClassName {
         name: vec![],
@@ -3259,7 +3379,16 @@ fn query_selector_all(
         hovering_chain,
     );
 
-    collected.keys().cloned().collect()
+    let mut node_idxs: Vec<usize> = collected.keys().cloned().collect();
+
+    if let Some(required_parent) = required_parent {
+        node_idxs = node_idxs
+            .into_iter()
+            .filter(|idx| has_parent(nodes_table, *idx, required_parent))
+            .collect();
+    }
+
+    node_idxs
 }
 
 extension!(
@@ -3298,6 +3427,7 @@ extension!(
     op_get_offset_y,
     op_collect_data_for_form,
     op_clone_node,
+    op_spawn_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js", "runtime_fetch.js"],
@@ -3382,9 +3512,17 @@ fn sorted_node_idxs(nodes: &HashMap<usize, Node>) -> Vec<usize> {
     node_idxs
 }
 
-fn get_dom_indexes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> DomIndexes {
-    let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
+enum DomIndexType {
+    Classes,
+    Tags,
+    Ids,
+    Children,
+    Root,
+    Attributes,
+}
 
+fn get_dom_indexes_classes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+    let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut class_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
         match html_node {
@@ -3400,14 +3538,36 @@ fn get_dom_indexes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -
             _ => {}
         };
     }
+    class_elements
+}
 
+fn get_dom_indexes_attributes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+    let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
+    let mut attribute_elements: HashMap<String, FixedBitSet> = HashMap::new();
+    for (html_node_idx, html_node) in html_nodes.iter() {
+        let Node::Element(element) = html_node else {
+            continue;
+        };
+
+        for key in element.attributes.keys() {
+            attribute_elements
+                .entry(key.clone())
+                .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
+                .insert(*html_node_idx);
+        }
+    }
+    attribute_elements
+}
+
+fn get_dom_indexes_ids(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+    let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut id_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
         match html_node {
             Node::Element(element) => {
-                if let Some(id) = element.attributes.get("id") {
+                if let Some(id) = element.attributes.get_str("id") {
                     id_elements
-                        .entry(id.clone())
+                        .entry(id.into_owned())
                         .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
                         .insert(*html_node_idx);
                 }
@@ -3415,6 +3575,14 @@ fn get_dom_indexes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -
             _ => {}
         };
     }
+    id_elements
+}
+
+fn get_dom_indexes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> DomIndexes {
+    let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
+
+    let class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs);
+    let id_elements = get_dom_indexes_ids(html_nodes, nodes_idxs);
 
     let mut tag_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
@@ -3451,19 +3619,7 @@ fn get_dom_indexes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -
         .copied()
         .expect("Expected at least one root index");
 
-    let mut attribute_elements: HashMap<String, FixedBitSet> = HashMap::new();
-    for (html_node_idx, html_node) in html_nodes.iter() {
-        let Node::Element(element) = html_node else {
-            continue;
-        };
-
-        for key in element.attributes.keys() {
-            attribute_elements
-                .entry(key.clone())
-                .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
-                .insert(*html_node_idx);
-        }
-    }
+    let attribute_elements = get_dom_indexes_attributes(html_nodes, nodes_idxs);
 
     DomIndexes {
         class_elements,
@@ -3516,11 +3672,7 @@ fn is_supported_form_element(
         return true;
     }
     if element.tag == "input" && element.attributes.contains_key("name") {
-        return match element
-            .attributes
-            .get("type")
-            .and_then(|v| Some(v.as_str()))
-        {
+        return match element.attributes.get_str("type").as_deref() {
             // If type="submit", only include its value if it was clicked
             Some("submit") => submitted_by.is_some_and(|v| v == node_idx),
             _ => true,
@@ -3645,6 +3797,112 @@ impl Renderer {
         }
     }
 
+    fn query_selector_all(&self, selector: String, required_parent: Option<usize>) -> Vec<usize> {
+        query_selector_all(
+            &filter_to_elements(&self.nodes),
+            selector_to_parts(&selector),
+            &self.window_size,
+            &self.dom_indexes,
+            &self.get_hover_chain(),
+            required_parent,
+        )
+    }
+
+    fn query_selector_all_nodes(
+        &self,
+        selector: String,
+        required_parent: Option<usize>,
+    ) -> Vec<(usize, Node)> {
+        let node_idxs = self.query_selector_all(selector, required_parent);
+        let owned = node_idxs
+            .into_iter()
+            .map(|idx| (idx, self.nodes.get(&idx).unwrap().clone()))
+            .collect();
+        owned
+    }
+
+    fn query_selector_node(
+        &self,
+        selector: String,
+        required_parent: Option<usize>,
+    ) -> Option<(usize, Node)> {
+        let node_idxs = self.query_selector_all(selector, required_parent);
+        let node = node_idxs.first();
+        let owned = node
+            .cloned()
+            .map(|idx| (idx, self.nodes.get(&idx).unwrap().clone()));
+        owned
+    }
+
+    fn replace_inner_html(&mut self, node_idx: usize, html: String) {
+        let children = self.dom_indexes.children_index.get(&node_idx);
+        if let Some(children) = children {
+            for child in children.clone() {
+                self.remove_node(child, true);
+            }
+        }
+        self.create_children_from_html(node_idx, html);
+        self.recompute_dom_indexes();
+        self.schedule_dom_update();
+    }
+
+    fn create_element(&mut self, tag: String) -> usize {
+        self.push_node(Node::Element(Element {
+            tag,
+            attributes: Attributes::new(),
+            parent: None,
+        }));
+        let node_idx = self.node_idx_cursor;
+        self.dom_indexes.children_index.insert(node_idx, vec![]);
+        node_idx
+    }
+
+    fn get_elements_by_tag_name(&self, tag: &String) -> Vec<(usize, Node)> {
+        let node_idxs = self.dom_indexes.tag_elements.get(tag);
+        let nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
+            idxs.ones()
+                .map(|idx| (idx, self.nodes.get(&idx).unwrap().clone()))
+                .filter(|(idx, node)| {
+                    node.get_parent().is_some() || *idx == self.dom_indexes.root_indice
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        nodes
+    }
+
+    fn update_element_attributes(&mut self, node_idx: usize, attributes: Attributes) -> Result<()> {
+        let (mut id_dirty, mut class_dirty) = (false, false);
+        match self
+            .nodes
+            .get_mut(&node_idx)
+            .with_context(|| "Failed to get node")?
+        {
+            Node::Element(element) => {
+                for (key, value) in attributes.values {
+                    if key == "id" {
+                        id_dirty = true;
+                    }
+                    if key == "class" {
+                        class_dirty = true;
+                    }
+                    element.attributes.insert(key, value);
+                }
+            }
+            _ => {}
+        };
+        self.dom_indexes.recompute_attribute_elements(&self.nodes, &self.nodes_idxs);
+        if id_dirty {
+            self.dom_indexes.recompute_id_elements(&self.nodes, &self.nodes_idxs);
+        }
+        if class_dirty {
+            self.dom_indexes.recompute_class_elements(&self.nodes, &self.nodes_idxs);
+        }
+        self.schedule_dom_update();
+        Ok(())
+    }
+
     fn clear_layout_state(&mut self) {
         self.layout_table.clear();
         self.node_layout_mapping.clear();
@@ -3682,13 +3940,17 @@ impl Renderer {
         let mut events = vec![];
         if let Node::Element(element) = node {
             if element.tag == "label" {
-                if let Some(for_attr) = element.attributes.get("for") {
-                    if let Some(for_elements) = self.dom_indexes.id_elements.get(for_attr) {
+                if let Some(for_attr) = element.attributes.get_str("for") {
+                    if let Some(for_elements) = self.dom_indexes.id_elements.get(for_attr.as_ref())
+                    {
                         for el in for_elements.ones() {
                             let node = self.nodes.get(&el).unwrap();
                             if let Node::Element(element) = node {
                                 if element.tag == "input"
-                                    && element.attributes.get("type").is_some_and(|v| v == "radio")
+                                    && element
+                                        .attributes
+                                        .get_str("type")
+                                        .is_some_and(|v| v == "radio")
                                 {
                                     events.push((el, HtmlEvent::Change));
                                 }
@@ -3763,7 +4025,7 @@ impl Renderer {
                     Node::Element(element) => {
                         let script_type = match element
                             .attributes
-                            .get("type")
+                            .get_str("type")
                             .map(|v| v.trim().to_ascii_lowercase())
                         {
                             None => ScriptType::Classic,
@@ -3783,11 +4045,11 @@ impl Renderer {
                             Some(script_type) if script_type == "module" => ScriptType::Module,
                             _ => return None,
                         };
-                        let src = element.attributes.get("src");
+                        let src = element.attributes.get_str("src");
                         let has_src = src.is_some();
-                        let is_async = has_src && element.attributes.get("async").is_some();
+                        let is_async = has_src && element.attributes.get_str("async").is_some();
                         let defer =
-                            has_src && !is_async && element.attributes.get("defer").is_some();
+                            has_src && !is_async && element.attributes.get_str("defer").is_some();
                         if let Some(src) = src {
                             return Some(Script {
                                 content: ScriptContent::Link(src.to_string()),
@@ -3892,13 +4154,13 @@ impl Renderer {
         let Some(Node::Element(element)) = self.nodes.get(&form) else {
             return Err(anyhow!("Failed to get form node"));
         };
-        let Some(action) = element.attributes.get("action") else {
+        let Some(action) = element.attributes.get_str("action") else {
             return Ok(());
         };
         let inputs = self.collect_inputs_in_form(form, submitted_by);
 
         let base_url = ReqwestUrl::parse(&self.url)?;
-        let mut parsed_url = resolve_url(action, Some(&base_url))?;
+        let mut parsed_url = resolve_url(action.as_ref(), Some(&base_url))?;
 
         {
             let mut query_parms = parsed_url.query_pairs_mut();
@@ -3906,13 +4168,13 @@ impl Renderer {
                 let Some(Node::Element(element)) = self.nodes.get(&input) else {
                     continue;
                 };
-                let Some(name) = element.attributes.get("name") else {
+                let Some(name) = element.attributes.get_str("name") else {
                     continue;
                 };
-                let Some(value) = element.attributes.get("value") else {
+                let Some(value) = element.attributes.get_str("value") else {
                     continue;
                 };
-                query_parms.append_pair(name, value);
+                query_parms.append_pair(name.as_ref(), value.as_ref());
             }
         };
 
@@ -4105,13 +4367,16 @@ impl Renderer {
                             .get(idx)
                             .is_some_and(|v| v.display != StyleDisplay::None) =>
                 {
-                    element.attributes.get("src").map(|src| src.as_str())
+                    element
+                        .attributes
+                        .get_str("src")
+                        .map(|src| src.into_owned())
                 }
                 _ => None,
             })
             .filter(|src| !src.starts_with("data:"))
             .filter_map(|src| {
-                let url = match resolve_url(src, Some(&base)) {
+                let url = match resolve_url(&src, Some(&base)) {
                     Ok(url) => url,
                     Err(err) => {
                         println!("Failed to resolve image URL {}: {}", src, err);
@@ -4122,7 +4387,7 @@ impl Renderer {
                     return None;
                 }
 
-                Some((url, Self::img_src_extension(src)?))
+                Some((url, Self::img_src_extension(&src)?))
             })
             .collect();
 
@@ -4254,7 +4519,7 @@ impl Renderer {
             Node::Element(element) => {
                 str += "<";
                 str += &element.tag;
-                for (key, value) in element.attributes.iter() {
+                for (key, value) in element.attributes.values.iter() {
                     str += " ";
                     str += key;
                     str += "=\"";
@@ -4450,12 +4715,12 @@ impl Renderer {
                                     Node::Element(element) => (
                                         element
                                             .attributes
-                                            .get("width")
+                                            .get_str("width")
                                             .and_then(|v| v.parse::<u32>().ok())
                                             .or(Some(150)),
                                         element
                                             .attributes
-                                            .get("height")
+                                            .get_str("height")
                                             .and_then(|v| v.parse::<u32>().ok())
                                             .or(Some(150)),
                                     ),
@@ -4504,9 +4769,9 @@ impl Renderer {
                         }
                         "img" | "video" => {
                             let src = if element.tag == "video" {
-                                element.attributes.get("poster")?
+                                element.attributes.get_str("poster")?
                             } else {
-                                element.attributes.get("src")?
+                                element.attributes.get_str("src")?
                             };
                             if src.starts_with("data:") {
                                 if let Some(data) = src.strip_prefix("data:image/svg+xml,") {
@@ -4543,12 +4808,12 @@ impl Renderer {
                                     .tokio
                                     .clone()
                                     .borrow_mut()
-                                    .block_on(self.get_img_src_data(src))
+                                    .block_on(self.get_img_src_data(&src))
                                     .ok()?;
                                 let result = match img_data {
                                     RequestCacheEntry::PngData(bytes) => rasterize_png(
                                         &mut self.cached_rasterizations,
-                                        src,
+                                        &src,
                                         &bytes,
                                         container_size.container_width_non_filling,
                                         container_size.container_height_non_filling,
@@ -4573,7 +4838,7 @@ impl Renderer {
                                         if *mode == LayoutMode::Complete {
                                             let pixmap = rasterize_jpeg(
                                                 &mut self.cached_rasterizations,
-                                                src,
+                                                &src,
                                                 target_w,
                                                 target_h,
                                             )
@@ -4646,17 +4911,15 @@ impl Renderer {
                 } else if element.tag == "iframe" {
                     let height = element
                         .attributes
-                        .get("height")
+                        .get_str("height")
                         .and_then(|v| v.parse::<f32>().ok())
                         .unwrap_or(150.) as u32;
                     let width = element
                         .attributes
-                        .get("width")
+                        .get_str("width")
                         .and_then(|v| v.parse::<f32>().ok())
                         .unwrap_or(300.) as u32;
-                    let Some(url) = element.attributes.get("src") else {
-                        return None;
-                    };
+                    let url = element.attributes.get_str("src");
                     let style = self.node_styles.get(&node_idx).unwrap();
                     let z_index = match style.z_index {
                         StyleZIndex::Auto => 0,
@@ -4664,7 +4927,10 @@ impl Renderer {
                     };
                     if !self.frames.contains_key(&node_idx) {
                         let handle = self
-                            .spawn_frame(url.clone(), PhysicalSize { width, height })
+                            .spawn_frame(
+                                url.and_then(|v| Some(v.into_owned())),
+                                PhysicalSize { width, height },
+                            )
                             .ok()?;
                         self.frames.insert(node_idx, handle);
                     }
@@ -4828,15 +5094,15 @@ impl Renderer {
         }
     }
 
-    fn spawn_frame(&mut self, url: String, size: PhysicalSize<u32>) -> Result<FrameHandle> {
+    fn spawn_frame(&mut self, url: Option<String>, size: PhysicalSize<u32>) -> Result<FrameHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
         let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
         let bitmap_for_thread = Arc::clone(&latest_bitmap);
         let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
         tx.send(FrameCommand::Render).unwrap();
-        let tx_proxy = RendererProxy::FrameLoop(tx);
+        let tx_proxy = RendererProxy::FrameLoop(tx.clone());
         std::thread::spawn(move || {
-            let mut browser = Browser::new(url.to_string(), false);
+            let mut browser = Browser::new(url.clone().unwrap_or("about:blank".to_string()), false);
 
             let browser_result = browser.open();
             match browser_result {
@@ -4863,42 +5129,31 @@ impl Renderer {
                 js_result
             );
 
+            let mut js_pending = true;
             loop {
-                while let Ok(cmd) = rx.try_recv() {
-                    match cmd {
-                        FrameCommand::Render | FrameCommand::UserEvent(UserEvent::DomUpdated) => {
-                            if browser
-                                .renderer
-                                .as_ref()
-                                .is_some_and(|renderer| renderer.borrow().pending_dom_update)
-                            {
-                                browser.process_dom_update();
-                            }
+                let cmd = rx.recv();
+                let had_command = cmd.is_ok();
+                match cmd {
+                    Ok(cmd) => {
+                        browser.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
 
-                            let mut pixels = vec![0; (size.width * size.height) as usize];
-                            browser.renderer.as_ref().unwrap().borrow_mut().render_into(
-                                &mut pixels,
-                                size.width,
-                                size.height,
-                                true,
-                            );
-
-                            *bitmap_for_thread.lock().unwrap() = pixels;
-
-                            let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+                        while let Ok(cmd) = rx.try_recv() {
+                            browser.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
                         }
-                        FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
-                            let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
-                        }
-                        _ => {}
-                    }
+                    },
+                    Err(_) => break,
+                };
+                if had_command || js_pending {
+                    js_pending = browser
+                        .pump_js_event_loop_once()
+                        .inspect_err(|err| eprintln!("Error occurred while pumping JS loop: {}", err))
+                        .unwrap_or(false);
                 }
-
-                let _ = browser.pump_js_event_loop_once();
             }
         });
         Ok(FrameHandle {
             surface: latest_bitmap,
+            tx,
         })
     }
 
@@ -5214,8 +5469,13 @@ impl Renderer {
         mode: &LayoutMode,
     ) -> Option<(u32, u32, Vec<usize>, u32)> {
         let style = self.node_styles.get(&node_idx).unwrap();
-        let container_sizes =
-            self.get_container_sizes(node_idx, &forced_size, style, &available_size, containing_node_idx);
+        let container_sizes = self.get_container_sizes(
+            node_idx,
+            &forced_size,
+            style,
+            &available_size,
+            containing_node_idx,
+        );
         if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
             self.containing_nodes.insert(
                 node_idx,
@@ -5510,8 +5770,13 @@ impl Renderer {
             }
         }
 
-        let container_sizes =
-            self.get_container_sizes(node_idx, &forced_size, style, &available_size, containing_node_idx);
+        let container_sizes = self.get_container_sizes(
+            node_idx,
+            &forced_size,
+            style,
+            &available_size,
+            containing_node_idx,
+        );
 
         let children_idxs: Vec<usize> = self
             .dom_indexes
@@ -5654,14 +5919,17 @@ impl Renderer {
         }
 
         let input_value = match &self.nodes.get(&node_idx).unwrap() {
-            Node::Element(element) => element.attributes.get("value"),
+            Node::Element(element) => element.attributes.get_str("value"),
             Node::Text(_) | Node::Comment(_) => None,
         };
-        if immediate_children.len() == 0 && input_value.is_some_and(|v| v.len() > 0) {
+        if immediate_children.len() == 0
+            && let Some(input_value) = input_value
+            && input_value.len() > 0
+        {
             let layout_box = self
                 .create_input_text_box(
                     node_idx,
-                    input_value.unwrap().clone(),
+                    input_value.into_owned(),
                     &mut content_position,
                     font_size,
                     save_as_final,
@@ -5792,14 +6060,8 @@ impl Renderer {
             return None;
         }
 
-        get_specified_size(
-            font_size,
-            size,
-            available_size,
-            None,
-            &self.window_size,
-        )
-        .and_then(|v| if v >= 0 { Some(v as u32) } else { None })
+        get_specified_size(font_size, size, available_size, None, &self.window_size)
+            .and_then(|v| if v >= 0 { Some(v as u32) } else { None })
     }
 
     fn layout_flex(
@@ -5831,8 +6093,13 @@ impl Renderer {
 
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
 
-        let container_sizes =
-            self.get_container_sizes(node_idx, &forced_size, &style, &available_size, containing_node_idx);
+        let container_sizes = self.get_container_sizes(
+            node_idx,
+            &forced_size,
+            &style,
+            &available_size,
+            containing_node_idx,
+        );
         let (containing_block_height, containing_block_width) =
             self.get_containing_block_size(containing_node_idx, node_idx, &style);
 
@@ -5892,13 +6159,16 @@ impl Renderer {
             .collect();
 
         let input_value = match &self.nodes.get(&node_idx).unwrap() {
-            Node::Element(element) => element.attributes.get("value"),
+            Node::Element(element) => element.attributes.get_str("value"),
             Node::Text(_) | Node::Comment(_) => None,
         };
-        if immediate_children.len() == 0 && input_value.is_some_and(|v| v.len() > 0) {
+        if immediate_children.len() == 0
+            && let Some(input_value) = input_value
+            && input_value.len() > 0
+        {
             if let Ok(layout_box_idx) = self.create_input_text_box(
                 node_idx,
-                input_value.unwrap().clone(),
+                input_value.into_owned(),
                 &mut content_position,
                 font_size,
                 save_as_final,
@@ -6644,6 +6914,25 @@ impl Renderer {
         self.dom_indexes.children_index.remove(&node_idx);
     }
 
+    pub fn detach_node(&mut self, node_idx: usize) {
+        let Some(parent) = self.nodes.get(&node_idx).and_then(|node| node.get_parent()) else {
+            return;
+        };
+
+        if let Some(children) = self.dom_indexes.children_index.get_mut(&parent) {
+            children.retain(|idx| *idx != node_idx);
+        }
+
+        if let Some(node) = self.nodes.get_mut(&node_idx) {
+            node.set_parent(None);
+        }
+        self.node_layout_mapping.remove(&node_idx);
+    }
+
+    pub fn recompute_children_index(&mut self) {
+        self.dom_indexes.recompute_children(&self.nodes, &self.nodes_idxs);
+    }
+
     pub fn recompute_dom_indexes(&mut self) {
         self.dom_indexes = get_dom_indexes(&self.nodes, &self.nodes_idxs);
     }
@@ -7042,6 +7331,17 @@ impl Browser {
     }
 
     async fn get_html(&self, url: String) -> Result<(String, String)> {
+        if url == "about:blank" {
+            return Ok((
+                r#"<html>
+  <head></head>
+  <body></body>
+</html>"#
+                    .to_string(),
+                url,
+            ));
+        }
+
         if let Some(stripped) = url.strip_prefix("file://") {
             let contents = fs::read_to_string(stripped)?;
             Ok((contents, url))
@@ -7104,6 +7404,94 @@ impl Browser {
         Ok(())
     }
 
+    fn handle_frame_command(
+        &mut self,
+        cmd: FrameCommand,
+        parent_proxy: &RendererProxy,
+        size: &PhysicalSize<u32>,
+        bitmap_for_thread: &Arc<Mutex<Vec<u32>>>,
+    ) {
+        match cmd {
+            FrameCommand::Render | FrameCommand::UserEvent(UserEvent::DomUpdated) => {
+                if self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.borrow().pending_dom_update)
+                {
+                    self.process_dom_update();
+                }
+
+                let mut pixels = vec![0; (size.width * size.height) as usize];
+                self.renderer.as_ref().unwrap().borrow_mut().render_into(
+                    &mut pixels,
+                    size.width,
+                    size.height,
+                    true,
+                );
+
+                *bitmap_for_thread.lock().unwrap() = pixels;
+
+                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+            }
+            FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
+                let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
+            }
+            FrameCommand::Dom(FrameDomCommand::QuerySelector {
+                selector,
+                required_parent,
+                reply,
+            }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let _ = reply
+                    .send(Ok(renderer.query_selector_node(selector, required_parent)));
+            }
+            FrameCommand::Dom(FrameDomCommand::QuerySelectorAll {
+                selector,
+                required_parent,
+                reply,
+            }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let _ =
+                    reply
+                        .send(Ok(renderer
+                            .query_selector_all_nodes(selector, required_parent)));
+            }
+            FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
+                html,
+                node_idx,
+                reply,
+            }) => {
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                renderer.replace_inner_html(node_idx, html);
+                let _ = reply.send(());
+            }
+            FrameCommand::Dom(FrameDomCommand::GetInnerHtml { node_idx, reply }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let html = renderer.get_element_inner_html(node_idx);
+                let _ = reply.send(html);
+            }
+            FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply }) => {
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let idx = renderer.create_element(tag);
+                let _ = reply.send(idx);
+            }
+            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let _ = reply.send(renderer.get_elements_by_tag_name(&tag));
+            }
+            FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
+                node_idx,
+                attributes,
+                reply,
+            }) => {
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let _ = reply
+                    .send(renderer.update_element_attributes(node_idx, attributes));
+            }
+            _ => {}
+        }
+    }
+
     fn pump_js_event_loop_once(&mut self) -> Result<bool> {
         let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
 
@@ -7159,10 +7547,7 @@ impl Browser {
                     );
                     match result {
                         Ok(_) => Self::drain_microtasks(&mut runtime),
-                        Err(err) => eprintln!(
-                            "Failed to execute JS with error: {}",
-                            err
-                        ),
+                        Err(err) => eprintln!("Failed to execute JS with error: {}", err),
                     };
                 }
                 ScriptContent::Link(link) => {
@@ -7214,10 +7599,7 @@ impl Browser {
                                 .with_event_loop_promise(result, Default::default())
                                 .await
                                 .inspect_err(|err| {
-                                    eprintln!(
-                                        "Failed to execute JS at {} with error: {}",
-                                        url, err
-                                    )
+                                    eprintln!("Failed to execute JS at {} with error: {}", url, err)
                                 });
                         }
                     }
@@ -7260,10 +7642,10 @@ impl Browser {
         if element.tag == "meta"
             && element
                 .attributes
-                .get("http-equiv")
+                .get_str("http-equiv")
                 .is_some_and(|v| v.to_lowercase() == "refresh")
         {
-            let Some(content) = element.attributes.get("content") else {
+            let Some(content) = element.attributes.get_str("content") else {
                 return None;
             };
             let Some((delay, instructions)) = content.split_once(";") else {
@@ -7521,8 +7903,8 @@ impl Browser {
                     FOCUSABLE_ELEMENTS.contains(&element.tag.as_str())
                         && element
                             .attributes
-                            .get("type")
-                            .is_none_or(|v| FOCUSABLE_INPUT_TYPES.contains(&v.as_str()))
+                            .get_str("type")
+                            .is_none_or(|v| FOCUSABLE_INPUT_TYPES.contains(&v.as_ref()))
                 });
                 renderer.focusable = focusable;
             }
@@ -7536,8 +7918,8 @@ impl Browser {
                     ["input", "button"].contains(&element.tag.as_str())
                         && element
                             .attributes
-                            .get("type")
-                            .is_some_and(|v| v == "submit")
+                            .get_str("type")
+                            .is_some_and(|v| v.as_ref() == "submit")
                 },
             );
             if let Some(submittable_input) = submittable_input {
@@ -7594,12 +7976,14 @@ impl Browser {
                 },
             );
             if let Some(parent) = parent_link {
-                let parent_href = if let Some(Node::Element(element)) =
-                    self.renderer.as_ref().unwrap().borrow().nodes.get(&parent)
-                {
-                    element.attributes.get("href").cloned()
-                } else {
-                    None
+                let parent_href = {
+                    let renderer = self.renderer.as_ref().unwrap().borrow();
+                    match renderer.nodes.get(&parent) {
+                        Some(Node::Element(element)) => {
+                            element.attributes.get_str("href").map(|v| v.into_owned())
+                        }
+                        _ => None,
+                    }
                 };
                 if let Some(href) = parent_href
                     && !default_prevented
@@ -7618,11 +8002,6 @@ impl Browser {
         let code = ScriptContent::Code(
             format!(
                 r#"
-            document.documentElement = document.querySelector("html");
-            document.body = document.querySelector("body");
-            document.head = document.querySelector("head");
-            document.activeElement = document.body;
-
             navigator.userAgent = "{}";
 
             window.__init_location("{}");
@@ -8045,7 +8424,7 @@ impl Browser {
         "#,
             scrollable_idx
         );
-        self.execute_host_script("script onscroll", code).unwrap();
+        let _ = self.execute_host_script("script onscroll", code).inspect_err(|err| eprintln!("Script onscroll handler failed with err: {}", err));
         if let Some(window) = self.window.as_mut() {
             window.request_redraw();
         }
@@ -8059,7 +8438,11 @@ impl Browser {
             let new_text = {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 if let Some(Node::Element(element)) = renderer.nodes.get_mut(&focusable) {
-                    let entry = element.attributes.entry("value".to_string()).or_default();
+                    let entry = element
+                        .attributes
+                        .values
+                        .entry("value".to_string())
+                        .or_default();
                     *entry += text.as_str();
                     Some(entry.clone())
                 } else {
@@ -8097,9 +8480,12 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://nodejs.org/en".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://slack.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
-    // let mut browser = Browser::new("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging);
+    // let mut browser = Browser::new(
+    //     "file:///home/pontus/browser/pages/test.html".to_string(),
+    //     hover_debugging,
+    // );
 
     let params = browser.open()?;
     browser.start_event_loop(params)?;
@@ -8171,7 +8557,7 @@ fn get_node_text_representation(
 fn format_element_tree_label(element: &Element) -> String {
     let mut label = format!("Node::Element: {}", element.tag.clone());
 
-    let mut attributes = element.attributes.iter().collect::<Vec<_>>();
+    let mut attributes = element.attributes.values.iter().collect::<Vec<_>>();
     attributes.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
 
     for (key, value) in attributes {
@@ -8491,14 +8877,14 @@ mod tests {
         let params = browser.open()?;
         browser.set_up_without_event_loop(
             params,
-            PhysicalSize::new(1920, 2160),
+            PhysicalSize::new(1920, 4320),
             RendererProxy::FrameLoop(tx),
         )?;
         browser.run_js()?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        let mut buffer = vec![0; 1920 * 2160];
-        browser.render_into(&mut buffer, 1920, 2160, true);
-        ensure_snapshot_matches(&buffer, "slackcom", 1920, 2160)
+        let mut buffer = vec![0; 1920 * 4320];
+        browser.render_into(&mut buffer, 1920, 4320, true);
+        ensure_snapshot_matches(&buffer, "slackcom", 1920, 4320)
     }
 
     #[test]

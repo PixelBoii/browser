@@ -1,14 +1,86 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use deno_core::{ToV8, v8};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::hash::Hash;
 
-const SELF_CLOSING_TAGS: [&str; 6] = ["br", "input", "meta", "link", "img", "hr"];
+const SELF_CLOSING_TAGS: [&str; 14] = [
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+    "source", "track", "wbr",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attributes {
+    pub values: HashMap<String, String>,
+}
+
+impl Attributes {
+    pub fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+        }
+    }
+
+    pub fn from_hash_map(values: HashMap<String, String>) -> Self {
+        Self {
+            values,
+        }
+    }
+
+    pub fn insert(&mut self, attribute: String, value: String) -> Option<String> {
+        self.values.insert(attribute, value)
+    }
+
+    pub fn get_str<Q>(&self, attribute: &Q) -> Option<Cow<'_, str>>
+    where
+        String: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.values.get(attribute).and_then(|v| Some(Cow::Borrowed(v.as_str())))
+    }
+
+    pub fn contains_key<Q>(&self, attribute: &Q) -> bool
+    where
+        String: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.values.contains_key(attribute)
+    }
+
+    pub fn remove<Q>(&mut self, attribute: &Q) -> Option<String>
+    where
+        String: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.values.remove(attribute)
+    }
+
+    pub fn keys(&self) -> std::collections::hash_map::Keys<'_, String, String> {
+        self.values.keys()
+    }
+}
+
+impl<'a> ToV8<'a> for Attributes {
+    type Error = Infallible;
+
+    fn to_v8<'i>(
+        self,
+        scope: &mut v8::PinScope<'a, 'i>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        let object = v8::Object::new(scope);
+        for (key, value) in self.values.iter() {
+            let value = value.clone().to_v8(scope)?;
+            object.set(scope, v8::String::new(scope, key).unwrap().into(), value);
+        }
+        Ok(object.into())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Element {
     pub tag: String,
-    pub attributes: HashMap<String, String>,
+    pub attributes: Attributes,
     pub parent: Option<usize>,
 }
 
@@ -76,7 +148,7 @@ impl<'a> ToV8<'a> for Element {
         set_object_prop(scope, object, "tag", self.tag);
         set_object_prop(scope, object, "parent", self.parent);
 
-        for (key, value) in self.attributes {
+        for (key, value) in self.attributes.values {
             set_object_prop(scope, attributes, &key, value);
         }
 
@@ -260,7 +332,9 @@ impl HtmlParser {
         let node = self.curr_node()?;
         match node {
             Node::Element(element) => {
-                element.attributes.insert(tag, value);
+                element
+                    .attributes
+                    .insert(tag, value);
             }
             _ => {}
         }
@@ -276,7 +350,7 @@ impl HtmlParser {
             }),
             _ => Node::Element(Element {
                 tag: self.tag.trim().to_string(),
-                attributes: HashMap::new(),
+                attributes: Attributes::new(),
                 parent: self.node.clone(),
             }),
         };

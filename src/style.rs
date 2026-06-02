@@ -269,15 +269,12 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
     Style {
         width: match node {
             HtmlNode::Element(element) => {
-                if let Some(width) = element.attributes.get(&"width".to_string()) {
-                    parse_style_size(width.clone()).unwrap()
+                if let Some(width) = element.attributes.get_str(&"width".to_string()) {
+                    parse_style_size(width.as_ref()).unwrap()
                 } else {
                     match element.tag.as_str() {
                         "br" => StyleSize::Px(0.),
-                        "input" => match element
-                            .attributes
-                            .get(&"type".to_string())
-                            .and_then(|v| Some(v.as_str()))
+                        "input" => match element.attributes.get_str(&"type".to_string()).as_deref()
                         {
                             Some("button") | Some("submit") | Some("reset") => StyleSize::Auto,
                             _ => StyleSize::Px(20.),
@@ -290,8 +287,8 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         },
         height: match node {
             HtmlNode::Element(element) => {
-                if let Some(height) = element.attributes.get(&"height".to_string()) {
-                    parse_style_size(height.clone()).unwrap()
+                if let Some(height) = element.attributes.get_str(&"height".to_string()) {
+                    parse_style_size(height.as_ref()).unwrap()
                 } else {
                     match element.tag.as_str() {
                         "br" => StyleSize::Px(10.),
@@ -322,7 +319,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                         "button" | "input" => {
                             if element
                                 .attributes
-                                .get("type")
+                                .get_str("type")
                                 .is_some_and(|v| v == "hidden")
                             {
                                 StyleDisplay::None
@@ -591,7 +588,8 @@ fn parse_clamp_size_part(value: &str) -> Result<StyleSize> {
     }
 }
 
-fn parse_style_size(value: String) -> Result<StyleSize> {
+fn parse_style_size(value: impl AsRef<str>) -> Result<StyleSize> {
+    let value = value.as_ref();
     if value == "auto" {
         return Ok(StyleSize::Auto);
     }
@@ -692,10 +690,11 @@ fn parse_style_size(value: String) -> Result<StyleSize> {
         let parsed = parse_size_number(em)?;
         return Ok(StyleSize::Em(parsed));
     }
-    let mut adjusted = value.clone();
-    if value.starts_with('.') {
-        adjusted = format!("0{}", adjusted);
-    }
+    let adjusted = if value.starts_with('.') {
+        format!("0{}", value)
+    } else {
+        value.to_string()
+    };
     if let Ok(parsed) = adjusted.parse::<f32>() {
         return Ok(StyleSize::Px(parsed));
     }
@@ -739,7 +738,7 @@ fn parse_grid_size(value: String) -> Result<GridColumnSize> {
 }
 
 fn get_inline_nodes(element: &HtmlElement) -> Result<Vec<Node>> {
-    let style_str = element.attributes.get("style");
+    let style_str = element.attributes.get_str("style");
     match style_str {
         Some(style) => {
             let mut inline_parser = CssParser::new_inline(&style);
@@ -765,13 +764,17 @@ pub fn element_matched_attributes(
                 if let Some(stripped) = key.strip_suffix('*') {
                     if element
                         .attributes
-                        .get(stripped)
+                        .get_str(stripped)
                         .is_none_or(|v| !v.contains(value))
                     {
                         return false;
                     }
                 } else {
-                    if element.attributes.get(key).is_none_or(|v| v != value) {
+                    if element
+                        .attributes
+                        .get_str(key)
+                        .is_none_or(|v| v.as_ref() != value)
+                    {
                         return false;
                     }
                 }
@@ -883,9 +886,9 @@ fn parse_border_style(value: String) -> Result<StyleBorderStyle> {
 pub fn get_class_list(element: &HtmlElement) -> HashSet<String> {
     let element_classes: HashSet<String> = element
         .attributes
-        .get("class")
-        .cloned()
-        .unwrap_or(String::new())
+        .get_str("class")
+        .map(|v| v.into_owned())
+        .unwrap_or_default()
         .split(" ")
         .map(|s| s.to_string())
         .collect();
@@ -975,7 +978,10 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
         if inside && char == ')' {
             let collected: String = buffer.drain(..).collect();
             let (name, default) = if let Some(collected) = collected.split_once(",") {
-                (collected.0.trim().to_owned(), Some(collected.1.trim().to_owned()))
+                (
+                    collected.0.trim().to_owned(),
+                    Some(collected.1.trim().to_owned()),
+                )
             } else {
                 (collected.trim().to_string(), None)
             };

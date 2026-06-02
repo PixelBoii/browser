@@ -106,10 +106,7 @@ Object.defineProperty(globalThis, "SVGAnimatedString", {
 class BaseNode {
     constructor() {
         this.__node_idx = null
-    }
-
-    get ownerDocument() {
-        return globalThis.document
+        this.ownerDocument = currentDocument
     }
 
     get isConnected() {
@@ -338,7 +335,7 @@ class HtmlElement extends BaseNode {
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_element(this.tag)
+        this.__node_idx = core.ops.op_create_element(this.tag, this.ownerDocument.__frameId)
     }
 
     addEventListener(event, cb) {
@@ -450,8 +447,7 @@ class HtmlElement extends BaseNode {
     }
 
     setAttribute(attr, value) {
-        // TODO: This should probably not stringify all values
-        core.ops.op_update_attributes(this.__node_idx, { [attr]: String(value) })
+        core.ops.op_update_attributes(this.__node_idx, { [attr]: value }, this.ownerDocument.__frameId)
     }
 
     removeAttribute(attr) {
@@ -473,17 +469,17 @@ class HtmlElement extends BaseNode {
 
     querySelector(selector) {
         const node = core.ops.op_query_selector(selector, this.__node_idx)
-        return node ? nodeToElement(node) : null
+        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
     }
 
     querySelectorAll(selector) {
         const nodes = core.ops.op_query_selector_all(selector, this.__node_idx)
-        return nodes.map(nodeToElement)
+        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
     }
 
     closest(selector) {
         const node = core.ops.op_get_closest(selector, this.__node_idx)
-        return node ? nodeToElement(node) : null
+        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
     }
 
     matches(selector) {
@@ -512,7 +508,7 @@ class HtmlElement extends BaseNode {
     }
 
     get innerHTML() {
-        return core.ops.op_get_inner_html(this.__node_idx)
+        return core.ops.op_get_inner_html(this.__node_idx, this.ownerDocument.__frameId)
     }
 
     get nodeType() {
@@ -520,7 +516,7 @@ class HtmlElement extends BaseNode {
     }
 
     set innerHTML(value) {
-        core.ops.op_set_inner_html(this.__node_idx, value);
+        core.ops.op_set_inner_html(this.__node_idx, value, this.ownerDocument.__frameId);
     }
 
     get textContent() {
@@ -540,7 +536,7 @@ class HtmlElement extends BaseNode {
     }
 
     set style(value) {
-        if (!value instanceof CSSStyleDeclaration) {
+        if (!(value instanceof CSSStyleDeclaration)) {
             throw new TypeError("Unsupported style value (for now)")
         }
         this.setAttribute('style', value)
@@ -577,6 +573,22 @@ class HtmlElement extends BaseNode {
 
     set src(value) {
         this.setAttribute('src', value)
+    }
+
+    get srcset() {
+        return this.getAttribute('srcset') ?? ""
+    }
+
+    set srcset(value) {
+        this.setAttribute('srcset', value)
+    }
+
+    get loading() {
+        return this.getAttribute('loading') ?? ""
+    }
+
+    set loading(value) {
+        this.setAttribute('loading', value)
     }
 
     get id() {
@@ -753,6 +765,15 @@ class HTMLIFrameElement extends HtmlElement {
     constructor() {
         super("iframe")
     }
+
+    spawnFrame() {
+        core.ops.op_spawn_frame(this.__node_idx, null)
+    }
+
+    get contentDocument() {
+        // Frame idx is the node idx
+        return new Document(this.__node_idx)
+    }
 }
 
 Object.defineProperty(globalThis, "HTMLElement", {
@@ -887,7 +908,7 @@ class CSSStyleDeclaration {
         }
 
         this.__element.__style = out
-        core.ops.op_update_attributes(this.__element.__node_idx, { style: out })
+        core.ops.op_update_attributes(this.__element.__node_idx, { style: out }, this.__element.ownerDocument.__frameId)
     }
 }
 
@@ -970,7 +991,7 @@ class ClassList {
 
     sync() {
         this.element.class = Array.from(this.list).join(" ")
-        core.ops.op_update_attributes(this.element.__node_idx, { class: this.element.class })
+        core.ops.op_update_attributes(this.element.__node_idx, { class: this.element.class }, this.element.ownerDocument.__frameId)
     }
 
     add(str) {
@@ -1005,9 +1026,16 @@ class ClassList {
     }
 }
 
+// TODO: Might want to key this by frame/document id too
+const nodeMap = new Map()
+
 function nodeToElement(pair) {
     const node_idx = pair[0]
     const node = pair[1]
+    const existing = nodeMap.get(node_idx)
+    if (existing) {
+        return existing
+    }
     let element;
     if (node.kind === "element") {
         const elementClass = tagToElement(node.tag)
@@ -1018,6 +1046,7 @@ function nodeToElement(pair) {
         element = withoutAutoRegisterNode(() => new TextNode(node.text))
     }
     element.__node_idx = node_idx
+    nodeMap.set(node_idx, element)
     return element
 }
 
@@ -1052,99 +1081,152 @@ function tagToElement(tag) {
                     HtmlElement
 }
 
-const documentFonts = {
-    status: "loaded",
-    ready: Promise.resolve([]),
-    load() {
-        return Promise.resolve([])
-    },
-    check() {
-        return true
-    },
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {
-        return true
-    },
-}
-
-globalThis.document = {
-    nodeType: Node.DOCUMENT_NODE,
-    hidden: false,
-    visibilityState: "visible",
-    readyState: "complete",
-    activeElement: null,
-    defaultView: globalThis,
+class Document {
+    constructor(frameId = null) {
+        this.__frameId = frameId
+    }
+    get nodeType() {
+        return Node.DOCUMENT_NODE
+    }
+    get hidden() {
+        return false
+    }
+    get visibilityState() {
+        return "visible"
+    }
+    get readyState() {
+        return "complete"
+    }
+    get activeElement() {
+        return this.body
+    }
+    get defaultView() {
+        return globalThis
+    }
     get cookie() {
         return core.ops.op_get_cookie(globalThis.location.href)
-    },
+    }
     set cookie(newValue) {
         core.ops.op_set_cookie(globalThis.location.href, String(newValue))
-    },
+    }
     get scripts() {
-        return document.querySelectorAll('script')
-    },
-    referrer: "",
-    fonts: documentFonts,
+        return this.querySelectorAll('script')
+    }
+    get referrer() {
+        return ""
+    }
+    get fonts() {
+        return {
+            status: "loaded",
+            ready: Promise.resolve([]),
+            load() {
+                return Promise.resolve([])
+            },
+            check() {
+                return true
+            },
+            addEventListener() {},
+            removeEventListener() {},
+            dispatchEvent() {
+                return true
+            },
+        }
+    }
+    get documentElement() {
+        return this.querySelector("html")
+    }
+    get head() {
+        return this.querySelector("head")
+    }
+    get body() {
+        return this.querySelector("body")
+    }
     createElementNS(ns, tag) {
         const element = this.createElement(tag)
         element.namespaceURI = ns
         return element
-    },
+    }
     createElement(tag, ...args) {
         const elementClass = tagToElement(tag)
-        const element = new elementClass(tag, ...args)
+        const element = withDocument(this, () => new elementClass(tag, ...args))
         return element
-    },
+    }
     createComment(data) {
-        const element = new CommentNode(data)
+        const element = withDocument(this, () => new CommentNode(data))
         return element
-    },
+    }
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(id)
-        return node ? nodeToElement(node) : null
-    },
+        return withDocument(this, () => node ? nodeToElement(node) : null)
+    }
     getElementsByTagName(tag) {
-        const nodes = core.ops.op_get_elements_by_tag_name(tag)
-        return nodes.map(nodeToElement)
-    },
+        const nodes = core.ops.op_get_elements_by_tag_name(tag, this.__frameId)
+        return withDocument(this, () => nodes.map(nodeToElement))
+    }
     querySelector(selector) {
-        const node = core.ops.op_query_selector(selector)
-        return node ? nodeToElement(node) : null
-    },
+        const node = core.ops.op_query_selector(selector, null, this.__frameId)
+        return withDocument(this, () => node ? nodeToElement(node) : null)
+    }
     querySelectorAll(selector) {
-        const nodes = core.ops.op_query_selector_all(selector)
-        return nodes.map(nodeToElement)
-    },
+        const nodes = core.ops.op_query_selector_all(selector, null, this.__frameId)
+        return withDocument(this, () => nodes.map(nodeToElement))
+    }
     addEventListener(event, cb) {
         registerEventListener(`${DOCUMENT_EVENT_TARGET}:${event}`, cb)
-    },
+    }
     removeEventListener(event, cb) {
         removeEventListenerByKey(`${DOCUMENT_EVENT_TARGET}:${event}`, cb)
-    },
+    }
     dispatchEvent(event) {
         return dispatchEventToTarget(this, event)
-    },
+    }
     createTextNode(text) {
         const element = new TextNode(text)
         return element
-    },
+    }
     createDocumentFragment() {
         return this.createElement("fragment")
-    },
+    }
     hasFocus() {
         return true
-    },
-    implementation: {
-        createHTMLDocument() {
-            const element = new HTMLIFrameElement()
-            element.setAttribute('src', 'about:blank')
-
-            // TODO: This should return the document inside of this iframe
-            // A little unsure of how to make that work though
+    }
+    get implementation() {
+        return {
+            createHTMLDocument() {
+                const element = new HTMLIFrameElement()
+                element.setAttribute('src', 'about:blank')
+                element.spawnFrame()
+                return element.contentDocument
+            },
+            hasFeature() {
+                return false
+            }
         }
     }
-};
+}
+
+const document = new Document()
+
+Object.defineProperty(globalThis, "document", {
+  value: document,
+  enumerable: true,
+  configurable: true,
+  writable: true,
+});
+
+let currentDocument = globalThis.document
+
+function withDocument(documentToUse, cb) {
+    let prev = currentDocument
+    currentDocument = documentToUse
+    let res = null
+    try {
+        res = cb()
+    } finally {
+        currentDocument = prev
+    }
+    return res
+}
 
 Object.defineProperty(globalThis, "setTimeout", {
   value: setTimeoutImpl,
@@ -1269,6 +1351,10 @@ class Location {
 
     get host() {
         return this.__url.host
+    }
+
+    get hostname() {
+        return this.__url.hostname
     }
 
     get port() {

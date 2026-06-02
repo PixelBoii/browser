@@ -571,13 +571,11 @@ impl<'a> CssParser<'a> {
                 parent: self.node,
             }));
         } else if self.label.trim().starts_with("@supports not") {
-            self.nodes.push(Node::SupportsNot(Supports {
-                parent: self.node,
-            }));
+            self.nodes
+                .push(Node::SupportsNot(Supports { parent: self.node }));
         } else if self.label.trim().starts_with("@supports") {
-            self.nodes.push(Node::Supports(Supports {
-                parent: self.node,
-            }));
+            self.nodes
+                .push(Node::Supports(Supports { parent: self.node }));
         } else if self.label.trim().starts_with("@media") {
             let name = self
                 .label
