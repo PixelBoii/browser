@@ -28,6 +28,7 @@ pub enum PseudoClass {
     Link,
     Visited,
     Disabled,
+    Lang(String),
     Before,
     After,
     Host,
@@ -327,6 +328,11 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     if let Some(stripped) = value.strip_prefix("has(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
             return Some(PseudoClass::Has(selector_to_parts(&stripped.to_string())));
+        }
+    }
+    if let Some(stripped) = value.strip_prefix("lang(") {
+        if let Some(stripped) = stripped.strip_suffix(")") {
+            return Some(PseudoClass::Lang(unquote(stripped).to_string()));
         }
     }
     if let Some(stripped) = value.strip_prefix("nth-child(") {

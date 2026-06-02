@@ -1453,6 +1453,27 @@ fn element_matches_class_part(
                     Node::Element(el) => el.attributes.contains_key("disabled"),
                     _ => false,
                 },
+                PseudoClass::Lang(target) => {
+                    let lang = walk_for_html_match(
+                        element,
+                        html_nodes,
+                        &mut |idx| match html_nodes.get(&idx).unwrap() {
+                            Node::Element(el) => el.attributes.contains_key("lang"),
+                            _ => false,
+                        },
+                        None,
+                    )
+                    .and_then(|idx| match html_nodes.get(&idx).unwrap() {
+                        Node::Element(el) => el.attributes.get_str("lang"),
+                        _ => None,
+                    });
+                    lang.is_some_and(|lang| {
+                        lang.eq_ignore_ascii_case(target)
+                            || lang
+                                .strip_prefix(target)
+                                .is_some_and(|rest| rest.starts_with('-'))
+                    })
+                }
                 _ => false,
             }
         }
