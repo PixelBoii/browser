@@ -7298,6 +7298,7 @@ struct Browser {
     executed_scripts: ExecutedScripts,
     network_fetch: Rc<RefCell<NetworkFetch>>,
     document_id: u64,
+    dom_content_loaded_dispatched: bool,
     hover_debugging: bool,
 }
 
@@ -7322,6 +7323,10 @@ impl std::fmt::Debug for Browser {
             .field("executed_scripts", &self.executed_scripts)
             .field("network_fetch", &self.network_fetch)
             .field("document_id", &self.document_id)
+            .field(
+                "dom_content_loaded_dispatched",
+                &self.dom_content_loaded_dispatched,
+            )
             .field("hover_debugging", &self.hover_debugging)
             .finish()
     }
@@ -7344,6 +7349,7 @@ impl Browser {
             layout_booted: false,
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
             document_id: 0,
+            dom_content_loaded_dispatched: false,
             hover_debugging,
         }
     }
@@ -7427,6 +7433,25 @@ impl Browser {
         let value = runtime.execute_script(name, code)?;
         Self::drain_microtasks(&mut runtime);
         Ok(value)
+    }
+
+    fn dispatch_dom_content_loaded_once(&mut self) -> Result<()> {
+        if self.dom_content_loaded_dispatched {
+            return Ok(());
+        }
+
+        self.dom_content_loaded_dispatched = true;
+        self.execute_host_script(
+            "DOMContentLoaded",
+            r#"
+                document.dispatchEvent(new Event("DOMContentLoaded", {
+                    bubbles: true,
+                    cancelable: false,
+                }))
+            "#
+            .to_string(),
+        )?;
+        Ok(())
     }
 
     fn reset_js_document_state(&mut self) -> Result<()> {
@@ -7661,6 +7686,7 @@ impl Browser {
             .clone()
             .borrow_mut()
             .block_on(self.execute_js(scripts))?;
+        self.dispatch_dom_content_loaded_once()?;
 
         Ok(())
     }
@@ -7769,6 +7795,7 @@ impl Browser {
                 .replace_document(self.url.clone(), nodes_table, nodes_idxs);
             self.document_id += 1;
             self.executed_scripts = ExecutedScripts::new();
+            self.dom_content_loaded_dispatched = false;
             self.reset_js_document_state()?;
             self.setup_js_dom()?;
             let start = Instant::now();

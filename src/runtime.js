@@ -776,6 +776,44 @@ class HTMLIFrameElement extends HtmlElement {
     }
 }
 
+class HTMLMediaElement extends HtmlElement {
+    constructor(tag) {
+        super(tag)
+        this.paused = true
+        this.__currentTime = 0
+    }
+
+    pause() {
+        this.paused = true
+    }
+
+    play() {
+        this.paused = false
+        return Promise.resolve()
+    }
+
+    get currentTime() {
+        return this.__currentTime
+    }
+
+    set currentTime(value) {
+        const number = Number(value)
+        this.__currentTime = Number.isFinite(number) ? number : 0
+    }
+}
+
+class HTMLVideoElement extends HTMLMediaElement {
+    constructor() {
+        super("video")
+    }
+}
+
+class HTMLAudioElement extends HTMLMediaElement {
+    constructor() {
+        super("audio")
+    }
+}
+
 Object.defineProperty(globalThis, "HTMLElement", {
     value: HtmlElement,
     enumerable: true,
@@ -796,6 +834,24 @@ Object.defineProperty(globalThis, "HTMLCanvasElement", {
 });
 Object.defineProperty(globalThis, "HTMLIFrameElement", {
     value: HTMLIFrameElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLMediaElement", {
+    value: HTMLMediaElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLVideoElement", {
+    value: HTMLVideoElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLAudioElement", {
+    value: HTMLAudioElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -1087,7 +1143,11 @@ function tagToElement(tag) {
             HtmlCanvasElement :
             tag === "iframe" ?
                 HTMLIFrameElement :
-                    HtmlElement
+                tag === "video" ?
+                    HTMLVideoElement :
+                    tag === "audio" ?
+                        HTMLAudioElement :
+                        HtmlElement
 }
 
 class Document {
@@ -1533,7 +1593,11 @@ function runEventListeners(event_key, event) {
     }
 
     for (const cb of listeners.slice()) {
-        cb.call(event.currentTarget ?? event.target ?? globalThis, event)
+        try {
+            cb.call(event.currentTarget ?? event.target ?? globalThis, event)
+        } catch (err) {
+            console.error(err)
+        }
         if (event.__immediateStopped) {
             break
         }
