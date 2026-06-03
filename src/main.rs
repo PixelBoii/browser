@@ -1331,6 +1331,36 @@ where
     }
 }
 
+#[inline(never)]
+fn class_name_part_match_class<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[inline(never)]
+fn class_name_part_match_id<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[inline(never)]
+fn class_name_part_match_pseudo<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[inline(never)]
+fn class_name_part_match_tag<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[inline(never)]
+fn class_name_part_match_attributes<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[inline(never)]
+fn class_name_part_match_combined<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 fn element_matches_class_part(
     part: &ClassNamePart,
     element: usize,
@@ -1342,22 +1372,22 @@ fn element_matches_class_part(
     precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
 ) -> bool {
     match part {
-        ClassNamePart::Class(class) => {
+        ClassNamePart::Class(class) => class_name_part_match_class(|| {
             if let Some(elements_to_keep) = class_elements.get(class) {
                 elements_to_keep.contains(element)
             } else {
                 false
             }
-        }
-        ClassNamePart::Id(id) => match html_nodes.get(&element).unwrap() {
+        }),
+        ClassNamePart::Id(id) => class_name_part_match_id(|| match html_nodes.get(&element).unwrap() {
             Node::Element(walk_element) => walk_element
                 .attributes
                 .get_str("id")
                 .is_some_and(|el_id| el_id.as_ref() == id),
             _ => false,
-        },
+        }),
         ClassNamePart::ArrowRight | ClassNamePart::Ampersand | ClassNamePart::Tilde => true,
-        ClassNamePart::PseudoClass(class) => {
+        ClassNamePart::PseudoClass(class) => class_name_part_match_pseudo(|| {
             match class {
                 // All elements are children of root
                 PseudoClass::Root => true,
@@ -1476,16 +1506,16 @@ fn element_matches_class_part(
                 }
                 _ => false,
             }
-        }
-        ClassNamePart::Tag(tag) => match html_nodes.get(&element).unwrap() {
+        }),
+        ClassNamePart::Tag(tag) => class_name_part_match_tag(|| match html_nodes.get(&element).unwrap() {
             Node::Element(walk_element) => tag == "*" || walk_element.tag == *tag,
             _ => false,
-        },
-        ClassNamePart::Attributes(attributes) => match html_nodes.get(&element).unwrap() {
+        }),
+        ClassNamePart::Attributes(attributes) => class_name_part_match_attributes(|| match html_nodes.get(&element).unwrap() {
             Node::Element(walk_element) => element_matched_attributes(walk_element, attributes),
             _ => false,
-        },
-        ClassNamePart::Combined(combined) => combined.iter().all(|part| {
+        }),
+        ClassNamePart::Combined(combined) => class_name_part_match_combined(|| combined.iter().all(|part| {
             element_matches_class_part(
                 part,
                 element,
@@ -1496,7 +1526,7 @@ fn element_matches_class_part(
                 hovering_has_impact,
                 precomputed_selectors,
             )
-        }),
+        })),
     }
 }
 
@@ -1727,6 +1757,7 @@ fn get_specificity_tuple(parts: &Vec<ClassNamePart>) -> [i32; 3] {
     tuple
 }
 
+#[inline(never)]
 fn get_base_elements_by_attributes(
     html_nodes: &HashMap<usize, &Node>,
     dom_indexes: &DomIndexes,
@@ -8536,10 +8567,57 @@ impl Browser {
     }
 }
 
+fn profile_compute_node_styles(args: &[String]) -> Result<()> {
+    let url = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("https://slack.com/");
+    let iterations = args
+        .get(3)
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .context("Expected iterations to be an integer")?
+        .unwrap_or(50);
+
+    let mut browser = Browser::new(url.to_string(), false);
+    let params = browser.open()?;
+    let window_size = PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
+    let hovering_chain = vec![];
+    let mut css_parse_cache = HashMap::new();
+    let mut compute = || {
+        compute_node_styles(
+            &browser.url,
+            browser.tokio.as_ref().unwrap(),
+            &browser.network_fetch,
+            &params.nodes,
+            params.dom_indexes.root_indice,
+            &window_size,
+            &params.dom_indexes,
+            &mut css_parse_cache,
+            &hovering_chain,
+        )
+    };
+
+    std::hint::black_box(compute());
+    for _ in 0..iterations {
+        std::hint::black_box(compute());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let hover_debugging = env::args().any(|arg| arg == "--hover-debugging");
+    let args = env::args().collect::<Vec<String>>();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--profile-compute-node-styles")
+    {
+        return profile_compute_node_styles(&args);
+    }
+
+    let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let mut browser = Browser::new("https://slack.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new(
