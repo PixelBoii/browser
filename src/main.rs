@@ -41,8 +41,9 @@ use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 
 use crate::css::{
-    ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery, Node as CssNode,
-    Overflow, PropertyValue, PseudoClass, parse_media_query_parts, selector_to_parts,
+    ClassIndexes, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery,
+    Node as CssNode, Overflow, PropertyValue, PseudoClass, parse_media_query_parts,
+    selector_to_parts,
 };
 use crate::loader::HttpModuleLoader;
 use crate::parser::{Attributes, CommentElement, TextElement};
@@ -166,7 +167,7 @@ enum LayoutMode {
 
 #[derive(Debug, Default)]
 struct DomIndexes {
-    class_elements: HashMap<String, FixedBitSet>,
+    class_elements: Vec<FixedBitSet>,
     tag_elements: HashMap<String, FixedBitSet>,
     id_elements: HashMap<String, FixedBitSet>,
     children_index: HashMap<usize, Vec<usize>>,
@@ -175,8 +176,13 @@ struct DomIndexes {
 }
 
 impl DomIndexes {
-    pub fn recompute_class_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
-        self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs);
+    pub fn recompute_class_elements(
+        &mut self,
+        html_nodes: &HashMap<usize, Node>,
+        nodes_idxs: &Vec<usize>,
+        class_indexes: &ClassIndexes,
+    ) {
+        self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     }
 
     pub fn recompute_attribute_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
@@ -356,6 +362,7 @@ struct Renderer {
     event_loop_proxy: Option<RendererProxy>,
     hovering_impact: HashSet<usize>,
     frames: HashMap<usize, FrameHandle>,
+    css_parser: CssParser,
 }
 
 #[derive(Debug, Clone)]
@@ -1143,12 +1150,13 @@ fn compute_node_style(
     }
 }
 
-fn parse_css_nodes(css_nodes: &Vec<String>) -> Result<Vec<CssNode>> {
+fn parse_css_nodes(
+    parser: &mut CssParser,
+    css_nodes: &Vec<String>,
+) -> Result<()> {
     let joined = css_nodes.join("\n");
-    let mut parser = CssParser::new(&joined.as_str());
-    parser.parse()?;
-
-    Ok(parser.nodes)
+    parser.parse(joined.as_str())?;
+    Ok(())
 }
 
 fn flatten_css_chunks(mut parsed_css_chunks: Vec<(usize, Vec<CssNode>)>) -> Vec<CssNode> {
@@ -1170,7 +1178,7 @@ fn move_up_ancestor_chain(
     element: usize,
     html_nodes: &HashMap<usize, &Node>,
     css_nodes: &Vec<(usize, &CssNode)>,
-    class_elements: &HashMap<String, FixedBitSet>,
+    class_elements: &Vec<FixedBitSet>,
     css_node: &CssNode,
     window_size: &PhysicalSize<u32>,
     require_immediate_match: bool,
@@ -1241,7 +1249,7 @@ fn move_up_class_part(
     element: usize,
     css_nodes: &Vec<(usize, &CssNode)>,
     html_nodes: &HashMap<usize, &Node>,
-    class_elements: &HashMap<String, FixedBitSet>,
+    class_elements: &Vec<FixedBitSet>,
     parts: &Vec<ClassNamePart>,
     css_node: usize,
     nested_part_idx: usize,
@@ -1365,7 +1373,7 @@ fn element_matches_class_part(
     part: &ClassNamePart,
     element: usize,
     html_nodes: &HashMap<usize, &Node>,
-    class_elements: &HashMap<String, FixedBitSet>,
+    class_elements: &Vec<FixedBitSet>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
@@ -1373,7 +1381,7 @@ fn element_matches_class_part(
 ) -> bool {
     match part {
         ClassNamePart::Class(class) => class_name_part_match_class(|| {
-            if let Some(elements_to_keep) = class_elements.get(class) {
+            if let Some(elements_to_keep) = class_elements.get(*class) {
                 elements_to_keep.contains(element)
             } else {
                 false
@@ -1534,7 +1542,7 @@ fn narrow_elements_by_ancestors(
     element: usize,
     css_nodes: &Vec<(usize, &CssNode)>,
     html_nodes: &HashMap<usize, &Node>,
-    class_elements: &HashMap<String, FixedBitSet>,
+    class_elements: &Vec<FixedBitSet>,
     css_node: usize,
     name_part_idx: usize,
     nested_part_idx: usize,
@@ -1924,7 +1932,7 @@ fn search_elements_for_css_nodes(
                     };
 
                     let elements: Option<FixedBitSet> = match last_part {
-                        ClassNamePart::Class(class) => class_elements.get(class).cloned(),
+                        ClassNamePart::Class(class) => class_elements.get(*class).cloned(),
                         ClassNamePart::Id(id) => id_elements.get(id).cloned(),
                         ClassNamePart::PseudoClass(class) => {
                             match class {
@@ -1970,7 +1978,7 @@ fn search_elements_for_css_nodes(
                                     }
                                 }
                                 ClassNamePart::Class(class) => {
-                                    (true, class_elements.get(class).cloned())
+                                    (true, class_elements.get(*class).cloned())
                                 }
                                 ClassNamePart::Id(id) => (true, id_elements.get(id).cloned()),
                                 ClassNamePart::Attributes(attributes) => (
@@ -2262,20 +2270,22 @@ fn get_css_nodes(
     root_indice: usize,
     dom_indexes: &DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
+    css_parser: &mut CssParser,
 ) -> Vec<CssNode> {
     let expandable = get_expandable_css_nodes(nodes, root_indice, &dom_indexes.children_index);
     let mut parsed_css_chunks = vec![];
     let mut needs_fetching = vec![];
     for (idx, exp) in expandable.iter().enumerate() {
-        if let Some(cached) = css_parse_cache.get(&exp) {
-            parsed_css_chunks.push((idx, cached.clone()));
+        if let Some(cached_nodes) = css_parse_cache.get(&exp) {
+            parsed_css_chunks.push((idx, cached_nodes.clone()));
         } else {
             match exp {
                 ExpandableCssNode::Link(link) => needs_fetching.push((idx, link, exp)),
                 ExpandableCssNode::Inline(text) => {
-                    let parsed = parse_css_nodes(&vec![text.clone()]).unwrap();
-                    css_parse_cache.insert(exp.clone(), parsed.clone());
-                    parsed_css_chunks.push((idx, parsed));
+                    parse_css_nodes(css_parser, &vec![text.clone()]).unwrap();
+                    let nodes = css_parser.drain_result();
+                    css_parse_cache.insert(exp.clone(), nodes.clone());
+                    parsed_css_chunks.push((idx, nodes));
                 }
             };
         }
@@ -2284,9 +2294,10 @@ fn get_css_nodes(
         let fetched =
             fetch_expandable_css(base_url, tokio, network_fetch, &needs_fetching).unwrap();
         for (str, (idx, _, exp)) in fetched.into_iter().zip(needs_fetching) {
-            let parsed = parse_css_nodes(&vec![str]).unwrap();
-            css_parse_cache.insert(exp.clone(), parsed.clone());
-            parsed_css_chunks.push((idx, parsed));
+            parse_css_nodes(css_parser, &vec![str]).unwrap();
+            let nodes = css_parser.drain_result();
+            css_parse_cache.insert(exp.clone(), nodes.clone());
+            parsed_css_chunks.push((idx, nodes));
         }
     }
     flatten_css_chunks(parsed_css_chunks)
@@ -2390,11 +2401,13 @@ fn compute_node_styles(
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
     network_fetch: &Rc<RefCell<NetworkFetch>>,
     nodes: &HashMap<usize, Node>,
+    nodes_idxs: &Vec<usize>,
     root_indice: usize,
     window_size: &PhysicalSize<u32>,
-    dom_indexes: &DomIndexes,
+    dom_indexes: &mut DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
     hovering_chain: &Vec<usize>,
+    css_parser: &mut CssParser,
 ) -> (
     HashMap<usize, Style>,
     HashMap<usize, u32>,
@@ -2410,11 +2423,13 @@ fn compute_node_styles(
         root_indice,
         dom_indexes,
         css_parse_cache,
+        css_parser,
     );
     println!(
         "Retrieved parsed css nodes in {}ms",
         Instant::now().duration_since(start).as_millis()
     );
+    dom_indexes.recompute_class_elements(nodes, nodes_idxs, &css_parser.class_definitions);
 
     let css_children_index =
         build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
@@ -2465,8 +2480,8 @@ fn compute_node_styles(
         &definitions_map,
     );
     println!(
-        "computing styles took {}ms",
-        Instant::now().duration_since(start).as_millis()
+        "computing styles took {} microseconds",
+        Instant::now().duration_since(start).as_micros()
     );
     (
         node_styles,
@@ -2888,7 +2903,7 @@ fn op_query_selector(
     #[number] frame_id: Option<usize>,
 ) -> Result<Option<(usize, Node)>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
-    let renderer: Ref<'_, Renderer> = host.renderer.borrow();
+    let mut renderer = host.renderer.borrow_mut();
     if let Some(frame_id) = frame_id {
         js_send_onetime_to_frame(&renderer, frame_id, |reply| {
             FrameCommand::Dom(FrameDomCommand::QuerySelector {
@@ -2917,10 +2932,11 @@ fn op_get_closest(
     #[number] node_idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow();
+    let mut renderer = host.renderer.borrow_mut();
+    let selector = selector_to_parts(&selector, &mut renderer.css_parser.class_definitions);
     let matched_idxs: Vec<usize> = query_selector_all(
         &filter_to_elements(&renderer.nodes),
-        selector_to_parts(&selector),
+        selector,
         &renderer.window_size,
         &renderer.dom_indexes,
         &renderer.get_hover_chain(),
@@ -2964,7 +2980,7 @@ fn op_query_selector_all(
     #[number] frame_id: Option<usize>,
 ) -> Result<Vec<(usize, Node)>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow();
+    let mut renderer = host.renderer.borrow_mut();
     if let Some(frame_id) = frame_id {
         js_send_onetime_to_frame(&renderer, frame_id, |reply| {
             FrameCommand::Dom(FrameDomCommand::QuerySelectorAll {
@@ -3564,27 +3580,25 @@ fn sorted_node_idxs(nodes: &HashMap<usize, Node>) -> Vec<usize> {
     node_idxs
 }
 
-enum DomIndexType {
-    Classes,
-    Tags,
-    Ids,
-    Children,
-    Root,
-    Attributes,
-}
-
-fn get_dom_indexes_classes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+fn get_dom_indexes_classes(
+    html_nodes: &HashMap<usize, Node>,
+    nodes_idxs: &Vec<usize>,
+    class_indexes: &ClassIndexes,
+) -> Vec<FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
-    let mut class_elements: HashMap<String, FixedBitSet> = HashMap::new();
+    let mut class_elements = vec![
+        FixedBitSet::with_capacity(bitset_capacity);
+        class_indexes.len()
+    ];
     for (html_node_idx, html_node) in html_nodes.iter() {
         match html_node {
             Node::Element(element) => {
                 let class_list = get_class_list(element);
                 for class in class_list {
-                    class_elements
-                        .entry(class)
-                        .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
-                        .insert(*html_node_idx);
+                    let Some(class_idx) = class_indexes.class_to_idx.get(&class) else {
+                        continue;
+                    };
+                    class_elements[*class_idx].insert(*html_node_idx);
                 }
             }
             _ => {}
@@ -3630,10 +3644,14 @@ fn get_dom_indexes_ids(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize
     id_elements
 }
 
-fn get_dom_indexes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> DomIndexes {
+fn get_dom_indexes(
+    html_nodes: &HashMap<usize, Node>,
+    nodes_idxs: &Vec<usize>,
+    class_indexes: &ClassIndexes,
+) -> DomIndexes {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
 
-    let class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs);
+    let class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     let id_elements = get_dom_indexes_ids(html_nodes, nodes_idxs);
 
     let mut tag_elements: HashMap<String, FixedBitSet> = HashMap::new();
@@ -3781,7 +3799,7 @@ impl Renderer {
         window_size: PhysicalSize<u32>,
         font_handler: Rc<FontHandler>,
         network_fetch: Rc<RefCell<NetworkFetch>>,
-        dom_indexes: DomIndexes,
+        mut dom_indexes: DomIndexes,
         nodes_idxs: Vec<usize>,
     ) -> Self {
         let request_cache = HashMap::new();
@@ -3794,6 +3812,7 @@ impl Renderer {
         let hovering = None;
 
         let mut css_parse_cache = HashMap::new();
+        let mut css_parser = CssParser::new();
 
         let (node_styles, resolved_font_sizes, variable_definitions, hovering_impact) =
             compute_node_styles(
@@ -3801,11 +3820,13 @@ impl Renderer {
                 &tokio,
                 &network_fetch,
                 &nodes_table,
+                &nodes_idxs,
                 dom_indexes.root_indice,
                 &window_size,
-                &dom_indexes,
+                &mut dom_indexes,
                 &mut css_parse_cache,
                 &vec![],
+                &mut css_parser,
             );
 
         let node_idx_cursor = nodes_idxs.len();
@@ -3846,13 +3867,15 @@ impl Renderer {
             event_loop_proxy: None,
             hovering_impact,
             frames: HashMap::new(),
+            css_parser,
         }
     }
 
-    fn query_selector_all(&self, selector: String, required_parent: Option<usize>) -> Vec<usize> {
+    fn query_selector_all(&mut self, selector: String, required_parent: Option<usize>) -> Vec<usize> {
+        let selector = selector_to_parts(&selector, &mut self.css_parser.class_definitions);
         query_selector_all(
             &filter_to_elements(&self.nodes),
-            selector_to_parts(&selector),
+            selector,
             &self.window_size,
             &self.dom_indexes,
             &self.get_hover_chain(),
@@ -3861,7 +3884,7 @@ impl Renderer {
     }
 
     fn query_selector_all_nodes(
-        &self,
+        &mut self,
         selector: String,
         required_parent: Option<usize>,
     ) -> Vec<(usize, Node)> {
@@ -3874,7 +3897,7 @@ impl Renderer {
     }
 
     fn query_selector_node(
-        &self,
+        &mut self,
         selector: String,
         required_parent: Option<usize>,
     ) -> Option<(usize, Node)> {
@@ -3961,7 +3984,11 @@ impl Renderer {
             self.dom_indexes.recompute_id_elements(&self.nodes, &self.nodes_idxs);
         }
         if class_dirty {
-            self.dom_indexes.recompute_class_elements(&self.nodes, &self.nodes_idxs);
+            self.dom_indexes.recompute_class_elements(
+                &self.nodes,
+                &self.nodes_idxs,
+                &self.css_parser.class_definitions,
+            );
         }
         self.schedule_dom_update();
         Ok(())
@@ -6998,7 +7025,7 @@ impl Renderer {
     }
 
     pub fn recompute_dom_indexes(&mut self) {
-        self.dom_indexes = get_dom_indexes(&self.nodes, &self.nodes_idxs);
+        self.dom_indexes = get_dom_indexes(&self.nodes, &self.nodes_idxs, &self.css_parser.class_definitions);
     }
 
     pub fn get_hover_chain(&self) -> Vec<usize> {
@@ -7021,11 +7048,13 @@ impl Renderer {
             &self.tokio,
             &self.network_fetch,
             &self.nodes,
+            &self.nodes_idxs,
             self.dom_indexes.root_indice,
             &self.window_size,
-            &self.dom_indexes,
+            &mut self.dom_indexes,
             &mut self.css_parse_cache,
             &hover_chain,
+            &mut self.css_parser,
         );
     }
 
@@ -7530,7 +7559,7 @@ impl Browser {
                 required_parent,
                 reply,
             }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let _ = reply
                     .send(Ok(renderer.query_selector_node(selector, required_parent)));
             }
@@ -7539,7 +7568,7 @@ impl Browser {
                 required_parent,
                 reply,
             }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let _ =
                     reply
                         .send(Ok(renderer
@@ -7892,7 +7921,7 @@ impl Browser {
             .enumerate()
             .collect();
         let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs);
+        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &ClassIndexes::new());
         self.detect_html_redirect(&dom_indexes);
         Ok(BootParams {
             nodes: nodes_table,
@@ -8580,21 +8609,24 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
         .unwrap_or(50);
 
     let mut browser = Browser::new(url.to_string(), false);
-    let params = browser.open()?;
+    let mut params = browser.open()?;
     let window_size = PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
     let hovering_chain = vec![];
     let mut css_parse_cache = HashMap::new();
+    let mut css_parser = CssParser::new();
     let mut compute = || {
         compute_node_styles(
             &browser.url,
             browser.tokio.as_ref().unwrap(),
             &browser.network_fetch,
             &params.nodes,
+            &params.nodes_idxs,
             params.dom_indexes.root_indice,
             &window_size,
-            &params.dom_indexes,
+            &mut params.dom_indexes,
             &mut css_parse_cache,
             &hovering_chain,
+            &mut css_parser,
         )
     };
 

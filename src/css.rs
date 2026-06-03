@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+use anyhow::{Context, Result, anyhow};
 
 use crate::style::{
     GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay,
@@ -43,7 +45,7 @@ pub enum PseudoClass {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClassNamePart {
-    Class(String),
+    Class(usize),
     Id(String),
     PseudoClass(PseudoClass),
     Attributes(Vec<ClassNamePartAttribute>),
@@ -256,13 +258,13 @@ enum CssBuildPhase {
 }
 
 #[derive(Debug)]
-pub struct CssParser<'a> {
-    input: &'a str,
+pub struct CssParser {
     stage: CssBuildPhase,
     label: String,
     pub nodes: Vec<Node>,
     node: Option<usize>,
     in_url: bool,
+    pub class_definitions: ClassIndexes,
 }
 
 pub fn unquote(mut value: &str) -> &str {
@@ -301,12 +303,12 @@ fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
     Some(ClassNamePart::Attributes(attributes))
 }
 
-fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
+fn parse_pseudo_class(value: &str, class_definitions: &mut ClassIndexes) -> Option<PseudoClass> {
     if let Some(stripped) = value.strip_prefix("is(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
             let selectors = split_ignoring_parentheses(stripped.to_string(), ',', &[])
                 .into_iter()
-                .map(|s| selector_to_parts(&s.trim().to_string()))
+                .map(|s| selector_to_parts(&s.trim().to_string(), class_definitions))
                 .collect();
             return Some(PseudoClass::Is(selectors));
         }
@@ -315,19 +317,25 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
         if let Some(stripped) = stripped.strip_suffix(")") {
             let selectors = split_ignoring_parentheses(stripped.to_string(), ',', &[])
                 .into_iter()
-                .map(|s| selector_to_parts(&s.trim().to_string()))
+                .map(|s| selector_to_parts(&s.trim().to_string(), class_definitions))
                 .collect();
             return Some(PseudoClass::Where(selectors));
         }
     }
     if let Some(stripped) = value.strip_prefix("not(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
-            return Some(PseudoClass::Not(selector_to_parts(&stripped.to_string())));
+            return Some(PseudoClass::Not(selector_to_parts(
+                &stripped.to_string(),
+                class_definitions,
+            )));
         }
     }
     if let Some(stripped) = value.strip_prefix("has(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
-            return Some(PseudoClass::Has(selector_to_parts(&stripped.to_string())));
+            return Some(PseudoClass::Has(selector_to_parts(
+                &stripped.to_string(),
+                class_definitions,
+            )));
         }
     }
     if let Some(stripped) = value.strip_prefix("lang(") {
@@ -399,7 +407,42 @@ fn parse_pseudo_class(value: &str) -> Option<PseudoClass> {
     None
 }
 
-pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
+#[derive(Debug, Clone, Default)]
+pub struct ClassIndexes {
+    cursor: usize,
+    pub class_to_idx: HashMap<String, usize>,
+    pub idx_to_class: HashMap<usize, String>,
+}
+
+impl ClassIndexes {
+    pub fn new() -> Self {
+        ClassIndexes {
+            cursor: 0,
+            class_to_idx: HashMap::new(),
+            idx_to_class: HashMap::new(),
+        }
+    }
+
+    pub fn upsert_definition(&mut self, class: String) -> usize {
+        if let Some(idx) = self.class_to_idx.get(&class) {
+            *idx
+        } else {
+            self.class_to_idx.insert(class.clone(), self.cursor);
+            self.idx_to_class.insert(self.cursor, class);
+            self.cursor += 1;
+            self.cursor - 1
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.cursor
+    }
+}
+
+pub fn selector_to_parts(
+    selector: &String,
+    class_definitions: &mut ClassIndexes,
+) -> Vec<ClassNamePart> {
     let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>', '~']);
     nested_parts
         .into_iter()
@@ -448,12 +491,16 @@ pub fn selector_to_parts(selector: &String) -> Vec<ClassNamePart> {
             for cond in conditions {
                 let mut chars = cond.chars();
                 let parsed = match chars.nth(0).unwrap() {
-                    '.' => Some(ClassNamePart::Class(chars.as_str().to_string())),
+                    '.' => {
+                        let name = chars.as_str().to_string();
+                        let idx = class_definitions.upsert_definition(name);
+                        Some(ClassNamePart::Class(idx))
+                    }
                     '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
                     ':' => {
                         let pseudo_class =
                             chars.as_str().strip_prefix(':').unwrap_or(chars.as_str());
-                        let parsed = parse_pseudo_class(pseudo_class);
+                        let parsed = parse_pseudo_class(pseudo_class, class_definitions);
                         match parsed {
                             Some(parsed) => Some(ClassNamePart::PseudoClass(parsed)),
                             None => {
@@ -541,26 +588,26 @@ pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
     criterias
 }
 
-impl<'a> CssParser<'a> {
-    pub fn new(input: &'a str) -> Self {
+impl CssParser {
+    pub fn new() -> Self {
         Self {
-            input,
             stage: CssBuildPhase::Start,
             label: String::new(),
             nodes: vec![],
             node: None,
             in_url: false,
+            class_definitions: ClassIndexes::new(),
         }
     }
 
-    pub fn new_inline(input: &'a str) -> Self {
+    pub fn new_inline() -> Self {
         Self {
-            input,
             stage: CssBuildPhase::Specifier,
             label: String::new(),
             nodes: vec![],
             node: None,
             in_url: false,
+            class_definitions: ClassIndexes::new(),
         }
     }
 
@@ -612,8 +659,10 @@ impl<'a> CssParser<'a> {
             .map(|l| l.trim().to_string())
             .collect();
 
-        let name_parts: Vec<Vec<ClassNamePart>> =
-            name.iter().map(|n| selector_to_parts(n)).collect();
+        let name_parts: Vec<Vec<ClassNamePart>> = name
+            .iter()
+            .map(|n| selector_to_parts(n, &mut self.class_definitions))
+            .collect();
 
         self.nodes.push(Node::ClassName(ClassName {
             name,
@@ -681,8 +730,19 @@ impl<'a> CssParser<'a> {
         self.curr_node()?.get_parent()
     }
 
-    pub fn parse(&mut self) -> Result<()> {
-        let chars = self.input.trim().chars();
+    pub fn drain_result(&mut self) -> Vec<Node> {
+        let nodes = self.nodes.drain(..).collect();
+        self.node = None;
+        self.in_url = false;
+        self.label.clear();
+        nodes
+    }
+
+    pub fn parse(&mut self, input: &str) -> Result<()> {
+        if self.nodes.len() > 0 {
+            return Err(anyhow!("CssParser.parse called with stale results in parser!"));
+        }
+        let chars = input.trim().chars();
         for char in chars {
             match char {
                 '@' => match self.stage {

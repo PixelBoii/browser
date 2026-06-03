@@ -741,8 +741,8 @@ fn get_inline_nodes(element: &HtmlElement) -> Result<Vec<Node>> {
     let style_str = element.attributes.get_str("style");
     match style_str {
         Some(style) => {
-            let mut inline_parser = CssParser::new_inline(&style);
-            inline_parser.parse()?;
+            let mut inline_parser = CssParser::new_inline();
+            inline_parser.parse(&style)?;
             Ok(inline_parser.nodes)
         }
         None => Ok(vec![]),
