@@ -1242,7 +1242,7 @@ fn move_up_ancestor_chain(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
 ) -> bool {
     let parent = css_node.get_parent();
     if let Some(parent) = parent {
@@ -1316,7 +1316,7 @@ fn move_up_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
 ) -> bool {
     let node = css_nodes[css_node].1;
     // If we've reached the beginning, that means this node is done, so move up the chain
@@ -1370,28 +1370,28 @@ fn move_up_class_part(
 }
 
 fn walk_for_html_match<F>(
-    element: usize,
+    mut element: usize,
     html_nodes: &NodesTable,
     match_fn: &mut F,
-    quota: Option<i32>,
+    mut quota: Option<i32>,
 ) -> Option<usize>
 where
     F: FnMut(usize) -> bool,
 {
-    // If we're not allowed to walk anymore, give up
-    if quota.is_some_and(|quota| quota == 0) {
-        None
-    } else if match_fn(element) {
-        Some(element)
-    } else if let Some(parent) = html_nodes.get(element).unwrap().get_parent() {
-        walk_for_html_match(
-            parent,
-            html_nodes,
-            match_fn,
-            quota.and_then(|quota| Some(quota - 1)),
-        )
-    } else {
-        None
+    loop {
+        // If we're not allowed to walk anymore, give up
+        if quota.is_some_and(|quota| quota == 0) {
+            return None;
+        }
+        if match_fn(element) {
+            return Some(element);
+        }
+        if let Some(parent) = html_nodes.get(element).unwrap().get_parent() {
+            element = parent;
+            quota = quota.map(|quota| quota - 1);
+        } else {
+            return None;
+        }
     }
 }
 
@@ -1433,7 +1433,7 @@ fn element_matches_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
 ) -> bool {
     match part {
         ClassNamePart::Class(class) => class_name_part_match_class(|| {
@@ -1457,14 +1457,14 @@ fn element_matches_class_part(
                 PseudoClass::Root => true,
                 PseudoClass::Not(selector) => {
                     let negative_matches = precomputed_selectors.get(selector).unwrap();
-                    !negative_matches.contains(&element)
+                    !negative_matches.contains(element)
                 }
                 PseudoClass::Is(selectors) | PseudoClass::Where(selectors) => {
                     selectors.iter().any(|selector| {
                         precomputed_selectors
                         .get(selector)
                         .unwrap()
-                        .contains(&element)
+                        .contains(element)
                     })
                 }
                 PseudoClass::Hover => {
@@ -1606,7 +1606,7 @@ fn narrow_elements_by_ancestors(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, Vec<usize>>,
+    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
 ) -> bool {
     let walk_quota = if require_immediate_match {
         Some(1)
@@ -1951,9 +1951,13 @@ fn search_elements_for_css_nodes(
             _ => {}
         }
     }
-    let mut precomputed_selectors: HashMap<Vec<ClassNamePart>, Vec<usize>> = HashMap::new();
+    let element_indexes = filter_to_elements(html_nodes);
+    let max_element_idx = element_indexes.iter().max().cloned().map(|v| v + 1).unwrap_or(0);
+
+    let mut precomputed_selectors: HashMap<Vec<ClassNamePart>, FixedBitSet> = HashMap::new();
     for selector in unique_selectors {
-        let results = query_selector_all(
+        let mut results = FixedBitSet::with_capacity(max_element_idx);
+        for idx in query_selector_all(
             html_nodes,
             selector.clone(),
             &PhysicalSize {
@@ -1963,12 +1967,11 @@ fn search_elements_for_css_nodes(
             dom_indexes,
             hovering_chain,
             None,
-        );
+        ) {
+            results.insert(idx);
+        }
         precomputed_selectors.insert(selector, results);
     }
-
-    let element_indexes = filter_to_elements(html_nodes);
-    let max_element_idx = element_indexes.iter().max().cloned().map(|v| v + 1).unwrap_or(0);
 
     for css_node_idx in to_resolve {
         let node = css_nodes[css_node_idx].1;
@@ -2008,7 +2011,7 @@ fn search_elements_for_css_nodes(
                                         precomputed_selectors.get(selector).unwrap();
                                     let mut bitset = FixedBitSet::with_capacity(max_element_idx);
                                     for idx in element_indexes.iter() {
-                                        if !negative_matches.contains(idx) {
+                                        if !negative_matches.contains(*idx) {
                                             bitset.insert(*idx);
                                         }
                                     }
