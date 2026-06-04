@@ -178,22 +178,22 @@ struct DomIndexes {
 impl DomIndexes {
     pub fn recompute_class_elements(
         &mut self,
-        html_nodes: &HashMap<usize, Node>,
+        html_nodes: &NodesTable,
         nodes_idxs: &Vec<usize>,
         class_indexes: &ClassIndexes,
     ) {
         self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     }
 
-    pub fn recompute_attribute_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+    pub fn recompute_attribute_elements(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
         self.attribute_elements = get_dom_indexes_attributes(html_nodes, nodes_idxs);
     }
 
-    pub fn recompute_id_elements(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+    pub fn recompute_id_elements(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
         self.id_elements = get_dom_indexes_ids(html_nodes, nodes_idxs);
     }
 
-    pub fn recompute_children(&mut self, html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) {
+    pub fn recompute_children(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
         self.children_index = build_children_index(html_nodes, nodes_idxs);
     }
 }
@@ -326,11 +326,67 @@ struct RenderedNode {
 }
 
 #[derive(Debug)]
+struct NodesTable {
+    data: Vec<Option<Node>>,
+    cursor: usize,
+}
+
+impl NodesTable {
+    pub fn new_from_nodes(data: Vec<Node>) -> Self {
+        Self {
+            cursor: data.len(),
+            data: data.into_iter().map(|v| Some(v)).collect(),
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&Node> {
+        let value = self.data.get(idx)?.as_ref();
+        value
+    }
+
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut Node> {
+        let value = self.data.get_mut(idx)?.as_mut();
+        value
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = usize> + '_ {
+        self.data.iter().enumerate().filter_map(|(idx, v)| {
+            if v.is_some() {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &Node)> + '_ {
+        self.data
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, e)| e.as_ref().and_then(|e| Some((idx, e))))
+    }
+
+    pub fn remove(&mut self, idx: usize) {
+        self.data[idx] = None;
+    }
+
+    pub fn insert(&mut self, idx: usize, value: Node) {
+        if idx >= self.data.len() {
+            self.data.resize(idx + 1, None);
+        }
+        self.data[idx] = Some(value);
+    }
+
+    pub fn contains_key(&self, idx: usize) -> bool {
+        self.data.get(idx).is_some_and(|v| v.is_some())
+    }
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
-    node_idx_cursor: usize,
     pub nodes_idxs: Vec<usize>,
-    pub nodes: HashMap<usize, parser::Node>,
+    pub nodes: NodesTable,
     node_styles: HashMap<usize, Style>,
     layout_table: HashMap<usize, LayoutBox>,
     node_layout_mapping: HashMap<usize, usize>,
@@ -1021,11 +1077,11 @@ enum ExpandableCssNode {
 
 fn get_expandable_css_nodes_walk(
     expandable: &mut Vec<ExpandableCssNode>,
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     children_index: &HashMap<usize, Vec<usize>>,
     idx: usize,
 ) {
-    let Some(Node::Element(element)) = nodes.get(&idx) else {
+    let Some(Node::Element(element)) = nodes.get(idx) else {
         return;
     };
     if element.tag == "style" {
@@ -1035,7 +1091,7 @@ fn get_expandable_css_nodes_walk(
             return;
         }
         let child = children.first().unwrap();
-        let child_node = &nodes.get(child).unwrap();
+        let child_node = &nodes.get(*child).unwrap();
         let text = match child_node {
             Node::Element(element) => {
                 println!("Got element when expecting CSS text {:?}", element);
@@ -1064,7 +1120,7 @@ fn get_expandable_css_nodes_walk(
 }
 
 fn get_expandable_css_nodes(
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     root_indice: usize,
     children_index: &HashMap<usize, Vec<usize>>,
 ) -> Vec<ExpandableCssNode> {
@@ -1078,7 +1134,7 @@ fn get_expandable_css_nodes(
 fn compute_node_style(
     node_styles: &mut HashMap<usize, Style>,
     resolved_font_sizes: &mut HashMap<usize, u32>,
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     node_idx: usize,
     children_index: &HashMap<usize, Vec<usize>>,
     css_nodes: &Vec<CssNode>,
@@ -1092,7 +1148,7 @@ fn compute_node_style(
     variable_definitions: &VariableDefinitions,
 ) {
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
-    let node = &nodes.get(&node_idx).unwrap();
+    let node = &nodes.get(node_idx).unwrap();
     let mut style = if matches!(node, Node::Element(_)) {
         parse_style(
             node_idx,
@@ -1176,7 +1232,7 @@ fn flatten_css_chunks(mut parsed_css_chunks: Vec<(usize, Vec<CssNode>)>) -> Vec<
 
 fn move_up_ancestor_chain(
     element: usize,
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     css_nodes: &Vec<(usize, &CssNode)>,
     class_elements: &Vec<FixedBitSet>,
     css_node: &CssNode,
@@ -1248,7 +1304,7 @@ fn move_up_ancestor_chain(
 fn move_up_class_part(
     element: usize,
     css_nodes: &Vec<(usize, &CssNode)>,
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     class_elements: &Vec<FixedBitSet>,
     parts: &Vec<ClassNamePart>,
     css_node: usize,
@@ -1315,7 +1371,7 @@ fn move_up_class_part(
 
 fn walk_for_html_match<F>(
     element: usize,
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     match_fn: &mut F,
     quota: Option<i32>,
 ) -> Option<usize>
@@ -1327,7 +1383,7 @@ where
         None
     } else if match_fn(element) {
         Some(element)
-    } else if let Some(parent) = html_nodes.get(&element).unwrap().get_parent() {
+    } else if let Some(parent) = html_nodes.get(element).unwrap().get_parent() {
         walk_for_html_match(
             parent,
             html_nodes,
@@ -1372,7 +1428,7 @@ fn class_name_part_match_combined<T>(f: impl FnOnce() -> T) -> T {
 fn element_matches_class_part(
     part: &ClassNamePart,
     element: usize,
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     class_elements: &Vec<FixedBitSet>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
@@ -1387,7 +1443,7 @@ fn element_matches_class_part(
                 false
             }
         }),
-        ClassNamePart::Id(id) => class_name_part_match_id(|| match html_nodes.get(&element).unwrap() {
+        ClassNamePart::Id(id) => class_name_part_match_id(|| match html_nodes.get(element).unwrap() {
             Node::Element(walk_element) => walk_element
                 .attributes
                 .get_str("id")
@@ -1399,7 +1455,6 @@ fn element_matches_class_part(
             match class {
                 // All elements are children of root
                 PseudoClass::Root => true,
-                // TODO: Both the Not and Is logic can be heavily optimized by simply computing the query_selector_all once, not once per element
                 PseudoClass::Not(selector) => {
                     let negative_matches = precomputed_selectors.get(selector).unwrap();
                     !negative_matches.contains(&element)
@@ -1417,19 +1472,19 @@ fn element_matches_class_part(
                     hovering_chain.contains(&element)
                 }
                 PseudoClass::FirstChild => html_nodes
-                    .get(&element)
+                    .get(element)
                     .and_then(|node| node.get_parent())
                     .and_then(|parent| dom_indexes.children_index.get(&parent))
                     .is_some_and(|siblings| siblings.first().is_some_and(|idx| *idx == element)),
                 PseudoClass::NthChild(n) => n.parse::<usize>().ok().is_some_and(|target| {
                     html_nodes
-                        .get(&element)
+                        .get(element)
                         .and_then(|node| node.get_parent())
                         .and_then(|parent| dom_indexes.children_index.get(&parent))
                         .and_then(|siblings| siblings.iter().position(|idx| *idx == element))
                         .is_some_and(|pos| pos + 1 == target)
                 }),
-                PseudoClass::FirstOfType => html_nodes.get(&element).is_some_and(|node| {
+                PseudoClass::FirstOfType => html_nodes.get(element).is_some_and(|node| {
                     let Node::Element(element_node) = node else {
                         return false;
                     };
@@ -1437,24 +1492,24 @@ fn element_matches_class_part(
                         .and_then(|parent| dom_indexes.children_index.get(&parent))
                         .and_then(|siblings| {
                             siblings.iter().find(|idx| {
-                                matches!(html_nodes.get(idx), Some(Node::Element(sibling)) if sibling.tag == element_node.tag)
+                                matches!(html_nodes.get(**idx), Some(Node::Element(sibling)) if sibling.tag == element_node.tag)
                             })
                         })
                         .is_some_and(|idx| *idx == element)
                 }),
                 PseudoClass::NthOfType(n) => n.parse::<usize>().ok().is_some_and(|target| {
-                    let Some(Node::Element(element_node)) = html_nodes.get(&element) else {
+                    let Some(Node::Element(element_node)) = html_nodes.get(element) else {
                         return false;
                     };
                     html_nodes
-                        .get(&element)
+                        .get(element)
                         .and_then(|node| node.get_parent())
                         .and_then(|parent| dom_indexes.children_index.get(&parent))
                         .and_then(|siblings| {
                             siblings
                                 .iter()
                                 .filter(|idx| {
-                                    matches!(html_nodes.get(idx), Some(Node::Element(sibling)) if sibling.tag == element_node.tag)
+                                    matches!(html_nodes.get(**idx), Some(Node::Element(sibling)) if sibling.tag == element_node.tag)
                                 })
                                 .position(|idx| *idx == element)
                         })
@@ -1462,19 +1517,19 @@ fn element_matches_class_part(
                 }),
                 PseudoClass::NthLastChild(n) => n.parse::<usize>().ok().is_some_and(|target| {
                     html_nodes
-                        .get(&element)
+                        .get(element)
                         .and_then(|node| node.get_parent())
                         .and_then(|parent| dom_indexes.children_index.get(&parent))
                         .and_then(|siblings| siblings.iter().rev().position(|idx| *idx == element))
                         .is_some_and(|pos| pos + 1 == target)
                 }),
                 PseudoClass::LastChild => html_nodes
-                    .get(&element)
+                    .get(element)
                     .and_then(|node| node.get_parent())
                     .and_then(|parent| dom_indexes.children_index.get(&parent))
                     .is_some_and(|siblings| siblings.last().is_some_and(|idx| *idx == element)),
                 PseudoClass::OnlyChild => html_nodes
-                    .get(&element)
+                    .get(element)
                     .and_then(|node| node.get_parent())
                     .and_then(|parent| dom_indexes.children_index.get(&parent))
                     .is_some_and(|siblings| siblings.len() == 1 && siblings[0] == element),
@@ -1482,12 +1537,12 @@ fn element_matches_class_part(
                     .children_index
                     .get(&element)
                     .is_none_or(|children| children.is_empty()),
-                PseudoClass::Link => match html_nodes.get(&element).unwrap() {
+                PseudoClass::Link => match html_nodes.get(element).unwrap() {
                     Node::Element(el) => el.tag == "a" && el.attributes.contains_key("href"),
                     _ => false,
                 },
                 PseudoClass::Visited => false,
-                PseudoClass::Disabled => match html_nodes.get(&element).unwrap() {
+                PseudoClass::Disabled => match html_nodes.get(element).unwrap() {
                     Node::Element(el) => el.attributes.contains_key("disabled"),
                     _ => false,
                 },
@@ -1495,13 +1550,13 @@ fn element_matches_class_part(
                     let lang = walk_for_html_match(
                         element,
                         html_nodes,
-                        &mut |idx| match html_nodes.get(&idx).unwrap() {
+                        &mut |idx| match html_nodes.get(idx).unwrap() {
                             Node::Element(el) => el.attributes.contains_key("lang"),
                             _ => false,
                         },
                         None,
                     )
-                    .and_then(|idx| match html_nodes.get(&idx).unwrap() {
+                    .and_then(|idx| match html_nodes.get(idx).unwrap() {
                         Node::Element(el) => el.attributes.get_str("lang"),
                         _ => None,
                     });
@@ -1515,11 +1570,11 @@ fn element_matches_class_part(
                 _ => false,
             }
         }),
-        ClassNamePart::Tag(tag) => class_name_part_match_tag(|| match html_nodes.get(&element).unwrap() {
+        ClassNamePart::Tag(tag) => class_name_part_match_tag(|| match html_nodes.get(element).unwrap() {
             Node::Element(walk_element) => tag == "*" || walk_element.tag == *tag,
             _ => false,
         }),
-        ClassNamePart::Attributes(attributes) => class_name_part_match_attributes(|| match html_nodes.get(&element).unwrap() {
+        ClassNamePart::Attributes(attributes) => class_name_part_match_attributes(|| match html_nodes.get(element).unwrap() {
             Node::Element(walk_element) => element_matched_attributes(walk_element, attributes),
             _ => false,
         }),
@@ -1541,7 +1596,7 @@ fn element_matches_class_part(
 fn narrow_elements_by_ancestors(
     element: usize,
     css_nodes: &Vec<(usize, &CssNode)>,
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     class_elements: &Vec<FixedBitSet>,
     css_node: usize,
     name_part_idx: usize,
@@ -1564,7 +1619,7 @@ fn narrow_elements_by_ancestors(
             let parts = &classes.name_parts[name_part_idx];
             let part = &parts[parts.len() - 1 - nested_part_idx];
             if let ClassNamePart::Tilde = part {
-                let Some(parent) = html_nodes.get(&element).and_then(|v| v.get_parent()) else {
+                let Some(parent) = html_nodes.get(element).and_then(|v| v.get_parent()) else {
                     return false;
                 };
                 let Some(siblings) = dom_indexes.children_index.get(&parent) else {
@@ -1576,7 +1631,7 @@ fn narrow_elements_by_ancestors(
                 return siblings
                     .iter()
                     .enumerate()
-                    .filter(|idx| *idx.1 != element && html_nodes.contains_key(idx.1))
+                    .filter(|idx| *idx.1 != element && html_nodes.contains_key(*idx.1))
                     .any(|(sibling_pos, sibling_idx)| {
                         sibling_pos < pos
                             && move_up_class_part(
@@ -1691,15 +1746,15 @@ fn narrow_elements_by_ancestors(
     };
 }
 
-fn get_parent_html_idx(node_idx: usize, html_nodes: &HashMap<usize, &Node>) -> Option<usize> {
-    html_nodes.get(&node_idx).unwrap().get_parent()
+fn get_parent_html_idx(node_idx: usize, html_nodes: &NodesTable) -> Option<usize> {
+    html_nodes.get(node_idx).unwrap().get_parent()
 }
 
 // Wrapper around search_elements_for_css_nodes that narrows the css_nodes down to only nodes that have property/variable children
 // Query selectors skip this step
 fn collect_class_nodes_for_elements(
     css_nodes: &Vec<(usize, &CssNode)>,
-    raw_html_nodes: &HashMap<usize, Node>,
+    raw_html_nodes: &NodesTable,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
@@ -1726,18 +1781,18 @@ fn collect_class_nodes_for_elements(
     search_elements_for_css_nodes(
         to_resolve,
         css_nodes,
-        &filter_to_elements(raw_html_nodes),
+        raw_html_nodes,
         window_size,
         dom_indexes,
         hovering_chain,
     )
 }
 
-fn filter_to_elements(html_nodes: &HashMap<usize, Node>) -> HashMap<usize, &Node> {
+fn filter_to_elements(html_nodes: &NodesTable) -> Vec<usize> {
     html_nodes
-        .into_iter()
+        .iter()
         .filter(|(_, value)| matches!(value, Node::Element(_)))
-        .map(|(key, value)| (*key, value))
+        .map(|(key, _)| key)
         .collect()
 }
 
@@ -1767,11 +1822,11 @@ fn get_specificity_tuple(parts: &Vec<ClassNamePart>) -> [i32; 3] {
 
 #[inline(never)]
 fn get_base_elements_by_attributes(
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     dom_indexes: &DomIndexes,
     attributes: &Vec<ClassNamePartAttribute>,
 ) -> FixedBitSet {
-    let mut base_items = FixedBitSet::with_capacity(*html_nodes.keys().max().unwrap_or(&0));
+    let mut base_items = FixedBitSet::with_capacity(html_nodes.keys().max().unwrap_or(0));
     let mut base_items_init = false;
     // Base items are the elements that contain all the keys in attributes
     for attr in attributes.iter() {
@@ -1813,7 +1868,7 @@ fn get_base_elements_by_attributes(
 
     let filtered_elements = base_items
         .ones()
-        .filter(|idx| match html_nodes.get(idx).unwrap() {
+        .filter(|idx| match html_nodes.get(*idx).unwrap() {
             Node::Element(element) => element_matched_attributes(element, attributes),
             _ => false,
         })
@@ -1862,11 +1917,10 @@ fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &
     }
 }
 
-// It is assumed that html_nodes only contains Node::Element here
 fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
     css_nodes: &Vec<(usize, &CssNode)>,
-    html_nodes: &HashMap<usize, &Node>,
+    html_nodes: &NodesTable,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
@@ -1900,7 +1954,7 @@ fn search_elements_for_css_nodes(
     let mut precomputed_selectors: HashMap<Vec<ClassNamePart>, Vec<usize>> = HashMap::new();
     for selector in unique_selectors {
         let results = query_selector_all(
-            &html_nodes,
+            html_nodes,
             selector.clone(),
             &PhysicalSize {
                 width: 0,
@@ -1913,6 +1967,9 @@ fn search_elements_for_css_nodes(
         precomputed_selectors.insert(selector, results);
     }
 
+    let element_indexes = filter_to_elements(html_nodes);
+    let max_element_idx = element_indexes.iter().max().cloned().map(|v| v + 1).unwrap_or(0);
+
     for css_node_idx in to_resolve {
         let node = css_nodes[css_node_idx].1;
         match node {
@@ -1924,11 +1981,11 @@ fn search_elements_for_css_nodes(
                     let last_part = parts.last().unwrap();
                     let node_specificity = get_specificity_tuple(parts);
                     let all_elements = || {
-                        html_nodes
-                            .iter()
-                            .map(|(idx, _)| idx)
-                            .cloned()
-                            .collect::<FixedBitSet>()
+                        let mut bitset = FixedBitSet::with_capacity(max_element_idx);
+                        for idx in element_indexes.iter().copied() {
+                            bitset.insert(idx);
+                        }
+                        bitset
                     };
 
                     let elements: Option<FixedBitSet> = match last_part {
@@ -1938,24 +1995,24 @@ fn search_elements_for_css_nodes(
                             match class {
                                 // No parent means it's a root element
                                 PseudoClass::Root => {
-                                    let elements = html_nodes
-                                        .iter()
-                                        .filter(|(_, node)| node.get_parent().is_none())
-                                        .map(|(idx, _)| idx)
-                                        .cloned()
-                                        .collect::<FixedBitSet>();
-                                    Some(elements)
+                                    let mut bitset = FixedBitSet::with_capacity(max_element_idx);
+                                    for idx in element_indexes.iter() {
+                                        if html_nodes.get(*idx).is_some_and(|node| node.get_parent().is_none()) {
+                                            bitset.insert(*idx);
+                                        }
+                                    }
+                                    Some(bitset)
                                 }
                                 PseudoClass::Not(selector) => {
                                     let negative_matches =
                                         precomputed_selectors.get(selector).unwrap();
-                                    let elements = html_nodes
-                                        .iter()
-                                        .map(|(idx, _)| idx)
-                                        .filter(|idx| !negative_matches.contains(idx))
-                                        .cloned()
-                                        .collect::<FixedBitSet>();
-                                    Some(elements)
+                                    let mut bitset = FixedBitSet::with_capacity(max_element_idx);
+                                    for idx in element_indexes.iter() {
+                                        if !negative_matches.contains(idx) {
+                                            bitset.insert(*idx);
+                                        }
+                                    }
+                                    Some(bitset)
                                 }
                                 _ => None,
                             }
@@ -1968,58 +2025,61 @@ fn search_elements_for_css_nodes(
                             }
                         }
                         ClassNamePart::Combined(combined) => {
-                            let last_part_combined = combined.last().unwrap();
-                            let (indexed, base_elements) = match last_part_combined {
-                                ClassNamePart::Tag(tag) => {
-                                    if tag == "*" {
-                                        (true, Some(all_elements()))
-                                    } else {
-                                        (true, tag_elements.get(tag).cloned())
+                            let mut base: Option<(usize, FixedBitSet, usize)> = None;
+                            for (part_idx, part) in combined.iter().enumerate() {
+                                let candidate = match part {
+                                    ClassNamePart::Tag(tag) if tag != "*" => {
+                                        tag_elements.get(tag).cloned()
                                     }
-                                }
-                                ClassNamePart::Class(class) => {
-                                    (true, class_elements.get(*class).cloned())
-                                }
-                                ClassNamePart::Id(id) => (true, id_elements.get(id).cloned()),
-                                ClassNamePart::Attributes(attributes) => (
-                                    true,
-                                    Some(get_base_elements_by_attributes(
-                                        html_nodes,
-                                        dom_indexes,
-                                        attributes,
-                                    )),
-                                ),
-                                _ => (false, Some(all_elements())),
-                            };
-                            let rules_to_apply = if indexed {
-                                &combined[..combined.len() - 1].to_vec()
-                            } else {
-                                combined
-                            };
-
-                            let capacity = if let Some(base_elements) = &base_elements {
-                                base_elements.len()
-                            } else {
-                                0usize
-                            };
-                            let mut filtered_elements = FixedBitSet::with_capacity(capacity);
-                            if let Some(base_elements) = base_elements {
-                                for el in base_elements.ones() {
-                                    let matched_all = rules_to_apply.iter().all(|part| {
-                                        element_matches_class_part(
-                                            part,
-                                            el,
-                                            &html_nodes,
-                                            &class_elements,
+                                    ClassNamePart::Class(class) => {
+                                        class_elements.get(*class).cloned()
+                                    }
+                                    ClassNamePart::Id(id) => id_elements.get(id).cloned(),
+                                    ClassNamePart::Attributes(attributes) => {
+                                        Some(get_base_elements_by_attributes(
+                                            html_nodes,
                                             dom_indexes,
-                                            hovering_chain,
-                                            &mut hovering_has_impact,
-                                            &precomputed_selectors,
-                                        )
-                                    });
-                                    if matched_all {
-                                        filtered_elements.insert(el);
+                                            attributes,
+                                        ))
                                     }
+                                    _ => None,
+                                };
+                                let Some(candidate) = candidate else {
+                                    continue;
+                                };
+                                let candidate_count = candidate.count_ones(..);
+                                if base
+                                    .as_ref()
+                                    .is_none_or(|(_, _, best)| candidate_count < *best)
+                                {
+                                    base = Some((part_idx, candidate, candidate_count));
+                                }
+                                if candidate_count == 0 {
+                                    break;
+                                }
+                            }
+
+                            let (base_part_idx, base_elements) = base
+                                .map(|(part_idx, elements, _)| (part_idx, elements))
+                                .unwrap_or_else(|| (usize::MAX, all_elements()));
+                            let mut filtered_elements = FixedBitSet::with_capacity(max_element_idx);
+                            for el in base_elements.ones() {
+                                let matched_all =
+                                    combined.iter().enumerate().all(|(part_idx, part)| {
+                                        part_idx == base_part_idx
+                                            || element_matches_class_part(
+                                                part,
+                                                el,
+                                                &html_nodes,
+                                                &class_elements,
+                                                dom_indexes,
+                                                hovering_chain,
+                                                &mut hovering_has_impact,
+                                                &precomputed_selectors,
+                                            )
+                                    });
+                                if matched_all {
+                                    filtered_elements.insert(el);
                                 }
                             }
                             Some(filtered_elements)
@@ -2093,7 +2153,7 @@ fn search_elements_for_css_nodes(
             }
             CssNode::MediaQuery(query) => {
                 if media_query_matches(query, window_size) {
-                    let elements: Vec<&usize> = html_nodes
+                    let elements: Vec<usize> = html_nodes
                         .iter()
                         .filter_map(|(idx, node)| match node {
                             Node::Element(_) => Some(idx),
@@ -2104,7 +2164,7 @@ fn search_elements_for_css_nodes(
                     for el in elements {
                         // If there's only a single part, we've already completed this class name by doing the last one
                         let is_match = move_up_ancestor_chain(
-                            *el,
+                            el,
                             &html_nodes,
                             css_nodes,
                             &class_elements,
@@ -2119,14 +2179,14 @@ fn search_elements_for_css_nodes(
                         );
 
                         if is_match {
-                            matches.entry(*el).or_default().push(css_node_idx);
+                            matches.entry(el).or_default().push(css_node_idx);
                         }
                     }
                 }
             }
             // Layers and supports always pass through, they just affect sorting
             CssNode::Layer(_) | CssNode::Supports(_) => {
-                let elements: Vec<&usize> = html_nodes
+                let elements: Vec<usize> = html_nodes
                     .iter()
                     .filter_map(|(idx, node)| match node {
                         Node::Element(_) => Some(idx),
@@ -2137,7 +2197,7 @@ fn search_elements_for_css_nodes(
                 for el in elements {
                     // If there's only a single part, we've already completed this class name by doing the last one
                     let is_match = move_up_ancestor_chain(
-                        *el,
+                        el,
                         &html_nodes,
                         css_nodes,
                         &class_elements,
@@ -2152,7 +2212,7 @@ fn search_elements_for_css_nodes(
                     );
 
                     if is_match {
-                        matches.entry(*el).or_default().push(css_node_idx);
+                        matches.entry(el).or_default().push(css_node_idx);
                     }
                 }
             }
@@ -2266,7 +2326,7 @@ fn get_css_nodes(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
     network_fetch: &Rc<RefCell<NetworkFetch>>,
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     root_indice: usize,
     dom_indexes: &DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
@@ -2400,7 +2460,7 @@ fn compute_node_styles(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
     network_fetch: &Rc<RefCell<NetworkFetch>>,
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
     root_indice: usize,
     window_size: &PhysicalSize<u32>,
@@ -2596,7 +2656,7 @@ fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Text(TextElement { text, parent: None }));
-    let node_idx = renderer.node_idx_cursor;
+    let node_idx = renderer.nodes.cursor;
     renderer.dom_indexes.children_index.insert(node_idx, vec![]);
     Ok(node_idx as i32)
 }
@@ -2612,7 +2672,7 @@ fn op_get_attribute<'s>(
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
-        .get(&node_idx)
+        .get(node_idx)
         .and_then(|node| match node {
             Node::Element(element) => element.attributes.values.get(&attribute),
             _ => None,
@@ -2646,12 +2706,12 @@ fn clone_node(
 ) -> Result<usize> {
     let mut node = renderer
         .nodes
-        .get(&node_idx)
+        .get(node_idx)
         .with_context(|| "Could not find node by idx")?
         .clone();
     node.set_parent(new_parent);
     renderer.push_node(node);
-    let new_node_idx = renderer.node_idx_cursor;
+    let new_node_idx = renderer.nodes.cursor;
     if deep {
         let old_children = renderer
             .dom_indexes
@@ -2699,7 +2759,7 @@ fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_o
 
     if let Some(parent) = renderer
         .nodes
-        .get(&node_idx)
+        .get(node_idx)
         .and_then(|node| node.get_parent())
     {
         get_offset_y_walk(renderer, parent, parent_offset)
@@ -2725,7 +2785,7 @@ fn op_get_attributes(
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
-        .get(&node_idx)
+        .get(node_idx)
         .and_then(|node| match node {
             Node::Element(element) => Some(element.attributes.clone()),
             _ => None,
@@ -2745,7 +2805,7 @@ fn op_create_comment_element(
         comment,
         parent: None,
     }));
-    let node_idx = renderer.node_idx_cursor;
+    let node_idx = renderer.nodes.cursor;
     renderer.dom_indexes.children_index.insert(node_idx, vec![]);
     Ok(node_idx as i32)
 }
@@ -2763,14 +2823,14 @@ fn op_append_child(
     if before_reference_idx.is_some_and(|idx| idx == node_idx) {
         return Ok(());
     }
-    if let Some(old_parent_idx) = renderer.nodes.get(&node_idx).unwrap().get_parent() {
+    if let Some(old_parent_idx) = renderer.nodes.get(node_idx).unwrap().get_parent() {
         if let Some(children) = renderer.dom_indexes.children_index.get_mut(&old_parent_idx) {
             children.retain(|idx| *idx != node_idx);
         }
     }
     renderer
         .nodes
-        .get_mut(&node_idx)
+        .get_mut(node_idx)
         .unwrap()
         .set_parent(Some(parent_idx));
     let children = renderer
@@ -2858,7 +2918,7 @@ fn op_get_node(
     let renderer = host.renderer.borrow();
     Ok(renderer
         .nodes
-        .get(&idx)
+        .get(idx)
         .and_then(|node| Some((idx, node.clone()))))
 }
 
@@ -2874,7 +2934,7 @@ fn op_get_element_by_id(
         .id_elements
         .get(&id)
         .and_then(|v| v.minimum());
-    let node = node_idx.and_then(|idx| Some((idx, renderer.nodes.get(&idx).unwrap().clone())));
+    let node = node_idx.and_then(|idx| Some((idx, renderer.nodes.get(idx).unwrap().clone())));
     Ok(node)
 }
 
@@ -2918,9 +2978,9 @@ fn op_query_selector(
     }
 }
 
-fn walk_closest(buffer: &mut Vec<usize>, nodes: &HashMap<usize, Node>, node_idx: usize) {
+fn walk_closest(buffer: &mut Vec<usize>, nodes: &NodesTable, node_idx: usize) {
     buffer.push(node_idx);
-    if let Some(parent) = nodes.get(&node_idx).and_then(|node| node.get_parent()) {
+    if let Some(parent) = nodes.get(node_idx).and_then(|node| node.get_parent()) {
         walk_closest(buffer, nodes, parent);
     }
 }
@@ -2935,7 +2995,7 @@ fn op_get_closest(
     let mut renderer = host.renderer.borrow_mut();
     let selector = selector_to_parts(&selector, &mut renderer.css_parser.class_definitions);
     let matched_idxs: Vec<usize> = query_selector_all(
-        &filter_to_elements(&renderer.nodes),
+        &renderer.nodes,
         selector,
         &renderer.window_size,
         &renderer.dom_indexes,
@@ -2950,21 +3010,18 @@ fn op_get_closest(
         .collect();
     allowed_matched_idxs.sort();
     let most_applicable = allowed_matched_idxs.first().map(|lidx| allowed_idxs[*lidx]);
-    let owned = most_applicable.map(|idx| (idx, renderer.nodes.get(&idx).unwrap().clone()));
+    let owned = most_applicable.map(|idx| (idx, renderer.nodes.get(idx).unwrap().clone()));
     Ok(owned)
 }
 
-fn has_parent<N>(nodes_table: &HashMap<usize, N>, node_idx: usize, target_parent: usize) -> bool
-where
-    N: std::borrow::Borrow<Node>,
-{
+fn has_parent(nodes_table: &NodesTable, node_idx: usize, target_parent: usize) -> bool {
     if node_idx == target_parent {
         return true;
     }
 
     if let Some(parent) = nodes_table
-        .get(&node_idx)
-        .and_then(|v| v.borrow().get_parent())
+        .get(node_idx)
+        .and_then(|v| v.get_parent())
     {
         has_parent(nodes_table, parent, target_parent)
     } else {
@@ -3048,7 +3105,7 @@ fn op_set_text_content(
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
 
-    match renderer.nodes.get_mut(&node_idx).unwrap() {
+    match renderer.nodes.get_mut(node_idx).unwrap() {
         Node::Text(element) => {
             element.text = text;
         }
@@ -3069,7 +3126,7 @@ fn op_set_text_content(
                 text,
                 parent: Some(node_idx),
             }));
-            let text_idx = renderer.node_idx_cursor;
+            let text_idx = renderer.nodes.cursor;
             renderer
                 .dom_indexes
                 .children_index
@@ -3121,7 +3178,7 @@ fn op_get_child_nodes(
         .get(&node_idx)
         .unwrap()
         .iter()
-        .map(|idx| (*idx, renderer.nodes.get(idx).unwrap().clone()))
+        .map(|idx| (*idx, renderer.nodes.get(*idx).unwrap().clone()))
         .collect();
     Ok(children)
 }
@@ -3134,12 +3191,12 @@ fn op_get_parent_node(
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
     let parent_idx =
-        if let Some(parent) = renderer.nodes.get(&node_idx).and_then(|v| v.get_parent()) {
+        if let Some(parent) = renderer.nodes.get(node_idx).and_then(|v| v.get_parent()) {
             parent
         } else {
             return Ok(None);
         };
-    let parent = (parent_idx, renderer.nodes.get(&parent_idx).unwrap().clone());
+    let parent = (parent_idx, renderer.nodes.get(parent_idx).unwrap().clone());
     Ok(Some(parent))
 }
 
@@ -3177,7 +3234,7 @@ fn op_remove_attribute(
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    match renderer.nodes.get_mut(&node_idx).unwrap() {
+    match renderer.nodes.get_mut(node_idx).unwrap() {
         Node::Element(element) => {
             element.attributes.remove(&attribute);
         }
@@ -3217,7 +3274,7 @@ fn op_fill_canvas_rect(
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let node = renderer.nodes.get(&node_idx).unwrap();
+    let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
         return Ok(());
     };
@@ -3262,7 +3319,7 @@ fn op_stroke_canvas_rect(
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let node = renderer.nodes.get(&node_idx).unwrap();
+    let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
         return Ok(());
     };
@@ -3338,7 +3395,7 @@ fn op_canvas_path_stroke(
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    let node = renderer.nodes.get(&node_idx).unwrap();
+    let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
         return Ok(());
     };
@@ -3406,7 +3463,7 @@ fn op_collect_data_for_form(
     let inputs = renderer.collect_inputs_in_form(form_node_idx, None);
     let mut data = HashMap::new();
     for input in inputs.iter() {
-        let Some(Node::Element(element)) = renderer.nodes.get(&input) else {
+        let Some(Node::Element(element)) = renderer.nodes.get(*input) else {
             continue;
         };
         let Some(name) = element.attributes.get_str("name") else {
@@ -3422,7 +3479,7 @@ fn op_collect_data_for_form(
 
 // This should walk the tree to be fully correct I think
 fn query_selector_all(
-    nodes_table: &HashMap<usize, &Node>,
+    nodes_table: &NodesTable,
     selector: Vec<ClassNamePart>,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
@@ -3574,14 +3631,14 @@ pub struct Script {
     is_async: bool,
 }
 
-fn sorted_node_idxs(nodes: &HashMap<usize, Node>) -> Vec<usize> {
-    let mut node_idxs: Vec<usize> = nodes.keys().copied().collect();
+fn sorted_node_idxs(nodes: &NodesTable) -> Vec<usize> {
+    let mut node_idxs: Vec<usize> = nodes.keys().collect();
     node_idxs.sort_unstable();
     node_idxs
 }
 
 fn get_dom_indexes_classes(
-    html_nodes: &HashMap<usize, Node>,
+    html_nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
     class_indexes: &ClassIndexes,
 ) -> Vec<FixedBitSet> {
@@ -3598,7 +3655,7 @@ fn get_dom_indexes_classes(
                     let Some(class_idx) = class_indexes.class_to_idx.get(&class) else {
                         continue;
                     };
-                    class_elements[*class_idx].insert(*html_node_idx);
+                    class_elements[*class_idx].insert(html_node_idx);
                 }
             }
             _ => {}
@@ -3607,7 +3664,7 @@ fn get_dom_indexes_classes(
     class_elements
 }
 
-fn get_dom_indexes_attributes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+fn get_dom_indexes_attributes(html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut attribute_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
@@ -3619,13 +3676,13 @@ fn get_dom_indexes_attributes(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Ve
             attribute_elements
                 .entry(key.clone())
                 .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
-                .insert(*html_node_idx);
+                .insert(html_node_idx);
         }
     }
     attribute_elements
 }
 
-fn get_dom_indexes_ids(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+fn get_dom_indexes_ids(html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut id_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
@@ -3635,7 +3692,7 @@ fn get_dom_indexes_ids(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize
                     id_elements
                         .entry(id.into_owned())
                         .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
-                        .insert(*html_node_idx);
+                        .insert(html_node_idx);
                 }
             }
             _ => {}
@@ -3645,7 +3702,7 @@ fn get_dom_indexes_ids(html_nodes: &HashMap<usize, Node>, nodes_idxs: &Vec<usize
 }
 
 fn get_dom_indexes(
-    html_nodes: &HashMap<usize, Node>,
+    html_nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
     class_indexes: &ClassIndexes,
 ) -> DomIndexes {
@@ -3661,7 +3718,7 @@ fn get_dom_indexes(
                 tag_elements
                     .entry(element.tag.clone())
                     .or_insert_with(|| FixedBitSet::with_capacity(bitset_capacity))
-                    .insert(*html_node_idx);
+                    .insert(html_node_idx);
             }
             _ => {}
         };
@@ -3672,16 +3729,15 @@ fn get_dom_indexes(
     let mut root_indices: Vec<usize> = html_nodes
         .iter()
         .filter_map(|(idx, node)| node.get_parent().is_none().then_some(idx))
-        .filter(|idx| match html_nodes.get(idx).unwrap() {
+        .filter(|idx| match html_nodes.get(*idx).unwrap() {
             Node::Element(_) | Node::Text(_) => true,
             Node::Comment(_) => false,
         })
-        .cloned()
         .collect();
     root_indices.sort_unstable();
     let root_indice = root_indices
         .iter()
-        .find(|idx| match html_nodes.get(idx).unwrap() {
+        .find(|idx| match html_nodes.get(**idx).unwrap() {
             Node::Element(element) => element.tag == "html",
             Node::Text(_) | Node::Comment(_) => false,
         })
@@ -3795,7 +3851,7 @@ impl Renderer {
     fn new(
         url: String,
         tokio: Rc<RefCell<tokio::runtime::Runtime>>,
-        nodes_table: HashMap<usize, Node>,
+        nodes_table: NodesTable,
         window_size: PhysicalSize<u32>,
         font_handler: Rc<FontHandler>,
         network_fetch: Rc<RefCell<NetworkFetch>>,
@@ -3829,11 +3885,8 @@ impl Renderer {
                 &mut css_parser,
             );
 
-        let node_idx_cursor = nodes_idxs.len();
-
         Self {
             url,
-            node_idx_cursor,
             nodes_idxs,
             nodes: nodes_table,
             node_styles,
@@ -3874,7 +3927,7 @@ impl Renderer {
     fn query_selector_all(&mut self, selector: String, required_parent: Option<usize>) -> Vec<usize> {
         let selector = selector_to_parts(&selector, &mut self.css_parser.class_definitions);
         query_selector_all(
-            &filter_to_elements(&self.nodes),
+            &self.nodes,
             selector,
             &self.window_size,
             &self.dom_indexes,
@@ -3891,7 +3944,7 @@ impl Renderer {
         let node_idxs = self.query_selector_all(selector, required_parent);
         let owned = node_idxs
             .into_iter()
-            .map(|idx| (idx, self.nodes.get(&idx).unwrap().clone()))
+            .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()))
             .collect();
         owned
     }
@@ -3905,7 +3958,7 @@ impl Renderer {
         let node = node_idxs.first();
         let owned = node
             .cloned()
-            .map(|idx| (idx, self.nodes.get(&idx).unwrap().clone()));
+            .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()));
         owned
     }
 
@@ -3927,7 +3980,7 @@ impl Renderer {
             attributes: Attributes::new(),
             parent: None,
         }));
-        let node_idx = self.node_idx_cursor;
+        let node_idx = self.nodes.cursor;
         self.dom_indexes.children_index.insert(node_idx, vec![]);
         node_idx
     }
@@ -3936,7 +3989,7 @@ impl Renderer {
         let node_idxs = self.dom_indexes.tag_elements.get(tag);
         let nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
             idxs.ones()
-                .map(|idx| (idx, self.nodes.get(&idx).unwrap().clone()))
+                .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()))
                 .filter(|(idx, node)| {
                     node.get_parent().is_some() || *idx == self.dom_indexes.root_indice
                 })
@@ -3951,7 +4004,7 @@ impl Renderer {
         let (mut changed, mut id_dirty, mut class_dirty) = (false, false, false);
         match self
             .nodes
-            .get_mut(&node_idx)
+            .get_mut(node_idx)
             .with_context(|| "Failed to get node")?
         {
             Node::Element(element) => {
@@ -4010,11 +4063,10 @@ impl Renderer {
     fn replace_document(
         &mut self,
         url: String,
-        nodes_table: HashMap<usize, Node>,
+        nodes_table: NodesTable,
         nodes_idxs: Vec<usize>,
     ) {
         self.url = url;
-        self.node_idx_cursor = nodes_idxs.len();
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
         self.hovering = None;
@@ -4027,7 +4079,7 @@ impl Renderer {
     }
 
     fn get_implicit_click_events(&self, node_idx: usize) -> Vec<(usize, HtmlEvent)> {
-        let node = self.nodes.get(&node_idx).unwrap();
+        let node = self.nodes.get(node_idx).unwrap();
         let mut events = vec![];
         if let Node::Element(element) = node {
             if element.tag == "label" {
@@ -4035,7 +4087,7 @@ impl Renderer {
                     if let Some(for_elements) = self.dom_indexes.id_elements.get(for_attr.as_ref())
                     {
                         for el in for_elements.ones() {
-                            let node = self.nodes.get(&el).unwrap();
+                            let node = self.nodes.get(el).unwrap();
                             if let Node::Element(element) = node {
                                 if element.tag == "input"
                                     && element
@@ -4088,7 +4140,7 @@ impl Renderer {
         }) && allow_scroll
         {
             Some(node_idx)
-        } else if let Some(parent) = self.nodes.get(&node_idx).and_then(|n| n.get_parent()) {
+        } else if let Some(parent) = self.nodes.get(node_idx).and_then(|n| n.get_parent()) {
             self.get_scrollable_node_idx_inner(parent)
         } else {
             None
@@ -4107,12 +4159,12 @@ impl Renderer {
         let mut scripts: Vec<Script> = self
             .nodes_idxs
             .iter()
-            .filter(|node_idx| match self.nodes.get(*node_idx).unwrap() {
+            .filter(|node_idx| match self.nodes.get(**node_idx).unwrap() {
                 Node::Element(element) => element.tag == "script",
                 _ => false,
             })
             .map(|idx| -> Option<Script> {
-                match self.nodes.get(idx).unwrap() {
+                match self.nodes.get(*idx).unwrap() {
                     Node::Element(element) => {
                         let script_type = match element
                             .attributes
@@ -4157,7 +4209,7 @@ impl Renderer {
                             return None;
                         }
                         let child = children.first().unwrap();
-                        let child_node = &self.nodes.get(child).unwrap();
+                        let child_node = &self.nodes.get(*child).unwrap();
 
                         let text = match child_node {
                             Node::Element(element) => {
@@ -4202,7 +4254,7 @@ impl Renderer {
     }
 
     pub fn walk_node_upwards(&self, idx: usize, callback: impl Fn(&Node) -> bool) -> Option<usize> {
-        if let Some(node) = self.nodes.get(&idx) {
+        if let Some(node) = self.nodes.get(idx) {
             if callback(node) {
                 return Some(idx);
             }
@@ -4220,7 +4272,7 @@ impl Renderer {
         node_idx: usize,
         submitted_by: Option<usize>,
     ) {
-        if let Some(node) = self.nodes.get(&node_idx) {
+        if let Some(node) = self.nodes.get(node_idx) {
             if let Node::Element(element) = node
                 && is_supported_form_element(element, node_idx, submitted_by)
             {
@@ -4242,7 +4294,7 @@ impl Renderer {
     }
 
     pub fn submit_form(&mut self, form: usize, submitted_by: Option<usize>) -> Result<()> {
-        let Some(Node::Element(element)) = self.nodes.get(&form) else {
+        let Some(Node::Element(element)) = self.nodes.get(form) else {
             return Err(anyhow!("Failed to get form node"));
         };
         let Some(action) = element.attributes.get_str("action") else {
@@ -4256,7 +4308,7 @@ impl Renderer {
         {
             let mut query_parms = parsed_url.query_pairs_mut();
             for input in inputs {
-                let Some(Node::Element(element)) = self.nodes.get(&input) else {
+                let Some(Node::Element(element)) = self.nodes.get(input) else {
                     continue;
                 };
                 let Some(name) = element.attributes.get_str("name") else {
@@ -4455,7 +4507,7 @@ impl Renderer {
                     if element.tag == "img"
                         && self
                             .node_styles
-                            .get(idx)
+                            .get(&idx)
                             .is_some_and(|v| v.display != StyleDisplay::None) =>
                 {
                     element
@@ -4584,7 +4636,7 @@ impl Renderer {
     }
 
     fn get_text_content(&self, node_idx: usize) -> String {
-        let node = &self.nodes.get(&node_idx).unwrap();
+        let node = &self.nodes.get(node_idx).unwrap();
         let mut str = String::new();
         match node {
             Node::Text(element) => {
@@ -4601,7 +4653,7 @@ impl Renderer {
     }
 
     fn get_element_html(&self, node_idx: usize) -> String {
-        let node = &self.nodes.get(&node_idx).unwrap();
+        let node = &self.nodes.get(node_idx).unwrap();
         let mut str = String::new();
         match node {
             Node::Text(element) => {
@@ -4678,7 +4730,7 @@ impl Renderer {
             .get(
                 &self
                     .nodes
-                    .get(&node_idx)
+                    .get(node_idx)
                     .unwrap()
                     .get_parent()
                     .unwrap_or(node_idx),
@@ -4704,7 +4756,7 @@ impl Renderer {
             self.resolved_heights.remove(&node_idx);
         }
 
-        match self.nodes.get(&node_idx).unwrap().clone() {
+        match self.nodes.get(node_idx).unwrap().clone() {
             Node::Comment(_) => None,
             Node::Text(text) => {
                 let style = self.node_styles.get(&node_idx).unwrap();
@@ -4802,7 +4854,7 @@ impl Renderer {
                     let (pixmap, height, width, opaque) = match element.tag.as_str() {
                         "canvas" => {
                             let (Some(canvas_width), Some(canvas_height)) =
-                                (match self.nodes.get(&node_idx).unwrap() {
+                                (match self.nodes.get(node_idx).unwrap() {
                                     Node::Element(element) => (
                                         element
                                             .attributes
@@ -5775,7 +5827,7 @@ impl Renderer {
         let containing_block = match style.position {
             StylePosition::Absolute | StylePosition::Fixed => Some(containing_node_idx),
             StylePosition::Relative | StylePosition::Static | StylePosition::Sticky => {
-                self.nodes.get(&node_idx).unwrap().get_parent()
+                self.nodes.get(node_idx).unwrap().get_parent()
             }
         };
         let containing_block_height = containing_block
@@ -6009,7 +6061,7 @@ impl Renderer {
             }
         }
 
-        let input_value = match &self.nodes.get(&node_idx).unwrap() {
+        let input_value = match &self.nodes.get(node_idx).unwrap() {
             Node::Element(element) => element.attributes.get_str("value"),
             Node::Text(_) | Node::Comment(_) => None,
         };
@@ -6249,7 +6301,7 @@ impl Renderer {
             })
             .collect();
 
-        let input_value = match &self.nodes.get(&node_idx).unwrap() {
+        let input_value = match &self.nodes.get(node_idx).unwrap() {
             Node::Element(element) => element.attributes.get_str("value"),
             Node::Text(_) | Node::Comment(_) => None,
         };
@@ -6751,7 +6803,7 @@ impl Renderer {
             let src_start = (pixel_y * pixmap_stride) as usize;
             let src_row = &pixels[src_start..src_start + pixmap_width as usize];
             let dst_start = (container_start_y * width as i32
-                + layout_box.rect.x
+                + layout_box.rect.x.min(width as i32)
                 + pixel_y as i32 * width as i32) as usize;
             let dst_row = &mut buffer[dst_start..(dst_start + pixmap_width as usize)];
             for pixel_x in 0..end_x {
@@ -6941,7 +6993,7 @@ impl Renderer {
 
     fn walk_parent_tree(&self, buffer: &mut Vec<usize>, idx: usize) {
         buffer.push(idx);
-        if let Some(node) = self.nodes.get(&idx) {
+        if let Some(node) = self.nodes.get(idx) {
             if let Some(parent) = node.get_parent() {
                 self.walk_parent_tree(buffer, parent);
             }
@@ -6955,8 +7007,8 @@ impl Renderer {
     }
 
     pub fn reserve_node_idx(&mut self) {
-        self.node_idx_cursor += 1;
-        self.nodes_idxs.push(self.node_idx_cursor);
+        self.nodes.cursor += 1;
+        self.nodes_idxs.push(self.nodes.cursor);
     }
 
     pub fn insert_node_at_idx(&mut self, idx: usize, node: Node) {
@@ -6965,7 +7017,7 @@ impl Renderer {
 
     pub fn push_node(&mut self, node: Node) {
         self.reserve_node_idx();
-        self.insert_node_at_idx(self.node_idx_cursor, node);
+        self.insert_node_at_idx(self.nodes.cursor, node);
     }
 
     pub fn remove_node(&mut self, node_idx: usize, remove_from_parent: bool) {
@@ -6982,7 +7034,7 @@ impl Renderer {
 
         // Remove from parent
         if remove_from_parent {
-            if let Some(parent) = self.nodes.get(&node_idx).unwrap().get_parent() {
+            if let Some(parent) = self.nodes.get(node_idx).unwrap().get_parent() {
                 let children = self.dom_indexes.children_index.get(&parent).unwrap();
                 let filtered: Vec<usize> = children
                     .into_iter()
@@ -7000,13 +7052,13 @@ impl Renderer {
             .filter(|idx| **idx != node_idx)
             .cloned()
             .collect();
-        self.nodes.remove(&node_idx);
+        self.nodes.remove(node_idx);
         self.node_layout_mapping.remove(&node_idx);
         self.dom_indexes.children_index.remove(&node_idx);
     }
 
     pub fn detach_node(&mut self, node_idx: usize) {
-        let Some(parent) = self.nodes.get(&node_idx).and_then(|node| node.get_parent()) else {
+        let Some(parent) = self.nodes.get(node_idx).and_then(|node| node.get_parent()) else {
             return;
         };
 
@@ -7014,7 +7066,7 @@ impl Renderer {
             children.retain(|idx| *idx != node_idx);
         }
 
-        if let Some(node) = self.nodes.get_mut(&node_idx) {
+        if let Some(node) = self.nodes.get_mut(node_idx) {
             node.set_parent(None);
         }
         self.node_layout_mapping.remove(&node_idx);
@@ -7265,7 +7317,7 @@ impl Renderer {
         let mut idx_mapping = HashMap::new();
         for (node_internal_idx, _) in parser.nodes.iter().enumerate() {
             self.reserve_node_idx();
-            idx_mapping.insert(node_internal_idx, self.node_idx_cursor);
+            idx_mapping.insert(node_internal_idx, self.nodes.cursor);
         }
         for (node_internal_idx, node) in parser.nodes.iter_mut().enumerate() {
             // Set root elements parent to us
@@ -7364,7 +7416,7 @@ struct Browser {
 
 struct BootParams {
     nodes_idxs: Vec<usize>,
-    nodes: HashMap<usize, parser::Node>,
+    nodes: NodesTable,
     dom_indexes: DomIndexes,
 }
 
@@ -7840,15 +7892,14 @@ impl Browser {
         ));
 
         if let Some(renderer) = &self.renderer {
-            let nodes_table = self
-                .html_parser
-                .as_mut()
-                .unwrap()
-                .nodes
-                .clone()
-                .into_iter()
-                .enumerate()
-                .collect();
+            let nodes_table = NodesTable::new_from_nodes(
+                self
+                    .html_parser
+                    .as_mut()
+                    .unwrap()
+                    .nodes
+                    .clone(),
+            );
             let nodes_idxs = sorted_node_idxs(&nodes_table);
             renderer
                 .borrow_mut()
@@ -7911,15 +7962,14 @@ impl Browser {
         self.register_tokio_runtime()?;
         self.navigate(self.url.clone())?;
         self.install_js_host();
-        let nodes_table = self
-            .html_parser
-            .as_mut()
-            .unwrap()
-            .nodes
-            .clone()
-            .into_iter()
-            .enumerate()
-            .collect();
+        let nodes_table = NodesTable::new_from_nodes(
+            self
+                .html_parser
+                .as_mut()
+                .unwrap()
+                .nodes
+                .clone()
+        );
         let nodes_idxs = sorted_node_idxs(&nodes_table);
         let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &ClassIndexes::new());
         self.detect_html_redirect(&dom_indexes);
@@ -8098,7 +8148,7 @@ impl Browser {
             if let Some(parent) = parent_link {
                 let parent_href = {
                     let renderer = self.renderer.as_ref().unwrap().borrow();
-                    match renderer.nodes.get(&parent) {
+                    match renderer.nodes.get(parent) {
                         Some(Node::Element(element)) => {
                             element.attributes.get_str("href").map(|v| v.into_owned())
                         }
@@ -8147,7 +8197,7 @@ impl Browser {
 
     fn refresh_renderer(
         &mut self,
-        nodes_table: HashMap<usize, Node>,
+        nodes_table: NodesTable,
         dom_indexes: DomIndexes,
         nodes_idxs: Vec<usize>,
         size: PhysicalSize<u32>,
@@ -8173,8 +8223,8 @@ impl Browser {
         &mut self,
         surf: &mut Surface<DisplayHandle, WindowHandle>,
         size: &PhysicalSize<u32>,
-        cursor: &Position,
     ) {
+        let animation_redraw = self.tick_animations();
         let first_boot = self.render(surf, &size);
         if first_boot {
             let start = Instant::now();
@@ -8187,8 +8237,8 @@ impl Browser {
         }
 
         // If there are animations, continue re-rendering until there aren't
-        if self.tick_animations() {
-            self.render_loop(surf, size, cursor);
+        if animation_redraw && let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -8377,7 +8427,7 @@ impl Browser {
                 let window = self.window.as_ref().unwrap();
                 match event {
                     Event::UserEvent(UserEvent::FrameUpdated) => {
-                        self.render_loop(&mut surf, &size, &cursor);
+                        self.render_loop(&mut surf, &size);
                     }
                     Event::UserEvent(UserEvent::DomUpdated) => self.execute_dom_update(),
                     Event::UserEvent(UserEvent::ChildMessage(message)) => {
@@ -8424,7 +8474,7 @@ impl Browser {
                             size = window.inner_size();
                         }
                         WindowEvent::RedrawRequested => {
-                            self.render_loop(&mut surf, &size, &cursor);
+                            self.render_loop(&mut surf, &size);
                         }
                         WindowEvent::CursorMoved {
                             device_id: _,
@@ -8557,7 +8607,7 @@ impl Browser {
         {
             let new_text = {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                if let Some(Node::Element(element)) = renderer.nodes.get_mut(&focusable) {
+                if let Some(Node::Element(element)) = renderer.nodes.get_mut(focusable) {
                     let entry = element
                         .attributes
                         .values
@@ -8667,13 +8717,13 @@ fn clear_buffer(buffer: &mut [u32], color: u32) {
 }
 
 fn build_children_index(
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     node_idxs: &Vec<usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mut children_index = HashMap::new();
 
     for idx in node_idxs.iter() {
-        if let Some(parent_idx) = nodes.get(idx).unwrap().get_parent() {
+        if let Some(parent_idx) = nodes.get(*idx).unwrap().get_parent() {
             let entry: &mut Vec<usize> = children_index.entry(parent_idx).or_default();
             entry.push(*idx);
         }
@@ -8691,12 +8741,12 @@ fn build_children_index(
 
 fn get_node_text_representation(
     node_idx: usize,
-    nodes: &HashMap<usize, Node>,
+    nodes: &NodesTable,
     layout_node_mapping: &HashMap<usize, usize>,
     layout_table: &HashMap<usize, LayoutBox>,
     node_styles: &HashMap<usize, Style>,
 ) -> String {
-    let mut label = match &nodes.get(&node_idx).unwrap() {
+    let mut label = match &nodes.get(node_idx).unwrap() {
         Node::Element(element) => format_element_tree_label(element),
         Node::Text(text) => match collapse_whitespace(&text.text) {
             Some(text) => format!("Node::Text \"{text}\""),
