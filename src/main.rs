@@ -173,6 +173,7 @@ struct DomIndexes {
     children_index: HashMap<usize, Vec<usize>>,
     attribute_elements: HashMap<String, FixedBitSet>,
     root_indice: usize,
+    node_bitset_capacity: usize,
 }
 
 impl DomIndexes {
@@ -185,16 +186,44 @@ impl DomIndexes {
         self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     }
 
-    pub fn recompute_attribute_elements(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
-        self.attribute_elements = get_dom_indexes_attributes(html_nodes, nodes_idxs);
-    }
-
-    pub fn recompute_id_elements(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
-        self.id_elements = get_dom_indexes_ids(html_nodes, nodes_idxs);
-    }
-
     pub fn recompute_children(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
         self.children_index = build_children_index(html_nodes, nodes_idxs);
+    }
+
+    pub fn update_bitset_capacity(&mut self, nodes_idxs: &Vec<usize>) {
+        self.node_bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
+    }
+
+    pub fn remove_id_node(&mut self, id: &String, node_idx: usize) {
+        if let Some(existing) = self.id_elements.get_mut(id) {
+            existing.remove(node_idx);
+        }
+    }
+
+    pub fn add_id_node(&mut self, id: &String, node_idx: usize) {
+        if let Some(existing) = self.id_elements.get_mut(id) {
+            existing.insert(node_idx);
+        } else {
+            self.id_elements.insert(id.clone(), FixedBitSet::with_capacity(self.node_bitset_capacity));
+        }
+    }
+
+    pub fn remove_class_node(&mut self, class: &String, node_idx: usize, class_indexes: &mut ClassIndexes) {
+        if let Some(class_idx) = class_indexes.class_to_idx.get(class) {
+            if let Some(existing) = self.class_elements.get_mut(*class_idx) {
+                existing.remove(node_idx);
+            }
+        }
+    }
+
+    pub fn add_class_node(&mut self, class: &String, node_idx: usize, class_indexes: &mut ClassIndexes) {
+        let (new, class_idx) = class_indexes.upsert_definition(class.clone());
+        if new {
+            self.class_elements.resize(class_indexes.len(), FixedBitSet::with_capacity(self.node_bitset_capacity));
+        }
+        if let Some(existing) = self.class_elements.get_mut(class_idx) {
+            existing.insert(node_idx);
+        }
     }
 }
 
@@ -2871,6 +2900,7 @@ fn op_append_child(
             renderer.nodes_idxs.insert(before_pos, idx);
         }
     }
+    renderer.update_bitset_capacity();
     renderer.recompute_children_index();
     renderer.schedule_dom_update();
     Ok(())
@@ -2900,7 +2930,6 @@ fn op_remove_child(state: &mut OpState, #[number] child_idx: usize) -> Result<()
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     renderer.detach_node(child_idx);
-    renderer.recompute_children_index();
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -3751,6 +3780,7 @@ fn get_dom_indexes(
         children_index,
         attribute_elements,
         root_indice,
+        node_bitset_capacity: bitset_capacity,
     }
 }
 
@@ -3959,6 +3989,10 @@ impl Renderer {
         owned
     }
 
+    fn update_bitset_capacity(&mut self) {
+        self.dom_indexes.update_bitset_capacity(&self.nodes_idxs);
+    }
+
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
         let children = self.dom_indexes.children_index.get(&node_idx);
         if let Some(children) = children {
@@ -3998,7 +4032,7 @@ impl Renderer {
     }
 
     fn update_element_attributes(&mut self, node_idx: usize, attributes: Attributes) -> Result<()> {
-        let (mut changed, mut id_dirty, mut class_dirty) = (false, false, false);
+        let mut changed = false;
         match self
             .nodes
             .get_mut(node_idx)
@@ -4015,10 +4049,16 @@ impl Renderer {
                         continue;
                     }
                     if key == "id" {
-                        id_dirty = true;
+                        if let Some(existing_id) = element.attributes.get_str("id") {
+                            self.dom_indexes.remove_id_node(&existing_id.into_owned(), node_idx);
+                        }
+                        self.dom_indexes.add_id_node(&value, node_idx);
                     }
                     if key == "class" {
-                        class_dirty = true;
+                        if let Some(existing_id) = element.attributes.get_str("class") {
+                            self.dom_indexes.remove_class_node(&existing_id.into_owned(), node_idx, &mut self.css_parser.class_definitions);
+                        }
+                        self.dom_indexes.add_class_node(&value, node_idx, &mut self.css_parser.class_definitions);
                     }
                     element.attributes.insert(key, value);
                     changed = true;
@@ -4026,21 +4066,9 @@ impl Renderer {
             }
             _ => {}
         };
-        if !changed {
-            return Ok(());
+        if changed {
+            self.schedule_dom_update();
         }
-        self.dom_indexes.recompute_attribute_elements(&self.nodes, &self.nodes_idxs);
-        if id_dirty {
-            self.dom_indexes.recompute_id_elements(&self.nodes, &self.nodes_idxs);
-        }
-        if class_dirty {
-            self.dom_indexes.recompute_class_elements(
-                &self.nodes,
-                &self.nodes_idxs,
-                &mut self.css_parser.class_definitions,
-            );
-        }
-        self.schedule_dom_update();
         Ok(())
     }
 
@@ -7006,6 +7034,7 @@ impl Renderer {
     pub fn reserve_node_idx(&mut self) {
         self.nodes.cursor += 1;
         self.nodes_idxs.push(self.nodes.cursor);
+        self.dom_indexes.update_bitset_capacity(&self.nodes_idxs);
     }
 
     pub fn insert_node_at_idx(&mut self, idx: usize, node: Node) {
