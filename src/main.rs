@@ -180,7 +180,7 @@ impl DomIndexes {
         &mut self,
         html_nodes: &NodesTable,
         nodes_idxs: &Vec<usize>,
-        class_indexes: &ClassIndexes,
+        class_indexes: &mut ClassIndexes,
     ) {
         self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     }
@@ -2485,7 +2485,7 @@ fn compute_node_styles(
         "Retrieved parsed css nodes in {}ms",
         Instant::now().duration_since(start).as_millis()
     );
-    dom_indexes.recompute_class_elements(nodes, nodes_idxs, &css_parser.class_definitions);
+    dom_indexes.recompute_class_elements(nodes, nodes_idxs, &mut css_parser.class_definitions);
 
     let css_children_index =
         build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
@@ -3636,7 +3636,7 @@ fn sorted_node_idxs(nodes: &NodesTable) -> Vec<usize> {
 fn get_dom_indexes_classes(
     html_nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
-    class_indexes: &ClassIndexes,
+    class_indexes: &mut ClassIndexes,
 ) -> Vec<FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut class_elements = vec![
@@ -3648,10 +3648,11 @@ fn get_dom_indexes_classes(
             Node::Element(element) => {
                 let class_list = get_class_list(element);
                 for class in class_list {
-                    let Some(class_idx) = class_indexes.class_to_idx.get(&class) else {
-                        continue;
-                    };
-                    class_elements[*class_idx].insert(html_node_idx);
+                    let (new, class_idx) = class_indexes.upsert_definition(class);
+                    if new {
+                        class_elements.resize(class_indexes.len(), FixedBitSet::with_capacity(bitset_capacity));
+                    }
+                    class_elements[class_idx].insert(html_node_idx);
                 }
             }
             _ => {}
@@ -3700,7 +3701,7 @@ fn get_dom_indexes_ids(html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) -> Hash
 fn get_dom_indexes(
     html_nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
-    class_indexes: &ClassIndexes,
+    class_indexes: &mut ClassIndexes,
 ) -> DomIndexes {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
 
@@ -4036,7 +4037,7 @@ impl Renderer {
             self.dom_indexes.recompute_class_elements(
                 &self.nodes,
                 &self.nodes_idxs,
-                &self.css_parser.class_definitions,
+                &mut self.css_parser.class_definitions,
             );
         }
         self.schedule_dom_update();
@@ -7073,7 +7074,7 @@ impl Renderer {
     }
 
     pub fn recompute_dom_indexes(&mut self) {
-        self.dom_indexes = get_dom_indexes(&self.nodes, &self.nodes_idxs, &self.css_parser.class_definitions);
+        self.dom_indexes = get_dom_indexes(&self.nodes, &self.nodes_idxs, &mut self.css_parser.class_definitions);
     }
 
     pub fn get_hover_chain(&self) -> Vec<usize> {
@@ -7967,7 +7968,7 @@ impl Browser {
                 .clone()
         );
         let nodes_idxs = sorted_node_idxs(&nodes_table);
-        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &ClassIndexes::new());
+        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &mut ClassIndexes::new());
         self.detect_html_redirect(&dom_indexes);
         Ok(BootParams {
             nodes: nodes_table,

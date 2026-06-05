@@ -423,14 +423,14 @@ impl ClassIndexes {
         }
     }
 
-    pub fn upsert_definition(&mut self, class: String) -> usize {
+    pub fn upsert_definition(&mut self, class: String) -> (bool, usize) {
         if let Some(idx) = self.class_to_idx.get(&class) {
-            *idx
+            (false, *idx)
         } else {
             self.class_to_idx.insert(class.clone(), self.cursor);
             self.idx_to_class.insert(self.cursor, class);
             self.cursor += 1;
-            self.cursor - 1
+            (true, self.cursor - 1)
         }
     }
 
@@ -493,7 +493,7 @@ pub fn selector_to_parts(
                 let parsed = match chars.nth(0).unwrap() {
                     '.' => {
                         let name = chars.as_str().to_string();
-                        let idx = class_definitions.upsert_definition(name);
+                        let (_, idx) = class_definitions.upsert_definition(name);
                         Some(ClassNamePart::Class(idx))
                     }
                     '#' => Some(ClassNamePart::Id(chars.as_str().to_string())),
