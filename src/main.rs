@@ -191,7 +191,21 @@ impl DomIndexes {
     }
 
     pub fn update_bitset_capacity(&mut self, nodes_idxs: &Vec<usize>) {
-        self.node_bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
+        let needed = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
+
+        self.node_bitset_capacity = needed;
+        for elements in &mut self.class_elements {
+            elements.grow(needed);
+        }
+        for elements in self.tag_elements.values_mut() {
+            elements.grow(needed);
+        }
+        for elements in self.id_elements.values_mut() {
+            elements.grow(needed);
+        }
+        for elements in self.attribute_elements.values_mut() {
+            elements.grow(needed);
+        }
     }
 
     pub fn remove_id_node(&mut self, id: &String, node_idx: usize) {
@@ -204,25 +218,44 @@ impl DomIndexes {
         if let Some(existing) = self.id_elements.get_mut(id) {
             existing.insert(node_idx);
         } else {
-            self.id_elements.insert(id.clone(), FixedBitSet::with_capacity(self.node_bitset_capacity));
+            let mut elements = FixedBitSet::with_capacity(self.node_bitset_capacity);
+            elements.insert(node_idx);
+            self.id_elements.insert(id.clone(), elements);
         }
     }
 
-    pub fn remove_class_node(&mut self, class: &String, node_idx: usize, class_indexes: &mut ClassIndexes) {
-        if let Some(class_idx) = class_indexes.class_to_idx.get(class) {
-            if let Some(existing) = self.class_elements.get_mut(*class_idx) {
-                existing.remove(node_idx);
+    pub fn remove_class_node(
+        &mut self,
+        class: &str,
+        node_idx: usize,
+        class_indexes: &mut ClassIndexes,
+    ) {
+        for class in class.split_whitespace() {
+            if let Some(class_idx) = class_indexes.class_to_idx.get(class) {
+                if let Some(existing) = self.class_elements.get_mut(*class_idx) {
+                    existing.remove(node_idx);
+                }
             }
         }
     }
 
-    pub fn add_class_node(&mut self, class: &String, node_idx: usize, class_indexes: &mut ClassIndexes) {
-        let (new, class_idx) = class_indexes.upsert_definition(class.clone());
-        if new {
-            self.class_elements.resize(class_indexes.len(), FixedBitSet::with_capacity(self.node_bitset_capacity));
-        }
-        if let Some(existing) = self.class_elements.get_mut(class_idx) {
-            existing.insert(node_idx);
+    pub fn add_class_node(
+        &mut self,
+        class: &str,
+        node_idx: usize,
+        class_indexes: &mut ClassIndexes,
+    ) {
+        for class in class.split_whitespace() {
+            let (new, class_idx) = class_indexes.upsert_definition(class.to_string());
+            if new {
+                self.class_elements.resize(
+                    class_indexes.len(),
+                    FixedBitSet::with_capacity(self.node_bitset_capacity),
+                );
+            }
+            if let Some(existing) = self.class_elements.get_mut(class_idx) {
+                existing.insert(node_idx);
+            }
         }
     }
 }
@@ -379,13 +412,11 @@ impl NodesTable {
     }
 
     pub fn keys(&self) -> impl Iterator<Item = usize> + '_ {
-        self.data.iter().enumerate().filter_map(|(idx, v)| {
-            if v.is_some() {
-                Some(idx)
-            } else {
-                None
-            }
-        })
+        self.data.iter().enumerate().filter_map(
+            |(idx, v)| {
+                if v.is_some() { Some(idx) } else { None }
+            },
+        )
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, &Node)> + '_ {
@@ -1235,10 +1266,7 @@ fn compute_node_style(
     }
 }
 
-fn parse_css_nodes(
-    parser: &mut CssParser,
-    css_nodes: &Vec<String>,
-) -> Result<()> {
+fn parse_css_nodes(parser: &mut CssParser, css_nodes: &Vec<String>) -> Result<()> {
     let joined = css_nodes.join("\n");
     parser.parse(joined.as_str())?;
     Ok(())
@@ -1472,14 +1500,19 @@ fn element_matches_class_part(
                 false
             }
         }),
-        ClassNamePart::Id(id) => class_name_part_match_id(|| match html_nodes.get(element).unwrap() {
-            Node::Element(walk_element) => walk_element
-                .attributes
-                .get_str("id")
-                .is_some_and(|el_id| el_id.as_ref() == id),
-            _ => false,
-        }),
-        ClassNamePart::ArrowRight | ClassNamePart::Ampersand | ClassNamePart::Tilde => true,
+        ClassNamePart::Id(id) => {
+            class_name_part_match_id(|| match html_nodes.get(element).unwrap() {
+                Node::Element(walk_element) => walk_element
+                    .attributes
+                    .get_str("id")
+                    .is_some_and(|el_id| el_id.as_ref() == id),
+                _ => false,
+            })
+        }
+        ClassNamePart::ArrowRight
+        | ClassNamePart::Ampersand
+        | ClassNamePart::Tilde
+        | ClassNamePart::AdjacentSibling => true,
         ClassNamePart::PseudoClass(class) => class_name_part_match_pseudo(|| {
             match class {
                 // All elements are children of root
@@ -1575,6 +1608,10 @@ fn element_matches_class_part(
                     Node::Element(el) => el.attributes.contains_key("disabled"),
                     _ => false,
                 },
+                PseudoClass::Checked => match html_nodes.get(element).unwrap() {
+                    Node::Element(el) => el.attributes.contains_key("checked"),
+                    _ => false,
+                },
                 PseudoClass::Lang(target) => {
                     let lang = walk_for_html_match(
                         element,
@@ -1599,26 +1636,32 @@ fn element_matches_class_part(
                 _ => false,
             }
         }),
-        ClassNamePart::Tag(tag) => class_name_part_match_tag(|| match html_nodes.get(element).unwrap() {
-            Node::Element(walk_element) => tag == "*" || walk_element.tag == *tag,
-            _ => false,
+        ClassNamePart::Tag(tag) => {
+            class_name_part_match_tag(|| match html_nodes.get(element).unwrap() {
+                Node::Element(walk_element) => tag == "*" || walk_element.tag == *tag,
+                _ => false,
+            })
+        }
+        ClassNamePart::Attributes(attributes) => {
+            class_name_part_match_attributes(|| match html_nodes.get(element).unwrap() {
+                Node::Element(walk_element) => element_matched_attributes(walk_element, attributes),
+                _ => false,
+            })
+        }
+        ClassNamePart::Combined(combined) => class_name_part_match_combined(|| {
+            combined.iter().all(|part| {
+                element_matches_class_part(
+                    part,
+                    element,
+                    html_nodes,
+                    class_elements,
+                    dom_indexes,
+                    hovering_chain,
+                    hovering_has_impact,
+                    precomputed_selectors,
+                )
+            })
         }),
-        ClassNamePart::Attributes(attributes) => class_name_part_match_attributes(|| match html_nodes.get(element).unwrap() {
-            Node::Element(walk_element) => element_matched_attributes(walk_element, attributes),
-            _ => false,
-        }),
-        ClassNamePart::Combined(combined) => class_name_part_match_combined(|| combined.iter().all(|part| {
-            element_matches_class_part(
-                part,
-                element,
-                html_nodes,
-                class_elements,
-                dom_indexes,
-                hovering_chain,
-                hovering_has_impact,
-                precomputed_selectors,
-            )
-        })),
     }
 }
 
@@ -1647,6 +1690,39 @@ fn narrow_elements_by_ancestors(
         CssNode::ClassName(classes) => {
             let parts = &classes.name_parts[name_part_idx];
             let part = &parts[parts.len() - 1 - nested_part_idx];
+            if let ClassNamePart::AdjacentSibling = part {
+                let Some(parent) = html_nodes.get(element).and_then(|v| v.get_parent()) else {
+                    return false;
+                };
+                let Some(siblings) = dom_indexes.children_index.get(&parent) else {
+                    return false;
+                };
+                let Some(pos) = siblings.iter().position(|sibling| *sibling == element) else {
+                    return false;
+                };
+                let Some(previous_element) = siblings[..pos].iter().rev().find(|sibling_idx| {
+                    matches!(html_nodes.get(**sibling_idx), Some(Node::Element(_)))
+                }) else {
+                    return false;
+                };
+                return move_up_class_part(
+                    *previous_element,
+                    css_nodes,
+                    html_nodes,
+                    class_elements,
+                    parts,
+                    css_node,
+                    nested_part_idx,
+                    name_part_idx,
+                    window_size,
+                    false,
+                    false,
+                    dom_indexes,
+                    hovering_chain,
+                    hovering_has_impact,
+                    precomputed_selectors,
+                );
+            }
             if let ClassNamePart::Tilde = part {
                 let Some(parent) = html_nodes.get(element).and_then(|v| v.get_parent()) else {
                     return false;
@@ -1707,6 +1783,7 @@ fn narrow_elements_by_ancestors(
                 | ClassNamePart::Attributes(_)
                 | ClassNamePart::Combined(_) => (true, false),
                 ClassNamePart::Tilde => (false, false),
+                ClassNamePart::AdjacentSibling => (false, false),
                 ClassNamePart::Ampersand => (false, require_immediate_match),
                 ClassNamePart::ArrowRight => (false, true),
             };
@@ -1906,7 +1983,7 @@ fn get_base_elements_by_attributes(
 }
 
 fn walk_into_part(part: &ClassNamePart) -> bool {
-    *part != ClassNamePart::Tilde
+    !matches!(part, ClassNamePart::Tilde | ClassNamePart::AdjacentSibling)
 }
 
 fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &ClassNamePart) {
@@ -1981,7 +2058,12 @@ fn search_elements_for_css_nodes(
         }
     }
     let element_indexes = filter_to_elements(html_nodes);
-    let max_element_idx = element_indexes.iter().max().cloned().map(|v| v + 1).unwrap_or(0);
+    let max_element_idx = element_indexes
+        .iter()
+        .max()
+        .cloned()
+        .map(|v| v + 1)
+        .unwrap_or(0);
 
     let mut precomputed_selectors: HashMap<Vec<ClassNamePart>, FixedBitSet> = HashMap::new();
     for selector in unique_selectors {
@@ -2029,7 +2111,10 @@ fn search_elements_for_css_nodes(
                                 PseudoClass::Root => {
                                     let mut bitset = FixedBitSet::with_capacity(max_element_idx);
                                     for idx in element_indexes.iter() {
-                                        if html_nodes.get(*idx).is_some_and(|node| node.get_parent().is_none()) {
+                                        if html_nodes
+                                            .get(*idx)
+                                            .is_some_and(|node| node.get_parent().is_none())
+                                        {
                                             bitset.insert(*idx);
                                         }
                                     }
@@ -3044,10 +3129,7 @@ fn has_parent(nodes_table: &NodesTable, node_idx: usize, target_parent: usize) -
         return true;
     }
 
-    if let Some(parent) = nodes_table
-        .get(node_idx)
-        .and_then(|v| v.get_parent())
-    {
+    if let Some(parent) = nodes_table.get(node_idx).and_then(|v| v.get_parent()) {
         has_parent(nodes_table, parent, target_parent)
     } else {
         false
@@ -3215,12 +3297,12 @@ fn op_get_parent_node(
 ) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
-    let parent_idx =
-        if let Some(parent) = renderer.nodes.get(node_idx).and_then(|v| v.get_parent()) {
-            parent
-        } else {
-            return Ok(None);
-        };
+    let parent_idx = if let Some(parent) = renderer.nodes.get(node_idx).and_then(|v| v.get_parent())
+    {
+        parent
+    } else {
+        return Ok(None);
+    };
     let parent = (parent_idx, renderer.nodes.get(parent_idx).unwrap().clone());
     Ok(Some(parent))
 }
@@ -3530,12 +3612,14 @@ fn query_selector_all(
     );
 
     let mut node_idxs: Vec<usize> = collected.keys().cloned().collect();
+    node_idxs.sort();
 
     if let Some(required_parent) = required_parent {
         node_idxs = node_idxs
             .into_iter()
             .filter(|idx| has_parent(nodes_table, *idx, required_parent))
             .collect();
+        node_idxs.sort();
     }
 
     node_idxs
@@ -3668,10 +3752,7 @@ fn get_dom_indexes_classes(
     class_indexes: &mut ClassIndexes,
 ) -> Vec<FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
-    let mut class_elements = vec![
-        FixedBitSet::with_capacity(bitset_capacity);
-        class_indexes.len()
-    ];
+    let mut class_elements = vec![FixedBitSet::with_capacity(bitset_capacity); class_indexes.len()];
     for (html_node_idx, html_node) in html_nodes.iter() {
         match html_node {
             Node::Element(element) => {
@@ -3679,7 +3760,10 @@ fn get_dom_indexes_classes(
                 for class in class_list {
                     let (new, class_idx) = class_indexes.upsert_definition(class);
                     if new {
-                        class_elements.resize(class_indexes.len(), FixedBitSet::with_capacity(bitset_capacity));
+                        class_elements.resize(
+                            class_indexes.len(),
+                            FixedBitSet::with_capacity(bitset_capacity),
+                        );
                     }
                     class_elements[class_idx].insert(html_node_idx);
                 }
@@ -3690,7 +3774,10 @@ fn get_dom_indexes_classes(
     class_elements
 }
 
-fn get_dom_indexes_attributes(html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+fn get_dom_indexes_attributes(
+    html_nodes: &NodesTable,
+    nodes_idxs: &Vec<usize>,
+) -> HashMap<String, FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut attribute_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
@@ -3708,7 +3795,10 @@ fn get_dom_indexes_attributes(html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) 
     attribute_elements
 }
 
-fn get_dom_indexes_ids(html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) -> HashMap<String, FixedBitSet> {
+fn get_dom_indexes_ids(
+    html_nodes: &NodesTable,
+    nodes_idxs: &Vec<usize>,
+) -> HashMap<String, FixedBitSet> {
     let bitset_capacity = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
     let mut id_elements: HashMap<String, FixedBitSet> = HashMap::new();
     for (html_node_idx, html_node) in html_nodes.iter() {
@@ -3951,7 +4041,11 @@ impl Renderer {
         }
     }
 
-    fn query_selector_all(&mut self, selector: String, required_parent: Option<usize>) -> Vec<usize> {
+    fn query_selector_all(
+        &mut self,
+        selector: String,
+        required_parent: Option<usize>,
+    ) -> Vec<usize> {
         let selector = selector_to_parts(&selector, &mut self.css_parser.class_definitions);
         query_selector_all(
             &self.nodes,
@@ -4050,15 +4144,24 @@ impl Renderer {
                     }
                     if key == "id" {
                         if let Some(existing_id) = element.attributes.get_str("id") {
-                            self.dom_indexes.remove_id_node(&existing_id.into_owned(), node_idx);
+                            self.dom_indexes
+                                .remove_id_node(&existing_id.into_owned(), node_idx);
                         }
                         self.dom_indexes.add_id_node(&value, node_idx);
                     }
                     if key == "class" {
                         if let Some(existing_id) = element.attributes.get_str("class") {
-                            self.dom_indexes.remove_class_node(&existing_id.into_owned(), node_idx, &mut self.css_parser.class_definitions);
+                            self.dom_indexes.remove_class_node(
+                                &existing_id.into_owned(),
+                                node_idx,
+                                &mut self.css_parser.class_definitions,
+                            );
                         }
-                        self.dom_indexes.add_class_node(&value, node_idx, &mut self.css_parser.class_definitions);
+                        self.dom_indexes.add_class_node(
+                            &value,
+                            node_idx,
+                            &mut self.css_parser.class_definitions,
+                        );
                     }
                     element.attributes.insert(key, value);
                     changed = true;
@@ -4085,12 +4188,7 @@ impl Renderer {
         self.resolved_widths.clear();
     }
 
-    fn replace_document(
-        &mut self,
-        url: String,
-        nodes_table: NodesTable,
-        nodes_idxs: Vec<usize>,
-    ) {
+    fn replace_document(&mut self, url: String, nodes_table: NodesTable, nodes_idxs: Vec<usize>) {
         self.url = url;
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
@@ -5306,15 +5404,22 @@ impl Renderer {
                         browser.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
 
                         while let Ok(cmd) = rx.try_recv() {
-                            browser.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
+                            browser.handle_frame_command(
+                                cmd,
+                                &parent_proxy,
+                                &size,
+                                &bitmap_for_thread,
+                            );
                         }
-                    },
+                    }
                     Err(_) => break,
                 };
                 if had_command || js_pending {
                     js_pending = browser
                         .pump_js_event_loop_once()
-                        .inspect_err(|err| eprintln!("Error occurred while pumping JS loop: {}", err))
+                        .inspect_err(|err| {
+                            eprintln!("Error occurred while pumping JS loop: {}", err)
+                        })
                         .unwrap_or(false);
                 }
             }
@@ -7099,11 +7204,16 @@ impl Renderer {
     }
 
     pub fn recompute_children_index(&mut self) {
-        self.dom_indexes.recompute_children(&self.nodes, &self.nodes_idxs);
+        self.dom_indexes
+            .recompute_children(&self.nodes, &self.nodes_idxs);
     }
 
     pub fn recompute_dom_indexes(&mut self) {
-        self.dom_indexes = get_dom_indexes(&self.nodes, &self.nodes_idxs, &mut self.css_parser.class_definitions);
+        self.dom_indexes = get_dom_indexes(
+            &self.nodes,
+            &self.nodes_idxs,
+            &mut self.css_parser.class_definitions,
+        );
     }
 
     pub fn get_hover_chain(&self) -> Vec<usize> {
@@ -7638,8 +7748,7 @@ impl Browser {
                 reply,
             }) => {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply
-                    .send(Ok(renderer.query_selector_node(selector, required_parent)));
+                let _ = reply.send(Ok(renderer.query_selector_node(selector, required_parent)));
             }
             FrameCommand::Dom(FrameDomCommand::QuerySelectorAll {
                 selector,
@@ -7647,10 +7756,9 @@ impl Browser {
                 reply,
             }) => {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ =
-                    reply
-                        .send(Ok(renderer
-                            .query_selector_all_nodes(selector, required_parent)));
+                let _ = reply.send(Ok(
+                    renderer.query_selector_all_nodes(selector, required_parent)
+                ));
             }
             FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
                 html,
@@ -7681,8 +7789,7 @@ impl Browser {
                 reply,
             }) => {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply
-                    .send(renderer.update_element_attributes(node_idx, attributes));
+                let _ = reply.send(renderer.update_element_attributes(node_idx, attributes));
             }
             _ => {}
         }
@@ -7918,14 +8025,8 @@ impl Browser {
         ));
 
         if let Some(renderer) = &self.renderer {
-            let nodes_table = NodesTable::new_from_nodes(
-                self
-                    .html_parser
-                    .as_mut()
-                    .unwrap()
-                    .nodes
-                    .clone(),
-            );
+            let nodes_table =
+                NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
             let nodes_idxs = sorted_node_idxs(&nodes_table);
             renderer
                 .borrow_mut()
@@ -7988,14 +8089,8 @@ impl Browser {
         self.register_tokio_runtime()?;
         self.navigate(self.url.clone())?;
         self.install_js_host();
-        let nodes_table = NodesTable::new_from_nodes(
-            self
-                .html_parser
-                .as_mut()
-                .unwrap()
-                .nodes
-                .clone()
-        );
+        let nodes_table =
+            NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
         let nodes_idxs = sorted_node_idxs(&nodes_table);
         let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &mut ClassIndexes::new());
         self.detect_html_redirect(&dom_indexes);
@@ -8620,7 +8715,9 @@ impl Browser {
         "#,
             scrollable_idx
         );
-        let _ = self.execute_host_script("script onscroll", code).inspect_err(|err| eprintln!("Script onscroll handler failed with err: {}", err));
+        let _ = self
+            .execute_host_script("script onscroll", code)
+            .inspect_err(|err| eprintln!("Script onscroll handler failed with err: {}", err));
         if let Some(window) = self.window.as_mut() {
             window.request_redraw();
         }
@@ -8742,10 +8839,7 @@ fn clear_buffer(buffer: &mut [u32], color: u32) {
     buffer.fill(color);
 }
 
-fn build_children_index(
-    nodes: &NodesTable,
-    node_idxs: &Vec<usize>,
-) -> HashMap<usize, Vec<usize>> {
+fn build_children_index(nodes: &NodesTable, node_idxs: &Vec<usize>) -> HashMap<usize, Vec<usize>> {
     let mut children_index = HashMap::new();
 
     for idx in node_idxs.iter() {
@@ -9159,6 +9253,10 @@ mod tests {
         assert_eq!(
             split_ignoring_parentheses("test>lol".into(), ' ', &['>']),
             vec!["test", ">", "lol"]
+        );
+        assert_eq!(
+            split_ignoring_parentheses("input:checked+label".into(), ' ', &['>', '~', '+']),
+            vec!["input:checked", "+", "label"]
         );
     }
 

@@ -30,6 +30,7 @@ pub enum PseudoClass {
     Link,
     Visited,
     Disabled,
+    Checked,
     Lang(String),
     Before,
     After,
@@ -53,6 +54,7 @@ pub enum ClassNamePart {
     Combined(Vec<ClassNamePart>),
     ArrowRight,
     Tilde,
+    AdjacentSibling,
     Ampersand,
 }
 
@@ -398,6 +400,9 @@ fn parse_pseudo_class(value: &str, class_definitions: &mut ClassIndexes) -> Opti
     if value == "disabled" {
         return Some(PseudoClass::Disabled);
     }
+    if value == "checked" {
+        return Some(PseudoClass::Checked);
+    }
     if value == "host" {
         return Some(PseudoClass::Host);
     }
@@ -443,7 +448,7 @@ pub fn selector_to_parts(
     selector: &String,
     class_definitions: &mut ClassIndexes,
 ) -> Vec<ClassNamePart> {
-    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>', '~']);
+    let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>', '~', '+']);
     nested_parts
         .into_iter()
         .filter_map(|p| -> Option<ClassNamePart> {
@@ -452,7 +457,7 @@ pub fn selector_to_parts(
             }
             let mut conditions = vec![];
             let mut buffer = String::new();
-            let new_statement = ['.', '#', '[', '>', '~', ':'];
+            let new_statement = ['.', '#', '[', '>', '~', '+', ':'];
             let mut parentheses_depth = 0;
             let mut escaped = false;
             for char in p.chars() {
@@ -514,6 +519,7 @@ pub fn selector_to_parts(
                     '[' => parse_selector_with_attributes(chars.as_str()),
                     '>' => Some(ClassNamePart::ArrowRight),
                     '~' => Some(ClassNamePart::Tilde),
+                    '+' => Some(ClassNamePart::AdjacentSibling),
                     '&' => Some(ClassNamePart::Ampersand),
                     _ => Some(ClassNamePart::Tag(cond.trim().to_string())),
                 };
@@ -740,7 +746,9 @@ impl CssParser {
 
     pub fn parse(&mut self, input: &str) -> Result<()> {
         if self.nodes.len() > 0 {
-            return Err(anyhow!("CssParser.parse called with stale results in parser!"));
+            return Err(anyhow!(
+                "CssParser.parse called with stale results in parser!"
+            ));
         }
         let chars = input.trim().chars();
         for char in chars {

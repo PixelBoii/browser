@@ -627,6 +627,18 @@ class HtmlElement extends BaseNode {
         }
     }
 
+    get checked() {
+        return this.hasAttribute('checked')
+    }
+
+    set checked(value) {
+        if (value) {
+            this.setAttribute('checked', '')
+        } else {
+            this.removeAttribute('checked')
+        }
+    }
+
     get height() {
         return this.getAttribute('height')
     }
@@ -1053,37 +1065,56 @@ class ClassList {
         core.ops.op_update_attributes(this.element.__node_idx, { class: this.element.class }, this.element.ownerDocument.__frameId)
     }
 
-    add(str) {
-        if (this.list.has(str)) {
-            return
+    add(...tokens) {
+        let changed = false
+        for (const token of tokens) {
+            if (this.list.has(token)) {
+                continue
+            }
+            this.list.add(token)
+            changed = true
         }
-        this.list.add(str)
-        this.sync()
+        if (changed) {
+            this.sync()
+        }
     }
 
     contains(str) {
         return this.list.has(str)
     }
 
-    toggle(str) {
+    toggle(str, force) {
+        const shouldAdd = force === undefined ? !this.list.has(str) : !!force
+        if (shouldAdd) {
+            if (!this.list.has(str)) {
+                this.list.add(str)
+                this.sync()
+            }
+            return true
+        }
         if (this.list.has(str)) {
             this.list.delete(str)
-        } else {
-            this.list.add(str)
+            this.sync()
         }
-        this.sync()
+        return false
     }
 
-    remove(str) {
-        if (!this.list.has(str)) {
-            return
+    remove(...tokens) {
+        let changed = false
+        for (const token of tokens) {
+            if (!this.list.has(token)) {
+                continue
+            }
+            this.list.delete(token)
+            changed = true
         }
-        this.list.delete(str)
-        this.sync()
+        if (changed) {
+            this.sync()
+        }
     }
 
     get length() {
-        return this.list.length
+        return this.list.size
     }
 
     [Symbol.iterator]() {
