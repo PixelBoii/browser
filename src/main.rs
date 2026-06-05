@@ -156,6 +156,7 @@ enum RequestCacheEntry {
     SvgData(String),
     CssData(String),
     JpegData(Bytes),
+    GifData(Bytes),
     Unsupported,
 }
 
@@ -1070,6 +1071,69 @@ fn rasterize_jpeg(
         .with_context(|| "Failed to convert to pixmap")?;
         cached_rasterizations.jpegs.insert(key.clone(), value);
         cached_rasterizations.jpegs.get(&key).unwrap()
+    };
+
+    Ok(pixmap.clone())
+}
+
+fn prepare_gif(
+    cached_rasterizations: &mut CachedRasterizations,
+    src: &str,
+    bytes: &[u8],
+    input_w: Option<u32>,
+    input_h: Option<u32>,
+    max_w: u32,
+    max_h: u32,
+) -> Result<(u32, u32)> {
+    let result = if let Some(cached) = cached_rasterizations.decoded_gifs.get(src) {
+        cached
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(bytes));
+        reader.set_format(image::ImageFormat::Gif);
+        cached_rasterizations
+            .decoded_gifs
+            .insert(src.to_string(), reader.decode()?);
+        cached_rasterizations.decoded_gifs.get(src).unwrap()
+    };
+
+    let (mut target_h, mut target_w) = infer_image_size(
+        Size {
+            height: result.height(),
+            width: result.width(),
+        },
+        input_w,
+        input_h,
+    );
+    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+
+    Ok((target_h, target_w))
+}
+
+fn rasterize_gif(
+    cached_rasterizations: &mut CachedRasterizations,
+    src: &str,
+    target_w: u32,
+    target_h: u32,
+) -> Result<tiny_skia::Pixmap> {
+    let decoded = cached_rasterizations.decoded_gifs.get(src).unwrap();
+    let key = (src.to_string(), target_h, target_w);
+    let pixmap = if let Some(cached) = cached_rasterizations.gifs.get(&key) {
+        cached
+    } else {
+        let result =
+            decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+        let rgba = result.to_rgba8();
+
+        let width = rgba.width();
+        let height = rgba.height();
+        let value = Pixmap::from_vec(
+            rgba.to_owned().into_raw(),
+            IntSize::from_wh(width, height).with_context(|| "Failed to create IntSize")?,
+        )
+        .with_context(|| "Failed to convert to pixmap")?;
+        cached_rasterizations.gifs.insert(key.clone(), value);
+        cached_rasterizations.gifs.get(&key).unwrap()
     };
 
     Ok(pixmap.clone())
@@ -3878,8 +3942,10 @@ fn get_dom_indexes(
 struct CachedRasterizations {
     decoded_pngs: HashMap<String, Pixmap>,
     decoded_jpegs: HashMap<String, DynamicImage>,
+    decoded_gifs: HashMap<String, DynamicImage>,
     decoded_svgs: HashMap<(String, u32), Tree>,
     jpegs: HashMap<(String, u32, u32), Pixmap>,
+    gifs: HashMap<(String, u32, u32), Pixmap>,
     svgs: HashMap<(String, u32, u32), Pixmap>,
 }
 
@@ -3888,8 +3954,10 @@ impl CachedRasterizations {
         Self {
             decoded_pngs: HashMap::new(),
             decoded_jpegs: HashMap::new(),
+            decoded_gifs: HashMap::new(),
             decoded_svgs: HashMap::new(),
             jpegs: HashMap::new(),
+            gifs: HashMap::new(),
             svgs: HashMap::new(),
         }
     }
@@ -4573,6 +4641,8 @@ impl Renderer {
             Some("image/svg+xml")
         } else if src.ends_with(".jpg") || src.ends_with(".jpeg") {
             Some("image/jpeg")
+        } else if src.ends_with(".gif") {
+            Some("image/gif")
         } else {
             None
         }
@@ -4602,6 +4672,7 @@ impl Renderer {
                 "image/png" => Ok(RequestCacheEntry::PngData(resp.bytes().await?)),
                 "image/svg+xml" => Ok(RequestCacheEntry::SvgData(resp.text().await?)),
                 "image/jpeg" => Ok(RequestCacheEntry::JpegData(resp.bytes().await?)),
+                "image/gif" => Ok(RequestCacheEntry::GifData(resp.bytes().await?)),
                 content_type => Err(anyhow!(
                     "Failed to handle image content-type: {}",
                     content_type
@@ -5141,6 +5212,37 @@ impl Renderer {
                                                 return None;
                                             }
                                             Ok(res) => res,
+                                        }
+                                    }
+                                    RequestCacheEntry::GifData(bytes) => {
+                                        let (target_h, target_w) = prepare_gif(
+                                            &mut self.cached_rasterizations,
+                                            &src,
+                                            &bytes,
+                                            container_size.container_width_non_filling,
+                                            container_size.container_height_non_filling,
+                                            max_w,
+                                            max_h,
+                                        )
+                                        .unwrap();
+                                        let (target_h, target_w) =
+                                            (target_h.max(1), target_w.max(1));
+                                        if *mode == LayoutMode::Complete {
+                                            let pixmap = rasterize_gif(
+                                                &mut self.cached_rasterizations,
+                                                &src,
+                                                target_w,
+                                                target_h,
+                                            )
+                                            .unwrap();
+                                            (pixmap, target_h, target_w, true)
+                                        } else {
+                                            (
+                                                Pixmap::new(target_w, target_h).unwrap(),
+                                                target_h,
+                                                target_w,
+                                                true,
+                                            )
                                         }
                                     }
                                     _ => panic!(),
