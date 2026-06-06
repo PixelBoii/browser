@@ -473,7 +473,7 @@ struct Renderer {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
-    cached_text_buffers: HashMap<(String, u32, Option<u32>), (Pixmap, u32, u32)>,
+    cached_text_buffers: HashMap<(String, u32, Option<u32>, u32), (Pixmap, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     variable_definitions: VariableDefinitions,
     event_loop_proxy: Option<RendererProxy>,
@@ -4960,7 +4960,7 @@ impl Renderer {
                     _ => None,
                 }?;
                 let max_width = Some(available_size.width);
-                let cache_key = (text.clone(), resolved_font_size, max_width);
+                let cache_key = (text.clone(), resolved_font_size, max_width, text_hex);
                 let (buffer, width, height) =
                     if let Some(cached) = self.cached_text_buffers.get(&cache_key) {
                         cached
@@ -5787,7 +5787,7 @@ impl Renderer {
             _ => None,
         }
         .with_context(|| "No color was specified for text")?;
-        let cache_key = (text.clone(), font_size, None);
+        let cache_key = (text.clone(), font_size, None, text_hex);
         let (buffer, width, height) = if let Some(cached) = self.cached_text_buffers.get(&cache_key)
         {
             cached
@@ -9319,14 +9319,14 @@ mod tests {
         let params = browser.open()?;
         browser.set_up_without_event_loop(
             params,
-            PhysicalSize::new(1920, 4320),
+            PhysicalSize::new(1920, 8640),
             RendererProxy::FrameLoop(tx),
         )?;
         browser.run_js()?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        let mut buffer = vec![0; 1920 * 4320];
-        browser.render_into(&mut buffer, 1920, 4320, true);
-        ensure_snapshot_matches(&buffer, "slackcom", 1920, 4320)
+        let mut buffer = vec![0; 1920 * 8640];
+        browser.render_into(&mut buffer, 1920, 8640, true);
+        ensure_snapshot_matches(&buffer, "slackcom", 1920, 8640)
     }
 
     #[test]
