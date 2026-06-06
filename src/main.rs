@@ -2016,9 +2016,7 @@ fn get_base_elements_by_attributes(
                     base_items.clear();
                 }
             }
-            ClassNamePartAttribute::KeyValue((key, _)) => {
-                // TODO: Move this to parsing
-                let key = key.strip_suffix('*').unwrap_or(key);
+            ClassNamePartAttribute::KeyValue((key, _, _, _)) => {
                 if let Some(matched) = dom_indexes.attribute_elements.get(key) {
                     if !base_items_init {
                         base_items = matched.clone();

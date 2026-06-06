@@ -12,7 +12,7 @@ const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClassNamePartAttribute {
-    KeyValue((String, String)),
+    KeyValue((String, String, bool, bool)),
     Key(String),
 }
 
@@ -288,13 +288,27 @@ fn parse_selector_with_attributes(mut rest: &str) -> Option<ClassNamePart> {
 
         let split: Vec<&str> = attribute.split("=").collect();
         if split.len() == 2 {
-            let key = split[0];
+            let mut key = split[0];
             let mut value = split[1];
             value = unquote(value.trim());
+
+            let mut like = false;
+            if let Some(stripped) = key.strip_suffix('*') {
+                key = stripped;
+                like = true;
+            }
+
+            let mut starts_with = false;
+            if let Some(stripped) = key.strip_suffix('^') {
+                key = stripped;
+                starts_with = true;
+            }
 
             attributes.push(ClassNamePartAttribute::KeyValue((
                 key.to_string(),
                 value.to_string(),
+                like,
+                starts_with,
             )));
         } else if split.len() == 1 {
             let key = split[0];

@@ -760,23 +760,18 @@ pub fn element_matched_attributes(
                     return false;
                 }
             }
-            ClassNamePartAttribute::KeyValue((key, value)) => {
-                if let Some(stripped) = key.strip_suffix('*') {
-                    if element
-                        .attributes
-                        .get_str(stripped)
-                        .is_none_or(|v| !v.contains(value))
-                    {
-                        return false;
-                    }
-                } else {
-                    if element
-                        .attributes
-                        .get_str(key)
-                        .is_none_or(|v| v.as_ref() != value)
-                    {
-                        return false;
-                    }
+            ClassNamePartAttribute::KeyValue((key, value, like, starts_with)) => {
+                if element
+                    .attributes
+                    .get_str(key)
+                    .is_none_or(|v| match (like, starts_with) {
+                        (true, true) => unreachable!(),
+                        (false, true) => !v.starts_with(value),
+                        (true, false) => !v.contains(value),
+                        (false, false) => v.as_ref() != value,
+                    })
+                {
+                    return false;
                 }
             }
         }
