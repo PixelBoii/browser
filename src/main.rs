@@ -4215,8 +4215,19 @@ impl Renderer {
         tag: &String,
         required_parent: Option<usize>,
     ) -> Vec<(usize, Node)> {
-        let node_idxs = self.dom_indexes.tag_elements.get(tag);
-        let mut nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
+        let tag = tag.to_ascii_lowercase();
+        let mut nodes: Vec<(usize, Node)> = if tag == "*" {
+            self.nodes_idxs
+                .iter()
+                .filter_map(|idx| {
+                    let node = self.nodes.get(*idx)?;
+                    matches!(node, Node::Element(_)).then(|| (*idx, node.clone()))
+                })
+                .filter(|(idx, node)| {
+                    node.get_parent().is_some() || *idx == self.dom_indexes.root_indice
+                })
+                .collect()
+        } else if let Some(idxs) = self.dom_indexes.tag_elements.get(&tag) {
             idxs.ones()
                 .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()))
                 .filter(|(idx, node)| {
@@ -9026,12 +9037,12 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    // let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string(), hover_debugging);
-    let mut browser = Browser::new(
-        "file:///home/pontus/browser/pages/test.html".to_string(),
-        hover_debugging,
-    );
+    // let mut browser = Browser::new(
+    //     "file:///home/pontus/browser/pages/test.html".to_string(),
+    //     hover_debugging,
+    // );
 
     let params = browser.open()?;
     browser.start_event_loop(params)?;
