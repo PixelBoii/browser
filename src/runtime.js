@@ -407,6 +407,15 @@ class HtmlElement extends BaseNode {
         return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
     }
 
+    getElementsByClassName(classNames) {
+        const nodes = core.ops.op_get_elements_by_class_name(
+            String(classNames),
+            this.__node_idx,
+            this.ownerDocument.__frameId,
+        )
+        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
+    }
+
     get firstChild() {
         return this.childNodes.at(0)
     }
@@ -1266,6 +1275,10 @@ class Document {
     }
     getElementsByTagName(tag) {
         const nodes = core.ops.op_get_elements_by_tag_name(tag, null, this.__frameId)
+        return withDocument(this, () => nodes.map(nodeToElement))
+    }
+    getElementsByClassName(classNames) {
+        const nodes = core.ops.op_get_elements_by_class_name(String(classNames), null, this.__frameId)
         return withDocument(this, () => nodes.map(nodeToElement))
     }
     querySelector(selector) {

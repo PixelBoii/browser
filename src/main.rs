@@ -347,6 +347,11 @@ enum FrameDomCommand {
         required_parent: Option<usize>,
         reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
     },
+    GetElementsByClassName {
+        class_names: String,
+        required_parent: Option<usize>,
+        reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
+    },
     UpdateElementAttributes {
         node_idx: usize,
         attributes: Attributes,
@@ -3122,10 +3127,36 @@ fn op_get_elements_by_tag_name(
     let renderer = host.renderer.borrow();
     if let Some(frame_id) = frame_id {
         js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply, required_parent })
+            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName {
+                tag,
+                reply,
+                required_parent,
+            })
         })
     } else {
         Ok(renderer.get_elements_by_tag_name(&tag, required_parent))
+    }
+}
+
+#[op2]
+fn op_get_elements_by_class_name(
+    state: &mut OpState,
+    #[string] class_names: String,
+    #[number] required_parent: Option<usize>,
+    #[number] frame_id: Option<usize>,
+) -> Result<Vec<(usize, Node)>, JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::GetElementsByClassName {
+                class_names,
+                reply,
+                required_parent,
+            })
+        })
+    } else {
+        Ok(renderer.get_elements_by_class_name(&class_names, required_parent))
     }
 }
 
@@ -3701,6 +3732,7 @@ extension!(
     op_get_parent_node,
     op_get_element_by_id,
     op_get_elements_by_tag_name,
+    op_get_elements_by_class_name,
     op_query_selector,
     op_query_selector_all,
     op_set_inner_html,
@@ -4178,7 +4210,11 @@ impl Renderer {
         node_idx
     }
 
-    fn get_elements_by_tag_name(&self, tag: &String, required_parent: Option<usize>) -> Vec<(usize, Node)> {
+    fn get_elements_by_tag_name(
+        &self,
+        tag: &String,
+        required_parent: Option<usize>,
+    ) -> Vec<(usize, Node)> {
         let node_idxs = self.dom_indexes.tag_elements.get(tag);
         let mut nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
             idxs.ones()
@@ -4197,6 +4233,50 @@ impl Renderer {
                 .collect();
         }
         nodes
+    }
+
+    fn get_elements_by_class_name(
+        &self,
+        class_names: &String,
+        required_parent: Option<usize>,
+    ) -> Vec<(usize, Node)> {
+        let classes = class_names.split_whitespace().collect::<Vec<_>>();
+        if classes.is_empty() {
+            return vec![];
+        }
+
+        let class_indexes = classes
+            .iter()
+            .map(|class| {
+                self.css_parser
+                    .class_definitions
+                    .class_to_idx
+                    .get(*class)
+                    .copied()
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(class_indexes) = class_indexes else {
+            return vec![];
+        };
+
+        let class_bitsets = class_indexes
+            .iter()
+            .map(|idx| self.dom_indexes.class_elements.get(*idx))
+            .collect::<Option<Vec<_>>>();
+        let Some(class_bitsets) = class_bitsets else {
+            return vec![];
+        };
+
+        let required_parent = required_parent.unwrap_or(self.dom_indexes.root_indice);
+        let mut valid_idxs = class_bitsets[0].clone();
+        for bitset in class_bitsets.iter().skip(1) {
+            valid_idxs.intersect_with(bitset);
+        }
+        valid_idxs
+            .ones()
+            .filter(|idx| has_parent(&self.nodes, *idx, required_parent))
+            .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()))
+            .collect()
     }
 
     fn update_element_attributes(&mut self, node_idx: usize, attributes: Attributes) -> Result<()> {
@@ -7889,9 +7969,22 @@ impl Browser {
                 let idx = renderer.create_element(tag);
                 let _ = reply.send(idx);
             }
-            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply, required_parent }) => {
+            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName {
+                tag,
+                reply,
+                required_parent,
+            }) => {
                 let renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let _ = reply.send(renderer.get_elements_by_tag_name(&tag, required_parent));
+            }
+            FrameCommand::Dom(FrameDomCommand::GetElementsByClassName {
+                class_names,
+                reply,
+                required_parent,
+            }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let _ =
+                    reply.send(renderer.get_elements_by_class_name(&class_names, required_parent));
             }
             FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
                 node_idx,
@@ -8933,12 +9026,12 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
+    // let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string(), hover_debugging);
-    // let mut browser = Browser::new(
-    //     "file:///home/pontus/browser/pages/test.html".to_string(),
-    //     hover_debugging,
-    // );
+    let mut browser = Browser::new(
+        "file:///home/pontus/browser/pages/test.html".to_string(),
+        hover_debugging,
+    );
 
     let params = browser.open()?;
     browser.start_event_loop(params)?;
