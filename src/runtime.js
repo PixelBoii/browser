@@ -172,6 +172,11 @@ class BaseNode {
         }
         return Node.DOCUMENT_POSITION_FOLLOWING
     }
+
+    getElementsByTagName(tag) {
+        const nodes = core.ops.op_get_elements_by_tag_name(tag, this.__node_idx, this.__frameId)
+        return withDocument(this, () => nodes.map(nodeToElement))
+    }
 }
 
 BaseNode.ELEMENT_NODE = 1
@@ -1260,7 +1265,7 @@ class Document {
         return withDocument(this, () => node ? nodeToElement(node) : null)
     }
     getElementsByTagName(tag) {
-        const nodes = core.ops.op_get_elements_by_tag_name(tag, this.__frameId)
+        const nodes = core.ops.op_get_elements_by_tag_name(tag, null, this.__frameId)
         return withDocument(this, () => nodes.map(nodeToElement))
     }
     querySelector(selector) {

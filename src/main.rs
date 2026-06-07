@@ -344,6 +344,7 @@ enum FrameDomCommand {
     },
     GetElementsByTagName {
         tag: String,
+        required_parent: Option<usize>,
         reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
     },
     UpdateElementAttributes {
@@ -3114,16 +3115,17 @@ fn op_get_element_by_id(
 fn op_get_elements_by_tag_name(
     state: &mut OpState,
     #[string] tag: String,
+    #[number] required_parent: Option<usize>,
     #[number] frame_id: Option<usize>,
 ) -> Result<Vec<(usize, Node)>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
     if let Some(frame_id) = frame_id {
         js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply })
+            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply, required_parent })
         })
     } else {
-        Ok(renderer.get_elements_by_tag_name(&tag))
+        Ok(renderer.get_elements_by_tag_name(&tag, required_parent))
     }
 }
 
@@ -4176,9 +4178,9 @@ impl Renderer {
         node_idx
     }
 
-    fn get_elements_by_tag_name(&self, tag: &String) -> Vec<(usize, Node)> {
+    fn get_elements_by_tag_name(&self, tag: &String, required_parent: Option<usize>) -> Vec<(usize, Node)> {
         let node_idxs = self.dom_indexes.tag_elements.get(tag);
-        let nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
+        let mut nodes: Vec<(usize, Node)> = if let Some(idxs) = node_idxs {
             idxs.ones()
                 .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()))
                 .filter(|(idx, node)| {
@@ -4188,6 +4190,12 @@ impl Renderer {
         } else {
             vec![]
         };
+        if let Some(required_parent) = required_parent {
+            nodes = nodes
+                .into_iter()
+                .filter(|(idx, _)| has_parent(&self.nodes, *idx, required_parent))
+                .collect();
+        }
         nodes
     }
 
@@ -7879,9 +7887,9 @@ impl Browser {
                 let idx = renderer.create_element(tag);
                 let _ = reply.send(idx);
             }
-            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply }) => {
+            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName { tag, reply, required_parent }) => {
                 let renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(renderer.get_elements_by_tag_name(&tag));
+                let _ = reply.send(renderer.get_elements_by_tag_name(&tag, required_parent));
             }
             FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
                 node_idx,
@@ -8923,7 +8931,7 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://slack.com".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string());
     // let mut browser = Browser::new(
     //     "file:///home/pontus/browser/pages/test.html".to_string(),
