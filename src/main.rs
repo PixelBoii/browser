@@ -4276,7 +4276,9 @@ impl Renderer {
     }
 
     fn get_implicit_click_events(&self, node_idx: usize) -> Vec<(usize, HtmlEvent)> {
-        let node = self.nodes.get(node_idx).unwrap();
+        let Some(node) = self.nodes.get(node_idx) else {
+            return vec![];
+        };
         let mut events = vec![];
         if let Node::Element(element) = node {
             if element.tag == "label" {
@@ -8932,7 +8934,7 @@ fn main() -> Result<()> {
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
-    // let mut browser = Browser::new("http://localhost:5173".to_string());
+    // let mut browser = Browser::new("http://localhost:5173".to_string(), hover_debugging);
     // let mut browser = Browser::new(
     //     "file:///home/pontus/browser/pages/test.html".to_string(),
     //     hover_debugging,
