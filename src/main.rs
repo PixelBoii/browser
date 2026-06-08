@@ -6761,6 +6761,12 @@ impl Renderer {
         self.resolved_specified_widths
             .insert(node_idx, specified_width);
 
+        if *mode == LayoutMode::BaseCalculation {
+            if let (Some(height), Some(width)) = (specified_height, specified_width) {
+                return Some((width, height, vec![], height));
+            }
+        }
+
         if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
             self.containing_nodes.insert(
                 node_idx,
