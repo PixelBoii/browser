@@ -371,6 +371,10 @@ class HtmlElement extends BaseNode {
         this.addEventListener('load', cb)
     }
 
+    set onclick(cb) {
+        this.addEventListener('click', cb)
+    }
+
     prepend(...elements) {
         if (this.__node_idx == null) {
             throw new Error("Item has not been registered on rust backend yet")
@@ -1161,6 +1165,17 @@ class ClassList {
 // TODO: Might want to key this by frame/document id too
 const nodeMap = new Map()
 
+function clearNodeMap() {
+    nodeMap.clear()
+}
+
+Object.defineProperty(globalThis, "__clear_node_map", {
+    value: clearNodeMap,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+})
+
 function nodeToElement(pair) {
     const node_idx = pair[0]
     const node = pair[1]
@@ -1329,6 +1344,9 @@ class Document {
     }
     dispatchEvent(event) {
         return dispatchEventToTarget(this, event)
+    }
+    set onclick(cb) {
+        this.addEventListener('click', cb)
     }
     createTextNode(text) {
         const element = new TextNode(text)

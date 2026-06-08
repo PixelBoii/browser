@@ -2736,7 +2736,20 @@ fn compute_node_styles(
 #[derive(Debug, Clone)]
 enum UserNavigateUrl {
     Raw(String),
-    Parsed(ReqwestUrl),
+    Form(FormNavigation),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum FormMethod {
+    Get,
+    Post,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FormNavigation {
+    url: ReqwestUrl,
+    method: FormMethod,
+    body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3677,10 +3690,7 @@ fn op_collect_data_for_form(
         let Some(name) = element.attributes.get_str("name") else {
             continue;
         };
-        let Some(value) = element.attributes.get_str("value") else {
-            continue;
-        };
-        data.insert(name.into_owned(), value.into_owned());
+        data.insert(name.into_owned(), form_control_value(element));
     }
     data
 }
@@ -4021,13 +4031,79 @@ fn is_supported_form_element(
         return true;
     }
     if element.tag == "input" && element.attributes.contains_key("name") {
-        return match element.attributes.get_str("type").as_deref() {
+        return match element.attributes.get_str("type") {
             // If type="submit", only include its value if it was clicked
-            Some("submit") => submitted_by.is_some_and(|v| v == node_idx),
+            Some(input_type) if input_type.eq_ignore_ascii_case("submit") => {
+                submitted_by.is_some_and(|v| v == node_idx)
+            }
             _ => true,
         };
     }
+    if element.tag == "button"
+        && element.attributes.contains_key("name")
+        && is_submit_button(element)
+    {
+        return submitted_by.is_some_and(|v| v == node_idx);
+    }
     false
+}
+
+fn form_control_value(element: &Element) -> String {
+    element
+        .attributes
+        .get_str("value")
+        .map(|value| value.into_owned())
+        .unwrap_or_default()
+}
+
+fn is_submit_button(element: &Element) -> bool {
+    match element.tag.as_str() {
+        "input" | "button" => element
+            .attributes
+            .get_str("type")
+            .is_some_and(|v| v.eq_ignore_ascii_case("submit")),
+        _ => false,
+    }
+}
+
+fn serialize_form_entries(entries: &[(String, String)]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in entries {
+        serializer.append_pair(name, value);
+    }
+    serializer.finish()
+}
+
+fn build_form_navigation(
+    current_url: &str,
+    action: Option<&str>,
+    method: Option<&str>,
+    entries: &[(String, String)],
+) -> Result<FormNavigation> {
+    let base_url = ReqwestUrl::parse(current_url)?;
+    let action = action.unwrap_or(current_url);
+    let mut parsed_url = resolve_url(action, Some(&base_url))?;
+    let method = match method {
+        Some(method) if method.eq_ignore_ascii_case("post") => FormMethod::Post,
+        _ => FormMethod::Get,
+    };
+
+    let body = match method {
+        FormMethod::Get => {
+            let mut query_parms = parsed_url.query_pairs_mut();
+            for (name, value) in entries {
+                query_parms.append_pair(name, value);
+            }
+            None
+        }
+        FormMethod::Post => Some(serialize_form_entries(entries)),
+    };
+
+    Ok(FormNavigation {
+        url: parsed_url,
+        method,
+        body,
+    })
 }
 
 fn blit_rgb_buffer(
@@ -4593,34 +4669,27 @@ impl Renderer {
         let Some(Node::Element(element)) = self.nodes.get(form) else {
             return Err(anyhow!("Failed to get form node"));
         };
-        let Some(action) = element.attributes.get_str("action") else {
-            return Ok(());
-        };
+        let action = element.attributes.get_str("action").map(|v| v.into_owned());
+        let method = element.attributes.get_str("method").map(|v| v.into_owned());
         let inputs = self.collect_inputs_in_form(form, submitted_by);
+        let mut entries = vec![];
+        for input in inputs {
+            let Some(Node::Element(element)) = self.nodes.get(input) else {
+                continue;
+            };
+            let Some(name) = element.attributes.get_str("name") else {
+                continue;
+            };
+            entries.push((name.into_owned(), form_control_value(element)));
+        }
 
-        let base_url = ReqwestUrl::parse(&self.url)?;
-        let mut parsed_url = resolve_url(action.as_ref(), Some(&base_url))?;
-
-        {
-            let mut query_parms = parsed_url.query_pairs_mut();
-            for input in inputs {
-                let Some(Node::Element(element)) = self.nodes.get(input) else {
-                    continue;
-                };
-                let Some(name) = element.attributes.get_str("name") else {
-                    continue;
-                };
-                let Some(value) = element.attributes.get_str("value") else {
-                    continue;
-                };
-                query_parms.append_pair(name.as_ref(), value.as_ref());
-            }
-        };
+        let navigation =
+            build_form_navigation(&self.url, action.as_deref(), method.as_deref(), &entries)?;
 
         let proxy = self.event_loop_proxy.as_ref().unwrap();
         proxy
             .fire_user_event(UserEvent::Navigate((
-                UserNavigateUrl::Parsed(parsed_url),
+                UserNavigateUrl::Form(navigation),
                 true,
             )))
             .unwrap();
@@ -7824,26 +7893,35 @@ impl Browser {
         );
     }
 
-    async fn get_html(&self, url: String) -> Result<(String, String)> {
-        if url == "about:blank" {
+    async fn get_html_for_navigation(&self, request: FormNavigation) -> Result<(String, String)> {
+        let url = request.url;
+        if url.as_str() == "about:blank" {
             return Ok((
                 r#"<html>
   <head></head>
   <body></body>
 </html>"#
                     .to_string(),
-                url,
+                url.to_string(),
             ));
         }
 
-        if let Some(stripped) = url.strip_prefix("file://") {
+        if request.method == FormMethod::Get
+            && let Some(stripped) = url.as_str().strip_prefix("file://")
+        {
             let contents = fs::read_to_string(stripped)?;
-            Ok((contents, url))
+            Ok((contents, url.to_string()))
         } else {
-            let url = resolve_url(&url, None)?;
             println!("Fetching HTML for {:?}", url);
             let client = &self.network_fetch.borrow_mut().client;
-            let resp = client.get(url).send().await?;
+            let request = match request.method {
+                FormMethod::Get => client.get(url),
+                FormMethod::Post => client
+                    .post(url)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(request.body.unwrap_or_default()),
+            };
+            let resp = request.send().await?;
             let url = resp.url().to_string();
             let text = resp.text().await?;
             Ok((text, url))
@@ -7912,7 +7990,7 @@ impl Browser {
     fn reset_js_document_state(&mut self) -> Result<()> {
         self.execute_host_script(
             "document navigation reset",
-            "globalThis.__clear_all_timers?.(); globalThis.__EVENT_LISTENERS = {}; history.state = null;".to_string(),
+            "globalThis.__clear_all_timers?.(); globalThis.__EVENT_LISTENERS = {}; globalThis.__clear_node_map?.(); history.state = null;".to_string(),
         )?;
         Ok(())
     }
@@ -8267,12 +8345,21 @@ impl Browser {
     }
 
     pub fn navigate(&mut self, href: String) -> Result<()> {
+        let url = resolve_url(&href, None)?;
+        self.navigate_with_request(FormNavigation {
+            url,
+            method: FormMethod::Get,
+            body: None,
+        })
+    }
+
+    pub fn navigate_with_request(&mut self, request: FormNavigation) -> Result<()> {
         let (input, final_url) = self
             .tokio
             .as_ref()
             .unwrap()
             .borrow_mut()
-            .block_on(self.get_html(href))?;
+            .block_on(self.get_html_for_navigation(request))?;
         println!("Changing url to {}", final_url);
         self.url = final_url;
 
@@ -8483,11 +8570,7 @@ impl Browser {
                     let Node::Element(element) = node else {
                         return false;
                     };
-                    ["input", "button"].contains(&element.tag.as_str())
-                        && element
-                            .attributes
-                            .get_str("type")
-                            .is_some_and(|v| v.as_ref() == "submit")
+                    is_submit_button(element)
                 },
             );
             if let Some(submittable_input) = submittable_input {
@@ -8676,16 +8759,13 @@ impl Browser {
 
     fn process_dom_update(&mut self) {
         println!("DOM UPDATED");
-        self.renderer
-            .as_ref()
-            .unwrap()
-            .borrow_mut()
-            .pending_dom_update = false;
-        self.renderer
-            .as_ref()
-            .unwrap()
-            .borrow_mut()
-            .recompute_nodes();
+        {
+            let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+            renderer.pending_dom_update = false;
+            renderer.hovering = None;
+            renderer.clear_layout_state();
+            renderer.recompute_nodes();
+        }
         self.layout_dirty = true;
         let start = Instant::now();
         let js_result = self.run_js();
@@ -8888,22 +8968,24 @@ impl Browser {
                             .unwrap();
                     }
                     Event::UserEvent(UserEvent::Navigate((href, reload))) => {
-                        let resolved_url = match href {
-                            UserNavigateUrl::Parsed(parsed) => parsed,
+                        let navigation = match href {
                             UserNavigateUrl::Raw(raw) => {
                                 let current_url = url::Url::parse(&self.url).unwrap();
-                                let resolved_url = current_url.join(&raw).unwrap();
-                                resolved_url
+                                FormNavigation {
+                                    url: current_url.join(&raw).unwrap(),
+                                    method: FormMethod::Get,
+                                    body: None,
+                                }
                             }
+                            UserNavigateUrl::Form(navigation) => navigation,
                         };
                         if reload {
-                            if let Err(err) = self.navigate(resolved_url.to_string()) {
+                            if let Err(err) = self.navigate_with_request(navigation) {
                                 eprintln!("Navigation failed: {err:?}");
                             }
                         } else {
-                            self.url = resolved_url.to_string();
-                            self.renderer.as_mut().unwrap().borrow_mut().url =
-                                resolved_url.to_string();
+                            self.url = navigation.url.to_string();
+                            self.renderer.as_mut().unwrap().borrow_mut().url = self.url.clone();
                             self.setup_js_dom().unwrap();
                         }
                     }
