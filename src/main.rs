@@ -6561,10 +6561,10 @@ impl Renderer {
         allow_fill: bool,
         container_sizes: &ContainerSizes,
     ) -> u32 {
-        let Some(style) = self.node_styles.get(&item.node_idx) else {
+        let Some(item_style) = self.node_styles.get(&item.node_idx) else {
             return 0;
         };
-        let align = match self.node_styles.get(&item.node_idx).unwrap().align_self {
+        let align = match item_style.align_self {
             StyleJustifyContent::Auto => parent_style.align_items,
             v => v,
         };
@@ -6772,8 +6772,8 @@ impl Renderer {
             ) {
                 let child_box = self.layout_table.get(&child).unwrap();
                 let size = match style.flex_direction {
-                    StyleFlexDirection::Row => flex_basis.unwrap_or(child_box.rect.width),
-                    StyleFlexDirection::Column => flex_basis.unwrap_or(child_box.rect.height),
+                    StyleFlexDirection::Row => child_box.rect.width,
+                    StyleFlexDirection::Column => child_box.rect.height,
                 };
                 let cross_size = match style.flex_direction {
                     StyleFlexDirection::Row => child_box.rect.height,
@@ -8303,7 +8303,7 @@ impl Browser {
             let Some(url) = instructions.strip_prefix("url=") else {
                 return None;
             };
-            let Ok(delay) = delay.parse::<f64>() else {
+            let Ok(_delay) = delay.parse::<f64>() else {
                 return None;
             };
             // Who cares about the delay
