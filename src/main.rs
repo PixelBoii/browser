@@ -6405,10 +6405,12 @@ impl Renderer {
             let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
                 self.get_margins(*child_idx, &child_style, available_size);
             content_position.x += margin_left_size as i32;
-            content_position.y += margin_top_size as i32;
             if let Some(child) = self.layout_node(
                 *child_idx,
-                content_position,
+                Position {
+                    x: content_position.x,
+                    y: content_position.y + margin_top_size as i32,
+                },
                 Size {
                     width: container_sizes.inner_width,
                     height: container_sizes.inner_height,
@@ -6461,7 +6463,8 @@ impl Renderer {
                 } else {
                     // This is a wrap, so reset X
                     content_position.x = original_cursor.x;
-                    content_position.y += child_height as i32 + margin_bottom_size;
+                    content_position.y +=
+                        margin_top_size as i32 + child_height as i32 + margin_bottom_size;
                     child_width_buffer = 0;
                     row_height = 0;
                     children_rows.new_row(child, 0);
