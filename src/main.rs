@@ -3853,6 +3853,23 @@ pub enum ScriptType {
     Module,
 }
 
+fn parse_script_type_attr(value: Option<&str>) -> Option<ScriptType> {
+    let script_type = value.unwrap_or("").trim().to_ascii_lowercase();
+    let script_type = script_type
+        .rsplit_once('-')
+        .map_or(script_type.as_str(), |(_, script_type)| script_type);
+
+    match script_type {
+        ""
+        | "text/javascript"
+        | "application/javascript"
+        | "text/ecmascript"
+        | "application/ecmascript" => Some(ScriptType::Classic),
+        "module" => Some(ScriptType::Module),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Script {
     content: ScriptContent,
@@ -4548,28 +4565,8 @@ impl Renderer {
             .map(|idx| -> Option<Script> {
                 match self.nodes.get(*idx).unwrap() {
                     Node::Element(element) => {
-                        let script_type = match element
-                            .attributes
-                            .get_str("type")
-                            .map(|v| v.trim().to_ascii_lowercase())
-                        {
-                            None => ScriptType::Classic,
-                            Some(script_type) if script_type.is_empty() => ScriptType::Classic,
-                            Some(script_type) if script_type == "text/javascript" => {
-                                ScriptType::Classic
-                            }
-                            Some(script_type) if script_type == "application/javascript" => {
-                                ScriptType::Classic
-                            }
-                            Some(script_type) if script_type == "text/ecmascript" => {
-                                ScriptType::Classic
-                            }
-                            Some(script_type) if script_type == "application/ecmascript" => {
-                                ScriptType::Classic
-                            }
-                            Some(script_type) if script_type == "module" => ScriptType::Module,
-                            _ => return None,
-                        };
+                        let script_type =
+                            parse_script_type_attr(element.attributes.get_str("type").as_deref())?;
                         let src = element.attributes.get_str("src");
                         let has_src = src.is_some();
                         let is_async = has_src && element.attributes.get_str("async").is_some();
@@ -8201,7 +8198,10 @@ impl Browser {
                 .await
                 {
                     Ok(Ok(())) => Ok(false),
-                    Ok(Err(err)) => Err(err.into()),
+                    Ok(Err(err)) => {
+                        eprintln!("Error occurred while pumping JS loop: {}", err);
+                        Ok(false)
+                    }
                     Err(_) => Ok(true),
                 }
             })
@@ -8274,7 +8274,7 @@ impl Browser {
                         }
                         ScriptType::Module => {
                             let module_id = if document_id == 0 {
-                                runtime.load_side_es_module(&url).await?
+                                runtime.load_side_es_module(&url).await
                             } else {
                                 let code = self
                                     .network_fetch
@@ -8291,15 +8291,22 @@ impl Browser {
                                     .append_pair("__browser_document", &document_id.to_string());
                                 runtime
                                     .load_side_es_module_from_code(&module_url, code)
-                                    .await?
+                                    .await
                             };
-                            let result = runtime.mod_evaluate(module_id);
-                            let _ = runtime
-                                .with_event_loop_promise(result, Default::default())
-                                .await
-                                .inspect_err(|err| {
-                                    eprintln!("Failed to execute JS at {} with error: {}", url, err)
-                                });
+                            if let Ok(module_id) = module_id.inspect_err(|err| {
+                                eprintln!("Failed to load JS module at {} with error: {}", url, err)
+                            }) {
+                                let result = runtime.mod_evaluate(module_id);
+                                let _ = runtime
+                                    .with_event_loop_promise(result, Default::default())
+                                    .await
+                                    .inspect_err(|err| {
+                                        eprintln!(
+                                            "Failed to execute JS at {} with error: {}",
+                                            url, err
+                                        )
+                                    });
+                            }
                         }
                     }
                 }
