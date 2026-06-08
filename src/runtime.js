@@ -829,6 +829,48 @@ class HTMLIFrameElement extends HtmlElement {
     }
 }
 
+class HTMLScriptElement extends HtmlElement {
+    constructor() {
+        super("script")
+    }
+
+    get type() { return this.getAttribute("type") ?? "" }
+    set type(value) { this.setAttribute("type", String(value)) }
+
+    get src() { return this.getAttribute("src") ?? "" }
+    set src(value) { this.setAttribute("src", String(value)) }
+
+    get nonce() { return this.getAttribute("nonce") ?? "" }
+    set nonce(value) { this.setAttribute("nonce", String(value)) }
+
+    get async() { return this.hasAttribute("async") }
+    set async(value) {
+        if (value) {
+            this.setAttribute("async", "")
+        } else {
+            this.removeAttribute("async")
+        }
+    }
+
+    get defer() { return this.hasAttribute("defer") }
+    set defer(value) {
+        if (value) {
+            this.setAttribute("defer", "")
+        } else {
+            this.removeAttribute("defer")
+        }
+    }
+
+    get noModule() { return this.hasAttribute("nomodule") }
+    set noModule(value) {
+        if (value) {
+            this.setAttribute("nomodule", "")
+        } else {
+            this.removeAttribute("nomodule")
+        }
+    }
+}
+
 class HTMLMediaElement extends HtmlElement {
     constructor(tag) {
         super(tag)
@@ -887,6 +929,12 @@ Object.defineProperty(globalThis, "HTMLCanvasElement", {
 });
 Object.defineProperty(globalThis, "HTMLIFrameElement", {
     value: HTMLIFrameElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLScriptElement", {
+    value: HTMLScriptElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -1226,6 +1274,8 @@ function tagToElement(tag) {
             HtmlCanvasElement :
             tag === "iframe" ?
                 HTMLIFrameElement :
+                tag === "script" ?
+                    HTMLScriptElement :
                 tag === "video" ?
                     HTMLVideoElement :
                     tag === "audio" ?
@@ -1237,6 +1287,7 @@ class Document {
     constructor(frameId = null) {
         this.__frameId = frameId
         this.__activeElement = null
+        this.__currentScript = null
     }
     get nodeType() {
         return Node.DOCUMENT_NODE
@@ -1267,6 +1318,9 @@ class Document {
     }
     get scripts() {
         return this.querySelectorAll('script')
+    }
+    get currentScript() {
+        return this.__currentScript
     }
     get referrer() {
         return ""
@@ -1382,6 +1436,15 @@ Object.defineProperty(globalThis, "document", {
   configurable: true,
   writable: true,
 });
+
+Object.defineProperty(globalThis, "__set_current_script_node_idx", {
+    value(nodeIdx) {
+        document.__currentScript = nodeIdx == null ? null : elementFromNodeIdx(nodeIdx)
+    },
+    enumerable: false,
+    configurable: true,
+    writable: true,
+})
 
 let currentDocument = globalThis.document
 

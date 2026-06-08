@@ -7843,6 +7843,7 @@ struct Browser {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     document_id: u64,
     dom_content_loaded_dispatched: bool,
+    load_dispatched: bool,
     hover_debugging: bool,
 }
 
@@ -7896,6 +7897,7 @@ impl Browser {
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
             document_id: 0,
             dom_content_loaded_dispatched: false,
+            load_dispatched: false,
             hover_debugging,
         }
     }
@@ -7975,6 +7977,15 @@ impl Browser {
         scope.perform_microtask_checkpoint();
     }
 
+    fn set_current_script(runtime: &mut JsRuntime, node_idx: Option<usize>) -> Result<()> {
+        let code = match node_idx {
+            Some(node_idx) => format!("__set_current_script_node_idx({node_idx})"),
+            None => "__set_current_script_node_idx(null)".to_string(),
+        };
+        runtime.execute_script("set current script", code)?;
+        Ok(())
+    }
+
     fn execute_host_script(
         &mut self,
         name: &'static str,
@@ -8001,6 +8012,25 @@ impl Browser {
             r#"
                 document.dispatchEvent(new Event("DOMContentLoaded", {
                     bubbles: true,
+                    cancelable: false,
+                }))
+            "#
+            .to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn dispatch_load_once(&mut self) -> Result<()> {
+        if self.load_dispatched {
+            return Ok(());
+        }
+
+        self.load_dispatched = true;
+        self.execute_host_script(
+            "load",
+            r#"
+                window.dispatchEvent(new Event("load", {
+                    bubbles: false,
                     cancelable: false,
                 }))
             "#
@@ -8202,10 +8232,12 @@ impl Browser {
             match &js.content {
                 ScriptContent::Code(code) => {
                     let code_context: String = code.chars().take(40).collect();
+                    Self::set_current_script(&mut runtime, js.node_idx)?;
                     let result = runtime.execute_script(
                         format!("injected code {} ({})", idx, code_context),
                         code.clone(),
                     );
+                    Self::set_current_script(&mut runtime, None)?;
                     match result {
                         Ok(_) => Self::drain_microtasks(&mut runtime),
                         Err(err) => eprintln!("Failed to execute JS with error: {}", err),
@@ -8229,7 +8261,9 @@ impl Browser {
                                 .await?
                                 .text()
                                 .await?;
+                            Self::set_current_script(&mut runtime, js.node_idx)?;
                             let result = runtime.execute_script(url.to_string(), code);
+                            Self::set_current_script(&mut runtime, None)?;
                             match result {
                                 Ok(_) => Self::drain_microtasks(&mut runtime),
                                 Err(err) => eprintln!(
@@ -8294,6 +8328,7 @@ impl Browser {
             .borrow_mut()
             .block_on(self.execute_js(scripts))?;
         self.dispatch_dom_content_loaded_once()?;
+        self.dispatch_load_once()?;
 
         Ok(())
     }
@@ -8405,6 +8440,7 @@ impl Browser {
             self.document_id += 1;
             self.executed_scripts = ExecutedScripts::new();
             self.dom_content_loaded_dispatched = false;
+            self.load_dispatched = false;
             self.reset_js_document_state()?;
             self.setup_js_dom()?;
             let start = Instant::now();
