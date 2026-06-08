@@ -1749,13 +1749,107 @@ Object.defineProperty(globalThis, "sessionStorage", {
     writable: true,
 })
 
-function matchMedia(selector) {
-    const matches = core.ops.op_media_query_matches(selector)
-    return {
-        media: selector,
-        matches,
-        onchange: null,
+class MediaQueryListEvent extends Event {
+    constructor(type, options = {}) {
+        super(type, options)
+        this.matches = options.matches ?? false
+        this.media = options.media ?? ""
     }
+}
+
+Object.defineProperty(globalThis, "MediaQueryListEvent", {
+    value: MediaQueryListEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class MediaQueryList {
+    constructor(media) {
+        this.media = String(media)
+        this.__listeners = []
+        this.__onchange = null
+    }
+
+    get matches() {
+        return core.ops.op_media_query_matches(this.media)
+    }
+
+    get onchange() {
+        return this.__onchange
+    }
+
+    set onchange(callback) {
+        if (this.__onchange !== null) {
+            this.removeEventListener("change", this.__onchange)
+        }
+
+        this.__onchange = typeof callback === "function" ? callback : null
+
+        if (this.__onchange !== null) {
+            this.addEventListener("change", this.__onchange)
+        }
+    }
+
+    addListener(callback) {
+        this.addEventListener("change", callback)
+    }
+
+    removeListener(callback) {
+        this.removeEventListener("change", callback)
+    }
+
+    addEventListener(type, callback) {
+        if (type !== "change" || callback == null || this.__listeners.includes(callback)) {
+            return
+        }
+        this.__listeners.push(callback)
+    }
+
+    removeEventListener(type, callback) {
+        if (type !== "change") {
+            return
+        }
+        const idx = this.__listeners.indexOf(callback)
+        if (idx !== -1) {
+            this.__listeners.splice(idx, 1)
+        }
+    }
+
+    dispatchEvent(event) {
+        if (!(event instanceof Event)) {
+            throw new TypeError("dispatchEvent expects an Event")
+        }
+
+        event.target = event.target ?? this
+        event.currentTarget = this
+
+        for (const listener of this.__listeners.slice()) {
+            if (typeof listener === "function") {
+                listener.call(this, event)
+            } else if (typeof listener?.handleEvent === "function") {
+                listener.handleEvent(event)
+            }
+
+            if (event.__immediateStopped) {
+                break
+            }
+        }
+
+        event.currentTarget = null
+        return !event.defaultPrevented
+    }
+}
+
+Object.defineProperty(globalThis, "MediaQueryList", {
+    value: MediaQueryList,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+function matchMedia(selector) {
+    return new MediaQueryList(selector)
 }
 
 Object.defineProperty(globalThis, "matchMedia", {
