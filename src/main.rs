@@ -263,6 +263,17 @@ impl DomIndexes {
             }
         }
     }
+
+    pub fn add_attribute_node(&mut self, attribute: &str, node_idx: usize) {
+        if let Some(existing) = self.attribute_elements.get_mut(attribute) {
+            existing.insert(node_idx);
+        } else {
+            let mut elements = FixedBitSet::with_capacity(self.node_bitset_capacity);
+            elements.insert(node_idx);
+            self.attribute_elements
+                .insert(attribute.to_string(), elements);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -348,6 +359,11 @@ enum FrameDomCommand {
     },
     GetElementsByTagName {
         tag: String,
+        required_parent: Option<usize>,
+        reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
+    },
+    GetElementsByName {
+        name: String,
         required_parent: Option<usize>,
         reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
     },
@@ -3161,6 +3177,28 @@ fn op_get_elements_by_tag_name(
 }
 
 #[op2]
+fn op_get_elements_by_name(
+    state: &mut OpState,
+    #[string] name: String,
+    #[number] required_parent: Option<usize>,
+    #[number] frame_id: Option<usize>,
+) -> Result<Vec<(usize, Node)>, JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::GetElementsByName {
+                name,
+                reply,
+                required_parent,
+            })
+        })
+    } else {
+        Ok(renderer.get_elements_by_name(&name, required_parent))
+    }
+}
+
+#[op2]
 fn op_get_elements_by_class_name(
     state: &mut OpState,
     #[string] class_names: String,
@@ -3751,6 +3789,7 @@ extension!(
     op_get_parent_node,
     op_get_element_by_id,
     op_get_elements_by_tag_name,
+    op_get_elements_by_name,
     op_get_elements_by_class_name,
     op_query_selector,
     op_query_selector_all,
@@ -4355,6 +4394,41 @@ impl Renderer {
         nodes
     }
 
+    fn get_elements_by_name(
+        &self,
+        name: &str,
+        required_parent: Option<usize>,
+    ) -> Vec<(usize, Node)> {
+        let mut nodes: Vec<(usize, Node)> =
+            if let Some(idxs) = self.dom_indexes.attribute_elements.get("name") {
+                idxs.ones()
+                    .filter_map(|idx| match self.nodes.get(idx) {
+                        Some(Node::Element(element))
+                            if element
+                                .attributes
+                                .get_str("name")
+                                .is_some_and(|element_name| element_name == name) =>
+                        {
+                            Some((idx, self.nodes.get(idx).unwrap().clone()))
+                        }
+                        _ => None,
+                    })
+                    .filter(|(idx, node)| {
+                        node.get_parent().is_some() || *idx == self.dom_indexes.root_indice
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+        if let Some(required_parent) = required_parent {
+            nodes = nodes
+                .into_iter()
+                .filter(|(idx, _)| has_parent(&self.nodes, *idx, required_parent))
+                .collect();
+        }
+        nodes
+    }
+
     fn get_elements_by_class_name(
         &self,
         class_names: &String,
@@ -4436,6 +4510,9 @@ impl Renderer {
                             node_idx,
                             &mut self.css_parser.class_definitions,
                         );
+                    }
+                    if !element.attributes.contains_key(&key) {
+                        self.dom_indexes.add_attribute_node(&key, node_idx);
                     }
                     element.attributes.insert(key, value);
                     changed = true;
@@ -8159,6 +8236,14 @@ impl Browser {
                 let renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let _ = reply.send(renderer.get_elements_by_tag_name(&tag, required_parent));
             }
+            FrameCommand::Dom(FrameDomCommand::GetElementsByName {
+                name,
+                reply,
+                required_parent,
+            }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let _ = reply.send(renderer.get_elements_by_name(&name, required_parent));
+            }
             FrameCommand::Dom(FrameDomCommand::GetElementsByClassName {
                 class_names,
                 reply,
@@ -8314,7 +8399,7 @@ impl Browser {
 
             // Run onload handlers
             if let Some(node_idx) = js.node_idx {
-                let code = format!("runEventListeners(`${{{}}}:load`)", node_idx);
+                let code = format!("runEventListeners(`${{{}}}:load`, new Event('load'))", node_idx);
                 runtime.execute_script("script onload", code.clone())?;
                 Self::drain_microtasks(&mut runtime);
             }
@@ -9731,6 +9816,23 @@ mod tests {
         let mut buffer = vec![0; 1920 * 8640];
         browser.render_into(&mut buffer, 1920, 8640, true);
         ensure_snapshot_matches(&buffer, "slackcom", 1920, 8640)
+    }
+
+    #[test]
+    fn render_x() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut browser = Browser::new("https://x.com/ThePrimeagen".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(
+            params,
+            PhysicalSize::new(1920, 1080),
+            RendererProxy::FrameLoop(tx),
+        )?;
+        browser.run_js()?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        browser.render_into(&mut buffer, 1920, 1080, true);
+        ensure_snapshot_matches(&buffer, "xcom", 1920, 1080)
     }
 
     #[test]

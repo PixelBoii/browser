@@ -1375,6 +1375,10 @@ class Document {
         const node = core.ops.op_get_element_by_id(id)
         return withDocument(this, () => node ? nodeToElement(node) : null)
     }
+    getElementsByName(name) {
+        const nodes = core.ops.op_get_elements_by_name(String(name), null, this.__frameId)
+        return withDocument(this, () => nodes.map(nodeToElement))
+    }
     getElementsByTagName(tag) {
         const nodes = core.ops.op_get_elements_by_tag_name(tag, null, this.__frameId)
         return withDocument(this, () => nodes.map(nodeToElement))
