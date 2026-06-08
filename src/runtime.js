@@ -302,9 +302,11 @@ Object.defineProperty(globalThis, "MouseEvent", {
 });
 
 class InputEvent extends Event {
-    constructor(data) {
-        super("input")
-        this.data = data
+    constructor(type, options = {}) {
+        super(type, options)
+        this.data = options.data ?? null
+        this.inputType = options.inputType ?? ""
+        this.isComposing = options.isComposing ?? false
     }
 }
 
@@ -403,6 +405,26 @@ class HtmlElement extends BaseNode {
         return core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement)
     }
 
+    get attributes() {
+        const attributeEntries = Object.entries(core.ops.op_get_attributes(this.__node_idx))
+        const attributes = attributeEntries.map(([name, value]) => ({
+            name,
+            value,
+            nodeName: name,
+            nodeValue: value,
+            textContent: value,
+            specified: true,
+        }))
+
+        attributes.item = index => attributes[index] ?? null
+        attributes.getNamedItem = name => attributes.find(attribute => attribute.name === name) ?? null
+        for (const attribute of attributes) {
+            attributes[attribute.name] = attribute
+        }
+
+        return attributes
+    }
+
     get children() {
         return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
     }
@@ -457,19 +479,19 @@ class HtmlElement extends BaseNode {
     }
 
     getAttribute(attr) {
-        return core.ops.op_get_attribute(this.__node_idx, attr)
+        return core.ops.op_get_attribute(this.__node_idx, String(attr))
     }
 
     setAttribute(attr, value) {
-        core.ops.op_update_attributes(this.__node_idx, { [attr]: value }, this.ownerDocument.__frameId)
+        core.ops.op_update_attributes(this.__node_idx, { [String(attr)]: String(value) }, this.ownerDocument.__frameId)
     }
 
     removeAttribute(attr) {
-        core.ops.op_remove_attribute(this.__node_idx, attr)
+        core.ops.op_remove_attribute(this.__node_idx, String(attr))
     }
 
     hasAttribute(attr) {
-        return !!this.getAttribute(attr)
+        return this.getAttribute(attr) != null
     }
 
     remove() {
@@ -1198,6 +1220,7 @@ function tagToElement(tag) {
 class Document {
     constructor(frameId = null) {
         this.__frameId = frameId
+        this.__activeElement = null
     }
     get nodeType() {
         return Node.DOCUMENT_NODE
@@ -1212,7 +1235,10 @@ class Document {
         return "complete"
     }
     get activeElement() {
-        return this.body
+        return this.__activeElement ?? this.body
+    }
+    set activeElement(element) {
+        this.__activeElement = element
     }
     get defaultView() {
         return globalThis
@@ -1228,6 +1254,12 @@ class Document {
     }
     get referrer() {
         return ""
+    }
+    hasStorageAccess() {
+        return Promise.resolve(true)
+    }
+    requestStorageAccess() {
+        return Promise.resolve()
     }
     get fonts() {
         return {
@@ -1391,6 +1423,9 @@ Object.defineProperty(globalThis, "clearInterval", {
 Object.defineProperties(globalThis, {
   innerWidth: { value: 1024, enumerable: true, configurable: true, writable: true },
   innerHeight: { value: 768, enumerable: true, configurable: true, writable: true },
+  outerWidth: { value: 1024, enumerable: true, configurable: true, writable: true },
+  outerHeight: { value: 768, enumerable: true, configurable: true, writable: true },
+  devicePixelRatio: { value: 1, enumerable: true, configurable: true, writable: true },
   pageXOffset: { value: 0, enumerable: true, configurable: true, writable: true },
   pageYOffset: { value: 0, enumerable: true, configurable: true, writable: true },
   scrollTo: {
@@ -1516,6 +1551,28 @@ Object.defineProperty(globalThis, "__init_location", {
     writable: true
 })
 
+Object.defineProperty(globalThis, "isSecureContext", {
+    get() {
+        return globalThis.location?.protocol === "https:" || globalThis.location?.hostname === "localhost"
+    },
+    enumerable: true,
+    configurable: true,
+})
+
+Object.defineProperty(globalThis, "screen", {
+    value: {
+        width: 1024,
+        height: 768,
+        availWidth: 1024,
+        availHeight: 768,
+        colorDepth: 24,
+        pixelDepth: 24,
+    },
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 // TODO: Fill this out from the resolved style table.
 function getComputedStyle() {
     return {
@@ -1530,6 +1587,23 @@ function getComputedStyle() {
 
 Object.defineProperty(globalThis, "getComputedStyle", {
     value: getComputedStyle,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+const CSS = {
+    supports(propertyOrCondition, value) {
+        const unsupportedPrefix = /-(webkit|moz|ms)-/i
+        return !unsupportedPrefix.test(String(propertyOrCondition))
+    },
+    escape(value) {
+        return String(value).replace(/[^a-zA-Z0-9_\-]/g, char => `\\${char}`)
+    },
+}
+
+Object.defineProperty(globalThis, "CSS", {
+    value: CSS,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -1606,7 +1680,40 @@ Object.defineProperty(globalThis, "matchMedia", {
 const navigator = {
     // This is set by setup_js_dom in rust
     userAgent: null,
-    platform: "Linux x86_64"
+    platform: "Linux x86_64",
+    language: "en-US",
+    languages: ["en-US", "en"],
+    cookieEnabled: true,
+    onLine: true,
+    maxTouchPoints: 0,
+    mediaDevices: {
+        enumerateDevices() {
+            return Promise.resolve([])
+        },
+    },
+    userAgentData: {
+        brands: [
+            { brand: "Chromium", version: "124" },
+            { brand: "Not-A.Brand", version: "99" },
+        ],
+        mobile: false,
+        platform: "Linux",
+        getHighEntropyValues(hints) {
+            const values = {
+                architecture: "x86",
+                bitness: "64",
+                brands: this.brands,
+                fullVersionList: this.brands,
+                mobile: this.mobile,
+                model: "",
+                platform: this.platform,
+                platformVersion: "",
+                uaFullVersion: "124.0.0.0",
+            }
+
+            return Promise.resolve(Object.fromEntries(String(hints ?? "").split(",").filter(Boolean).map(hint => [hint, values[hint]])))
+        },
+    },
 }
 
 Object.defineProperty(globalThis, "navigator", {
@@ -1958,21 +2065,140 @@ Object.defineProperty(globalThis, "frames", {
 
 class XMLHttpRequest {
     constructor() {
-        //
+        this.readyState = XMLHttpRequest.UNSENT
+        this.status = 0
+        this.statusText = ""
+        this.response = ""
+        this.responseText = ""
+        this.responseURL = ""
+        this.responseType = ""
+        this.timeout = 0
+        this.withCredentials = false
+        this.onreadystatechange = null
+        this.onload = null
+        this.onerror = null
+        this.onloadend = null
+        this.__listeners = {}
+        this.__method = "GET"
+        this.__url = ""
+        this.__async = true
+        this.__requestHeaders = {}
+        this.__responseHeaders = new Headers()
     }
 
     addEventListener(event, cb) {
-        //
+        if (!this.__listeners[event]) {
+            this.__listeners[event] = []
+        }
+        this.__listeners[event].push(cb)
     }
 
-    send() {
-        //
+    removeEventListener(event, cb) {
+        const listeners = this.__listeners[event]
+        if (!listeners) {
+            return
+        }
+
+        const idx = listeners.indexOf(cb)
+        if (idx !== -1) {
+            listeners.splice(idx, 1)
+        }
     }
 
-    open() {
-        //
+    __dispatch(event) {
+        const eventObject = new Event(event)
+        eventObject.target = this
+        eventObject.currentTarget = this
+
+        const handler = this[`on${event}`]
+        if (typeof handler === "function") {
+            handler.call(this, eventObject)
+        }
+
+        for (const cb of this.__listeners[event] ?? []) {
+            cb.call(this, eventObject)
+        }
+    }
+
+    __setReadyState(readyState) {
+        this.readyState = readyState
+        this.__dispatch("readystatechange")
+    }
+
+    open(method, url, async = true) {
+        this.__method = String(method).toUpperCase()
+        this.__url = resolveBrowserUrl(url)
+        this.__async = async !== false
+        this.__requestHeaders = {}
+        this.__setReadyState(XMLHttpRequest.OPENED)
+    }
+
+    setRequestHeader(header, value) {
+        this.__requestHeaders[String(header)] = String(value)
+    }
+
+    getResponseHeader(header) {
+        return this.__responseHeaders.get(header)
+    }
+
+    getAllResponseHeaders() {
+        let out = ""
+        this.__responseHeaders.forEach((value, key) => {
+            out += `${key}: ${value}\r\n`
+        })
+        return out
+    }
+
+    send(body = null) {
+        const run = async () => {
+            try {
+                const init = {
+                    method: this.__method,
+                    headers: this.__requestHeaders,
+                    credentials: this.withCredentials ? "include" : "same-origin",
+                }
+
+                if (this.__method !== "GET" && this.__method !== "HEAD") {
+                    init.body = body
+                }
+
+                const response = await browserFetch(this.__url, init)
+
+                this.status = response.status
+                this.statusText = response.statusText
+                this.responseURL = response.url
+                this.__responseHeaders = response.headers
+                this.__setReadyState(XMLHttpRequest.HEADERS_RECEIVED)
+                this.__setReadyState(XMLHttpRequest.LOADING)
+
+                const text = await response.text()
+                this.responseText = text
+                this.response = text
+                this.__setReadyState(XMLHttpRequest.DONE)
+                this.__dispatch("load")
+                this.__dispatch("loadend")
+            } catch (err) {
+                this.__error = err
+                this.__setReadyState(XMLHttpRequest.DONE)
+                this.__dispatch("error")
+                this.__dispatch("loadend")
+            }
+        }
+
+        run()
     }
 }
+
+XMLHttpRequest.UNSENT = 0
+XMLHttpRequest.OPENED = 1
+XMLHttpRequest.HEADERS_RECEIVED = 2
+XMLHttpRequest.LOADING = 3
+XMLHttpRequest.DONE = 4
+XMLHttpRequest.prototype.UNSENT = XMLHttpRequest.UNSENT
+XMLHttpRequest.prototype.OPENED = XMLHttpRequest.OPENED
+XMLHttpRequest.prototype.HEADERS_RECEIVED = XMLHttpRequest.HEADERS_RECEIVED
+XMLHttpRequest.prototype.LOADING = XMLHttpRequest.LOADING
+XMLHttpRequest.prototype.DONE = XMLHttpRequest.DONE
 
 Object.defineProperty(globalThis, "XMLHttpRequest", {
     value: XMLHttpRequest,

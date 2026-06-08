@@ -6,8 +6,8 @@ use std::convert::Infallible;
 use std::hash::Hash;
 
 const SELF_CLOSING_TAGS: [&str; 14] = [
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-    "source", "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,9 +23,7 @@ impl Attributes {
     }
 
     pub fn from_hash_map(values: HashMap<String, String>) -> Self {
-        Self {
-            values,
-        }
+        Self { values }
     }
 
     pub fn insert(&mut self, attribute: String, value: String) -> Option<String> {
@@ -37,7 +35,9 @@ impl Attributes {
         String: std::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.values.get(attribute).and_then(|v| Some(Cow::Borrowed(v.as_str())))
+        self.values
+            .get(attribute)
+            .and_then(|v| Some(Cow::Borrowed(v.as_str())))
     }
 
     pub fn contains_key<Q>(&self, attribute: &Q) -> bool
@@ -230,6 +230,7 @@ pub struct HtmlParser {
     pub stage: BuildPhase,
     pub tag: String,
     value: String,
+    attribute_quote: Option<char>,
     pub nodes: Vec<Node>,
     node: Option<usize>,
 }
@@ -304,6 +305,7 @@ impl HtmlParser {
             input,
             tag: "".to_string(),
             value: "".to_string(),
+            attribute_quote: None,
             stage: BuildPhase::Start,
             nodes: vec![],
             node: None,
@@ -332,13 +334,12 @@ impl HtmlParser {
         let node = self.curr_node()?;
         match node {
             Node::Element(element) => {
-                element
-                    .attributes
-                    .insert(tag, value);
+                element.attributes.insert(tag, value);
             }
             _ => {}
         }
         self.value = "".to_string();
+        self.attribute_quote = None;
         Ok(())
     }
 
@@ -545,14 +546,15 @@ impl HtmlParser {
                         self.tag.push(char);
                     }
                     BuildPhase::AttributeValue => {
-                        if char == '"' {
+                        if char == '"' || char == '\'' {
+                            self.attribute_quote = Some(char);
                             self.stage = BuildPhase::AttributeValueInside;
                         } else {
                             self.value.push(char);
                         }
                     }
                     BuildPhase::AttributeValueInside => {
-                        if char == '"' {
+                        if Some(char) == self.attribute_quote {
                             self.close_attribute()?;
                             self.stage = BuildPhase::TagDone;
                         } else {

@@ -60,6 +60,10 @@ const WINDOW_HEIGHT: u32 = 1080;
 // Many websites rely on the user-agent to be one of the major browsers, so we don't use our own for now
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+fn js_string_literal(value: &str) -> String {
+    deno_core::serde_json::to_string(value).expect("serializing a string literal cannot fail")
+}
+
 #[derive(Debug, Clone)]
 struct RectBorderSide {
     size: u32,
@@ -2741,6 +2745,8 @@ enum UserEvent {
     Navigate((UserNavigateUrl, bool)),
     FrameUpdated,
     ChildMessage(String),
+    Hover(Position),
+    Click,
 }
 
 #[derive(Debug, Clone)]
@@ -7940,6 +7946,44 @@ impl Browser {
 
                 let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
             }
+            FrameCommand::UserEvent(UserEvent::Hover(position)) => {
+                self.apply_hovering(&position);
+
+                let mut pixels = vec![0; (size.width * size.height) as usize];
+                self.renderer.as_ref().unwrap().borrow_mut().render_into(
+                    &mut pixels,
+                    size.width,
+                    size.height,
+                    true,
+                );
+
+                *bitmap_for_thread.lock().unwrap() = pixels;
+                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+            }
+            FrameCommand::UserEvent(UserEvent::Click) => {
+                if let Err(err) = self.on_click() {
+                    eprintln!("Failed to handle iframe click: {err:?}");
+                }
+
+                if self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.borrow().pending_dom_update)
+                {
+                    self.process_dom_update();
+                }
+
+                let mut pixels = vec![0; (size.width * size.height) as usize];
+                self.renderer.as_ref().unwrap().borrow_mut().render_into(
+                    &mut pixels,
+                    size.width,
+                    size.height,
+                    true,
+                );
+
+                *bitmap_for_thread.lock().unwrap() = pixels;
+                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+            }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
             }
@@ -8339,6 +8383,25 @@ impl Browser {
                     ),
                 );
             }
+            let clicked_iframe = {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                renderer.nodes.get(hovering_node_idx).is_some_and(
+                    |node| matches!(node, Node::Element(element) if element.tag == "iframe"),
+                )
+            };
+            if clicked_iframe {
+                if let Some(handle) = self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .frames
+                    .get(&hovering_node_idx)
+                {
+                    let _ = handle.tx.send(FrameCommand::UserEvent(UserEvent::Click));
+                }
+                return Ok(());
+            }
             let parents = self
                 .renderer
                 .as_ref()
@@ -8659,7 +8722,7 @@ impl Browser {
     }
 
     fn apply_hovering(&mut self, cursor: &Position) {
-        let (should_re_render, hovering) = {
+        let (should_re_render, hovering, iframe_hover) = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             let old_value = renderer.hovering.clone();
             renderer.compute_hovering(*cursor);
@@ -8673,8 +8736,54 @@ impl Browser {
                     .hovering_impact
                     .contains(&renderer.layout_to_node_idx(&idx))
             });
-            (new_value != old_value && one_has_hovering_impact, new_value)
+            let iframe_hover = new_value.and_then(|hovering_layout_idx| {
+                let hovering_node_idx = renderer.layout_to_node_idx(&hovering_layout_idx);
+                let iframe_node = renderer.nodes.get(hovering_node_idx).is_some_and(
+                    |node| matches!(node, Node::Element(element) if element.tag == "iframe"),
+                );
+                if !iframe_node {
+                    return None;
+                }
+
+                renderer
+                    .rendered_nodes_ordered
+                    .iter()
+                    .find(|rendered_node| rendered_node.layout_box_idx == hovering_layout_idx)
+                    .and_then(|rendered_node| {
+                        renderer
+                            .layout_table
+                            .get(&hovering_layout_idx)
+                            .map(|layout_box| {
+                                (
+                                    hovering_node_idx,
+                                    Position {
+                                        x: cursor.x - layout_box.rect.x,
+                                        y: cursor.y - layout_box.rect.y - rendered_node.offset_y,
+                                    },
+                                )
+                            })
+                    })
+            });
+            (
+                new_value != old_value && one_has_hovering_impact,
+                new_value,
+                iframe_hover,
+            )
         };
+        if let Some((iframe_node_idx, local_position)) = iframe_hover {
+            let frame_tx = {
+                self.renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .frames
+                    .get(&iframe_node_idx)
+                    .map(|handle| handle.tx.clone())
+            };
+            if let Some(frame_tx) = frame_tx {
+                let _ = frame_tx.send(FrameCommand::UserEvent(UserEvent::Hover(local_position)));
+            }
+        }
         if should_re_render || self.hover_debugging {
             self.layout_dirty = true;
             self.renderer
@@ -8687,7 +8796,9 @@ impl Browser {
             {
                 self.apply_debug_hover(hovering);
             }
-            self.window.as_mut().unwrap().request_redraw();
+            if let Some(window) = self.window.as_mut() {
+                window.request_redraw();
+            }
         }
     }
 
@@ -8755,8 +8866,6 @@ impl Browser {
 
         self.setup_js_dom()?;
 
-        let mut cursor = Position { x: 0, y: 0 };
-
         event_loop
             .run(move |event, elwt| {
                 let window = self.window.as_ref().unwrap();
@@ -8815,7 +8924,7 @@ impl Browser {
                             device_id: _,
                             position,
                         } => {
-                            cursor = Position {
+                            let cursor = Position {
                                 x: position.x as i32,
                                 y: position.y as i32,
                             };
@@ -8940,7 +9049,7 @@ impl Browser {
     fn handle_keyup(&mut self, event: KeyEvent) {
         let focusable = self.renderer.as_ref().unwrap().borrow().focusable;
         if let Some(focusable) = focusable
-            && let Some(text) = event.text
+            && let Some(input_text) = event.text
         {
             let new_text = {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
@@ -8950,14 +9059,21 @@ impl Browser {
                         .values
                         .entry("value".to_string())
                         .or_default();
-                    *entry += text.as_str();
+                    *entry += input_text.as_str();
                     Some(entry.clone())
                 } else {
                     None
                 }
             };
 
-            if let Some(text) = new_text {
+            if new_text.is_some() {
+                let input_data = js_string_literal(&input_text);
+                let input_type =
+                    js_string_literal(if input_text.contains('\n') || input_text.contains('\r') {
+                        "insertLineBreak"
+                    } else {
+                        "insertText"
+                    });
                 self.renderer
                     .as_ref()
                     .unwrap()
@@ -8969,12 +9085,17 @@ impl Browser {
                     format!(
                         r#"
                 (() => {{
-                    const event = new InputEvent("{}")
+                    const event = new InputEvent("input", {{
+                        bubbles: true,
+                        cancelable: false,
+                        data: {},
+                        inputType: {},
+                    }})
                     __elementFromNodeIdx({}).dispatchEvent(event)
                     return event.defaultPrevented
                 }})()
                 "#,
-                        text, focusable
+                        input_data, input_type, focusable
                     ),
                 )
                 .unwrap();
