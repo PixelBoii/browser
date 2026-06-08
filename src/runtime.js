@@ -5,7 +5,7 @@ import * as infra from "ext:deno_web/00_infra.js";
 import * as DOMException from "ext:deno_web/01_dom_exception.js";
 import * as broadcastChannel from "ext:deno_web/01_broadcast_channel.js";
 import * as mimesniff from "ext:deno_web/01_mimesniff.js";
-// import * as event from "ext:deno_web/02_event.js";
+import * as denoEvent from "ext:deno_web/02_event.js";
 import * as structuredClone from "ext:deno_web/02_structured_clone.js";
 import * as abortSignal from "ext:deno_web/03_abort_signal.js";
 import * as globalInterfaces from "ext:deno_web/04_global_interfaces.js";
@@ -27,6 +27,8 @@ import * as request from "ext:deno_fetch/23_request.js";
 import * as response from "ext:deno_fetch/23_response.js";
 import * as fetch from "ext:browser/runtime_fetch.js";
 import * as crypto from "ext:deno_crypto/00_crypto.js";
+
+denoEvent.saveGlobalThisReference(globalThis)
 
 const { core } = Deno
 let nextTimerId = 1
@@ -1933,7 +1935,16 @@ function removeEventListener(event, cb) {
     removeEventListenerByKey(`${WINDOW_EVENT_TARGET}:${event}`, cb)
 }
 
+function dispatchDenoEventToWindow(event) {
+    denoEvent.setTarget(event, globalThis)
+    runEventListeners(`${WINDOW_EVENT_TARGET}:${event.type}`, event)
+    return !event.defaultPrevented
+}
+
 function dispatchEvent(event) {
+    if (event instanceof denoEvent.Event) {
+        return dispatchDenoEventToWindow(event)
+    }
     return dispatchEventToTarget(globalThis, event)
 }
 
@@ -2358,7 +2369,7 @@ Object.defineProperty(globalThis, "top", {
 })
 
 function postMessage(message) {
-    runEventListeners("window:message", new MessageEvent(message))
+    dispatchDenoEventToWindow(new denoEvent.MessageEvent("message", { data: message }))
 }
 
 Object.defineProperty(globalThis, "postMessage", {
@@ -2368,14 +2379,8 @@ Object.defineProperty(globalThis, "postMessage", {
     writable: true,
 })
 
-class MessageEvent {
-    constructor(data) {
-        this.data = data
-    }
-}
-
 Object.defineProperty(globalThis, "MessageEvent", {
-    value: MessageEvent,
+    value: denoEvent.MessageEvent,
     enumerable: true,
     configurable: true,
     writable: true,

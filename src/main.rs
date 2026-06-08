@@ -9109,14 +9109,15 @@ impl Browser {
                     }
                     Event::UserEvent(UserEvent::DomUpdated) => self.execute_dom_update(),
                     Event::UserEvent(UserEvent::ChildMessage(message)) => {
+                        let data = js_string_literal(&message);
                         let code = format!(
                             r#"
                         (() => {{
-                            const event = new MessageEvent("{}")
-                            runEventListeners('window:message', event)
+                            const event = new MessageEvent("message", {{ data: {} }})
+                            window.dispatchEvent(event)
                         }})()
                         "#,
-                            message
+                            data
                         );
                         self.execute_host_script("child message handler", code)
                             .unwrap();
