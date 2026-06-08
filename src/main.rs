@@ -2887,6 +2887,9 @@ fn op_spawn_frame(
 ) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
+    if renderer.frames.contains_key(&node_idx) {
+        return Ok(());
+    }
     let handle = renderer
         .spawn_frame(url, PhysicalSize::new(300, 150))
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
@@ -8209,8 +8212,12 @@ impl Browser {
                     };
                 }
                 ScriptContent::Link(link) => {
-                    let base = ReqwestUrl::parse(&self.url)?;
-                    let url = resolve_url(&link, Some(&base))?;
+                    let Ok(base) = ReqwestUrl::parse(&self.url) else {
+                        continue;
+                    };
+                    let Ok(url) = resolve_url(&link, Some(&base)) else {
+                        continue;
+                    };
                     match js.script_type {
                         ScriptType::Classic => {
                             let code = self
@@ -9615,6 +9622,23 @@ mod tests {
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         browser.render_into(&mut buffer, 1920, 1080, true);
         ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
+    }
+
+    #[test]
+    fn renders_swapped_com() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut browser = Browser::new("https://widget.swapped.com/".to_string(), false);
+        let params = browser.open()?;
+        browser.set_up_without_event_loop(
+            params,
+            PhysicalSize::new(1920, 1080),
+            RendererProxy::FrameLoop(tx),
+        )?;
+        browser.run_js()?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        browser.render_into(&mut buffer, 1920, 1080, true);
+        ensure_snapshot_matches(&buffer, "widgetswappedcom", 1920, 1080)
     }
 
     #[test]

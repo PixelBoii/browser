@@ -500,8 +500,15 @@ impl HtmlParser {
                     BuildPhase::AttributeName => {
                         self.stage = BuildPhase::AttributeValue;
                     }
-                    BuildPhase::AttributeValueInside => {
+                    BuildPhase::AttributeValue | BuildPhase::AttributeValueInside => {
                         self.value.push(char);
+                    }
+                    BuildPhase::Start => {
+                        self.stage = BuildPhase::Text;
+                        self.tag.push(char);
+                    }
+                    BuildPhase::Text | BuildPhase::CommentOpen | BuildPhase::TagClosing => {
+                        self.tag.push(char);
                     }
                     _ => {}
                 },

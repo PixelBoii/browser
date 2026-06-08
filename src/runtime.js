@@ -819,11 +819,12 @@ class HTMLIFrameElement extends HtmlElement {
     }
 
     spawnFrame() {
-        core.ops.op_spawn_frame(this.__node_idx, null)
+        core.ops.op_spawn_frame(this.__node_idx, this.getAttribute("src"))
     }
 
     get contentDocument() {
         // Frame idx is the node idx
+        this.spawnFrame()
         return new Document(this.__node_idx)
     }
 }
@@ -1868,6 +1869,27 @@ function removeEventListener(event, cb) {
 function dispatchEvent(event) {
     return dispatchEventToTarget(globalThis, event)
 }
+
+// TODO: Build window first, then map to globalThis
+function Window() {}
+
+Window.prototype.addEventListener = addEventListener
+Window.prototype.removeEventListener = removeEventListener
+Window.prototype.dispatchEvent = dispatchEvent
+
+Object.defineProperty(Window, Symbol.hasInstance, {
+    value(instance) {
+        return instance === globalThis
+    },
+    configurable: true,
+})
+
+Object.defineProperty(globalThis, "Window", {
+    value: Window,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 Object.defineProperty(globalThis, "addEventListener", {
     value: addEventListener,
