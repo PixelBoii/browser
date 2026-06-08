@@ -6834,6 +6834,13 @@ impl Renderer {
         if style.align_items == StyleJustifyContent::Stretch && allow_fill {
             for item in &mut base_items {
                 let child_style: &Style = &self.node_styles.get(&item.node_idx).unwrap();
+                let align = match child_style.align_self {
+                    StyleJustifyContent::Auto => style.align_items,
+                    v => v,
+                };
+                if align != StyleJustifyContent::Stretch {
+                    continue;
+                }
                 match style.flex_direction {
                     StyleFlexDirection::Column => {
                         if child_style.width == StyleSize::Auto {
