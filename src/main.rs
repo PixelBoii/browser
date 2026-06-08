@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
@@ -3800,6 +3800,13 @@ fn deno_fetch_without_telemetry() -> deno_core::Extension {
         )
     });
     extension
+}
+
+fn install_default_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 #[derive(Debug)]
@@ -7858,6 +7865,8 @@ impl std::fmt::Debug for Browser {
 
 impl Browser {
     fn new(url: String, hover_debugging: bool) -> Self {
+        install_default_crypto_provider();
+
         let font_handler = Rc::new(FontHandler::new().unwrap());
 
         Self {
@@ -9229,8 +9238,6 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let args = env::args().collect::<Vec<String>>();
     if args
         .get(1)
@@ -9589,6 +9596,7 @@ mod tests {
             PhysicalSize::new(1920, 1080),
             RendererProxy::FrameLoop(tx),
         )?;
+        browser.run_js()?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         browser.render_into(&mut buffer, 1920, 1080, true);
