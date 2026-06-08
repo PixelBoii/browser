@@ -175,10 +175,119 @@ class BaseNode {
         return Node.DOCUMENT_POSITION_FOLLOWING
     }
 
+    isEqualNode(other) {
+        return nodesAreEqual(this, other)
+    }
+
     getElementsByTagName(tag) {
         const nodes = core.ops.op_get_elements_by_tag_name(tag, this.__node_idx, this.ownerDocument.__frameId)
         return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
     }
+}
+
+function nodeNameForEquality(node) {
+    if (node.nodeName != null) {
+        return node.nodeName
+    }
+
+    switch (node.nodeType) {
+        case Node.TEXT_NODE:
+            return "#text"
+        case Node.COMMENT_NODE:
+            return "#comment"
+        case Node.DOCUMENT_NODE:
+            return "#document"
+        case Node.DOCUMENT_FRAGMENT_NODE:
+            return "#document-fragment"
+        default:
+            return null
+    }
+}
+
+function nodeValueForEquality(node) {
+    if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE) {
+        return node.nodeValue ?? node.textContent ?? ""
+    }
+    return node.nodeValue ?? null
+}
+
+function nodeLocalNameForEquality(node) {
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+        return node.localName ?? null
+    }
+
+    return node.localName ?? node.tag ?? node.tagName?.toLowerCase() ?? null
+}
+
+function nodeChildrenForEquality(node) {
+    if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE) {
+        return []
+    }
+    if (node.nodeType === Node.DOCUMENT_NODE) {
+        const root = node.documentElement
+        return root ? [root] : []
+    }
+    return Array.from(node.childNodes ?? [])
+}
+
+function nodeAttributesForEquality(node) {
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+        return []
+    }
+    return Array.from(node.attributes ?? [])
+}
+
+function nodesHaveEqualAttributes(left, right) {
+    const leftAttributes = nodeAttributesForEquality(left)
+    const rightAttributes = nodeAttributesForEquality(right)
+    if (leftAttributes.length !== rightAttributes.length) {
+        return false
+    }
+
+    for (const attribute of leftAttributes) {
+        const rightAttribute = rightAttributes.find(candidate => candidate.name === attribute.name)
+        if (!rightAttribute || rightAttribute.value !== attribute.value) {
+            return false
+        }
+    }
+
+    return true
+}
+
+function nodesAreEqual(left, right) {
+    if (left === right) {
+        return true
+    }
+    if (!right || right.nodeType == null || left.nodeType !== right.nodeType) {
+        return false
+    }
+
+    if (nodeNameForEquality(left) !== nodeNameForEquality(right)) {
+        return false
+    }
+    if (nodeLocalNameForEquality(left) !== nodeLocalNameForEquality(right)) {
+        return false
+    }
+    if ((left.namespaceURI ?? null) !== (right.namespaceURI ?? null)) {
+        return false
+    }
+    if ((left.prefix ?? null) !== (right.prefix ?? null)) {
+        return false
+    }
+    if (nodeValueForEquality(left) !== nodeValueForEquality(right)) {
+        return false
+    }
+    if (!nodesHaveEqualAttributes(left, right)) {
+        return false
+    }
+
+    const leftChildren = nodeChildrenForEquality(left)
+    const rightChildren = nodeChildrenForEquality(right)
+    if (leftChildren.length !== rightChildren.length) {
+        return false
+    }
+
+    return leftChildren.every((child, index) => nodesAreEqual(child, rightChildren[index]))
 }
 
 BaseNode.ELEMENT_NODE = 1
@@ -1312,6 +1421,12 @@ class Document {
     get defaultView() {
         return globalThis
     }
+    get location() {
+        return globalThis.location
+    }
+    set location(value) {
+        globalThis.location.href = value
+    }
     get cookie() {
         return core.ops.op_get_cookie(globalThis.location.href)
     }
@@ -1408,6 +1523,9 @@ class Document {
     }
     set onclick(cb) {
         this.addEventListener('click', cb)
+    }
+    isEqualNode(other) {
+        return nodesAreEqual(this, other)
     }
     createTextNode(text) {
         const element = new TextNode(text)
@@ -1586,6 +1704,10 @@ class Location {
         return this.__url.href
     }
 
+    toString() {
+        return this.href
+    }
+
     set href(value) {
         core.ops.op_set_location_href(value, true)
     }
@@ -1759,6 +1881,20 @@ class MediaQueryListEvent extends Event {
 
 Object.defineProperty(globalThis, "MediaQueryListEvent", {
     value: MediaQueryListEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class CustomEvent extends Event {
+    constructor(type, options) {
+        super(type)
+        this.__detail = options.detail
+    }
+}
+
+Object.defineProperty(globalThis, "CustomEvent", {
+    value: CustomEvent,
     enumerable: true,
     configurable: true,
     writable: true,
