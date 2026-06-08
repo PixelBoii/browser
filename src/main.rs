@@ -9545,7 +9545,7 @@ mod tests {
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Browser, RendererProxy, pixmaps_are_equal, rgb_buffer_to_premul_bytes,
+        Browser, Position, RendererProxy, pixmaps_are_equal, rgb_buffer_to_premul_bytes,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
@@ -9599,6 +9599,10 @@ mod tests {
         browser.run_js()?;
         browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
+        browser.render_into(&mut buffer, 1920, 1080, true);
+        browser.apply_hovering(&Position { x: 865, y: 652 });
+        browser.on_click()?;
+        browser.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         browser.render_into(&mut buffer, 1920, 1080, true);
         ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
     }
