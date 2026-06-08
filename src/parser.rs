@@ -243,7 +243,7 @@ pub struct TraceItem {
     pub tag: String,
 }
 
-const UNIQUE_TAGS: [&str; 2] = ["script", "style"];
+const RAW_TEXT_TAGS: [&str; 3] = ["script", "style", "noscript"];
 
 fn decode_html_entities(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -321,10 +321,12 @@ impl HtmlParser {
         Ok(node)
     }
 
-    fn curr_is_script(&mut self) -> bool {
-        match self.curr_node() {
-            Ok(Node::Element(element)) => UNIQUE_TAGS.contains(&element.tag.as_str()),
-            _ => false,
+    fn curr_raw_text_tag(&self) -> Option<String> {
+        match self.node.and_then(|node_idx| self.nodes.get(node_idx)) {
+            Some(Node::Element(element)) if RAW_TEXT_TAGS.contains(&element.tag.as_str()) => {
+                Some(element.tag.clone())
+            }
+            _ => None,
         }
     }
 
@@ -394,16 +396,16 @@ impl HtmlParser {
         let input = self.input.clone();
         let chars = input.chars();
         for char in chars {
-            // If in a script we ignore most parsing logic and just keep adding to "tag" until we see </script>
+            // Raw-text elements do not parse their contents as markup.
             if self.stage == BuildPhase::ScriptOpen {
                 self.tag.push(char);
 
-                let suffix_target = UNIQUE_TAGS
-                    .iter()
-                    .map(|t| format!("</{}>", t))
-                    .find(|t| self.tag.ends_with(t));
-                if let Some(suffix) = suffix_target {
-                    // Save script content as its own element
+                if let Some(suffix) = self
+                    .curr_raw_text_tag()
+                    .map(|tag| format!("</{}>", tag))
+                    .filter(|suffix| self.tag.ends_with(suffix))
+                {
+                    // Save raw text content as its own element.
                     self.stage = BuildPhase::Text;
                     self.tag = self
                         .tag
@@ -411,7 +413,7 @@ impl HtmlParser {
                         .with_context(|| "Failed to strip tag suffix")?
                         .to_string();
                     self.create_node_from_state()?;
-                    // Go up the tree twice, first up from the text, then up from the script tag
+                    // Go up the tree twice, first up from the text, then up from the raw-text tag.
                     let curr_node = self.curr_node()?;
                     self.node = curr_node.get_parent();
                     let curr_node = self.curr_node()?;
@@ -452,7 +454,7 @@ impl HtmlParser {
                     BuildPhase::Tag => {
                         self.create_node_from_state()?;
                         self.self_close_if_appropiate();
-                        if self.curr_is_script() {
+                        if self.curr_raw_text_tag().is_some() {
                             self.stage = BuildPhase::ScriptOpen;
                         } else {
                             self.stage = BuildPhase::Start;
@@ -461,7 +463,7 @@ impl HtmlParser {
                     }
                     BuildPhase::TagDone => {
                         self.self_close_if_appropiate();
-                        if self.curr_is_script() {
+                        if self.curr_raw_text_tag().is_some() {
                             self.stage = BuildPhase::ScriptOpen;
                         } else {
                             self.stage = BuildPhase::Start;
@@ -481,7 +483,7 @@ impl HtmlParser {
                     BuildPhase::AttributeName | BuildPhase::AttributeValue => {
                         self.close_attribute()?;
                         self.self_close_if_appropiate();
-                        if self.curr_is_script() {
+                        if self.curr_raw_text_tag().is_some() {
                             self.stage = BuildPhase::ScriptOpen;
                         } else {
                             self.stage = BuildPhase::Start;
