@@ -13,7 +13,7 @@ use resvg::tiny_skia::{IntSize, Pixmap};
 use resvg::usvg::Tree;
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
-    StyleSize, get_base_style, parse_style,
+    StyleSize, StyleTransform, StyleTransformOperation, get_base_style, parse_style,
 };
 
 use std::cell::{Ref, RefCell, RefMut};
@@ -411,6 +411,7 @@ impl RendererProxy {
 #[derive(Debug)]
 struct RenderedNode {
     layout_box_idx: usize,
+    offset_x: i32,
     offset_y: i32,
 }
 
@@ -4850,6 +4851,7 @@ impl Renderer {
                 buffer,
                 width,
                 height,
+                0,
                 scroll_y,
                 &mut new_rendered_nodes_ordered,
             );
@@ -5189,6 +5191,44 @@ impl Renderer {
             )
             .unwrap_or(&16);
         *resolved_parent_font_size
+    }
+
+    fn resolve_transform_offset(&self, style: &Style, layout_box: &LayoutBox) -> (i32, i32) {
+        let StyleTransform::Operations(operations) = &style.transform else {
+            return (0, 0);
+        };
+
+        let font_size = self
+            .resolved_font_sizes
+            .get(&layout_box.node_idx)
+            .cloned()
+            .unwrap_or(16);
+        let mut offset_x = 0;
+        let mut offset_y = 0;
+        for operation in operations {
+            match operation {
+                StyleTransformOperation::Translate { x, y } => {
+                    offset_x += get_specified_size(
+                        font_size,
+                        x,
+                        Some(layout_box.rect.width),
+                        Some(0),
+                        &self.window_size,
+                    )
+                    .unwrap_or(0);
+                    offset_y += get_specified_size(
+                        font_size,
+                        y,
+                        Some(layout_box.rect.height),
+                        Some(0),
+                        &self.window_size,
+                    )
+                    .unwrap_or(0);
+                }
+            }
+        }
+
+        (offset_x, offset_y)
     }
 
     fn layout_node(
@@ -6397,10 +6437,12 @@ impl Renderer {
         self.resolved_specified_widths
             .insert(node_idx, specified_width);
 
-        if *mode == LayoutMode::BaseCalculation {
-            if let (Some(height), Some(width)) = (specified_height, specified_width) {
-                return Some((width, height, vec![], height));
-            }
+        if *mode == LayoutMode::BaseCalculation
+            && let (Some(height), Some(width)) = (specified_height, specified_width)
+            && height > 0
+            && width > 0
+        {
+            return Some((width, height, vec![], height));
         }
 
         let container_sizes = self.get_container_sizes(
@@ -6418,17 +6460,19 @@ impl Renderer {
             .unwrap()
             .clone();
 
-        let immediate_children: Vec<&usize> = children_idxs
+        let immediate_children: Vec<usize> = children_idxs
             .iter()
+            .copied()
             .filter(|c| {
-                let style = &self.node_styles.get(*c);
+                let style = &self.node_styles.get(c);
                 style.is_some_and(|style| !style.position.is_free())
             })
             .collect();
-        let free_children: Vec<&usize> = children_idxs
+        let free_children: Vec<usize> = children_idxs
             .iter()
+            .copied()
             .filter(|c| {
-                let style = &self.node_styles.get(*c);
+                let style = &self.node_styles.get(c);
                 style.is_some_and(|style| style.position.is_free())
             })
             .collect();
@@ -6448,6 +6492,7 @@ impl Renderer {
         let mut max_child_height: u32 = 0;
         let mut row_height: u32 = 0;
         let mut child_width_buffer = 0;
+        let mut line_has_content = false;
 
         let mut children_rows = MarginRows::new();
 
@@ -6468,22 +6513,31 @@ impl Renderer {
 
         for child_local_idx in 0..immediate_children.len() {
             let child_idx = immediate_children[child_local_idx];
-            let prev_child_idx = if child_local_idx >= 1 {
-                Some(immediate_children[child_local_idx - 1])
-            } else {
-                None
-            };
-            let next_child_idx = if child_local_idx + 1 < immediate_children.len() {
-                Some(immediate_children[child_local_idx + 1])
-            } else {
-                None
-            };
-            let child_style = self.node_styles.get(child_idx).unwrap().clone();
+            let prev_child_idx = child_local_idx
+                .checked_sub(1)
+                .map(|idx| immediate_children[idx]);
+            let next_child_idx = immediate_children.get(child_local_idx + 1).copied();
+            let child_style = self.node_styles.get(&child_idx).unwrap().clone();
+            if child_style.display != StyleDisplay::None
+                && matches!(
+                    self.nodes.get(child_idx),
+                    Some(Node::Element(element)) if element.tag == "br"
+                )
+            {
+                content_position.x = original_cursor.x;
+                content_position.y += row_height.max(font_size) as i32;
+                child_width_buffer = 0;
+                row_height = 0;
+                line_has_content = false;
+                max_child_height =
+                    max_child_height.max((content_position.y - original_cursor.y).max(0) as u32);
+                continue;
+            }
             let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
-                self.get_margins(*child_idx, &child_style, available_size);
+                self.get_margins(child_idx, &child_style, available_size);
             content_position.x += margin_left_size as i32;
             if let Some(child) = self.layout_node(
-                *child_idx,
+                child_idx,
                 Position {
                     x: content_position.x,
                     y: content_position.y + margin_top_size as i32,
@@ -6505,9 +6559,9 @@ impl Renderer {
                 let child_width = child_box.rect.width;
                 let child_height = child_box.rect.height;
                 let prev_child_display: Option<StyleDisplay> =
-                    prev_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
+                    prev_child_idx.map(|idx| self.node_styles.get(&idx).unwrap().display);
                 let next_child_display: Option<StyleDisplay> =
-                    next_child_idx.and_then(|idx| Some(self.node_styles.get(idx).unwrap().display));
+                    next_child_idx.map(|idx| self.node_styles.get(&idx).unwrap().display);
                 if child_style.display.is_inline()
                     && prev_child_display.is_none_or(|v| v.is_inline())
                     && next_child_display.is_none_or(|v| v.is_inline())
@@ -6529,8 +6583,13 @@ impl Renderer {
                     } else {
                         content_position.x += child_width_with_margin;
                         child_width_buffer += child_width_with_margin;
-                        children_rows.last_row(child, 0);
+                        if line_has_content {
+                            children_rows.last_row(child, 0);
+                        } else {
+                            children_rows.new_row(child, 0);
+                        }
                     }
+                    line_has_content = true;
                     row_height = row_height.max(child_height);
 
                     if !child_style.position.is_free() {
@@ -6544,6 +6603,7 @@ impl Renderer {
                         margin_top_size as i32 + child_height as i32 + margin_bottom_size;
                     child_width_buffer = 0;
                     row_height = 0;
+                    line_has_content = false;
                     children_rows.new_row(child, 0);
 
                     if !child_style.position.is_free() {
@@ -6575,12 +6635,12 @@ impl Renderer {
             children.push(layout_box);
         }
 
-        let content_height = (content_position.y - original_cursor.y)
-            .max(max_child_height as i32)
-            .max(0) as u32;
+        let content_height =
+            ((content_position.y - original_cursor.y).max(0) as u32 + row_height)
+                .max(max_child_height);
         let height = specified_height
             .unwrap_or_else(|| {
-                if children.is_empty() {
+                if children.is_empty() && content_height == 0 {
                     (padding_top_size + padding_bottom_size) as u32
                 } else {
                     content_height + (padding_top_size + padding_bottom_size) as u32
@@ -6611,7 +6671,7 @@ impl Renderer {
             self.queue_free_child_for_layout(
                 containing_node_idx,
                 node_idx,
-                *child_idx,
+                child_idx,
                 Size { height, width },
                 cursor.clone(),
             );
@@ -7214,14 +7274,15 @@ impl Renderer {
                     .layout_table
                     .get(&renderer_node.layout_box_idx)
                     .unwrap();
-                let end_x = layout_box.rect.x + layout_box.rect.width as i32;
-                let end_y = layout_box.rect.y + layout_box.rect.height as i32;
-                let scroll_y = renderer_node.offset_y;
+                let start_x = layout_box.rect.x + renderer_node.offset_x;
+                let start_y = layout_box.rect.y + renderer_node.offset_y;
+                let end_x = start_x + layout_box.rect.width as i32;
+                let end_y = start_y + layout_box.rect.height as i32;
 
-                position.x > layout_box.rect.x
+                position.x > start_x
                     && position.x < end_x
-                    && position.y > layout_box.rect.y + scroll_y
-                    && position.y < end_y + scroll_y
+                    && position.y > start_y
+                    && position.y < end_y
             });
         self.hovering = hovering.and_then(|v| Some(v.layout_box_idx));
     }
@@ -7232,16 +7293,19 @@ impl Renderer {
         buffer: &mut [u32],
         width: u32,
         height: u32,
+        offset_x: i32,
         offset_y: i32,
     ) {
+        let container_start_x = layout_box.rect.x + offset_x;
+        let container_start_y = layout_box.rect.y + offset_y;
         if let Some(border) = &layout_box.rect.border.left {
             draw_rect_filled(
                 buffer,
                 false,
                 width,
                 height,
-                layout_box.rect.x,
-                layout_box.rect.y + offset_y,
+                container_start_x,
+                container_start_y,
                 border.size,
                 layout_box.rect.height,
                 border.color,
@@ -7253,8 +7317,8 @@ impl Renderer {
                 false,
                 width,
                 height,
-                layout_box.rect.x,
-                layout_box.rect.y + offset_y,
+                container_start_x,
+                container_start_y,
                 layout_box.rect.width,
                 border.size,
                 border.color,
@@ -7266,8 +7330,8 @@ impl Renderer {
                 false,
                 width,
                 height,
-                layout_box.rect.x + layout_box.rect.width as i32 - border.size as i32,
-                layout_box.rect.y + offset_y,
+                container_start_x + layout_box.rect.width as i32 - border.size as i32,
+                container_start_y,
                 border.size,
                 layout_box.rect.height,
                 border.color,
@@ -7279,8 +7343,8 @@ impl Renderer {
                 false,
                 width,
                 height,
-                layout_box.rect.x,
-                layout_box.rect.y + offset_y + layout_box.rect.height as i32 - border.size as i32,
+                container_start_x,
+                container_start_y + layout_box.rect.height as i32 - border.size as i32,
                 layout_box.rect.width,
                 border.size,
                 border.color,
@@ -7294,6 +7358,7 @@ impl Renderer {
         buffer: &mut [u32],
         width: u32,
         height: u32,
+        container_start_x: i32,
         container_start_y: i32,
         pixmap_buffer: &tiny_skia::Pixmap,
         opaque: bool,
@@ -7302,16 +7367,16 @@ impl Renderer {
         let pixmap_width = layout_box.rect.width.min(pixmap_buffer.width());
         let pixmap_height = layout_box.rect.height.min(pixmap_buffer.height());
         let pixmap_stride = pixmap_buffer.width();
-        let end_x = pixmap_width.min((width as i32 - layout_box.rect.x).max(0) as u32);
-        let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
+        let end_x = pixmap_width.min((width as i32 - container_start_x).max(0) as u32);
         let start_y = (-container_start_y).max(0) as u32;
+        let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
         for pixel_y in start_y..end_y {
             let src_start = (pixel_y * pixmap_stride) as usize;
             let src_row = &pixels[src_start..src_start + pixmap_width as usize];
             let dst_start = (container_start_y * width as i32
-                + layout_box.rect.x.min(width as i32)
+                + container_start_x.min(width as i32)
                 + pixel_y as i32 * width as i32) as usize;
-            let dst_row = &mut buffer[dst_start..(dst_start + pixmap_width as usize)];
+            let dst_row = &mut buffer[dst_start..(dst_start + end_x as usize)];
             for pixel_x in 0..end_x {
                 let pixel = src_row[pixel_x as usize];
                 if opaque {
@@ -7332,27 +7397,33 @@ impl Renderer {
         buffer: &mut [u32],
         width: u32,
         height: u32,
+        parent_offset_x: i32,
         parent_offset_y: i32,
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
     ) {
+        let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
+        let style = self.node_styles.get(&layout_box.node_idx).cloned();
+        let (transform_x, transform_y) = style
+            .as_ref()
+            .map(|style| self.resolve_transform_offset(style, layout_box))
+            .unwrap_or((0, 0));
+        let offset_x = parent_offset_x + transform_x;
         let offset_y = parent_offset_y
             + self
                 .scroll_y
                 .get(&self.layout_to_node_idx(&layout_box_idx))
                 .cloned()
-                .unwrap_or(0);
+                .unwrap_or(0)
+            + transform_y;
         rendered_nodes_ordered.push(RenderedNode {
             layout_box_idx,
+            offset_x,
             offset_y,
         });
-        let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
-        if self
-            .node_styles
-            .get(&layout_box.node_idx)
-            .is_some_and(|style| style.opacity == 0.0)
-        {
+        if style.is_some_and(|style| style.opacity == 0.0) {
             return;
         }
+        let container_start_x = layout_box.rect.x + offset_x;
         let container_start_y = layout_box.rect.y + offset_y;
         let container_end_y = container_start_y + layout_box.content_height as i32;
         // If outside viewport, don't render
@@ -7415,6 +7486,7 @@ impl Renderer {
                                 buffer,
                                 width,
                                 height,
+                                container_start_x,
                                 container_start_y,
                                 pixmap,
                                 false,
@@ -7423,7 +7495,7 @@ impl Renderer {
                     }
                     _ => {}
                 };
-                self.paint_borders(&layout_box, buffer, width, height, offset_y);
+                self.paint_borders(&layout_box, buffer, width, height, offset_x, offset_y);
             }
             LayoutKind::Text(text) => {
                 let bg_hex: Option<u32> = match layout_box.rect.background {
@@ -7436,7 +7508,7 @@ impl Renderer {
                         false,
                         width,
                         height,
-                        layout_box.rect.x,
+                        container_start_x,
                         container_start_y,
                         layout_box.rect.width,
                         layout_box.rect.height,
@@ -7448,6 +7520,7 @@ impl Renderer {
                     buffer,
                     width,
                     height,
+                    container_start_x,
                     container_start_y,
                     text,
                     false,
@@ -7459,6 +7532,7 @@ impl Renderer {
                     buffer,
                     width,
                     height,
+                    container_start_x,
                     container_start_y,
                     pixmap_buffer,
                     *opaque,
@@ -7476,7 +7550,7 @@ impl Renderer {
                         handle.surface.lock().unwrap().as_ref(),
                         layout_box.rect.width,
                         layout_box.rect.height,
-                        layout_box.rect.x,
+                        container_start_x,
                         container_start_y,
                     );
                 } else {
@@ -7491,6 +7565,7 @@ impl Renderer {
                 buffer,
                 width,
                 height,
+                offset_x,
                 offset_y,
                 rendered_nodes_ordered,
             );
@@ -8306,14 +8381,14 @@ impl Browser {
         for (idx, js) in scripts.iter().enumerate() {
             if let ScriptContent::Link(link) = &js.content {
                 if self.executed_scripts.links.contains(&link) {
-                    println!("Script has already been ran, ignoring: {}", link);
+                    // println!("Script has already been ran, ignoring: {}", link);
                     continue;
                 }
 
                 self.executed_scripts.links.push(link.to_string());
             } else if let Some(node_idx) = js.node_idx {
                 if self.executed_scripts.nodes.contains(&node_idx) {
-                    println!("Script has already been ran, ignoring: {}", node_idx);
+                    // println!("Script has already been ran, ignoring: {}", node_idx);
                     continue;
                 }
 
@@ -8997,7 +9072,7 @@ impl Browser {
                                 (
                                     hovering_node_idx,
                                     Position {
-                                        x: cursor.x - layout_box.rect.x,
+                                        x: cursor.x - layout_box.rect.x - rendered_node.offset_x,
                                         y: cursor.y - layout_box.rect.y - rendered_node.offset_y,
                                     },
                                 )
@@ -9399,7 +9474,7 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://x.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string(), hover_debugging);
     // let mut browser = Browser::new(
     //     "file:///home/pontus/browser/pages/test.html".to_string(),

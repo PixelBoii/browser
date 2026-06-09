@@ -1842,11 +1842,15 @@ class Storage {
     __STORE = {}
 
     getItem(key) {
-        return this.__STORE[key]
+        return this.__STORE[key] ?? null
     }
 
     setItem(key, value) {
         this.__STORE[key] = value
+    }
+
+    removeItem(key) {
+        this.__STORE[key] = null
     }
 }
 

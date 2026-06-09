@@ -163,6 +163,17 @@ pub enum StylePointerEvents {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StyleTransformOperation {
+    Translate { x: StyleSize, y: StyleSize },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StyleTransform {
+    None,
+    Operations(Vec<StyleTransformOperation>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     pub width: StyleSize,
     pub height: StyleSize,
@@ -208,6 +219,7 @@ pub struct Style {
     pub z_index: StyleZIndex,
     pub pointer_events: StylePointerEvents,
     pub opacity: f32,
+    pub transform: StyleTransform,
 }
 
 impl Style {
@@ -257,6 +269,7 @@ impl Style {
             z_index: self.z_index.clone(),
             pointer_events: self.pointer_events.clone(),
             opacity: self.opacity,
+            transform: self.transform.clone(),
         }
     }
 }
@@ -425,6 +438,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         z_index: StyleZIndex::Auto,
         pointer_events: StylePointerEvents::Auto,
         opacity: parent_style.map(|v| v.opacity).unwrap_or(1.0),
+        transform: StyleTransform::None,
     }
 }
 
@@ -458,6 +472,105 @@ fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
         1 => Ok((values[0].clone(), values[0].clone())),
         2 => Ok((values[0].clone(), values[1].clone())),
         _ => Err(anyhow!("Failed to parse inline size {}", value)),
+    }
+}
+
+fn split_transform_args(value: &str) -> Vec<String> {
+    let comma_parts: Vec<String> = split_ignoring_parentheses(value.to_string(), ',', &[])
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if comma_parts.len() > 1 {
+        comma_parts
+    } else {
+        split_ignoring_parentheses(value.to_string(), ' ', &[])
+            .into_iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+}
+
+fn parse_transform_operation(name: &str, args: &str) -> Result<Option<StyleTransformOperation>> {
+    let parts = split_transform_args(args);
+    match name.to_ascii_lowercase().as_str() {
+        "translate" => {
+            if parts.is_empty() || parts.len() > 2 {
+                return Ok(None);
+            }
+            Ok(Some(StyleTransformOperation::Translate {
+                x: parse_style_size(&parts[0])?,
+                y: parts
+                    .get(1)
+                    .map(|part| parse_style_size(part))
+                    .transpose()?
+                    .unwrap_or(StyleSize::Px(0.)),
+            }))
+        }
+        "translatex" => {
+            if parts.len() != 1 {
+                return Ok(None);
+            }
+            Ok(Some(StyleTransformOperation::Translate {
+                x: parse_style_size(&parts[0])?,
+                y: StyleSize::Px(0.),
+            }))
+        }
+        "translatey" => {
+            if parts.len() != 1 {
+                return Ok(None);
+            }
+            Ok(Some(StyleTransformOperation::Translate {
+                x: StyleSize::Px(0.),
+                y: parse_style_size(&parts[0])?,
+            }))
+        }
+        "translate3d" => {
+            if parts.len() != 3 {
+                return Ok(None);
+            }
+            Ok(Some(StyleTransformOperation::Translate {
+                x: parse_style_size(&parts[0])?,
+                y: parse_style_size(&parts[1])?,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_transform(value: &str) -> Result<Option<StyleTransform>> {
+    let original = value.trim();
+    if original == "none" {
+        return Ok(Some(StyleTransform::None));
+    }
+
+    let mut operations = vec![];
+    for function in split_ignoring_parentheses(original.to_string(), ' ', &[]) {
+        let function = function.trim();
+        if function.is_empty() {
+            continue;
+        }
+        let Some((name, args)) = function.split_once('(') else {
+            return Ok(None);
+        };
+        let name = name.trim();
+        let Some(args) = args.strip_suffix(')') else {
+            return Ok(None);
+        };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let Some(operation) = parse_transform_operation(name, args)? else {
+            return Ok(None);
+        };
+        operations.push(operation);
+    }
+
+    if operations.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(StyleTransform::Operations(operations)))
     }
 }
 
@@ -1621,6 +1734,9 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
             "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
             "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
+            "transform" => parse_transform(&value)?
+                .map(PropertyValue::Transform)
+                .unwrap_or(PropertyValue::Raw(value)),
             "initial-value" | "syntax" | "inherits" => PropertyValue::Raw(value),
             _ => {
                 // println!("Failed to parse style \"{}\"", property);
@@ -1921,6 +2037,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("pointer-events", PropertyValue::PointerEvents(value)) => {
             style.pointer_events = value;
+        }
+        ("transform", PropertyValue::Transform(value)) => {
+            style.transform = value;
         }
         ("opacity", PropertyValue::Raw(value)) => {
             if let Ok(value) = value.parse::<f32>() {

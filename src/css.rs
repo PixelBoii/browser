@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::style::{
     GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay,
     StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize,
-    StyleZIndex, parse_property_value, split_ignoring_parentheses,
+    StyleTransform, StyleZIndex, parse_property_value, split_ignoring_parentheses,
 };
 
 const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
@@ -177,6 +177,7 @@ pub enum PropertyValue {
     VariableTemplate(Vec<VariableTemplatePart>),
     ZIndex(StyleZIndex),
     PointerEvents(StylePointerEvents),
+    Transform(StyleTransform),
 }
 
 #[derive(Debug, Clone)]
