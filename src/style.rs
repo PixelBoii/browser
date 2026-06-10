@@ -132,6 +132,7 @@ pub struct StyleSizeAndColor {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridColumnSize {
+    Auto,
     Px(i32),
     Rem(f32),
     Percent(f32),
@@ -214,6 +215,7 @@ pub struct Style {
     pub border_right: StyleSizeAndColor,
     pub border_bottom: StyleSizeAndColor,
     pub grid_template_columns: GridTemplateColumns,
+    pub grid_template_rows: GridTemplateColumns,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub z_index: StyleZIndex,
@@ -264,6 +266,7 @@ impl Style {
             border_right: self.border_right.clone(),
             border_bottom: self.border_bottom.clone(),
             grid_template_columns: self.grid_template_columns.clone(),
+            grid_template_rows: self.grid_template_rows.clone(),
             overflow_x: self.overflow_x.clone(),
             overflow_y: self.overflow_y.clone(),
             z_index: self.z_index.clone(),
@@ -433,6 +436,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             style: StyleBorderStyle::None,
         },
         grid_template_columns: GridTemplateColumns::None,
+        grid_template_rows: GridTemplateColumns::None,
         overflow_x: Overflow::Auto,
         overflow_y: Overflow::Auto,
         z_index: StyleZIndex::Auto,
@@ -816,6 +820,9 @@ fn parse_style_size(value: impl AsRef<str>) -> Result<StyleSize> {
 }
 
 fn parse_grid_size(value: String) -> Result<GridColumnSize> {
+    if value == "auto" {
+        return Ok(GridColumnSize::Auto);
+    }
     if value.ends_with("%") {
         let percentage = value
             .strip_suffix("%")
@@ -1731,6 +1738,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                 PropertyValue::BorderSide(parse_border_side_value(value)?)
             }
             "grid-template-columns" => parse_grid_template_columns_value(value)?,
+            "grid-template-rows" => parse_grid_template_columns_value(value)?,
             "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
             "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
             "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
@@ -2017,6 +2025,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("grid-template-columns", PropertyValue::GridTemplateColumns(columns)) => {
             style.grid_template_columns = columns;
+        }
+        ("grid-template-rows", PropertyValue::GridTemplateColumns(rows)) => {
+            style.grid_template_rows = rows;
         }
         ("overflow", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow.clone();

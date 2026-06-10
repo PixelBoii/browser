@@ -4078,6 +4078,17 @@ impl CachedRasterizations {
     }
 }
 
+#[derive(Debug)]
+struct GridBaseItem {
+    node_idx: usize,
+    base_width: u32,
+    target_width: u32,
+    base_height: u32,
+    target_height: u32,
+    column: i32,
+    row: i32,
+}
+
 pub enum HtmlEvent {
     Click,
     Change,
@@ -6130,6 +6141,58 @@ impl Renderer {
         current_column >= template_columns.len() as i32
     }
 
+    fn calculate_grid_item_size(&self, template: &Vec<GridTemplateColumnsValue>, base_item_target: usize, to_distribute: u32, to_give: u32, max_total_fractions: i32, total_auto_columns: i32, max_sizes: &Vec<u32>) -> i32 {
+        match &template[base_item_target] {
+            GridTemplateColumnsValue::Size(size) => match size {
+                GridColumnSize::Px(px) => *px,
+                GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                GridColumnSize::Percent(percent) => {
+                    (to_distribute as f32 * (*percent / 100.)) as i32
+                }
+                GridColumnSize::Fraction(fraction) => {
+                    (to_give as f32
+                        * (*fraction as f32 / max_total_fractions as f32))
+                        as i32
+                }
+                GridColumnSize::Auto => {
+                    if max_total_fractions == 0 {
+                        to_give as i32 / total_auto_columns
+                    } else {
+                        max_sizes[base_item_target] as i32
+                    }
+                }
+            },
+            GridTemplateColumnsValue::MinMax((min, max)) => {
+                let min_parsed = match min {
+                    GridColumnSize::Px(px) => *px,
+                    GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                    GridColumnSize::Percent(percent) => {
+                        (to_distribute as f32 * (*percent / 100.)) as i32
+                    }
+                    GridColumnSize::Fraction(_) => panic!(),
+                    // TODO: I think this needs auto calculation too
+                    GridColumnSize::Auto => 0,
+                };
+                let max_parsed = match max {
+                    GridColumnSize::Px(px) => *px,
+                    GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                    GridColumnSize::Percent(percent) => {
+                        (to_distribute as f32 * (*percent / 100.)) as i32
+                    }
+                    GridColumnSize::Fraction(fraction) => {
+                        (to_give as f32
+                            * (*fraction as f32 / max_total_fractions as f32))
+                            as i32
+                    }
+                    // TODO: I think this needs auto calculation too
+                    GridColumnSize::Auto => 0,
+                };
+
+                max_parsed.max(min_parsed)
+            }
+        }
+    }
+
     fn layout_grid(
         &mut self,
         node_idx: usize,
@@ -6193,6 +6256,7 @@ impl Renderer {
         let mut max_child_height = 0;
         let mut longest_row_width = 0;
         let width_to_distribute = container_sizes.inner_width;
+        let height_to_distribute = container_sizes.inner_height;
         let children_idxs = self
             .dom_indexes
             .children_index
@@ -6201,7 +6265,11 @@ impl Renderer {
             .unwrap();
         let mut current_column = 0;
         let mut definitely_used_width = 0;
-        let mut max_total_fractions = 0;
+        let mut definitely_used_height = 0;
+        let mut max_column_fractions = 0;
+        let mut max_row_fractions = 0;
+        let mut total_auto_columns = 0;
+        let mut total_auto_rows = 0;
         if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
             for value in template_columns.iter() {
                 match value {
@@ -6213,29 +6281,67 @@ impl Renderer {
                                 (container_sizes.inner_width as f32 * (*percent / 100.)) as i32
                             }
                             GridColumnSize::Fraction(fraction) => {
-                                max_total_fractions += fraction;
+                                max_column_fractions += fraction;
                                 0
                             }
+                            GridColumnSize::Auto => {
+                                total_auto_columns += 1;
+                                0
+                            },
                         };
                     }
                     GridTemplateColumnsValue::MinMax((_, max)) => {
                         if let GridColumnSize::Fraction(fraction) = max {
-                            max_total_fractions += fraction;
+                            max_column_fractions += fraction;
                         }
                     }
                 };
             }
         }
-        let dynamic_space_to_give = width_to_distribute - definitely_used_width as u32;
+        if let GridTemplateColumns::Values(template_rows) = style.grid_template_rows.clone() {
+            for value in template_rows.iter() {
+                match value {
+                    GridTemplateColumnsValue::Size(size) => {
+                        definitely_used_height += match size {
+                            GridColumnSize::Px(px) => *px,
+                            GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                            GridColumnSize::Percent(percent) => {
+                                (container_sizes.inner_height as f32 * (*percent / 100.)) as i32
+                            }
+                            GridColumnSize::Fraction(fraction) => {
+                                max_row_fractions += fraction;
+                                0
+                            }
+                            GridColumnSize::Auto => {
+                                total_auto_rows += 1;
+                                0
+                            },
+                        };
+                    }
+                    GridTemplateColumnsValue::MinMax((_, max)) => {
+                        if let GridColumnSize::Fraction(fraction) = max {
+                            max_row_fractions += fraction;
+                        }
+                    }
+                };
+            }
+        }
+        let mut dynamic_width_to_give = width_to_distribute - definitely_used_width as u32;
+        let mut dynamic_height_to_give = height_to_distribute - definitely_used_height as u32;
         let justify_items = style.justify_items;
         let align_items = style.align_items;
-        // Inline-block doesn't fill the width, so instruct children to not do that either
-        let child_allow_fill = match style.display {
-            StyleDisplay::InlineBlock | StyleDisplay::Inline => false,
-            StyleDisplay::Grid if justify_items != StyleJustifyContent::Stretch => false,
-            _ => allow_fill,
+        let child_allow_fill = if justify_items != StyleJustifyContent::Stretch {
+            false
+        } else {
+            allow_fill
         };
         let grid_template_columns = style.grid_template_columns.clone();
+        let grid_template_rows = style.grid_template_rows.clone();
+        let mut base_items = vec![];
+        let mut column_count = 1usize;
+        let mut row_count = 1usize;
+        let mut current_row: usize = 0;
+        // Compute base items and their ideal sizes
         for child_idx in children_idxs.iter() {
             let wrap = match grid_template_columns {
                 GridTemplateColumns::Values(ref template_columns) => {
@@ -6244,59 +6350,16 @@ impl Renderer {
                 GridTemplateColumns::None => current_column >= 1,
             };
             if wrap {
-                content_position.x = original_content_position.x;
-                content_position.y += max_child_height;
                 max_child_height = 0;
                 current_column = 0;
+                current_row += 1;
+                row_count = row_count.max(current_row + 1);
             }
-            let specified_column_size =
-                if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
-                    match &template_columns[current_column as usize] {
-                        GridTemplateColumnsValue::Size(size) => match size {
-                            GridColumnSize::Px(px) => *px,
-                            GridColumnSize::Rem(rem) => (rem * 16.) as i32,
-                            GridColumnSize::Percent(percent) => {
-                                (width_to_distribute as f32 * (*percent / 100.)) as i32
-                            }
-                            GridColumnSize::Fraction(fraction) => {
-                                (dynamic_space_to_give as f32
-                                    * (*fraction as f32 / max_total_fractions as f32))
-                                    as i32
-                            }
-                        },
-                        GridTemplateColumnsValue::MinMax((min, max)) => {
-                            let min_parsed = match min {
-                                GridColumnSize::Px(px) => *px,
-                                GridColumnSize::Rem(rem) => (rem * 16.) as i32,
-                                GridColumnSize::Percent(percent) => {
-                                    (width_to_distribute as f32 * (*percent / 100.)) as i32
-                                }
-                                GridColumnSize::Fraction(_) => panic!(),
-                            };
-                            let max_parsed = match max {
-                                GridColumnSize::Px(px) => *px,
-                                GridColumnSize::Rem(rem) => (rem * 16.) as i32,
-                                GridColumnSize::Percent(percent) => {
-                                    (width_to_distribute as f32 * (*percent / 100.)) as i32
-                                }
-                                GridColumnSize::Fraction(fraction) => {
-                                    (dynamic_space_to_give as f32
-                                        * (*fraction as f32 / max_total_fractions as f32))
-                                        as i32
-                                }
-                            };
-
-                            max_parsed.max(min_parsed)
-                        }
-                    }
-                } else {
-                    container_sizes.inner_width as i32
-                };
             if let Some(child) = self.layout_node(
                 *child_idx,
                 content_position,
                 Size {
-                    width: specified_column_size as u32,
+                    width: container_sizes.inner_width,
                     height: container_sizes.inner_height,
                 },
                 OptionalSize {
@@ -6304,31 +6367,115 @@ impl Renderer {
                     width: None,
                 },
                 containing_node_idx,
+                false,
+                false,
+                &LayoutMode::BaseCalculation,
+            ) {
+                let child_box = self.layout_table.get(&child).unwrap();
+                base_items.push(GridBaseItem {
+                    node_idx: *child_idx,
+                    base_width: child_box.rect.width,
+                    target_width: child_box.rect.width,
+                    base_height: child_box.rect.height,
+                    target_height: child_box.rect.height,
+                    column: current_column,
+                    row: current_row as i32,
+                });
+                current_column += 1;
+                column_count = column_count.max(current_column as usize);
+            }
+        }
+        // Compute max sizes per column (used for auto calculation)
+        let mut column_max_widths = vec![0; column_count];
+        let mut column_max_heights = vec![0; row_count];
+        for base_item in base_items.iter() {
+            column_max_widths[base_item.column as usize] = column_max_widths[base_item.column as usize].max(base_item.base_width);
+            column_max_heights[base_item.row as usize] = column_max_heights[base_item.row as usize].max(base_item.base_height);
+        }
+        // Deduct max sizes per {} from dynamic_{}_to_give as it will be used by auto calculation
+        if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
+            for column in 0..column_count {
+                if let Some(GridTemplateColumnsValue::Size(GridColumnSize::Auto)) = template_columns.get(column) && max_column_fractions > 0 {
+                    dynamic_width_to_give = dynamic_width_to_give.saturating_sub(column_max_widths[column]);
+                }
+            }
+        }
+        if let GridTemplateColumns::Values(ref template_rows) = grid_template_rows {
+            for row in 0..row_count {
+                if let Some(GridTemplateColumnsValue::Size(GridColumnSize::Auto)) = template_rows.get(row) && max_row_fractions > 0 {
+                    dynamic_height_to_give = dynamic_height_to_give.saturating_sub(column_max_heights[row]);
+                }
+            }
+        }
+        // Lay out base items and convert build real layout children
+        for base_item in base_items.iter_mut() {
+            let specified_column_size = if let GridTemplateColumns::Values(columns) = &grid_template_columns {
+                self.calculate_grid_item_size(columns, base_item.column as usize, width_to_distribute, dynamic_width_to_give, max_column_fractions, total_auto_columns, &column_max_widths)
+            } else {
+                container_sizes.inner_width as i32
+            };
+            let specified_height = if let GridTemplateColumns::Values(rows) = &grid_template_rows {
+                self.calculate_grid_item_size(rows, base_item.row as usize, height_to_distribute, dynamic_height_to_give, max_row_fractions, total_auto_rows, &column_max_heights)
+            } else {
+                height_to_distribute as i32 / row_count as i32
+            };
+            base_item.target_width = specified_column_size as u32;
+            base_item.target_height = specified_height as u32;
+        }
+        let mut last_column = 0;
+        for base_item in base_items {
+            let wrap = base_item.column <= last_column;
+            last_column = base_item.column;
+            if wrap {
+                content_position.x = original_content_position.x;
+                content_position.y += max_child_height;
+                max_child_height = 0;
+            }
+            let free_x = (base_item.target_width as i32 - base_item.base_width as i32).max(0);
+            let free_y = (base_item.target_height as i32 - base_item.base_height as i32).max(0);
+            let offset_x = match justify_items {
+                StyleJustifyContent::Center => free_x / 2,
+                StyleJustifyContent::FlexEnd => free_x,
+                _ => 0,
+            };
+            let offset_y = match align_items {
+                StyleJustifyContent::Center => free_y / 2,
+                StyleJustifyContent::FlexEnd => free_y,
+                _ => 0,
+            };
+            let child_position = Position {
+                x: content_position.x + offset_x,
+                y: content_position.y + offset_y,
+            };
+            let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
+            let forced_width = match child_style.width {
+                StyleSize::Auto if justify_items == StyleJustifyContent::Stretch => base_item.target_width,
+                _ => base_item.base_width,
+            };
+            let forced_height = match child_style.height {
+                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => base_item.target_height,
+                _ => base_item.base_height,
+            };
+            if let Some(child) = self.layout_node(
+                base_item.node_idx,
+                child_position,
+                Size {
+                    width: base_item.target_width,
+                    height: base_item.target_height,
+                },
+                OptionalSize {
+                    width: Some(forced_width),
+                    height: Some(forced_height),
+                },
+                containing_node_idx,
                 child_allow_fill,
                 save_as_final,
                 mode,
             ) {
-                let child_box = self.layout_table.get(&child).unwrap();
-                let child_width = child_box.rect.width as i32;
-                let child_height = child_box.rect.height as i32;
-                let free_x = (specified_column_size - child_width).max(0);
-                let free_y = (container_sizes.inner_height as i32 - child_height).max(0);
-                let offset_x = match justify_items {
-                    StyleJustifyContent::Center => free_x / 2,
-                    StyleJustifyContent::FlexEnd => free_x,
-                    _ => 0,
-                };
-                let offset_y = match align_items {
-                    StyleJustifyContent::Center => free_y / 2,
-                    StyleJustifyContent::FlexEnd => free_y,
-                    _ => 0,
-                };
-                self.move_entire_box(child, offset_x, offset_y);
-                content_position.x += specified_column_size;
+                content_position.x += base_item.target_width as i32;
                 longest_row_width =
                     longest_row_width.max(content_position.x - original_content_position.x);
-                current_column += 1;
-                max_child_height = max_child_height.max(child_height);
+                max_child_height = max_child_height.max(base_item.target_height as i32);
                 children.push(child);
             }
         }
@@ -9474,12 +9621,12 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    let mut browser = Browser::new("https://x.com".to_string(), hover_debugging);
+    // let mut browser = Browser::new("https://x.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string(), hover_debugging);
-    // let mut browser = Browser::new(
-    //     "file:///home/pontus/browser/pages/test.html".to_string(),
-    //     hover_debugging,
-    // );
+    let mut browser = Browser::new(
+        "file:///home/pontus/browser/pages/test.html".to_string(),
+        hover_debugging,
+    );
 
     let params = browser.open()?;
     browser.start_event_loop(params)?;
