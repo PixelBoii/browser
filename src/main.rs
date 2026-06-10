@@ -6141,7 +6141,16 @@ impl Renderer {
         current_column >= template_columns.len() as i32
     }
 
-    fn calculate_grid_item_size(&self, template: &Vec<GridTemplateColumnsValue>, base_item_target: usize, to_distribute: u32, to_give: u32, max_total_fractions: i32, total_auto_columns: i32, max_sizes: &Vec<u32>) -> i32 {
+    fn calculate_grid_item_size(
+        &self,
+        template: &Vec<GridTemplateColumnsValue>,
+        base_item_target: usize,
+        to_distribute: u32,
+        to_give: u32,
+        max_total_fractions: i32,
+        total_auto_columns: i32,
+        max_sizes: &Vec<u32>,
+    ) -> i32 {
         match &template[base_item_target] {
             GridTemplateColumnsValue::Size(size) => match size {
                 GridColumnSize::Px(px) => *px,
@@ -6150,9 +6159,7 @@ impl Renderer {
                     (to_distribute as f32 * (*percent / 100.)) as i32
                 }
                 GridColumnSize::Fraction(fraction) => {
-                    (to_give as f32
-                        * (*fraction as f32 / max_total_fractions as f32))
-                        as i32
+                    (to_give as f32 * (*fraction as f32 / max_total_fractions as f32)) as i32
                 }
                 GridColumnSize::Auto => {
                     if max_total_fractions == 0 {
@@ -6180,9 +6187,7 @@ impl Renderer {
                         (to_distribute as f32 * (*percent / 100.)) as i32
                     }
                     GridColumnSize::Fraction(fraction) => {
-                        (to_give as f32
-                            * (*fraction as f32 / max_total_fractions as f32))
-                            as i32
+                        (to_give as f32 * (*fraction as f32 / max_total_fractions as f32)) as i32
                     }
                     // TODO: I think this needs auto calculation too
                     GridColumnSize::Auto => 0,
@@ -6287,7 +6292,7 @@ impl Renderer {
                             GridColumnSize::Auto => {
                                 total_auto_columns += 1;
                                 0
-                            },
+                            }
                         };
                     }
                     GridTemplateColumnsValue::MinMax((_, max)) => {
@@ -6315,7 +6320,7 @@ impl Renderer {
                             GridColumnSize::Auto => {
                                 total_auto_rows += 1;
                                 0
-                            },
+                            }
                         };
                     }
                     GridTemplateColumnsValue::MinMax((_, max)) => {
@@ -6389,33 +6394,60 @@ impl Renderer {
         let mut column_max_widths = vec![0; column_count];
         let mut column_max_heights = vec![0; row_count];
         for base_item in base_items.iter() {
-            column_max_widths[base_item.column as usize] = column_max_widths[base_item.column as usize].max(base_item.base_width);
-            column_max_heights[base_item.row as usize] = column_max_heights[base_item.row as usize].max(base_item.base_height);
+            column_max_widths[base_item.column as usize] =
+                column_max_widths[base_item.column as usize].max(base_item.base_width);
+            column_max_heights[base_item.row as usize] =
+                column_max_heights[base_item.row as usize].max(base_item.base_height);
         }
         // Deduct max sizes per {} from dynamic_{}_to_give as it will be used by auto calculation
         if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
             for column in 0..column_count {
-                if let Some(GridTemplateColumnsValue::Size(GridColumnSize::Auto)) = template_columns.get(column) && max_column_fractions > 0 {
-                    dynamic_width_to_give = dynamic_width_to_give.saturating_sub(column_max_widths[column]);
+                if let Some(GridTemplateColumnsValue::Size(GridColumnSize::Auto)) =
+                    template_columns.get(column)
+                    && max_column_fractions > 0
+                {
+                    dynamic_width_to_give =
+                        dynamic_width_to_give.saturating_sub(column_max_widths[column]);
                 }
             }
         }
         if let GridTemplateColumns::Values(ref template_rows) = grid_template_rows {
             for row in 0..row_count {
-                if let Some(GridTemplateColumnsValue::Size(GridColumnSize::Auto)) = template_rows.get(row) && max_row_fractions > 0 {
-                    dynamic_height_to_give = dynamic_height_to_give.saturating_sub(column_max_heights[row]);
+                if let Some(GridTemplateColumnsValue::Size(GridColumnSize::Auto)) =
+                    template_rows.get(row)
+                    && max_row_fractions > 0
+                {
+                    dynamic_height_to_give =
+                        dynamic_height_to_give.saturating_sub(column_max_heights[row]);
                 }
             }
         }
         // Lay out base items and convert build real layout children
         for base_item in base_items.iter_mut() {
-            let specified_column_size = if let GridTemplateColumns::Values(columns) = &grid_template_columns {
-                self.calculate_grid_item_size(columns, base_item.column as usize, width_to_distribute, dynamic_width_to_give, max_column_fractions, total_auto_columns, &column_max_widths)
-            } else {
-                container_sizes.inner_width as i32
-            };
+            let specified_column_size =
+                if let GridTemplateColumns::Values(columns) = &grid_template_columns {
+                    self.calculate_grid_item_size(
+                        columns,
+                        base_item.column as usize,
+                        width_to_distribute,
+                        dynamic_width_to_give,
+                        max_column_fractions,
+                        total_auto_columns,
+                        &column_max_widths,
+                    )
+                } else {
+                    container_sizes.inner_width as i32
+                };
             let specified_height = if let GridTemplateColumns::Values(rows) = &grid_template_rows {
-                self.calculate_grid_item_size(rows, base_item.row as usize, height_to_distribute, dynamic_height_to_give, max_row_fractions, total_auto_rows, &column_max_heights)
+                self.calculate_grid_item_size(
+                    rows,
+                    base_item.row as usize,
+                    height_to_distribute,
+                    dynamic_height_to_give,
+                    max_row_fractions,
+                    total_auto_rows,
+                    &column_max_heights,
+                )
             } else {
                 height_to_distribute as i32 / row_count as i32
             };
@@ -6449,11 +6481,15 @@ impl Renderer {
             };
             let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
             let forced_width = match child_style.width {
-                StyleSize::Auto if justify_items == StyleJustifyContent::Stretch => base_item.target_width,
+                StyleSize::Auto if justify_items == StyleJustifyContent::Stretch => {
+                    base_item.target_width
+                }
                 _ => base_item.base_width,
             };
             let forced_height = match child_style.height {
-                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => base_item.target_height,
+                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => {
+                    base_item.target_height
+                }
                 _ => base_item.base_height,
             };
             if let Some(child) = self.layout_node(
@@ -6782,9 +6818,8 @@ impl Renderer {
             children.push(layout_box);
         }
 
-        let content_height =
-            ((content_position.y - original_cursor.y).max(0) as u32 + row_height)
-                .max(max_child_height);
+        let content_height = ((content_position.y - original_cursor.y).max(0) as u32 + row_height)
+            .max(max_child_height);
         let height = specified_height
             .unwrap_or_else(|| {
                 if children.is_empty() && content_height == 0 {
@@ -8627,7 +8662,10 @@ impl Browser {
 
             // Run onload handlers
             if let Some(node_idx) = js.node_idx {
-                let code = format!("runEventListeners(`${{{}}}:load`, new Event('load'))", node_idx);
+                let code = format!(
+                    "runEventListeners(`${{{}}}:load`, new Event('load'))",
+                    node_idx
+                );
                 runtime.execute_script("script onload", code.clone())?;
                 Self::drain_microtasks(&mut runtime);
             }

@@ -1044,7 +1044,10 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         } else {
             (cleaned.trim(), None)
         };
-        let mut parts: Vec<&str> = rgba.split([',', ' ']).filter(|str| !str.is_empty()).collect();
+        let mut parts: Vec<&str> = rgba
+            .split([',', ' '])
+            .filter(|str| !str.is_empty())
+            .collect();
         match parts.len() {
             3 => {}
             4 => {
