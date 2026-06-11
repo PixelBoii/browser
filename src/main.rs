@@ -514,7 +514,9 @@ struct FlexItem {
     node_idx: usize,
     target_size: f32,
     base_size: f32,
+    max_size: f32,
     cross_size: f32,
+    max_cross_size: f32,
     shrink: u32,
     grow: u32,
 }
@@ -6449,7 +6451,7 @@ impl Renderer {
                     &column_max_heights,
                 )
             } else {
-                height_to_distribute as i32 / row_count as i32
+                base_item.base_height as i32
             };
             base_item.target_width = specified_column_size as u32;
             base_item.target_height = specified_height as u32;
@@ -6877,20 +6879,20 @@ impl Renderer {
 
     fn calculate_cross_offset(
         &self,
-        item: &FlexItem,
+        node_idx: usize,
+        used_cross: u32,
         parent_style: &Style,
         has_definite_height: bool,
         allow_fill: bool,
         container_sizes: &ContainerSizes,
     ) -> u32 {
-        let Some(item_style) = self.node_styles.get(&item.node_idx) else {
+        let Some(item_style) = self.node_styles.get(&node_idx) else {
             return 0;
         };
         let align = match item_style.align_self {
             StyleJustifyContent::Auto => parent_style.align_items,
             v => v,
         };
-        let used_cross = item.cross_size.round() as u32;
         let cross_free_space = match parent_style.flex_direction {
             StyleFlexDirection::Column if allow_fill => {
                 container_sizes.inner_width.saturating_sub(used_cross)
@@ -7107,11 +7109,37 @@ impl Renderer {
                     StyleFlexDirection::Row => child_box.rect.height,
                     StyleFlexDirection::Column => child_box.rect.width,
                 };
+                let max_width = get_specified_size(
+                    font_size,
+                    &child_style.max_width,
+                    Some(container_sizes.inner_width),
+                    None,
+                    &self.window_size,
+                )
+                .unwrap_or(i32::MAX);
+                let max_height = get_specified_size(
+                    font_size,
+                    &child_style.max_height,
+                    Some(container_sizes.inner_height),
+                    None,
+                    &self.window_size,
+                )
+                .unwrap_or(i32::MAX);
+                let max_size = match style.flex_direction {
+                    StyleFlexDirection::Row => max_width,
+                    StyleFlexDirection::Column => max_height,
+                };
+                let max_cross_size = match style.flex_direction {
+                    StyleFlexDirection::Row => max_height,
+                    StyleFlexDirection::Column => max_width,
+                };
                 base_items.push(FlexItem {
                     node_idx: *child_idx,
                     target_size: size as f32,
-                    base_size: size as f32,
-                    cross_size: cross_size as f32,
+                    base_size: (size as f32).min(max_size as f32),
+                    max_size: max_size as f32,
+                    cross_size: (cross_size as f32).min(max_cross_size as f32),
+                    max_cross_size: max_cross_size as f32,
                     shrink: child_style.flex_shrink,
                     grow: child_style.flex_grow,
                 });
@@ -7141,7 +7169,7 @@ impl Renderer {
                 for item in &mut base_items {
                     let scaled = item.base_size * item.shrink as f32;
                     let reduction = overflow * scaled / total_scaled;
-                    item.target_size = (item.base_size - reduction).max(0.);
+                    item.target_size = (item.base_size - reduction).max(0.).min(item.max_size);
                 }
             }
         } else if overflow < 0. && allow_fill {
@@ -7149,13 +7177,15 @@ impl Renderer {
             let total_grow: u32 = base_items.iter().map(|i| i.grow).sum();
             if total_grow > 0 {
                 for item in &mut base_items {
-                    item.target_size =
-                        item.base_size + left_to_grow * (item.grow as f32 / total_grow as f32);
+                    item.target_size = (item.base_size
+                        + left_to_grow * (item.grow as f32 / total_grow as f32))
+                        .min(item.max_size);
                 }
             }
         }
 
         // Stretch children on cross-axis if appropiate
+        let mut definite_cross_size = false;
         if style.align_items == StyleJustifyContent::Stretch && allow_fill {
             for item in &mut base_items {
                 let child_style: &Style = &self.node_styles.get(&item.node_idx).unwrap();
@@ -7169,12 +7199,16 @@ impl Renderer {
                 match style.flex_direction {
                     StyleFlexDirection::Column => {
                         if child_style.width == StyleSize::Auto {
-                            item.cross_size = cross_available_size as f32;
+                            item.cross_size =
+                                (cross_available_size as f32).min(item.max_cross_size);
+                            definite_cross_size = true;
                         }
                     }
                     StyleFlexDirection::Row => {
                         if child_style.height == StyleSize::Auto && has_definite_height {
-                            item.cross_size = cross_available_size as f32;
+                            item.cross_size =
+                                (cross_available_size as f32).min(item.max_cross_size);
+                            definite_cross_size = true;
                         }
                     }
                 };
@@ -7240,22 +7274,11 @@ impl Renderer {
                 let mut children_rows = MarginRows::new();
 
                 for (item_idx, item) in base_items.iter().enumerate() {
-                    let cross_offset = self.calculate_cross_offset(
-                        &item,
-                        &style,
-                        has_definite_height,
-                        allow_fill,
-                        &container_sizes,
-                    );
                     let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
-                    let (margin_left_size, margin_right_size, margin_top_size, _) =
+                    let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
                         self.get_margins(item.node_idx, &child_style, available_size);
-                    let stretch_cross = child_style.align_self == StyleJustifyContent::Stretch
-                        || (child_style.align_self == StyleJustifyContent::Auto
-                            && style.align_items == StyleJustifyContent::Stretch);
                     // Re-compute cursor for each child so that align-self works
-                    content_position.y =
-                        original_content_cursor.y + cross_offset as i32 + margin_top_size;
+                    content_position.y = original_content_cursor.y + margin_top_size;
                     content_position.x += margin_left_size;
 
                     let last = item_idx == base_items.len() - 1;
@@ -7267,7 +7290,7 @@ impl Renderer {
                             height: container_sizes.inner_height,
                         },
                         OptionalSize {
-                            height: stretch_cross.then_some(item.cross_size as u32),
+                            height: definite_cross_size.then_some(item.cross_size as u32),
                             width: Some(item.target_size as u32),
                         },
                         containing_node_idx,
@@ -7276,6 +7299,18 @@ impl Renderer {
                         mode,
                     ) {
                         let child_box = self.layout_table.get(&child).unwrap();
+                        // Adjust by cross offset after laying it out, as the final height may change from base due to different width
+                        let outer_cross = child_box.rect.height
+                            + margin_top_size.max(0) as u32
+                            + margin_bottom_size.max(0) as u32;
+                        let cross_offset = self.calculate_cross_offset(
+                            item.node_idx,
+                            outer_cross,
+                            &style,
+                            has_definite_height,
+                            allow_fill,
+                            &container_sizes,
+                        );
                         if !child_style.position.is_free() {
                             content_position.x += child_box.rect.width as i32 + margin_right_size;
                             children_rows.last_row(child, 0);
@@ -7285,6 +7320,8 @@ impl Renderer {
                             }
                             max_child_height = max_child_height.max(child_box.rect.height);
                         }
+                        content_position.y += cross_offset as i32;
+                        self.move_entire_box(child, 0, cross_offset as i32);
                         children.push(child);
                     }
                 }
@@ -7325,18 +7362,10 @@ impl Renderer {
                 let mut children_rows = MarginRows::new();
 
                 for (item_idx, item) in base_items.iter().enumerate() {
-                    let cross_offset = self.calculate_cross_offset(
-                        &item,
-                        &style,
-                        has_definite_height,
-                        allow_fill,
-                        &container_sizes,
-                    );
                     let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
                     let (margin_left_size, _, margin_top_size, margin_bottom_size) =
                         self.get_margins(item.node_idx, &child_style, available_size);
-                    content_position.x =
-                        original_content_cursor.x + cross_offset as i32 + margin_left_size;
+                    content_position.x = original_content_cursor.x + margin_left_size;
                     // TODO: This should probably go into the flex calculation
                     content_position.y += margin_top_size;
 
@@ -7350,7 +7379,7 @@ impl Renderer {
                         },
                         OptionalSize {
                             height: Some(item.target_size as u32),
-                            width: Some(item.cross_size as u32),
+                            width: definite_cross_size.then_some(item.cross_size as u32),
                         },
                         containing_node_idx,
                         allow_fill,
@@ -7358,6 +7387,17 @@ impl Renderer {
                         mode,
                     ) {
                         let child_box = self.layout_table.get(&child).unwrap();
+                        let outer_cross = child_box.rect.width
+                            + margin_top_size.max(0) as u32
+                            + margin_bottom_size.max(0) as u32;
+                        let cross_offset = self.calculate_cross_offset(
+                            item.node_idx,
+                            outer_cross,
+                            &style,
+                            has_definite_height,
+                            allow_fill,
+                            &container_sizes,
+                        );
                         if !child_style.position.is_free() {
                             max_affecting_child_width =
                                 max_affecting_child_width.max(child_box.rect.width);
@@ -7368,6 +7408,8 @@ impl Renderer {
                                 content_position.y += main_gap as i32;
                             }
                         }
+                        content_position.x += cross_offset as i32;
+                        self.move_entire_box(child, cross_offset as i32, 0);
                         children.push(child);
                     }
                 }
