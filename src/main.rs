@@ -6153,7 +6153,10 @@ impl Renderer {
         total_auto_columns: i32,
         max_sizes: &Vec<u32>,
     ) -> i32 {
-        match &template[base_item_target] {
+        let Some(value) = &template.get(base_item_target) else {
+            return 0;
+        };
+        match value {
             GridTemplateColumnsValue::Size(size) => match size {
                 GridColumnSize::Px(px) => *px,
                 GridColumnSize::Rem(rem) => (rem * 16.) as i32,
@@ -9701,12 +9704,12 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    // let mut browser = Browser::new("https://x.com".to_string(), hover_debugging);
+    let mut browser = Browser::new("https://www.google.com".to_string(), hover_debugging);
     // let mut browser = Browser::new("http://localhost:5173".to_string(), hover_debugging);
-    let mut browser = Browser::new(
-        "file:///home/pontus/browser/pages/test.html".to_string(),
-        hover_debugging,
-    );
+    // let mut browser = Browser::new(
+    //     "file:///home/pontus/browser/pages/test.html".to_string(),
+    //     hover_debugging,
+    // );
 
     let params = browser.open()?;
     browser.start_event_loop(params)?;
