@@ -163,6 +163,19 @@ pub enum StylePointerEvents {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StyleVisibility {
+    Visible,
+    Hidden,
+    Collapse,
+}
+
+impl StyleVisibility {
+    pub fn is_visible(self) -> bool {
+        self == StyleVisibility::Visible
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleTransformOperation {
     Translate { x: StyleSize, y: StyleSize },
@@ -221,6 +234,7 @@ pub struct Style {
     pub z_index: StyleZIndex,
     pub pointer_events: StylePointerEvents,
     pub opacity: f32,
+    pub visibility: StyleVisibility,
     pub transform: StyleTransform,
 }
 
@@ -272,6 +286,7 @@ impl Style {
             z_index: self.z_index.clone(),
             pointer_events: self.pointer_events.clone(),
             opacity: self.opacity,
+            visibility: self.visibility,
             transform: self.transform.clone(),
         }
     }
@@ -442,6 +457,9 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         z_index: StyleZIndex::Auto,
         pointer_events: StylePointerEvents::Auto,
         opacity: parent_style.map(|v| v.opacity).unwrap_or(1.0),
+        visibility: parent_style
+            .map(|style| style.visibility)
+            .unwrap_or(StyleVisibility::Visible),
         transform: StyleTransform::None,
     }
 }
@@ -1745,6 +1763,14 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
             "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
             "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
+            "visibility" => match value.as_str().trim() {
+                "visible" => PropertyValue::Visibility(StyleVisibility::Visible),
+                "hidden" => PropertyValue::Visibility(StyleVisibility::Hidden),
+                "collapse" => PropertyValue::Visibility(StyleVisibility::Collapse),
+                "inherit" | "unset" => PropertyValue::Raw(value),
+                "initial" => PropertyValue::Visibility(StyleVisibility::Visible),
+                _ => Err(anyhow!("Failed to parse visibility: {}", value))?,
+            },
             "transform" => parse_transform(&value)?
                 .map(PropertyValue::Transform)
                 .unwrap_or(PropertyValue::Raw(value)),
@@ -2060,10 +2086,8 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
                 style.opacity = value.clamp(0.0, 1.0);
             }
         }
-        ("visibility", PropertyValue::Raw(value)) => {
-            if value == "hidden" || value == "collapse" {
-                style.opacity = 0.0;
-            }
+        ("visibility", PropertyValue::Visibility(value)) => {
+            style.visibility = value;
         }
         (_, PropertyValue::Raw(_)) => {}
         (_, value) => {

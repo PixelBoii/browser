@@ -14,7 +14,8 @@ use resvg::tiny_skia::{IntSize, Pixmap};
 use resvg::usvg::Tree;
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
-    StyleSize, StyleTransform, StyleTransformOperation, get_base_style, parse_style,
+    StyleSize, StyleTransform, StyleTransformOperation, StyleVisibility, get_base_style,
+    parse_style,
 };
 
 use std::cell::{Ref, RefCell, RefMut};
@@ -6070,9 +6071,13 @@ impl Renderer {
         let inner_width = container_width.saturating_sub(
             (padding_left_size + padding_right_size + border_left_size + border_right_size) as u32,
         );
-        // TODO: Container heights should probably respect min and max height
-        let container_height_non_filling = specified_height;
-        let container_height = specified_height.unwrap_or(available_size.height);
+        let container_height_non_filling = specified_height
+            .map(|v| v.min(max_height.unwrap_or(u32::MAX)).max(min_height.unwrap_or(u32::MIN)));
+        let container_height = specified_height
+            .or(min_height)
+            .unwrap_or(available_size.height)
+            .min(max_height.unwrap_or(u32::MAX))
+            .max(min_height.unwrap_or(u32::MIN));
         let inner_height = container_height.saturating_sub(
             (padding_top_size + padding_bottom_size + border_top_size + border_bottom_size) as u32,
         );
@@ -7011,7 +7016,7 @@ impl Renderer {
             &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
-        let has_definite_height = forced_size.height.is_some() || specified_height.is_some();
+        let has_definite_height = forced_size.height.is_some() || specified_height.is_some() || container_sizes.min_height.is_some();
         self.resolved_specified_heights
             .insert(node_idx, specified_height);
         self.resolved_specified_widths
@@ -7506,6 +7511,9 @@ impl Renderer {
                 if style.pointer_events == StylePointerEvents::None {
                     return false;
                 }
+                if !style.visibility.is_visible() {
+                    return false;
+                }
                 let layout_box = self
                     .layout_table
                     .get(&renderer_node.layout_box_idx)
@@ -7656,15 +7664,21 @@ impl Renderer {
             offset_x,
             offset_y,
         });
-        if style.is_some_and(|style| style.opacity == 0.0) {
+        if style.as_ref().is_some_and(|style| style.opacity == 0.0) {
             return;
         }
+        let visible = style
+            .as_ref()
+            .is_none_or(|style| style.visibility == StyleVisibility::Visible);
         let container_start_x = layout_box.rect.x + offset_x;
         let container_start_y = layout_box.rect.y + offset_y;
         let container_end_y = container_start_y + layout_box.content_height as i32;
         // If outside viewport, don't render
         // This is a bit naive but should be okay for now
         if container_start_y > height as i32 || container_end_y < 0 {
+            return;
+        }
+        if !visible {
             return;
         }
         match &layout_box.kind {
