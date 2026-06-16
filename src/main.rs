@@ -9723,9 +9723,10 @@ impl Browser {
             tab.window = tab_window;
             match tab.open() {
                 Ok(params) => {
-                    let proxy = RendererProxy::WindowLoop(proxy);
-                    tab.set_up_without_event_loop(params, proxy.clone()).unwrap();
-                    tab.start_main_loop(proxy, rx);
+                    let window_proxy = RendererProxy::WindowLoop(proxy);
+                    let frame_proxy = RendererProxy::FrameLoop(tx);
+                    tab.set_up_without_event_loop(params, frame_proxy).unwrap();
+                    tab.start_main_loop(window_proxy, rx);
                 },
                 Err(err) => eprintln!("Failed to open frame due to {}", err),
             };
