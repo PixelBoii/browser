@@ -9821,16 +9821,17 @@ impl Browser {
                     let Ok(url) = ReqwestUrl::parse(&text) else {
                         return;
                     };
-                    let _ = self.current_tab()
-                        .tx
-                        .send(FrameCommand::UserEvent(UserEvent::Navigate((
-                            UserNavigateUrl::Form(FormNavigation {
-                                url,
-                                method: FormMethod::Get,
-                                body: None,
-                            }),
-                            true,
-                        ))));
+                    let _ =
+                        self.current_tab()
+                            .tx
+                            .send(FrameCommand::UserEvent(UserEvent::Navigate((
+                                UserNavigateUrl::Form(FormNavigation {
+                                    url,
+                                    method: FormMethod::Get,
+                                    body: None,
+                                }),
+                                true,
+                            ))));
                 }
             }
         }
