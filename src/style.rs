@@ -1074,10 +1074,10 @@ fn parse_color(value: String) -> Result<StyleBackground> {
             }
             _ => panic!("Invalid RGBA string: {}", rgba),
         }
-        let parsed_parts: Vec<u8> = parts
+        let parsed_parts: Vec<f32> = parts
             .iter()
             .take(3)
-            .filter_map(|part| part.trim().parse::<u8>().ok())
+            .filter_map(|part| part.trim().parse::<f32>().ok())
             .collect();
         let alpha = if let Some(alpha) = alpha {
             (alpha.parse::<f32>()?.clamp(0.0, 1.0) * 255.0).round() as u8
@@ -1087,7 +1087,12 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         if parsed_parts.len() != 3 {
             panic!("Invalid RGBA string: {}", rgba);
         }
-        let hex = rgba_to_hex((parsed_parts[0], parsed_parts[1], parsed_parts[2], alpha));
+        let hex = rgba_to_hex((
+            parsed_parts[0] as u8,
+            parsed_parts[1] as u8,
+            parsed_parts[2] as u8,
+            alpha,
+        ));
         Ok(StyleBackground::Hex(hex))
     } else {
         match value.to_ascii_lowercase().as_str() {

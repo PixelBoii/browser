@@ -1,11 +1,18 @@
 #![allow(dead_code, unused_imports)]
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc, sync::mpsc::Sender};
 
 use anyhow::{Context, Result, anyhow};
 use resvg::tiny_skia::Pixmap;
+use winit::{
+    event::KeyEvent,
+    keyboard::{KeyCode, PhysicalKey},
+};
 
-use crate::{FontHandler, Position, blend_rgba_with_rgba, draw_rect_filled, text_to_buffer};
+use crate::{
+    BrowserAction, FontHandler, Position, blend_rgb_with_rgba, blend_rgba_with_rgba,
+    draw_rect_filled, text_to_buffer,
+};
 
 pub struct UiBuilder {
     curr: Option<usize>,
@@ -13,6 +20,12 @@ pub struct UiBuilder {
     width: u32,
     height: u32,
     font_handler: Rc<FontHandler>,
+    pub comms_tx: Sender<BrowserAction>,
+}
+
+pub struct Typeable {
+    pub text: String,
+    pub on_enter: Option<Box<dyn Fn(&Typeable)>>,
 }
 
 pub struct Element {
@@ -23,6 +36,7 @@ pub struct Element {
     pub parent: Option<usize>,
     pub on_click: Option<Box<dyn Fn()>>,
     pub hor: bool,
+    pub typeable: Option<Typeable>,
     pub gap: u32,
 }
 
@@ -36,6 +50,7 @@ impl Element {
             parent: None,
             on_click: None,
             hor: false,
+            typeable: None,
             gap: 0,
         }
     }
@@ -63,10 +78,11 @@ impl Node {
 }
 
 pub struct UiRuntime {
-    pub nodes: Vec<Node>,
+    pub builder: UiBuilder,
     pub buffer: Vec<u32>,
     pub layout: Vec<LayoutBox>,
     pub hovering: Option<usize>,
+    pub focused: Option<usize>,
 }
 
 impl UiRuntime {
@@ -77,7 +93,7 @@ impl UiRuntime {
             let end_x = start_x + layout_box.width as i32;
             let end_y = start_y + layout_box.height as i32;
 
-            if matches!(&self.nodes[layout_box.node_idx], Node::Element(_))
+            if matches!(&&self.builder.nodes[layout_box.node_idx], Node::Element(_))
                 && position.x >= start_x
                 && position.x < end_x
                 && position.y >= start_y
@@ -94,26 +110,70 @@ impl UiRuntime {
         let Some(hovering) = self.hovering else {
             return;
         };
-        let mut outer_node = Some(&self.nodes[hovering]);
-        while let Some(node) = outer_node {
+        let mut outer_node = Some((hovering, &self.builder.nodes[hovering]));
+        let mut typeable_found = false;
+        while let Some((node_idx, node)) = outer_node {
             if let Node::Element(element) = node {
                 if let Some(cb) = &element.on_click {
                     cb();
                 }
+                if element.typeable.is_some() && !typeable_found {
+                    typeable_found = true;
+                    self.focused = Some(node_idx);
+                }
             };
-            outer_node = node.get_parent().map(|parent| &self.nodes[parent]);
+            outer_node = node
+                .get_parent()
+                .map(|parent| (parent, &self.builder.nodes[parent]));
         }
+        if !typeable_found {
+            self.focused = None;
+        }
+    }
+
+    pub fn on_keyup(&mut self, event: KeyEvent) {
+        let Some(focused) = self.focused else {
+            return;
+        };
+        let Node::Element(element) = &mut self.builder.nodes[focused] else {
+            return;
+        };
+        let Some(typeable) = &mut element.typeable else {
+            return;
+        };
+        if let Some(text) = event.text {
+            if typeable.text.len() > 0
+                && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Backspace))
+            {
+                typeable.text.pop();
+            } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Enter))
+                && let Some(on_enter) = &typeable.on_enter
+            {
+                on_enter(&*typeable);
+            } else {
+                typeable.text += &text;
+            }
+            let _ = self.builder.comms_tx.send(BrowserAction::Rerender);
+        }
+    }
+
+    pub fn rerender(&mut self) -> Result<()> {
+        let (layout, buffer) = self.builder.layout_pair()?;
+        self.layout = layout;
+        self.buffer = buffer;
+        Ok(())
     }
 }
 
 impl UiBuilder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, comms_tx: Sender<BrowserAction>) -> Result<Self> {
         Ok(Self {
             curr: None,
             nodes: vec![],
             width,
             height,
             font_handler: Rc::new(FontHandler::new()?),
+            comms_tx,
         })
     }
 
@@ -169,6 +229,11 @@ impl UiBuilder {
         Ok(())
     }
 
+    pub fn typeable(&mut self, typeable: Typeable) -> Result<()> {
+        self.curr_element_mut()?.typeable = Some(typeable);
+        Ok(())
+    }
+
     pub fn text(&mut self, text: String) -> Result<()> {
         let node = Node::Text(TextElement {
             text,
@@ -194,7 +259,6 @@ impl UiBuilder {
         mut cursor: (i32, i32),
         node_idx: usize,
         children_index: &HashMap<usize, Vec<usize>>,
-        horizontal: bool,
     ) -> Result<()> {
         match &self.nodes[node_idx] {
             Node::Element(el) => {
@@ -213,17 +277,35 @@ impl UiBuilder {
 
                 if let Some(children) = children_index.get(&node_idx) {
                     for child in children {
-                        self.render_node(layouts, cursor, *child, children_index, el.hor)?;
+                        self.render_node(layouts, cursor, *child, children_index)?;
 
                         let child_node = &self.nodes[*child];
                         if let Node::Element(child_el) = child_node {
-                            if horizontal {
+                            if el.hor {
                                 cursor.0 += child_el.width as i32 + el.gap as i32;
                             } else {
                                 cursor.1 += child_el.height as i32 + el.gap as i32;
                             }
                         }
                     }
+                }
+
+                if let Some(typeable) = &el.typeable
+                    && typeable.text.len() > 0
+                {
+                    let (pixmap, width, height) =
+                        text_to_buffer(&self.font_handler, 0x00_00_00_FF, &typeable.text, 14, None)
+                            .with_context(|| "Failed to convert text to buffer")?;
+
+                    layouts.push(LayoutBox {
+                        x: cursor.0,
+                        y: cursor.1,
+                        kind: LayoutKind::Text(pixmap),
+                        width,
+                        height,
+                        bg_color: 0x00_00_00_00,
+                        node_idx,
+                    });
                 }
             }
             Node::Text(el) => {
@@ -245,29 +327,14 @@ impl UiBuilder {
         Ok(())
     }
 
-    pub fn render(&mut self) -> Result<UiRuntime> {
+    fn layout_to_buffer(&self, layouts: &Vec<LayoutBox>) -> Vec<u32> {
         let mut buffer = vec![0; (self.width * self.height) as usize];
-        let cursor = (0, 0);
-        let mut children_index: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (idx, node) in self.nodes.iter().enumerate() {
-            if let Some(parent) = node.get_parent() {
-                children_index.entry(parent).or_default().push(idx);
-            }
-        }
-        // Start on root node
-        let mut layouts = vec![];
-        let hor = if let Node::Element(el) = &self.nodes[0] {
-            el.hor
-        } else {
-            false
-        };
-        self.render_node(&mut layouts, cursor, 0, &children_index, hor)?;
         for layout in layouts.iter() {
             match &layout.kind {
                 LayoutKind::Element => {
                     draw_rect_filled(
                         &mut buffer,
-                        true,
+                        false,
                         self.width,
                         self.height,
                         layout.x as i32,
@@ -291,7 +358,7 @@ impl UiBuilder {
                             let pixel = pixmap.pixels()[(y * pixmap.width() + x) as usize];
                             let dst =
                                 &mut buffer[(dst_y as u32 * self.width + dst_x as u32) as usize];
-                            *dst = blend_rgba_with_rgba(
+                            *dst = blend_rgb_with_rgba(
                                 *dst,
                                 (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()),
                             );
@@ -300,11 +367,36 @@ impl UiBuilder {
                 }
             }
         }
+        buffer
+    }
+
+    fn compute_children_index(&self) -> HashMap<usize, Vec<usize>> {
+        let mut children_index: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some(parent) = node.get_parent() {
+                children_index.entry(parent).or_default().push(idx);
+            }
+        }
+        children_index
+    }
+
+    pub fn layout_pair(&self) -> Result<(Vec<LayoutBox>, Vec<u32>)> {
+        let cursor = (0, 0);
+        let children_index = self.compute_children_index();
+        let mut layouts = vec![];
+        self.render_node(&mut layouts, cursor, 0, &children_index)?;
+        let buffer = self.layout_to_buffer(&layouts);
+        Ok((layouts, buffer))
+    }
+
+    pub fn render(self) -> Result<UiRuntime> {
+        let (layout, buffer) = self.layout_pair()?;
         Ok(UiRuntime {
-            layout: layouts,
+            builder: self,
+            layout,
             buffer,
-            nodes: self.nodes.drain(..).collect(),
             hovering: None,
+            focused: None,
         })
     }
 }
@@ -336,7 +428,8 @@ mod tests {
 
     #[test]
     fn renders() -> Result<()> {
-        let mut builder = UiBuilder::new(1920, 1080)?;
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut builder = UiBuilder::new(1920, 1080, tx)?;
         builder.start_element();
         builder.bg(0x00_FF_00_FF)?;
         builder.width(1920)?;

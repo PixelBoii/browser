@@ -57,11 +57,11 @@ use crate::style::{
     build_css_children_index, element_matched_attributes, get_chain_order, get_class_list,
     get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
 };
-use crate::ui::UiBuilder;
+use crate::ui::{Typeable, UiBuilder, UiRuntime};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
-const HEADER_HEIGHT: u32 = 60;
+const HEADER_HEIGHT: u32 = 100;
 
 // Many websites rely on the user-agent to be one of the major frames, so we don't use our own for now
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -5792,16 +5792,17 @@ impl Renderer {
         tx.send(FrameCommand::Render).unwrap();
         let tx_proxy = RendererProxy::FrameLoop(tx.clone());
         std::thread::spawn(move || {
-            let mut frame = Frame::new(url.clone().unwrap_or("about:blank".to_string()), false, size);
+            let mut frame = Frame::new(
+                url.clone().unwrap_or("about:blank".to_string()),
+                false,
+                size,
+            );
 
             let frame_result = frame.open();
             match frame_result {
                 Ok(params) => {
                     let _ = frame
-                        .set_up_without_event_loop(
-                            params,
-                            tx_proxy,
-                        )
+                        .set_up_without_event_loop(params, tx_proxy)
                         .inspect_err(|err| eprintln!("Failed to start iframe renderer: {:?}", err));
                 }
                 Err(err) => {
@@ -6071,8 +6072,10 @@ impl Renderer {
         let inner_width = container_width.saturating_sub(
             (padding_left_size + padding_right_size + border_left_size + border_right_size) as u32,
         );
-        let container_height_non_filling = specified_height
-            .map(|v| v.min(max_height.unwrap_or(u32::MAX)).max(min_height.unwrap_or(u32::MIN)));
+        let container_height_non_filling = specified_height.map(|v| {
+            v.min(max_height.unwrap_or(u32::MAX))
+                .max(min_height.unwrap_or(u32::MIN))
+        });
         let container_height = specified_height
             .or(min_height)
             .unwrap_or(available_size.height)
@@ -7016,7 +7019,9 @@ impl Renderer {
             &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
-        let has_definite_height = forced_size.height.is_some() || specified_height.is_some() || container_sizes.min_height.is_some();
+        let has_definite_height = forced_size.height.is_some()
+            || specified_height.is_some()
+            || container_sizes.min_height.is_some();
         self.resolved_specified_heights
             .insert(node_idx, specified_height);
         self.resolved_specified_widths
@@ -8937,9 +8942,7 @@ impl Frame {
             if had_command || js_pending {
                 js_pending = self
                     .pump_js_event_loop_once()
-                    .inspect_err(|err| {
-                        eprintln!("Error occurred while pumping JS loop: {}", err)
-                    })
+                    .inspect_err(|err| eprintln!("Error occurred while pumping JS loop: {}", err))
                     .unwrap_or(false);
             }
         }
@@ -9216,7 +9219,8 @@ impl Frame {
 
     fn render_loop(&mut self) -> Vec<u32> {
         let animation_redraw = self.tick_animations();
-        let mut buffer = vec![0; self.render_size.width as usize * self.render_size.height as usize];
+        let mut buffer =
+            vec![0; self.render_size.width as usize * self.render_size.height as usize];
         let first_boot = self.render(&mut buffer);
         if first_boot {
             let start = Instant::now();
@@ -9236,10 +9240,7 @@ impl Frame {
         buffer
     }
 
-    fn render(
-        &mut self,
-        buffer: &mut Vec<u32>,
-    ) -> bool {
+    fn render(&mut self, buffer: &mut Vec<u32>) -> bool {
         let start = Instant::now();
 
         self.renderer.as_mut().unwrap().borrow_mut().render_into(
@@ -9412,7 +9413,7 @@ impl Frame {
             FrameCommand::Render => {
                 let buffer = self.render_loop();
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
-            },
+            }
             FrameCommand::Resized(new_size) => {
                 self.render_size = new_size;
                 self.layout_dirty = true;
@@ -9490,7 +9491,7 @@ impl Frame {
                     }
                 };
             }
-            _ => {},
+            _ => {}
         };
     }
 
@@ -9619,7 +9620,14 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
         .context("Expected iterations to be an integer")?
         .unwrap_or(50);
 
-    let mut frame = Frame::new(url.to_string(), false, PhysicalSize { width: WINDOW_WIDTH, height: WINDOW_HEIGHT });
+    let mut frame = Frame::new(
+        url.to_string(),
+        false,
+        PhysicalSize {
+            width: WINDOW_WIDTH,
+            height: WINDOW_HEIGHT,
+        },
+    );
     let mut params = frame.open()?;
     let window_size = PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
     let hovering_chain = vec![];
@@ -9657,12 +9665,14 @@ pub struct Browser {
 }
 
 pub struct TabHandle {
-    tx: Sender<FrameCommand>
+    tx: Sender<FrameCommand>,
 }
 
 enum BrowserAction {
     OpenTab(String),
     SelectTab(usize),
+    Rerender,
+    Navigate(String),
 }
 
 impl Browser {
@@ -9670,12 +9680,20 @@ impl Browser {
         &self.tabs[self.current_tab_idx]
     }
 
-    fn get_header_buffer(&self, action_tx: Sender<BrowserAction>) -> Result<ui::UiRuntime> {
-        let mut builder = UiBuilder::new(WINDOW_WIDTH, HEADER_HEIGHT)?;
+    fn get_header_buffer(
+        &self,
+        url: &String,
+        action_tx: Sender<BrowserAction>,
+    ) -> Result<ui::UiRuntime> {
+        let mut builder = UiBuilder::new(WINDOW_WIDTH, HEADER_HEIGHT, action_tx.clone())?;
         builder.start_element();
         builder.width(WINDOW_WIDTH)?;
         builder.height(HEADER_HEIGHT)?;
         builder.bg(0x2e2e2eFF)?;
+
+        builder.start_element();
+        builder.width(WINDOW_WIDTH)?;
+        builder.height(60)?;
         builder.padding(10)?;
         builder.hor()?;
         builder.gap(10)?;
@@ -9708,18 +9726,38 @@ impl Browser {
 
         builder.finish_element()?;
 
+        builder.start_element();
+        builder.bg(0x363636FF)?;
+        builder.width(WINDOW_WIDTH)?;
+        builder.height(40)?;
+        let enter_tx = action_tx.clone();
+        builder.typeable(Typeable {
+            text: url.clone(),
+            on_enter: Some(Box::new(move |typeable: &Typeable| {
+                let _ = enter_tx.send(BrowserAction::Navigate(typeable.text.clone()));
+            })),
+        })?;
+        builder.finish_element()?;
+
+        builder.finish_element()?;
+
         builder.render()
     }
 
     pub fn open_tab(&self, url: String, hover_debugging: bool) -> Result<TabHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = TabHandle {
-            tx: tx.clone(),
-        };
+        let handle = TabHandle { tx: tx.clone() };
         let proxy = self.event_loop_proxy.clone();
         let tab_window = Some(self.window.clone());
         std::thread::spawn(move || {
-            let mut tab = Frame::new(url, hover_debugging, PhysicalSize { width: WINDOW_WIDTH, height: WINDOW_HEIGHT - HEADER_HEIGHT });
+            let mut tab = Frame::new(
+                url,
+                hover_debugging,
+                PhysicalSize {
+                    width: WINDOW_WIDTH,
+                    height: WINDOW_HEIGHT - HEADER_HEIGHT,
+                },
+            );
             tab.window = tab_window;
             match tab.open() {
                 Ok(params) => {
@@ -9727,11 +9765,75 @@ impl Browser {
                     let frame_proxy = RendererProxy::FrameLoop(tx);
                     tab.set_up_without_event_loop(params, frame_proxy).unwrap();
                     tab.start_main_loop(window_proxy, rx);
-                },
+                }
                 Err(err) => eprintln!("Failed to open frame due to {}", err),
             };
         });
         Ok(handle)
+    }
+
+    fn poll_header_events(
+        &mut self,
+        header: &mut UiRuntime,
+        window: &Arc<Window>,
+        header_comms_rx: &Receiver<BrowserAction>,
+        hover_debugging: bool,
+    ) {
+        while let Ok(action) = header_comms_rx.try_recv() {
+            match action {
+                BrowserAction::OpenTab(url) => match self.open_tab(url.clone(), hover_debugging) {
+                    Ok(handle) => {
+                        self.tabs.push(handle);
+                        self.current_tab_idx = self.tabs.len() - 1;
+                        match header.rerender() {
+                            Ok(_) => {
+                                window.request_redraw();
+                            }
+                            Err(err) => {
+                                eprintln!("Failed to render header: {err:?}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to open tab: {err:?}")
+                    }
+                },
+                BrowserAction::SelectTab(tab_idx) => {
+                    self.current_tab_idx = tab_idx;
+                    match header.rerender() {
+                        Ok(_) => {
+                            window.request_redraw();
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to render header: {err:?}");
+                        }
+                    }
+                }
+                BrowserAction::Rerender => match header.rerender() {
+                    Ok(_) => {
+                        window.request_redraw();
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to render header: {err:?}");
+                    }
+                },
+                BrowserAction::Navigate(text) => {
+                    let Ok(url) = ReqwestUrl::parse(&text) else {
+                        return;
+                    };
+                    let _ = self.current_tab()
+                        .tx
+                        .send(FrameCommand::UserEvent(UserEvent::Navigate((
+                            UserNavigateUrl::Form(FormNavigation {
+                                url,
+                                method: FormMethod::Get,
+                                body: None,
+                            }),
+                            true,
+                        ))));
+                }
+            }
+        }
     }
 
     pub fn open(url: String, hover_debugging: bool) -> Result<()> {
@@ -9754,14 +9856,19 @@ impl Browser {
         let mut surf = Surface::new(&ctx, surf_window.window_handle().expect("Window handle"))
             .expect("Softbuffer surface failed");
 
-        let mut browser = Browser { tabs: vec![], current_tab_idx: 0, window: window.clone(), event_loop_proxy: event_loop.create_proxy() };
-        let handle = browser.open_tab(url, hover_debugging)?;
+        let mut browser = Browser {
+            tabs: vec![],
+            current_tab_idx: 0,
+            window: window.clone(),
+            event_loop_proxy: event_loop.create_proxy(),
+        };
+        let handle = browser.open_tab(url.clone(), hover_debugging)?;
         browser.tabs.push(handle);
 
         let mut tab_buffer = vec![0; WINDOW_WIDTH as usize * HEADER_HEIGHT as usize];
 
         let (browser_action_tx, browser_action_rx) = std::sync::mpsc::channel();
-        let mut header = browser.get_header_buffer(browser_action_tx.clone())?;
+        let mut header = browser.get_header_buffer(&url, browser_action_tx.clone())?;
 
         event_loop
             .run(move |event, elwt| {
@@ -9770,8 +9877,14 @@ impl Browser {
                         WindowEvent::CloseRequested => elwt.exit(),
                         WindowEvent::Resized(new_size) => {
                             size = new_size;
-                            let tab_size = PhysicalSize { width: new_size.width, height: new_size.height - HEADER_HEIGHT };
-                            let _ = browser.current_tab().tx.send(FrameCommand::Resized(tab_size));
+                            let tab_size = PhysicalSize {
+                                width: new_size.width,
+                                height: new_size.height - HEADER_HEIGHT,
+                            };
+                            let _ = browser
+                                .current_tab()
+                                .tx
+                                .send(FrameCommand::Resized(tab_size));
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged { .. } => {
@@ -9779,7 +9892,8 @@ impl Browser {
                         }
                         WindowEvent::RedrawRequested => {
                             let width = NonZeroU32::new(size.width.max(1)).expect("Non-zero width");
-                            let height = NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
+                            let height =
+                                NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
                             surf.resize(width, height).expect("Resize failed");
 
                             let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
@@ -9798,12 +9912,24 @@ impl Browser {
                             device_id: _,
                             position,
                         } => {
-                            header.apply_hovering(Position { x: position.x as i32, y: position.y as i32 });
+                            header.apply_hovering(Position {
+                                x: position.x as i32,
+                                y: position.y as i32,
+                            });
                             let tab_cursor = Position {
                                 x: position.x as i32,
                                 y: position.y as i32 - HEADER_HEIGHT as i32,
                             };
-                            let _ = browser.current_tab().tx.send(FrameCommand::UserEvent(UserEvent::Hover(tab_cursor)));
+                            let _ = browser
+                                .current_tab()
+                                .tx
+                                .send(FrameCommand::UserEvent(UserEvent::Hover(tab_cursor)));
+                            browser.poll_header_events(
+                                &mut header,
+                                &window,
+                                &browser_action_rx,
+                                hover_debugging,
+                            );
                         }
                         WindowEvent::MouseInput {
                             device_id: _,
@@ -9812,55 +9938,17 @@ impl Browser {
                         } => match (button, state) {
                             (MouseButton::Left, ElementState::Released) => {
                                 header.on_click();
-                                let _ = browser.current_tab().tx.send(FrameCommand::UserEvent(UserEvent::Click));
-                                while let Ok(action) = browser_action_rx.try_recv() {
-                                    match action {
-                                        BrowserAction::OpenTab(url) => {
-                                            match browser.open_tab(url, hover_debugging) {
-                                                Ok(handle) => {
-                                                    browser.tabs.push(handle);
-                                                    browser.current_tab_idx =
-                                                        browser.tabs.len() - 1;
-                                                    match browser.get_header_buffer(
-                                                        browser_action_tx.clone(),
-                                                    ) {
-                                                        Ok(new_header) => {
-                                                            header = new_header;
-                                                            window.request_redraw();
-                                                        }
-                                                        Err(err) => {
-                                                            eprintln!(
-                                                                "Failed to render header: {err:?}"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Err(err) => {
-                                                    eprintln!("Failed to open tab: {err:?}")
-                                                }
-                                            }
-                                        }
-                                        BrowserAction::SelectTab(tab_idx) => {
-                                            if tab_idx < browser.tabs.len() {
-                                                browser.current_tab_idx = tab_idx;
-                                                match browser
-                                                    .get_header_buffer(browser_action_tx.clone())
-                                                {
-                                                    Ok(new_header) => {
-                                                        header = new_header;
-                                                        window.request_redraw();
-                                                    }
-                                                    Err(err) => {
-                                                        eprintln!(
-                                                            "Failed to render header: {err:?}"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            },
+                                let _ = browser
+                                    .current_tab()
+                                    .tx
+                                    .send(FrameCommand::UserEvent(UserEvent::Click));
+                                browser.poll_header_events(
+                                    &mut header,
+                                    &window,
+                                    &browser_action_rx,
+                                    hover_debugging,
+                                );
+                            }
                             _ => {}
                         },
                         WindowEvent::MouseWheel {
@@ -9870,7 +9958,9 @@ impl Browser {
                         } => {
                             match delta {
                                 MouseScrollDelta::LineDelta(_, y) => {
-                                    let _ = browser.current_tab().tx.send(FrameCommand::UserEvent(UserEvent::ScrollBy((0., y * 140.))));
+                                    let _ = browser.current_tab().tx.send(FrameCommand::UserEvent(
+                                        UserEvent::ScrollBy((0., y * 140.)),
+                                    ));
                                 }
                                 _ => {}
                             };
@@ -9881,7 +9971,17 @@ impl Browser {
                             is_synthetic: _,
                         } => {
                             if event.state == ElementState::Released {
-                                let _ = browser.current_tab().tx.send(FrameCommand::UserEvent(UserEvent::Keyup(event)));
+                                let _ = browser
+                                    .current_tab()
+                                    .tx
+                                    .send(FrameCommand::UserEvent(UserEvent::Keyup(event.clone())));
+                                header.on_keyup(event);
+                                browser.poll_header_events(
+                                    &mut header,
+                                    &window,
+                                    &browser_action_rx,
+                                    hover_debugging,
+                                );
                             }
                         }
                         _ => {}
@@ -9898,7 +9998,7 @@ impl Browser {
                         buffer[0..offset].copy_from_slice(&header.buffer);
 
                         buffer.present().expect("Failed to present");
-                    },
+                    }
                     Event::AboutToWait => {
                         for tab in browser.tabs.iter() {
                             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -9914,7 +10014,7 @@ impl Browser {
                                     } else {
                                         elwt.set_control_flow(ControlFlow::Wait);
                                     }
-                                },
+                                }
                                 Err(err) => {
                                     eprintln!("Failed to get tab reply: {}", err);
                                 }
@@ -10256,7 +10356,7 @@ pub fn ensure_snapshot_matches(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Result};
+    use anyhow::Result;
     use std::{
         ops::Add,
         time::{Duration, Instant},
@@ -10264,20 +10364,22 @@ mod tests {
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, Position, RendererProxy, ensure_snapshot_matches, style::{
+        Frame, Position, RendererProxy, ensure_snapshot_matches,
+        style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
-        }
+        },
     };
 
     #[test]
     fn renders_google() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://www.google.com".to_string(), false, PhysicalSize::new(1920, 1080));
+        let mut frame = Frame::new(
+            "https://www.google.com".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
@@ -10292,12 +10394,13 @@ mod tests {
     #[test]
     fn renders_swapped_com() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://widget.swapped.com/".to_string(), false, PhysicalSize::new(1920, 1080));
+        let mut frame = Frame::new(
+            "https://widget.swapped.com/".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
@@ -10308,12 +10411,13 @@ mod tests {
     #[test]
     fn render_vite_dev() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://vite.dev".to_string(), false, PhysicalSize::new(1920, 4320));
+        let mut frame = Frame::new(
+            "https://vite.dev".to_string(),
+            false,
+            PhysicalSize::new(1920, 4320),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 4320];
         frame.render_into(&mut buffer, 1920, 4320, true);
@@ -10323,12 +10427,13 @@ mod tests {
     #[test]
     fn render_time_tracker() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://pixel-time-tracker.pages.dev/".to_string(), false, PhysicalSize::new(1920, 1080));
+        let mut frame = Frame::new(
+            "https://pixel-time-tracker.pages.dev/".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_into(&mut buffer, 1920, 1080, true);
@@ -10338,12 +10443,13 @@ mod tests {
     #[test]
     fn render_slack() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://slack.com/".to_string(), false, PhysicalSize::new(1920, 8640));
+        let mut frame = Frame::new(
+            "https://slack.com/".to_string(),
+            false,
+            PhysicalSize::new(1920, 8640),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 8640];
@@ -10354,12 +10460,13 @@ mod tests {
     #[test]
     fn render_x() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://x.com/ThePrimeagen".to_string(), false, PhysicalSize::new(1920, 1080));
+        let mut frame = Frame::new(
+            "https://x.com/ThePrimeagen".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
@@ -10370,12 +10477,13 @@ mod tests {
     #[test]
     fn render_nodejs() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new("https://nodejs.org/en".to_string(), false, PhysicalSize::new(1920, 2160));
+        let mut frame = Frame::new(
+            "https://nodejs.org/en".to_string(),
+            false,
+            PhysicalSize::new(1920, 2160),
+        );
         let params = frame.open()?;
-        frame.set_up_without_event_loop(
-            params,
-            RendererProxy::FrameLoop(tx),
-        )?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
