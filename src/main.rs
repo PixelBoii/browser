@@ -132,6 +132,25 @@ impl RectBorder {
 }
 
 #[derive(Debug, Clone)]
+pub struct BorderRadius {
+    top_left: u32,
+    top_right: u32,
+    bottom_right: u32,
+    bottom_left: u32,
+}
+
+impl BorderRadius {
+    pub fn new_empty() -> Self {
+        Self {
+            top_left: 0,
+            top_right: 0,
+            bottom_right: 0,
+            bottom_left: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Rect {
     x: i32,
     y: i32,
@@ -139,6 +158,7 @@ struct Rect {
     height: u32,
     background: StyleBackground,
     border: RectBorder,
+    border_radius: BorderRadius,
 }
 
 #[derive(Debug, Clone)]
@@ -3576,6 +3596,7 @@ fn op_fill_canvas_rect(
         width,
         height,
         0x00_00_00_FF,
+        &BorderRadius::new_empty(),
     );
 
     renderer.schedule_dom_update();
@@ -3622,6 +3643,7 @@ fn op_stroke_canvas_rect(
         line_width,
         height,
         0x00_00_00_FF,
+        &BorderRadius::new_empty(),
     ); // Left
     draw_rect_filled(
         &mut canvas.buffer,
@@ -3633,6 +3655,7 @@ fn op_stroke_canvas_rect(
         width,
         line_width,
         0x00_00_00_FF,
+        &BorderRadius::new_empty(),
     ); // Top
     draw_rect_filled(
         &mut canvas.buffer,
@@ -3644,6 +3667,7 @@ fn op_stroke_canvas_rect(
         line_width,
         height,
         0x00_00_00_FF,
+        &BorderRadius::new_empty(),
     ); // Right
     draw_rect_filled(
         &mut canvas.buffer,
@@ -3655,6 +3679,7 @@ fn op_stroke_canvas_rect(
         width,
         line_width,
         0x00_00_00_FF,
+        &BorderRadius::new_empty(),
     ); // Bottom
 
     renderer.schedule_dom_update();
@@ -5307,6 +5332,7 @@ impl Renderer {
                             height: *height,
                             background: StyleBackground::Transparent,
                             border: RectBorder::new_empty(),
+                            border_radius: BorderRadius::new_empty(),
                         },
                         // TODO: Can probably avoid cloning here
                         kind: LayoutKind::Text(buffer.clone()),
@@ -5588,6 +5614,7 @@ impl Renderer {
                                 height,
                                 background: StyleBackground::Transparent,
                                 border: RectBorder::new_empty(),
+                                border_radius: BorderRadius::new_empty(),
                             },
                             kind: LayoutKind::PixMap((pixmap, opaque)),
                             children: vec![],
@@ -5638,6 +5665,7 @@ impl Renderer {
                                     right: None,
                                     bottom: None,
                                 },
+                                border_radius: BorderRadius::new_empty(),
                             },
                             kind: LayoutKind::Iframe,
                             children: vec![],
@@ -5693,28 +5721,28 @@ impl Renderer {
                             left: RectBorderSide::parse_from_style(
                                 &style.border_left,
                                 &style,
-                                resolved_font_size as u32,
+                                resolved_font_size,
                                 &available_size,
                                 &self.window_size,
                             ),
                             top: RectBorderSide::parse_from_style(
                                 &style.border_top,
                                 &style,
-                                resolved_font_size as u32,
+                                resolved_font_size,
                                 &available_size,
                                 &self.window_size,
                             ),
                             right: RectBorderSide::parse_from_style(
                                 &style.border_right,
                                 &style,
-                                resolved_font_size as u32,
+                                resolved_font_size,
                                 &available_size,
                                 &self.window_size,
                             ),
                             bottom: RectBorderSide::parse_from_style(
                                 &style.border_bottom,
                                 &style,
-                                resolved_font_size as u32,
+                                resolved_font_size,
                                 &available_size,
                                 &self.window_size,
                             ),
@@ -5722,6 +5750,37 @@ impl Renderer {
                         let z_index = match style.z_index {
                             StyleZIndex::Auto => 0,
                             StyleZIndex::Number(value) => value,
+                        };
+
+                        let border_radius = BorderRadius {
+                            top_left: get_specified_size(
+                                resolved_font_size,
+                                &style.border_radius_top_left,
+                                Some(available_size.width),
+                                None,
+                                &self.window_size,
+                            )? as u32,
+                            top_right: get_specified_size(
+                                resolved_font_size,
+                                &style.border_radius_top_right,
+                                Some(available_size.width),
+                                None,
+                                &self.window_size,
+                            )? as u32,
+                            bottom_right: get_specified_size(
+                                resolved_font_size,
+                                &style.border_radius_bottom_right,
+                                Some(available_size.width),
+                                None,
+                                &self.window_size,
+                            )? as u32,
+                            bottom_left: get_specified_size(
+                                resolved_font_size,
+                                &style.border_radius_bottom_left,
+                                Some(available_size.width),
+                                None,
+                                &self.window_size,
+                            )? as u32,
                         };
 
                         if let StyleBackground::DataUrl((format, data)) = &style_bg {
@@ -5766,6 +5825,7 @@ impl Renderer {
                                     height,
                                     background: style_bg,
                                     border,
+                                    border_radius,
                                 },
                                 kind: LayoutKind::Element,
                                 children,
@@ -6137,6 +6197,7 @@ impl Renderer {
                     height: *height,
                     background: StyleBackground::Transparent,
                     border: RectBorder::new_empty(),
+                    border_radius: BorderRadius::new_empty(),
                 },
                 // TODO: Could avoid a clone here
                 kind: LayoutKind::Text(buffer.clone()),
@@ -7558,6 +7619,7 @@ impl Renderer {
                 border.size,
                 layout_box.rect.height,
                 border.color,
+                &BorderRadius::new_empty(),
             );
         }
         if let Some(border) = &layout_box.rect.border.top {
@@ -7571,6 +7633,7 @@ impl Renderer {
                 layout_box.rect.width,
                 border.size,
                 border.color,
+                &BorderRadius::new_empty(),
             );
         }
         if let Some(border) = &layout_box.rect.border.right {
@@ -7584,6 +7647,7 @@ impl Renderer {
                 border.size,
                 layout_box.rect.height,
                 border.color,
+                &BorderRadius::new_empty(),
             );
         }
         if let Some(border) = &layout_box.rect.border.bottom {
@@ -7597,6 +7661,7 @@ impl Renderer {
                 layout_box.rect.width,
                 border.size,
                 border.color,
+                &BorderRadius::new_empty(),
             );
         }
     }
@@ -7730,6 +7795,7 @@ impl Renderer {
                             (layout_box.rect.height as i32 - top_border_size - bottom_border_size)
                                 .max(0) as u32,
                             code.clone(),
+                            &layout_box.rect.border_radius,
                         );
                     }
                     StyleBackground::DataUrl(_) => {
@@ -7768,6 +7834,7 @@ impl Renderer {
                         layout_box.rect.width,
                         layout_box.rect.height,
                         bg,
+                        &layout_box.rect.border_radius,
                     );
                 }
                 self.apply_pixmap_on_buffer(
@@ -9675,17 +9742,23 @@ enum BrowserAction {
     Navigate(String),
 }
 
+struct HeaderState {
+    url: String,
+}
+
 impl Browser {
     pub fn current_tab(&self) -> &TabHandle {
         &self.tabs[self.current_tab_idx]
     }
 
-    fn get_header_buffer(
+    fn build_header(
         &self,
-        url: &String,
+        builder: &mut UiBuilder,
+        state: &Rc<RefCell<HeaderState>>,
         action_tx: Sender<BrowserAction>,
-    ) -> Result<ui::UiRuntime> {
-        let mut builder = UiBuilder::new(WINDOW_WIDTH, HEADER_HEIGHT, action_tx.clone())?;
+    ) -> Result<()> {
+        builder.clean();
+
         builder.start_element();
         builder.width(WINDOW_WIDTH)?;
         builder.height(HEADER_HEIGHT)?;
@@ -9703,6 +9776,7 @@ impl Browser {
             builder.padding(10)?;
             builder.width(100)?;
             builder.height(40)?;
+            builder.rounded(10)?;
             builder.bg(0x363636FF)?;
             builder.text(format!("Tab {}", tab_idx + 1))?;
             let tx = action_tx.clone();
@@ -9717,6 +9791,7 @@ impl Browser {
         builder.width(100)?;
         builder.height(40)?;
         builder.bg(0x363636FF)?;
+        builder.rounded(10)?;
         builder.text("NEW".to_string())?;
         let tx = action_tx.clone();
         builder.on_click(move || {
@@ -9728,11 +9803,17 @@ impl Browser {
 
         builder.start_element();
         builder.bg(0x363636FF)?;
+        builder.padding(10)?;
         builder.width(WINDOW_WIDTH)?;
         builder.height(40)?;
         let enter_tx = action_tx.clone();
+        let on_input_state = state.clone();
         builder.typeable(Typeable {
-            text: url.clone(),
+            text: state.borrow().url.clone(),
+            color: 0xFF_FF_FF_FF,
+            on_input: Some(Box::new(move |typeable: &Typeable| {
+                on_input_state.borrow_mut().url = typeable.text.clone();
+            })),
             on_enter: Some(Box::new(move |typeable: &Typeable| {
                 let _ = enter_tx.send(BrowserAction::Navigate(typeable.text.clone()));
             })),
@@ -9741,7 +9822,20 @@ impl Browser {
 
         builder.finish_element()?;
 
-        builder.render()
+        Ok(())
+    }
+
+    fn get_header_buffer(
+        &self,
+        url: &String,
+        action_tx: Sender<BrowserAction>,
+    ) -> Result<ui::UiRuntime<HeaderState>> {
+        let state = HeaderState { url: url.clone() };
+        let mut runtime =
+            UiRuntime::new_empty(WINDOW_WIDTH, HEADER_HEIGHT, action_tx.clone(), state)?;
+        self.build_header(&mut runtime.builder, &runtime.state, action_tx)?;
+        runtime.rerender()?;
+        Ok(runtime)
     }
 
     pub fn open_tab(&self, url: String, hover_debugging: bool) -> Result<TabHandle> {
@@ -9774,7 +9868,7 @@ impl Browser {
 
     fn poll_header_events(
         &mut self,
-        header: &mut UiRuntime,
+        header: &mut UiRuntime<HeaderState>,
         window: &Arc<Window>,
         header_comms_rx: &Receiver<BrowserAction>,
         hover_debugging: bool,
@@ -9785,6 +9879,9 @@ impl Browser {
                     Ok(handle) => {
                         self.tabs.push(handle);
                         self.current_tab_idx = self.tabs.len() - 1;
+                        let comms_tx = header.builder.comms_tx.clone();
+                        self.build_header(&mut header.builder, &header.state, comms_tx)
+                            .unwrap();
                         match header.rerender() {
                             Ok(_) => {
                                 window.request_redraw();
@@ -9800,6 +9897,9 @@ impl Browser {
                 },
                 BrowserAction::SelectTab(tab_idx) => {
                     self.current_tab_idx = tab_idx;
+                    let comms_tx = header.builder.comms_tx.clone();
+                    self.build_header(&mut header.builder, &header.state, comms_tx)
+                        .unwrap();
                     match header.rerender() {
                         Ok(_) => {
                             window.request_redraw();
@@ -9809,14 +9909,19 @@ impl Browser {
                         }
                     }
                 }
-                BrowserAction::Rerender => match header.rerender() {
-                    Ok(_) => {
-                        window.request_redraw();
-                    }
-                    Err(err) => {
-                        eprintln!("Failed to render header: {err:?}");
-                    }
-                },
+                BrowserAction::Rerender => {
+                    let comms_tx = header.builder.comms_tx.clone();
+                    self.build_header(&mut header.builder, &header.state, comms_tx)
+                        .unwrap();
+                    match header.rerender() {
+                        Ok(_) => {
+                            window.request_redraw();
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to render header: {err:?}");
+                        }
+                    };
+                }
                 BrowserAction::Navigate(text) => {
                     let Ok(url) = ReqwestUrl::parse(&text) else {
                         return;
@@ -10226,6 +10331,7 @@ fn draw_glyph(
             1,
             1,
             with_coverage(color, c),
+            &BorderRadius::new_empty(),
         );
     });
 }
@@ -10298,6 +10404,7 @@ pub fn draw_rect_filled(
     w: u32,
     h: u32,
     color: u32,
+    border_radius: &BorderRadius,
 ) {
     let max_x = width as i32;
     let max_y = height as i32;
@@ -10307,10 +10414,71 @@ pub fn draw_rect_filled(
     let end_y = (y + h as i32).min(max_y);
     let stride = width as usize;
 
+    let has_border_radius = border_radius.top_left > 0
+        || border_radius.top_right > 0
+        || border_radius.bottom_right > 0
+        || border_radius.bottom_left > 0;
+    let mut mask = vec![true; (w * h) as usize];
+    if has_border_radius {
+        let radius = border_radius.top_left.min(w / 2).min(h / 2) as usize;
+        for row in 0..radius {
+            for col in 0..radius {
+                let dx = radius as i32 - col as i32;
+                let dy = radius as i32 - row as i32;
+
+                if dx * dx + dy * dy > (radius * radius) as i32 {
+                    mask[row * w as usize + col] = false;
+                }
+            }
+        }
+        let radius = border_radius.top_right.min(w / 2).min(h / 2) as usize;
+        for row in 0..radius {
+            for col in 0..radius {
+                let dx = col as i32;
+                let dy = radius as i32 - row as i32;
+
+                if dx * dx + dy * dy > (radius * radius) as i32 {
+                    mask[row * w as usize + col + w as usize - radius] = false;
+                }
+            }
+        }
+        let radius = border_radius.bottom_left.min(w / 2).min(h / 2) as usize;
+        for row in 0..radius {
+            for col in 0..radius {
+                let dx = radius as i32 - col as i32;
+                let dy = row as i32;
+
+                if dx * dx + dy * dy > (radius * radius) as i32 {
+                    mask[(row + h as usize - radius) * w as usize + col] = false;
+                }
+            }
+        }
+        let radius = border_radius.bottom_right.min(w / 2).min(h / 2) as usize;
+        for row in 0..radius {
+            for col in 0..radius {
+                let dx = col as i32;
+                let dy = row as i32;
+
+                if dx * dx + dy * dy > (radius * radius) as i32 {
+                    mask[(row + h as usize - radius) * w as usize + col + w as usize - radius] =
+                        false;
+                }
+            }
+        }
+    }
+
     let color_tuple = rgba_to_premul_tuple(color);
     for py in start_y..end_y {
         let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
         for px in start_x..end_x {
+            if has_border_radius {
+                let local_x = (px - x) as usize;
+                let local_y = (py - y) as usize;
+                if !mask[local_y * w as usize + local_x] {
+                    continue;
+                }
+            }
+
             if buffer_rgba {
                 row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
             } else {

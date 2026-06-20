@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports)]
 
-use std::{collections::HashMap, rc::Rc, sync::mpsc::Sender};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc::Sender};
 
 use anyhow::{Context, Result, anyhow};
 use resvg::tiny_skia::Pixmap;
@@ -25,6 +25,8 @@ pub struct UiBuilder {
 
 pub struct Typeable {
     pub text: String,
+    pub color: u32,
+    pub on_input: Option<Box<dyn Fn(&Typeable)>>,
     pub on_enter: Option<Box<dyn Fn(&Typeable)>>,
 }
 
@@ -38,6 +40,7 @@ pub struct Element {
     pub hor: bool,
     pub typeable: Option<Typeable>,
     pub gap: u32,
+    pub border_radius: u32,
 }
 
 impl Element {
@@ -52,6 +55,7 @@ impl Element {
             hor: false,
             typeable: None,
             gap: 0,
+            border_radius: 0,
         }
     }
 }
@@ -77,15 +81,39 @@ impl Node {
     }
 }
 
-pub struct UiRuntime {
+pub struct UiRuntime<T> {
     pub builder: UiBuilder,
     pub buffer: Vec<u32>,
     pub layout: Vec<LayoutBox>,
     pub hovering: Option<usize>,
     pub focused: Option<usize>,
+    pub state: Rc<RefCell<T>>,
 }
 
-impl UiRuntime {
+impl<T> UiRuntime<T> {
+    pub fn new_empty(
+        width: u32,
+        height: u32,
+        comms_tx: Sender<BrowserAction>,
+        state: T,
+    ) -> Result<Self> {
+        Ok(Self {
+            builder: UiBuilder {
+                curr: None,
+                nodes: vec![],
+                width,
+                height,
+                font_handler: Rc::new(FontHandler::new()?),
+                comms_tx,
+            },
+            buffer: vec![],
+            layout: vec![],
+            hovering: None,
+            focused: None,
+            state: Rc::new(RefCell::new(state)),
+        })
+    }
+
     pub fn apply_hovering(&mut self, position: Position) {
         for layout_box in self.layout.iter().rev() {
             let start_x = layout_box.x;
@@ -152,6 +180,9 @@ impl UiRuntime {
                 on_enter(&*typeable);
             } else {
                 typeable.text += &text;
+            }
+            if let Some(on_input) = &typeable.on_input {
+                on_input(&*typeable);
             }
             let _ = self.builder.comms_tx.send(BrowserAction::Rerender);
         }
@@ -229,6 +260,11 @@ impl UiBuilder {
         Ok(())
     }
 
+    pub fn rounded(&mut self, border_radius: u32) -> Result<()> {
+        self.curr_element_mut()?.border_radius = border_radius;
+        Ok(())
+    }
+
     pub fn typeable(&mut self, typeable: Typeable) -> Result<()> {
         self.curr_element_mut()?.typeable = Some(typeable);
         Ok(())
@@ -253,6 +289,11 @@ impl UiBuilder {
         Ok(())
     }
 
+    pub fn clean(&mut self) {
+        self.nodes.clear();
+        self.curr = None;
+    }
+
     fn render_node(
         &self,
         layouts: &mut Vec<LayoutBox>,
@@ -270,6 +311,7 @@ impl UiBuilder {
                     kind: LayoutKind::Element,
                     bg_color: el.bg_color,
                     node_idx,
+                    border_radius: el.border_radius,
                 });
 
                 cursor.0 += el.padding as i32;
@@ -293,9 +335,14 @@ impl UiBuilder {
                 if let Some(typeable) = &el.typeable
                     && typeable.text.len() > 0
                 {
-                    let (pixmap, width, height) =
-                        text_to_buffer(&self.font_handler, 0x00_00_00_FF, &typeable.text, 14, None)
-                            .with_context(|| "Failed to convert text to buffer")?;
+                    let (pixmap, width, height) = text_to_buffer(
+                        &self.font_handler,
+                        typeable.color,
+                        &typeable.text,
+                        14,
+                        None,
+                    )
+                    .with_context(|| "Failed to convert text to buffer")?;
 
                     layouts.push(LayoutBox {
                         x: cursor.0,
@@ -305,6 +352,7 @@ impl UiBuilder {
                         height,
                         bg_color: 0x00_00_00_00,
                         node_idx,
+                        border_radius: 0,
                     });
                 }
             }
@@ -321,6 +369,7 @@ impl UiBuilder {
                     height,
                     bg_color: 0x00_00_00_00,
                     node_idx,
+                    border_radius: 0,
                 });
             }
         };
@@ -342,6 +391,12 @@ impl UiBuilder {
                         layout.width,
                         layout.height,
                         layout.bg_color,
+                        &crate::BorderRadius {
+                            top_left: layout.border_radius,
+                            top_right: layout.border_radius,
+                            bottom_right: layout.border_radius,
+                            bottom_left: layout.border_radius,
+                        },
                     );
                 }
                 LayoutKind::Text(pixmap) => {
@@ -388,17 +443,6 @@ impl UiBuilder {
         let buffer = self.layout_to_buffer(&layouts);
         Ok((layouts, buffer))
     }
-
-    pub fn render(self) -> Result<UiRuntime> {
-        let (layout, buffer) = self.layout_pair()?;
-        Ok(UiRuntime {
-            builder: self,
-            layout,
-            buffer,
-            hovering: None,
-            focused: None,
-        })
-    }
 }
 
 pub enum LayoutKind {
@@ -414,6 +458,7 @@ pub struct LayoutBox {
     pub height: u32,
     pub bg_color: u32,
     pub node_idx: usize,
+    pub border_radius: u32,
 }
 
 mod tests {
@@ -424,12 +469,17 @@ mod tests {
     use softbuffer::{Context as SoftContext, Surface};
     use winit::{dpi::PhysicalSize, event_loop::EventLoopBuilder, window::WindowBuilder};
 
-    use crate::{Position, ensure_snapshot_matches, ui::UiBuilder};
+    use crate::{
+        Position, ensure_snapshot_matches,
+        ui::{UiBuilder, UiRuntime},
+    };
 
     #[test]
     fn renders() -> Result<()> {
         let (tx, _) = std::sync::mpsc::channel();
-        let mut builder = UiBuilder::new(1920, 1080, tx)?;
+        let state = false;
+        let runtime = UiRuntime::new_empty(1920, 1080, tx, state)?;
+        let mut builder = runtime.builder;
         builder.start_element();
         builder.bg(0x00_FF_00_FF)?;
         builder.width(1920)?;
@@ -444,8 +494,6 @@ mod tests {
         builder.finish_element()?;
 
         builder.finish_element()?;
-
-        let runtime = builder.render()?;
 
         ensure_snapshot_matches(&runtime.buffer, "UiBuilder", 1920, 1080)?;
 

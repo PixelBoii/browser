@@ -236,6 +236,10 @@ pub struct Style {
     pub opacity: f32,
     pub visibility: StyleVisibility,
     pub transform: StyleTransform,
+    pub border_radius_top_left: StyleSize,
+    pub border_radius_top_right: StyleSize,
+    pub border_radius_bottom_right: StyleSize,
+    pub border_radius_bottom_left: StyleSize,
 }
 
 impl Style {
@@ -288,6 +292,10 @@ impl Style {
             opacity: self.opacity,
             visibility: self.visibility,
             transform: self.transform.clone(),
+            border_radius_top_left: self.border_radius_top_left.clone(),
+            border_radius_top_right: self.border_radius_top_right.clone(),
+            border_radius_bottom_right: self.border_radius_bottom_right.clone(),
+            border_radius_bottom_left: self.border_radius_bottom_left.clone(),
         }
     }
 }
@@ -461,6 +469,10 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             .map(|style| style.visibility)
             .unwrap_or(StyleVisibility::Visible),
         transform: StyleTransform::None,
+        border_radius_top_left: StyleSize::Px(0.),
+        border_radius_top_right: StyleSize::Px(0.),
+        border_radius_bottom_right: StyleSize::Px(0.),
+        border_radius_bottom_left: StyleSize::Px(0.),
     }
 }
 
@@ -1620,7 +1632,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             | "padding-block-end"
             | "padding-inline-start"
             | "padding-inline-end" => PropertyValue::Size(parse_style_size(value)?),
-            "margin" | "padding" | "inset" => {
+            "margin" | "padding" | "inset" | "border-radius" => {
                 PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?)
             }
             "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
@@ -1930,6 +1942,15 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("display", PropertyValue::Display(value)) => {
             style.display = value;
+        }
+        (
+            "border-radius",
+            PropertyValue::CombinedSize((top_left, top_right, bottom_right, bottom_left)),
+        ) => {
+            style.border_radius_top_left = top_left;
+            style.border_radius_top_right = top_right;
+            style.border_radius_bottom_right = bottom_right;
+            style.border_radius_bottom_left = bottom_left;
         }
         ("position", PropertyValue::Position(value)) => {
             style.position = value;
