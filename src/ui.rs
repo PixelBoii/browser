@@ -478,8 +478,8 @@ mod tests {
     fn renders() -> Result<()> {
         let (tx, _) = std::sync::mpsc::channel();
         let state = false;
-        let runtime = UiRuntime::new_empty(1920, 1080, tx, state)?;
-        let mut builder = runtime.builder;
+        let mut runtime = UiRuntime::new_empty(1920, 1080, tx, state)?;
+        let builder = &mut runtime.builder;
         builder.start_element();
         builder.bg(0x00_FF_00_FF)?;
         builder.width(1920)?;
@@ -494,6 +494,8 @@ mod tests {
         builder.finish_element()?;
 
         builder.finish_element()?;
+
+        runtime.rerender()?;
 
         ensure_snapshot_matches(&runtime.buffer, "UiBuilder", 1920, 1080)?;
 
