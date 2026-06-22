@@ -1561,6 +1561,13 @@ Object.defineProperty(globalThis, "document", {
   writable: true,
 });
 
+Object.defineProperty(globalThis, "Document", {
+  value: Document,
+  enumerable: true,
+  configurable: true,
+  writable: true,
+});
+
 Object.defineProperty(globalThis, "__set_current_script_node_idx", {
     value(nodeIdx) {
         document.__currentScript = nodeIdx == null ? null : elementFromNodeIdx(nodeIdx)
