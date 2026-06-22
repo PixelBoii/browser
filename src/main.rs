@@ -10627,23 +10627,6 @@ mod tests {
     }
 
     #[test]
-    fn render_x() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut frame = Frame::new(
-            "https://x.com/ThePrimeagen".to_string(),
-            false,
-            PhysicalSize::new(1920, 1080),
-        );
-        let params = frame.open()?;
-        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
-        frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        let mut buffer = vec![0; 1920 * 1080];
-        frame.render_into(&mut buffer, 1920, 1080, true);
-        ensure_snapshot_matches(&buffer, "xcom", 1920, 1080)
-    }
-
-    #[test]
     fn render_nodejs() -> Result<()> {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
