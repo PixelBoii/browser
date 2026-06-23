@@ -2072,6 +2072,10 @@ function removeEventListenerByKey(key, cb) {
     }
 }
 
+function hasEventListeners(event_key) {
+    return !!globalThis.__EVENT_LISTENERS[event_key]
+}
+
 function runEventListeners(event_key, event) {
     const listeners = globalThis.__EVENT_LISTENERS[event_key]
     if (!listeners) {
@@ -2161,6 +2165,13 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
     dispatchEventToPath(path, event, target)
     return event.defaultPrevented
 }
+
+Object.defineProperty(globalThis, "hasEventListeners", {
+    value: hasEventListeners,
+    enumerable: true,
+    configurable: true,
+    writable: true
+})
 
 Object.defineProperty(globalThis, "runEventListeners", {
     value: runEventListeners,

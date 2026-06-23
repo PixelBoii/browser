@@ -9403,6 +9403,21 @@ impl Frame {
                 Instant::now().duration_since(start).as_millis(),
                 js_result
             );
+            let nodes_idxs = self.renderer.as_ref().unwrap().borrow().nodes_idxs.iter().map(|idx| idx.to_string()).collect::<Vec<String>>().join(",");
+            let load_code = format!(r#"
+            (() => {{
+                const idxs = [{}]
+                for (let idx of idxs) {{
+                    runEventListeners(`${{idx}}:load`, new Event("load", {{
+                        bubbles: false,
+                        cancelable: false,
+                    }}))
+                }}
+            }})()
+            "#, nodes_idxs);
+            let _ = self
+                .execute_host_script("load onscroll", load_code)
+                .inspect_err(|err| eprintln!("Element load handler failed with err: {}", err));
         }
 
         // If there are animations, continue re-rendering until there aren't
