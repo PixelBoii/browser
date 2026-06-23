@@ -535,7 +535,11 @@ struct Renderer {
     hovering_impact: HashSet<usize>,
     frames: HashMap<usize, FrameHandle>,
     css_parser: CssParser,
+    workers: HashMap<String, WorkerHandle>
 }
+
+#[derive(Debug, Clone)]
+struct WorkerHandle {}
 
 #[derive(Debug, Clone)]
 struct FlexItem {
@@ -3775,6 +3779,17 @@ fn op_collect_data_for_form(
     data
 }
 
+#[op2(fast)]
+fn op_spawn_worker(
+    state: &mut OpState,
+    #[string] src: &str
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.spawn_worker(src).map_err(|err| JsErrorBox::generic(format!("Failed to spawn worker: {err}")))?;
+    Ok(())
+}
+
 // This should walk the tree to be fully correct I think
 fn query_selector_all(
     nodes_table: &NodesTable,
@@ -3817,6 +3832,21 @@ fn query_selector_all(
 }
 
 extension!(
+  browser_worker,
+  ops = [
+    op_tls_peer_certificate,
+  ],
+  esm_entry_point = "ext:browser_worker/runtime_worker.js",
+  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js"],
+  state = |state| {
+    let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
+      sys_traits::impls::RealSys,
+    ));
+    state.put(deno_permissions::PermissionsContainer::allow_all(parser));
+  },
+);
+
+extension!(
   browser,
   ops = [
     op_create_element,
@@ -3855,9 +3885,10 @@ extension!(
     op_collect_data_for_form,
     op_clone_node,
     op_spawn_frame,
+    op_spawn_worker,
   ],
   esm_entry_point = "ext:browser/runtime.js",
-  esm = [dir "src", "runtime.js", "runtime_fetch.js"],
+  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js"],
   state = |state| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,
@@ -4336,6 +4367,7 @@ impl Renderer {
             hovering_impact,
             frames: HashMap::new(),
             css_parser,
+            workers: HashMap::new(),
         }
     }
 
@@ -5073,6 +5105,80 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    fn spawn_worker(&mut self, src: &str) -> Result<()> {
+        let handle = WorkerHandle {};
+        let url = self.url.clone();
+        let inner_src = src.to_string();
+        let network = NetworkFetch::new();
+        std::thread::spawn(move || {
+            let blob_store = Arc::new(BlobStore::default());
+            let broadcast_channel = InMemoryBroadcastChannel::default();
+            let mut runtime = deno_core::JsRuntime::new(
+                deno_core::RuntimeOptions {
+                    module_loader: Some(Rc::new(HttpModuleLoader::new())),
+                    extensions: vec![
+                        browser_worker::init(),
+                        deno_webidl::deno_webidl::init(),
+                        deno_web::deno_web::init(blob_store, None, broadcast_channel),
+                        deno_net::deno_net::init(None, None),
+                        deno_fetch_without_telemetry(),
+                        deno_node_crypto_shim::init(),
+                        deno_crypto::deno_crypto::init(None),
+                    ],
+                    ..Default::default()
+                },
+            );
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime in worker thread");
+            let Ok(base) = ReqwestUrl::parse(&url) else {
+                return;
+            };
+            let Ok(url) = resolve_url(&inner_src, Some(&base)) else {
+                return;
+            };
+            let fetch = async || -> Result<String> {
+                if let Some(stripped) = url.as_str().strip_prefix("file://") {
+                    let contents = fs::read_to_string(stripped)?;
+                    Ok(contents)
+                } else {
+                    let code = network
+                        .client
+                        .get(url.clone())
+                        .send()
+                        .await?
+                        .text()
+                        .await?;
+                    Ok(code)
+                }
+            };
+            let code = match tokio.block_on(fetch()) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("Failed to fetch JS in worker thread: {}", err);
+                    return;
+                },
+            };
+            match runtime.execute_script(url, code) {
+                Ok(_) => {},
+                Err(err) => {
+                    eprintln!("Failed to execute JS in worker thread: {}", err);
+                    return;
+                },
+            };
+            let future = runtime.run_event_loop(Default::default());
+            let _ = tokio.block_on(future).inspect_err(|err| {
+                eprintln!("Failed to run worker thread: {}", err);
+            });
+        });
+        if self.workers.contains_key(src) {
+            // TODO: Should kill the thread here
+        }
+        self.workers.insert(src.to_string(), handle);
+        Ok(())
     }
 
     fn build_layout(&mut self, width: u32, height: u32) -> Vec<usize> {
@@ -10146,7 +10252,7 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    Browser::open("https://www.google.com".to_string(), hover_debugging)?;
+    Browser::open("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging)?;
 
     Ok(())
 }
