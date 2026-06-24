@@ -934,10 +934,39 @@ class HTMLIFrameElement extends HtmlElement {
         core.ops.op_spawn_frame(this.__node_idx, this.getAttribute("src"))
     }
 
+    get src() {
+        return this.getAttribute("src")
+    }
+
+    set src(src) {
+        this.setAttribute("src", src)
+        if (src) {
+            this.spawnFrame()
+        }
+    }
+
     get contentDocument() {
         // Frame idx is the node idx
-        this.spawnFrame()
         return new Document(this.__node_idx)
+    }
+
+    get contentWindow() {
+        // Frame idx is the node idx
+        return new WindowProxy(this.__node_idx)
+    }
+}
+
+class WindowProxy {
+    constructor(frameId) {
+        this.__frame_id = frameId
+    }
+
+    postMessage(message) {
+        core.ops.op_post_message_to_frame(message, this.__frame_id)
+    }
+
+    get document() {
+        return new Document(this.__frame_id)
     }
 }
 

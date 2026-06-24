@@ -535,7 +535,7 @@ struct Renderer {
     hovering_impact: HashSet<usize>,
     frames: HashMap<usize, FrameHandle>,
     css_parser: CssParser,
-    workers: HashMap<String, WorkerHandle>
+    workers: HashMap<String, WorkerHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -2810,10 +2810,12 @@ enum UserEvent {
     FrameUpdated,
     TabUpdated(Vec<u32>),
     ChildMessage(String),
+    ParentMessage(String),
     Hover(Position),
     Click,
     Keyup(KeyEvent),
     ScrollBy((f32, f32)),
+    FrameLoaded(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -2945,7 +2947,7 @@ fn op_spawn_frame(
         return Ok(());
     }
     let handle = renderer
-        .spawn_frame(url, PhysicalSize::new(300, 150))
+        .spawn_frame(url, PhysicalSize::new(300, 150), node_idx)
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
     renderer.frames.insert(node_idx, handle);
     Ok(())
@@ -3003,6 +3005,24 @@ fn op_post_message_to_parent(
     host.proxy
         .fire_user_event(UserEvent::ChildMessage(message))
         .unwrap();
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_post_message_to_frame(
+    state: &mut OpState,
+    #[string] message: String,
+    #[number] frame_id: usize,
+) -> Result<(), JsErrorBox> {
+    println!("test");
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let Some(frame) = renderer.frames.get(&frame_id) else {
+        return Err(JsErrorBox::generic("Failed to get frame by idx"));
+    };
+    let _ = frame
+        .tx
+        .send(FrameCommand::UserEvent(UserEvent::ParentMessage(message)));
     Ok(())
 }
 
@@ -3780,13 +3800,12 @@ fn op_collect_data_for_form(
 }
 
 #[op2(fast)]
-fn op_spawn_worker(
-    state: &mut OpState,
-    #[string] src: &str
-) -> Result<(), JsErrorBox> {
+fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    renderer.spawn_worker(src).map_err(|err| JsErrorBox::generic(format!("Failed to spawn worker: {err}")))?;
+    renderer
+        .spawn_worker(src)
+        .map_err(|err| JsErrorBox::generic(format!("Failed to spawn worker: {err}")))?;
     Ok(())
 }
 
@@ -3881,6 +3900,7 @@ extension!(
     op_get_attribute,
     op_get_attributes,
     op_post_message_to_parent,
+    op_post_message_to_frame,
     op_get_offset_y,
     op_collect_data_for_form,
     op_clone_node,
@@ -4293,6 +4313,12 @@ fn blit_rgb_buffer(
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum LoadPhase {
+    JsDone,
+    IframeDone,
+}
+
 impl Renderer {
     fn new(
         url: String,
@@ -4368,6 +4394,22 @@ impl Renderer {
             frames: HashMap::new(),
             css_parser,
             workers: HashMap::new(),
+        }
+    }
+
+    fn element_has_loaded(&self, node_idx: usize, phase: &LoadPhase) -> bool {
+        let Some(node) = self.nodes.get(node_idx) else {
+            return false;
+        };
+        match node {
+            Node::Element(element) => {
+                if element.tag == "iframe" {
+                    *phase == LoadPhase::IframeDone
+                } else {
+                    *phase == LoadPhase::JsDone
+                }
+            }
+            _ => *phase == LoadPhase::JsDone,
         }
     }
 
@@ -5115,21 +5157,19 @@ impl Renderer {
         std::thread::spawn(move || {
             let blob_store = Arc::new(BlobStore::default());
             let broadcast_channel = InMemoryBroadcastChannel::default();
-            let mut runtime = deno_core::JsRuntime::new(
-                deno_core::RuntimeOptions {
-                    module_loader: Some(Rc::new(HttpModuleLoader::new())),
-                    extensions: vec![
-                        browser_worker::init(),
-                        deno_webidl::deno_webidl::init(),
-                        deno_web::deno_web::init(blob_store, None, broadcast_channel),
-                        deno_net::deno_net::init(None, None),
-                        deno_fetch_without_telemetry(),
-                        deno_node_crypto_shim::init(),
-                        deno_crypto::deno_crypto::init(None),
-                    ],
-                    ..Default::default()
-                },
-            );
+            let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+                module_loader: Some(Rc::new(HttpModuleLoader::new())),
+                extensions: vec![
+                    browser_worker::init(),
+                    deno_webidl::deno_webidl::init(),
+                    deno_web::deno_web::init(blob_store, None, broadcast_channel),
+                    deno_net::deno_net::init(None, None),
+                    deno_fetch_without_telemetry(),
+                    deno_node_crypto_shim::init(),
+                    deno_crypto::deno_crypto::init(None),
+                ],
+                ..Default::default()
+            });
             let tokio = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -5145,13 +5185,7 @@ impl Renderer {
                     let contents = fs::read_to_string(stripped)?;
                     Ok(contents)
                 } else {
-                    let code = network
-                        .client
-                        .get(url.clone())
-                        .send()
-                        .await?
-                        .text()
-                        .await?;
+                    let code = network.client.get(url.clone()).send().await?.text().await?;
                     Ok(code)
                 }
             };
@@ -5160,14 +5194,14 @@ impl Renderer {
                 Err(err) => {
                     eprintln!("Failed to fetch JS in worker thread: {}", err);
                     return;
-                },
+                }
             };
             match runtime.execute_script(url, code) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(err) => {
                     eprintln!("Failed to execute JS in worker thread: {}", err);
                     return;
-                },
+                }
             };
             let future = runtime.run_event_loop(Default::default());
             let _ = tokio.block_on(future).inspect_err(|err| {
@@ -5753,6 +5787,7 @@ impl Renderer {
                             .spawn_frame(
                                 url.and_then(|v| Some(v.into_owned())),
                                 PhysicalSize { width, height },
+                                node_idx,
                             )
                             .ok()?;
                         self.frames.insert(node_idx, handle);
@@ -5950,7 +5985,12 @@ impl Renderer {
         }
     }
 
-    fn spawn_frame(&mut self, url: Option<String>, size: PhysicalSize<u32>) -> Result<FrameHandle> {
+    fn spawn_frame(
+        &mut self,
+        url: Option<String>,
+        size: PhysicalSize<u32>,
+        node_idx: usize,
+    ) -> Result<FrameHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
         let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
         let bitmap_for_thread = Arc::clone(&latest_bitmap);
@@ -5984,6 +6024,7 @@ impl Renderer {
                 Instant::now().duration_since(start).as_millis(),
                 js_result
             );
+            let _ = parent_proxy.fire_user_event(UserEvent::FrameLoaded(node_idx));
 
             let mut js_pending = true;
             loop {
@@ -8702,6 +8743,20 @@ impl Frame {
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
             }
+            FrameCommand::UserEvent(UserEvent::ParentMessage(message)) => {
+                let data = js_string_literal(&message);
+                let code = format!(
+                    r#"
+                (() => {{
+                    const event = new MessageEvent("message", {{ data: {} }})
+                    window.dispatchEvent(event)
+                }})()
+                "#,
+                    data
+                );
+                self.execute_host_script("parent message handler", code)
+                    .unwrap();
+            }
             FrameCommand::Dom(FrameDomCommand::QuerySelector {
                 selector,
                 required_parent,
@@ -9390,6 +9445,39 @@ impl Frame {
         renderer.tick_animations()
     }
 
+    fn fire_load_phase(&mut self, phase: &LoadPhase, idxs: Option<&Vec<usize>>) {
+        let nodes_idxs = {
+            let renderer = self.renderer.as_ref().unwrap().borrow();
+            renderer
+                .nodes_idxs
+                .iter()
+                .filter(|idx| {
+                    idxs.is_none_or(|f| f.contains(idx))
+                        && renderer.element_has_loaded(**idx, phase)
+                })
+                .map(|idx| idx.to_string())
+                .collect::<Vec<String>>()
+                .join(",")
+        };
+        let load_code = format!(
+            r#"
+        (() => {{
+            const idxs = [{}]
+            for (let idx of idxs) {{
+                runEventListeners(`${{idx}}:load`, new Event("load", {{
+                    bubbles: false,
+                    cancelable: false,
+                }}))
+            }}
+        }})()
+        "#,
+            nodes_idxs
+        );
+        let _ = self
+            .execute_host_script("load", load_code)
+            .inspect_err(|err| eprintln!("Element load handler failed with err: {}", err));
+    }
+
     fn render_loop(&mut self) -> Vec<u32> {
         let animation_redraw = self.tick_animations();
         let mut buffer =
@@ -9403,21 +9491,7 @@ impl Frame {
                 Instant::now().duration_since(start).as_millis(),
                 js_result
             );
-            let nodes_idxs = self.renderer.as_ref().unwrap().borrow().nodes_idxs.iter().map(|idx| idx.to_string()).collect::<Vec<String>>().join(",");
-            let load_code = format!(r#"
-            (() => {{
-                const idxs = [{}]
-                for (let idx of idxs) {{
-                    runEventListeners(`${{idx}}:load`, new Event("load", {{
-                        bubbles: false,
-                        cancelable: false,
-                    }}))
-                }}
-            }})()
-            "#, nodes_idxs);
-            let _ = self
-                .execute_host_script("load onscroll", load_code)
-                .inspect_err(|err| eprintln!("Element load handler failed with err: {}", err));
+            self.fire_load_phase(&LoadPhase::JsDone, None);
         }
 
         // If there are animations, continue re-rendering until there aren't
@@ -9611,6 +9685,9 @@ impl Frame {
             FrameCommand::UserEvent(UserEvent::FrameUpdated) => {
                 let buffer = self.render_loop();
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
+            }
+            FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
+                self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
             }
             FrameCommand::UserEvent(UserEvent::DomUpdated) => self.execute_dom_update(),
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
@@ -10267,7 +10344,10 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    Browser::open("file:///home/pontus/browser/pages/test.html".to_string(), hover_debugging)?;
+    Browser::open(
+        "https://widget.swapped.com".to_string(),
+        hover_debugging,
+    )?;
 
     Ok(())
 }

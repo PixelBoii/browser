@@ -1,3 +1,7 @@
+function resolveBrowserUrl(value) {
+    return new URL(value, globalThis.location?.href ?? "about:blank").href
+}
+
 class XMLHttpRequest {
     constructor() {
         this.readyState = XMLHttpRequest.UNSENT
