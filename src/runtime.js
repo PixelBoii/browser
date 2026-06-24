@@ -947,11 +947,13 @@ class HTMLIFrameElement extends HtmlElement {
 
     get contentDocument() {
         // Frame idx is the node idx
+        this.spawnFrame()
         return new Document(this.__node_idx)
     }
 
     get contentWindow() {
         // Frame idx is the node idx
+        this.spawnFrame()
         return new WindowProxy(this.__node_idx)
     }
 }
