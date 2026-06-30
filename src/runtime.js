@@ -2358,6 +2358,20 @@ Object.defineProperty(globalThis, "fetch", {
   writable: true,
 });
 
+Object.defineProperty(globalThis, "AbortController", {
+  value: abortSignal.AbortController,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "AbortSignal", {
+  value: abortSignal.AbortSignal,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
 Object.defineProperty(globalThis, "Request", {
   value: BrowserRequest,
   enumerable: false,

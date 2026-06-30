@@ -16,6 +16,7 @@ class XMLHttpRequest {
         this.onreadystatechange = null
         this.onload = null
         this.onerror = null
+        this.onabort = null
         this.onloadend = null
         this.__listeners = {}
         this.__method = "GET"
@@ -23,6 +24,8 @@ class XMLHttpRequest {
         this.__async = true
         this.__requestHeaders = {}
         this.__responseHeaders = new Headers()
+        this.__abortController = null
+        this.__sendFlag = false
     }
 
     addEventListener(event, cb) {
@@ -69,6 +72,9 @@ class XMLHttpRequest {
         this.__url = resolveBrowserUrl(url)
         this.__async = async !== false
         this.__requestHeaders = {}
+        this.__responseHeaders = new Headers()
+        this.__abortController = null
+        this.__sendFlag = false
         this.__setReadyState(XMLHttpRequest.OPENED)
     }
 
@@ -90,11 +96,16 @@ class XMLHttpRequest {
 
     send(body = null) {
         const run = async () => {
+            const abortController = new AbortController()
+            this.__abortController = abortController
+            this.__sendFlag = true
+
             try {
                 const init = {
                     method: this.__method,
                     headers: this.__requestHeaders,
                     credentials: this.withCredentials ? "include" : "same-origin",
+                    signal: abortController.signal,
                 }
 
                 if (this.__method !== "GET" && this.__method !== "HEAD") {
@@ -111,13 +122,23 @@ class XMLHttpRequest {
                 this.__setReadyState(XMLHttpRequest.LOADING)
 
                 const text = await response.text()
+                if (abortController.signal.aborted) {
+                    return
+                }
                 this.responseText = text
                 this.response = text
+                this.__sendFlag = false
+                this.__abortController = null
                 this.__setReadyState(XMLHttpRequest.DONE)
                 this.__dispatch("load")
                 this.__dispatch("loadend")
             } catch (err) {
+                if (abortController.signal.aborted) {
+                    return
+                }
                 this.__error = err
+                this.__sendFlag = false
+                this.__abortController = null
                 this.__setReadyState(XMLHttpRequest.DONE)
                 this.__dispatch("error")
                 this.__dispatch("loadend")
@@ -125,6 +146,28 @@ class XMLHttpRequest {
         }
 
         run()
+    }
+
+    abort() {
+        const wasActive = this.__sendFlag
+        this.__sendFlag = false
+
+        if (this.__abortController) {
+            this.__abortController.abort()
+            this.__abortController = null
+        }
+
+        this.status = 0
+        this.statusText = ""
+        this.response = ""
+        this.responseText = ""
+        this.__responseHeaders = new Headers()
+
+        if (wasActive) {
+            this.__setReadyState(XMLHttpRequest.DONE)
+            this.__dispatch("abort")
+            this.__dispatch("loadend")
+        }
     }
 }
 

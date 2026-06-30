@@ -3995,7 +3995,10 @@ extension!(
 );
 
 fn deno_fetch_without_telemetry() -> deno_core::Extension {
-    let mut extension = deno_fetch::deno_fetch::init(Default::default());
+    let mut extension = deno_fetch::deno_fetch::init(deno_fetch::Options {
+        user_agent: USER_AGENT.to_string(),
+        ..Default::default()
+    });
     extension.esm_files.to_mut().retain(|source| {
         !matches!(
             source.specifier,
