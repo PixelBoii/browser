@@ -2471,6 +2471,13 @@ Object.defineProperty(globalThis, "MessagePort", {
   writable: true,
 });
 
+Object.defineProperty(globalThis, "File", {
+  value: file.File,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
 // TODO: Fill this out
 const frames = {}
 

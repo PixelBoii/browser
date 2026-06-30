@@ -8941,7 +8941,7 @@ impl Frame {
                     Ok(Ok(())) => Ok(false),
                     Ok(Err(err)) => {
                         eprintln!("Error occurred while pumping JS loop: {}", err);
-                        Ok(false)
+                        Ok(true)
                     }
                     Err(_) => Ok(true),
                 }
@@ -10459,7 +10459,7 @@ fn main() -> Result<()> {
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     Browser::open(
-        "file:///home/pontus/browser/pages/test.html".to_string(),
+        "https://widget.swapped.com".to_string(),
         hover_debugging,
     )?;
 

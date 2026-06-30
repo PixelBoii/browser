@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
+use palette::{FromColor, Hsl, Srgb};
 use winit::dpi::PhysicalSize;
 
 use crate::VariableDefinitions;
@@ -1045,6 +1046,49 @@ fn rgba_to_hex((r, g, b, a): (u8, u8, u8, u8)) -> u32 {
     ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32)
 }
 
+fn parse_percent(value: &str) -> Result<f32> {
+    let Some(value) = value.trim().strip_suffix('%') else {
+        return Err(anyhow!("Expected percentage, got {}", value));
+    };
+    Ok(value.parse::<f32>()? / 100.0)
+}
+
+fn parse_alpha(value: &str) -> Result<u8> {
+    let value = value.trim();
+    let parsed = if value.ends_with('%') {
+        parse_percent(value)?
+    } else {
+        value.parse::<f32>()?
+    };
+    Ok((parsed.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn parse_hsl_color(raw: &str) -> Result<StyleBackground> {
+    let cleaned = raw.strip_suffix(')').unwrap_or(raw);
+    let (hsl, alpha) = if let Some((hsl, alpha)) = cleaned.split_once('/') {
+        (hsl.trim(), Some(alpha.trim()))
+    } else {
+        (cleaned.trim(), None)
+    };
+    let mut parts = hsl
+        .split([',', ' '])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let alpha = match parts.len() {
+        3 => alpha.map(parse_alpha).transpose()?.unwrap_or(255),
+        4 => parse_alpha(parts.pop().unwrap())?,
+        _ => return Err(anyhow!("Invalid HSL string: {}", hsl)),
+    };
+    let hue = parts[0].trim_end_matches("deg").parse::<f32>()?;
+    let saturation = parse_percent(parts[1])?;
+    let lightness = parse_percent(parts[2])?;
+    let hsl = Hsl::new_srgb(hue, saturation, lightness);
+    let rgb: Srgb<u8> = Srgb::from_color(hsl).into_format();
+    Ok(StyleBackground::Hex(rgba_to_hex((
+        rgb.red, rgb.green, rgb.blue, alpha,
+    ))))
+}
+
 fn parse_color(value: String) -> Result<StyleBackground> {
     let value = value.trim();
     if value.starts_with("#") {
@@ -1106,6 +1150,8 @@ fn parse_color(value: String) -> Result<StyleBackground> {
             alpha,
         ));
         Ok(StyleBackground::Hex(hex))
+    } else if let Some(raw) = value.strip_prefix("hsla(").or(value.strip_prefix("hsl(")) {
+        parse_hsl_color(raw)
     } else {
         match value.to_ascii_lowercase().as_str() {
             "black" | "buttontext" | "canvastext" | "linktext" => {
