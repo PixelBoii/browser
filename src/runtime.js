@@ -1167,12 +1167,7 @@ Object.defineProperty(globalThis, "ResizeObserver", {
 class CSSStyleDeclaration {
     constructor(style, element) {
         this.__element = element
-        this.__properties = {}
-        let pairs = style ? style.split(";") : []
-        for (const pair of pairs) {
-            const [key, value] = pair.split(":")
-            this.__properties[key] = value
-        }
+        this.cssText = style
 
         return new Proxy(this, {
             set(target, key, value) {
@@ -1186,6 +1181,27 @@ class CSSStyleDeclaration {
         })
     }
 
+    get cssText() {
+        const keys = Object.keys(this)
+        let out = ""
+        for (const [key, value] of Object.entries(this.__properties)) {
+            out += `${key}:${value};`
+        }
+        return out
+    }
+
+    set cssText(style) {
+        this.__properties = {}
+        let pairs = style ? style.split(";") : []
+        for (const pair of pairs) {
+            let [key, value] = pair.split(":")
+            key = key?.trim()
+            value = value?.trim()
+            if (!key || !value) continue
+            this.__properties[key] = value
+        }
+    }
+
     getProperty(key) {
         return this.__properties[key]
     }
@@ -1195,6 +1211,11 @@ class CSSStyleDeclaration {
     }
 
     setProperty(key, value) {
+        if (key === "cssText") {
+            this.cssText = value
+            this.sync()
+            return
+        }
         if (this.__properties[key] === value) {
             return
         }
@@ -1204,12 +1225,7 @@ class CSSStyleDeclaration {
 
     // TODO: Need to convert property names into correct format. For example, background_color to background-color
     sync() {
-        const keys = Object.keys(this)
-        let out = ""
-        for (const [key, value] of Object.entries(this.__properties)) {
-            out += `${key}:${value};`
-        }
-
+        const out = this.cssText
         this.__element.__style = out
         core.ops.op_update_attributes(this.__element.__node_idx, { style: out }, this.__element.ownerDocument.__frameId)
     }
