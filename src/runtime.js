@@ -1038,6 +1038,80 @@ class HTMLScriptElement extends HtmlElement {
     }
 }
 
+class HTMLFormControlElement extends HtmlElement {
+    constructor(tag) {
+        super(tag)
+        this.__customValidityMessage = ""
+    }
+
+    setCustomValidity(message) {
+        this.__customValidityMessage = String(message)
+    }
+
+    checkValidity() {
+        return this.__customValidityMessage === ""
+    }
+
+    reportValidity() {
+        return this.checkValidity()
+    }
+
+    get validationMessage() {
+        return this.__customValidityMessage
+    }
+
+    get validity() {
+        const customError = this.__customValidityMessage !== ""
+        return {
+            badInput: false,
+            customError,
+            patternMismatch: false,
+            rangeOverflow: false,
+            rangeUnderflow: false,
+            stepMismatch: false,
+            tooLong: false,
+            tooShort: false,
+            typeMismatch: false,
+            valid: !customError,
+            valueMissing: false,
+        }
+    }
+
+    get willValidate() {
+        return !this.hasAttribute("disabled")
+    }
+}
+
+class HTMLInputElement extends HTMLFormControlElement {
+    constructor() {
+        super("input")
+    }
+}
+
+class HTMLTextAreaElement extends HTMLFormControlElement {
+    constructor() {
+        super("textarea")
+    }
+}
+
+class HTMLSelectElement extends HTMLFormControlElement {
+    constructor() {
+        super("select")
+    }
+}
+
+class HTMLButtonElement extends HTMLFormControlElement {
+    constructor() {
+        super("button")
+    }
+}
+
+class HTMLFormElement extends HtmlElement {
+    constructor() {
+        super("form")
+    }
+}
+
 class HTMLMediaElement extends HtmlElement {
     constructor(tag) {
         super(tag)
@@ -1102,6 +1176,36 @@ Object.defineProperty(globalThis, "HTMLIFrameElement", {
 });
 Object.defineProperty(globalThis, "HTMLScriptElement", {
     value: HTMLScriptElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLInputElement", {
+    value: HTMLInputElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLTextAreaElement", {
+    value: HTMLTextAreaElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLSelectElement", {
+    value: HTMLSelectElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLButtonElement", {
+    value: HTMLButtonElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLFormElement", {
+    value: HTMLFormElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -1459,11 +1563,21 @@ function tagToElement(tag) {
                 HTMLIFrameElement :
                 tag === "script" ?
                     HTMLScriptElement :
-                tag === "video" ?
-                    HTMLVideoElement :
-                    tag === "audio" ?
-                        HTMLAudioElement :
-                        HtmlElement
+                    tag === "input" ?
+                        HTMLInputElement :
+                    tag === "textarea" ?
+                        HTMLTextAreaElement :
+                    tag === "select" ?
+                        HTMLSelectElement :
+                    tag === "button" ?
+                        HTMLButtonElement :
+                    tag === "form" ?
+                        HTMLFormElement :
+                    tag === "video" ?
+                        HTMLVideoElement :
+                        tag === "audio" ?
+                            HTMLAudioElement :
+                            HtmlElement
 }
 
 class Document extends EventTarget {
@@ -2384,8 +2498,105 @@ class BrowserRequest extends request.Request {
     }
 }
 
+function fetchLogUrl(input) {
+    if (typeof input === "string") {
+        return input
+    }
+    if (input instanceof URL) {
+        return input.href
+    }
+    if (typeof input?.url === "string") {
+        return input.url
+    }
+    return String(input)
+}
+
+function fetchLogMethod(input, init) {
+    return String(init?.method ?? input?.method ?? "GET").toUpperCase()
+}
+
+const FETCH_LOG_BODY_LIMIT = 20000
+
+function fetchLogBodyPreview(text) {
+    text = String(text)
+    if (text.length <= FETCH_LOG_BODY_LIMIT) {
+        return text
+    }
+    return `${text.slice(0, FETCH_LOG_BODY_LIMIT)}...[truncated ${text.length - FETCH_LOG_BODY_LIMIT} chars]`
+}
+
+function fetchLogBodyText(body) {
+    if (body == null) {
+        return null
+    }
+    if (typeof body === "string") {
+        return body
+    }
+    if (body instanceof URLSearchParams) {
+        return body.toString()
+    }
+    if (body instanceof ArrayBuffer) {
+        return new TextDecoder().decode(body)
+    }
+    if (ArrayBuffer.isView(body)) {
+        return new TextDecoder().decode(body)
+    }
+    if (typeof body.entries === "function") {
+        return JSON.stringify(Array.from(body.entries()).map(([key, value]) => {
+            return [key, typeof value === "string" ? value : `[${value?.constructor?.name ?? "object"}]`]
+        }))
+    }
+    if (typeof body.text === "function") {
+        return body.text()
+    }
+    return `[${body?.constructor?.name ?? typeof body}]`
+}
+
+function fetchLogBody(label, body) {
+    try {
+        const text = fetchLogBodyText(body)
+        if (text == null) {
+            return
+        }
+        if (typeof text?.then === "function") {
+            text.then(value => {
+                console.log(`${label}\n${fetchLogBodyPreview(value)}`)
+            }, err => {
+                console.error(`${label} <failed to read>`, err)
+            })
+        } else {
+            console.log(`${label}\n${fetchLogBodyPreview(text)}`)
+        }
+    } catch (err) {
+        console.error(`${label} <failed to read>`, err)
+    }
+}
+
 function browserFetch(input, init) {
-    return fetch.fetch(resolveFetchInput(input), init)
+    const resolvedInput = resolveFetchInput(input)
+    const method = fetchLogMethod(resolvedInput, init)
+    const url = fetchLogUrl(resolvedInput)
+
+    console.log(`[fetch] -> ${method} ${url}`)
+    if (init?.body != null) {
+        fetchLogBody(`[fetch] request body ${method} ${url}`, init.body)
+    } else if (typeof resolvedInput?.clone === "function" && !resolvedInput.bodyUsed && method !== "GET" && method !== "HEAD") {
+        fetchLogBody(`[fetch] request body ${method} ${url}`, resolvedInput.clone())
+    }
+
+    return fetch.fetch(resolvedInput, init).then(response => {
+        const contentType = response.headers.get("content-type") ?? ""
+        console.log(`[fetch] <- ${response.status} ${response.statusText} ${method} ${response.url || url} content-type=${contentType}`)
+        try {
+            fetchLogBody(`[fetch] response body ${response.status} ${method} ${response.url || url}`, response.clone())
+        } catch (err) {
+            console.error(`[fetch] response body ${method} ${response.url || url} <failed to clone>`, err)
+        }
+        return response
+    }, err => {
+        console.error(`[fetch] !! ${method} ${url}`, err)
+        throw err
+    })
 }
 
 Object.defineProperty(globalThis, "fetch", {
@@ -2582,12 +2793,12 @@ Object.defineProperty(globalThis, "parent", {
     configurable: true,
 })
 
-// TODO: Actually implement this
 Object.defineProperty(globalThis, "top", {
-    value: document,
+    get() {
+        return core.ops.op_is_top() ? globalThis : parentStub
+    },
     enumerable: true,
     configurable: true,
-    writable: true,
 })
 
 function postMessage(message) {

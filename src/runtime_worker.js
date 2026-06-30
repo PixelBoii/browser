@@ -227,8 +227,105 @@ class BrowserRequest extends request.Request {
     }
 }
 
+function fetchLogUrl(input) {
+    if (typeof input === "string") {
+        return input
+    }
+    if (input instanceof URL) {
+        return input.href
+    }
+    if (typeof input?.url === "string") {
+        return input.url
+    }
+    return String(input)
+}
+
+function fetchLogMethod(input, init) {
+    return String(init?.method ?? input?.method ?? "GET").toUpperCase()
+}
+
+const FETCH_LOG_BODY_LIMIT = 20000
+
+function fetchLogBodyPreview(text) {
+    text = String(text)
+    if (text.length <= FETCH_LOG_BODY_LIMIT) {
+        return text
+    }
+    return `${text.slice(0, FETCH_LOG_BODY_LIMIT)}...[truncated ${text.length - FETCH_LOG_BODY_LIMIT} chars]`
+}
+
+function fetchLogBodyText(body) {
+    if (body == null) {
+        return null
+    }
+    if (typeof body === "string") {
+        return body
+    }
+    if (body instanceof URLSearchParams) {
+        return body.toString()
+    }
+    if (body instanceof ArrayBuffer) {
+        return new TextDecoder().decode(body)
+    }
+    if (ArrayBuffer.isView(body)) {
+        return new TextDecoder().decode(body)
+    }
+    if (typeof body.entries === "function") {
+        return JSON.stringify(Array.from(body.entries()).map(([key, value]) => {
+            return [key, typeof value === "string" ? value : `[${value?.constructor?.name ?? "object"}]`]
+        }))
+    }
+    if (typeof body.text === "function") {
+        return body.text()
+    }
+    return `[${body?.constructor?.name ?? typeof body}]`
+}
+
+function fetchLogBody(label, body) {
+    try {
+        const text = fetchLogBodyText(body)
+        if (text == null) {
+            return
+        }
+        if (typeof text?.then === "function") {
+            text.then(value => {
+                console.log(`${label}\n${fetchLogBodyPreview(value)}`)
+            }, err => {
+                console.error(`${label} <failed to read>`, err)
+            })
+        } else {
+            console.log(`${label}\n${fetchLogBodyPreview(text)}`)
+        }
+    } catch (err) {
+        console.error(`${label} <failed to read>`, err)
+    }
+}
+
 function browserFetch(input, init) {
-    return fetch.fetch(resolveFetchInput(input), init)
+    const resolvedInput = resolveFetchInput(input)
+    const method = fetchLogMethod(resolvedInput, init)
+    const url = fetchLogUrl(resolvedInput)
+
+    console.log(`[fetch:worker] -> ${method} ${url}`)
+    if (init?.body != null) {
+        fetchLogBody(`[fetch:worker] request body ${method} ${url}`, init.body)
+    } else if (typeof resolvedInput?.clone === "function" && !resolvedInput.bodyUsed && method !== "GET" && method !== "HEAD") {
+        fetchLogBody(`[fetch:worker] request body ${method} ${url}`, resolvedInput.clone())
+    }
+
+    return fetch.fetch(resolvedInput, init).then(response => {
+        const contentType = response.headers.get("content-type") ?? ""
+        console.log(`[fetch:worker] <- ${response.status} ${response.statusText} ${method} ${response.url || url} content-type=${contentType}`)
+        try {
+            fetchLogBody(`[fetch:worker] response body ${response.status} ${method} ${response.url || url}`, response.clone())
+        } catch (err) {
+            console.error(`[fetch:worker] response body ${method} ${response.url || url} <failed to clone>`, err)
+        }
+        return response
+    }, err => {
+        console.error(`[fetch:worker] !! ${method} ${url}`, err)
+        throw err
+    })
 }
 
 Object.defineProperty(globalThis, "fetch", {
