@@ -477,6 +477,11 @@ pub fn selector_to_parts(
             let mut parentheses_depth = 0;
             let mut escaped = false;
             for char in p.chars() {
+                if escaped {
+                    buffer.push(char);
+                    escaped = false;
+                    continue;
+                }
                 if char == '(' {
                     parentheses_depth += 1;
                     buffer.push(char);
@@ -487,23 +492,19 @@ pub fn selector_to_parts(
                     buffer.push(char);
                     continue;
                 }
-                if char == '\\' && !escaped {
+                if char == '\\' {
                     escaped = true;
                     continue;
                 }
                 if buffer.len() > 0
                     && new_statement.contains(&char)
                     && parentheses_depth == 0
-                    && !escaped
                     && !(buffer == ":" && char == ':')
                 {
                     conditions.push(buffer.clone());
                     buffer.clear();
                 }
                 buffer.push(char);
-                if escaped {
-                    escaped = false;
-                }
             }
             if buffer.len() > 0 {
                 conditions.push(buffer);
