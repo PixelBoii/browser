@@ -1,9 +1,12 @@
+import { EventTarget } from "./event_target.js";
+
 function resolveBrowserUrl(value) {
     return new URL(value, globalThis.location?.href ?? "about:blank").href
 }
 
-class XMLHttpRequest {
+class XMLHttpRequest extends EventTarget {
     constructor() {
+        super()
         this.readyState = XMLHttpRequest.UNSENT
         this.status = 0
         this.statusText = ""

@@ -1,0 +1,6 @@
+class EventTarget {
+}
+
+export {
+    EventTarget,
+}

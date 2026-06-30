@@ -27,6 +27,7 @@ import * as request from "ext:deno_fetch/23_request.js";
 import * as response from "ext:deno_fetch/23_response.js";
 import * as fetch from "ext:browser_worker/runtime_fetch.js";
 import * as crypto from "ext:deno_crypto/00_crypto.js";
+import { EventTarget } from "./event_target.js";
 import { XMLHttpRequest } from "ext:browser_worker/xml_http_request.js";
 
 denoEvent.saveGlobalThisReference(globalThis)
@@ -94,7 +95,7 @@ function camelize(str) {
 }
 
 Object.defineProperty(globalThis, "setTimeout", {
-  value: setTimeoutImpl,
+    value: setTimeoutImpl,
   enumerable: true,
   configurable: true,
   writable: true,
@@ -152,6 +153,13 @@ Object.defineProperty(globalThis, "isSecureContext", {
     },
     enumerable: true,
     configurable: true,
+})
+
+Object.defineProperty(globalThis, "EventTarget", {
+    value: EventTarget,
+    enumerable: true,
+    configurable: true,
+    writable: true,
 })
 
 const navigator = {

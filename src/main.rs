@@ -2851,6 +2851,7 @@ struct JsHostState {
     renderer: Rc<RefCell<Renderer>>,
     proxy: RendererProxy,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
+    is_top: bool,
 }
 
 #[op2]
@@ -3035,6 +3036,12 @@ fn op_post_message_to_parent(
         .fire_user_event(UserEvent::ChildMessage(message))
         .unwrap();
     Ok(())
+}
+
+#[op2(fast)]
+fn op_is_top(state: &mut OpState) -> bool {
+    let host = state.borrow::<JsHostState>();
+    host.is_top
 }
 
 #[op2(fast)]
@@ -3927,7 +3934,7 @@ extension!(
     op_tls_peer_certificate,
   ],
   esm_entry_point = "ext:browser_worker/runtime_worker.js",
-  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js"],
+  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js"],
   state = |state| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,
@@ -3966,6 +3973,7 @@ extension!(
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
+    op_is_top,
     op_get_node,
     op_get_closest,
     op_get_attribute,
@@ -3979,7 +3987,7 @@ extension!(
     op_spawn_worker,
   ],
   esm_entry_point = "ext:browser/runtime.js",
-  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js"],
+  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js"],
   state = |state| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,
@@ -6094,6 +6102,7 @@ impl Renderer {
                 false,
                 size,
             );
+            frame.is_top = false;
 
             let frame_result = frame.open();
             match frame_result {
@@ -8559,6 +8568,7 @@ struct Frame {
     document_id: u64,
     dom_content_loaded_dispatched: bool,
     load_dispatched: bool,
+    is_top: bool,
     hover_debugging: bool,
     render_size: PhysicalSize<u32>,
     loaded_nodes: Vec<usize>,
@@ -8615,6 +8625,7 @@ impl Frame {
             document_id: 0,
             dom_content_loaded_dispatched: false,
             load_dispatched: false,
+            is_top: true,
             hover_debugging,
             render_size,
             loaded_nodes: vec![],
@@ -9252,6 +9263,7 @@ impl Frame {
                 renderer: self.renderer.as_mut().cloned().unwrap(),
                 proxy: proxy,
                 executed_scripts: self.executed_scripts.clone(),
+                is_top: self.is_top,
             });
         }
         self.setup_js_dom()?;

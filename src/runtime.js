@@ -27,6 +27,7 @@ import * as request from "ext:deno_fetch/23_request.js";
 import * as response from "ext:deno_fetch/23_response.js";
 import * as fetch from "ext:browser/runtime_fetch.js";
 import * as crypto from "ext:deno_crypto/00_crypto.js";
+import { EventTarget } from "./event_target.js";
 import { XMLHttpRequest } from "ext:browser/xml_http_request.js";
 
 denoEvent.saveGlobalThisReference(globalThis)
@@ -106,10 +107,33 @@ Object.defineProperty(globalThis, "SVGAnimatedString", {
     enumerable: true
 })
 
-class BaseNode {
+Object.defineProperty(globalThis, "EventTarget", {
+    value: EventTarget,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class BaseNode extends EventTarget {
     constructor() {
+        super()
         this.__node_idx = null
         this.ownerDocument = currentDocument
+    }
+
+    addEventListener(event, cb) {
+        if (cb == null) {
+            return
+        }
+        registerEventListener(`${this.__node_idx}:${event}`, cb)
+    }
+
+    removeEventListener(event, cb) {
+        removeEventListenerByKey(`${this.__node_idx}:${event}`, cb)
+    }
+
+    dispatchEvent(event) {
+        return dispatchEventToTarget(this, event)
     }
 
     get isConnected() {
@@ -1442,8 +1466,9 @@ function tagToElement(tag) {
                         HtmlElement
 }
 
-class Document {
+class Document extends EventTarget {
     constructor(frameId = null) {
+        super()
         this.__frameId = frameId
         this.__activeElement = null
         this.__currentScript = null
@@ -1959,8 +1984,9 @@ Object.defineProperty(globalThis, "CustomEvent", {
     writable: true,
 })
 
-class MediaQueryList {
+class MediaQueryList extends EventTarget {
     constructor(media) {
+        super()
         this.media = String(media)
         this.__listeners = []
         this.__onchange = null
@@ -2101,8 +2127,14 @@ Object.defineProperty(globalThis, "navigator", {
 })
 
 function registerEventListener(key, cb) {
+    if (cb == null) {
+        return
+    }
     if (!(key in globalThis.__EVENT_LISTENERS)) {
         globalThis.__EVENT_LISTENERS[key] = []
+    }
+    if (globalThis.__EVENT_LISTENERS[key].includes(cb)) {
+        return
     }
     globalThis.__EVENT_LISTENERS[key].push(cb)
 }
@@ -2131,7 +2163,12 @@ function runEventListeners(event_key, event) {
 
     for (const cb of listeners.slice()) {
         try {
-            cb.call(event.currentTarget ?? event.target ?? globalThis, event)
+            const target = event.currentTarget ?? event.target ?? globalThis
+            if (typeof cb === "function") {
+                cb.call(target, event)
+            } else if (typeof cb?.handleEvent === "function") {
+                cb.handleEvent(event)
+            }
         } catch (err) {
             console.error(err)
         }
@@ -2531,17 +2568,18 @@ Object.defineProperty(globalThis, "MutationObserver", {
 })
 
 // Ideally this would be of the same structure as document, but that's a much larger change that will happen later on
-const parent = {
+const parentStub = {
     postMessage(message) {
         core.ops.op_post_message_to_parent(message)
     }
 }
 
 Object.defineProperty(globalThis, "parent", {
-    value: parent,
+    get() {
+        return core.ops.op_is_top() ? globalThis : parentStub
+    },
     enumerable: true,
     configurable: true,
-    writable: true,
 })
 
 // TODO: Actually implement this
