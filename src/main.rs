@@ -3221,12 +3221,6 @@ fn op_append_child<'s>(
 
         clear_result?;
         script_result?;
-
-        let load_code = format!(
-            "runEventListeners(`${{{}}}:load`, new Event('load'))",
-            node_idx
-        );
-        run_v8_source(scope, "script onload", &load_code)?;
     }
 
     Ok(())
@@ -8564,6 +8558,7 @@ struct Frame {
     load_dispatched: bool,
     hover_debugging: bool,
     render_size: PhysicalSize<u32>,
+    loaded_nodes: Vec<usize>,
 }
 
 struct BootParams {
@@ -8619,6 +8614,7 @@ impl Frame {
             load_dispatched: false,
             hover_debugging,
             render_size,
+            loaded_nodes: vec![],
         }
     }
 
@@ -9208,6 +9204,7 @@ impl Frame {
             *self.executed_scripts.borrow_mut() = ExecutedScripts::new();
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
+            self.loaded_nodes.clear();
             self.reset_js_document_state()?;
             self.setup_js_dom()?;
             let start = Instant::now();
@@ -9555,13 +9552,22 @@ impl Frame {
     fn fire_load_phase(&mut self, phase: &LoadPhase, idxs: Option<&Vec<usize>>) {
         let nodes_idxs = {
             let renderer = self.renderer.as_ref().unwrap().borrow();
-            renderer
+            let idxs_to_fire: Vec<&usize> = renderer
                 .nodes_idxs
                 .iter()
                 .filter(|idx| {
                     idxs.is_none_or(|f| f.contains(idx))
+                        && !self.loaded_nodes.contains(idx)
                         && renderer.element_has_loaded(**idx, phase)
                 })
+                .collect();
+
+            for idx in idxs_to_fire.iter() {
+                self.loaded_nodes.push(**idx);
+            }
+
+            idxs_to_fire
+                .iter()
                 .map(|idx| idx.to_string())
                 .collect::<Vec<String>>()
                 .join(",")
@@ -9650,6 +9656,7 @@ impl Frame {
             Instant::now().duration_since(start).as_millis(),
             js_result
         );
+        self.fire_load_phase(&LoadPhase::JsDone, None);
 
         // If the JS caused another update, execute it immediately
         if self
