@@ -7185,7 +7185,7 @@ impl Renderer {
                 node_idx,
                 child_idx,
                 Size { height, width },
-                cursor.clone(),
+                original_cursor.clone(),
             );
         }
 
@@ -7789,7 +7789,7 @@ impl Renderer {
                 node_idx,
                 *child_idx,
                 Size { height, width },
-                cursor.clone(),
+                original_content_cursor.clone(),
             );
         }
 
