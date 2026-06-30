@@ -70,6 +70,34 @@ fn js_string_literal(value: &str) -> String {
     deno_core::serde_json::to_string(value).expect("serializing a string literal cannot fail")
 }
 
+fn run_v8_source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    source: &str,
+) -> Result<(), JsErrorBox> {
+    v8::tc_scope!(let tc_scope, scope);
+
+    let source = v8::String::new(tc_scope, source)
+        .ok_or_else(|| JsErrorBox::generic(format!("Failed to allocate JS source for {name}")))?;
+    let Some(script) = v8::Script::compile(tc_scope, source, None) else {
+        if let Some(exception) = tc_scope.exception() {
+            let err = deno_core::exception_to_err(tc_scope, exception, false, true);
+            return Err(JsErrorBox::generic(err.to_string()));
+        }
+        return Err(JsErrorBox::generic(format!("Failed to compile {name}")));
+    };
+
+    if script.run(tc_scope).is_none() {
+        if let Some(exception) = tc_scope.exception() {
+            let err = deno_core::exception_to_err(tc_scope, exception, false, true);
+            return Err(JsErrorBox::generic(err.to_string()));
+        }
+        return Err(JsErrorBox::generic(format!("Failed to run {name}")));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct RectBorderSide {
     size: u32,
@@ -2822,6 +2850,7 @@ enum UserEvent {
 struct JsHostState {
     renderer: Rc<RefCell<Renderer>>,
     proxy: RendererProxy,
+    executed_scripts: Rc<RefCell<ExecutedScripts>>,
 }
 
 #[op2]
@@ -3084,74 +3113,122 @@ fn op_create_comment_element(
     Ok(node_idx as i32)
 }
 
-#[op2]
-#[serde]
-fn op_append_child(
-    state: &mut OpState,
+#[op2(reentrant)]
+fn op_append_child<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: Rc<RefCell<OpState>>,
     #[number] parent_idx: usize,
     #[number] node_idx: usize,
     #[number] before_reference_idx: Option<usize>,
-) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if before_reference_idx.is_some_and(|idx| idx == node_idx) {
-        return Ok(());
-    }
-    if let Some(old_parent_idx) = renderer.nodes.get(node_idx).unwrap().get_parent() {
-        if let Some(children) = renderer.dom_indexes.children_index.get_mut(&old_parent_idx) {
-            children.retain(|idx| *idx != node_idx);
+) -> Result<(), JsErrorBox> {
+    let (renderer, executed_scripts) = {
+        let state = state.borrow();
+        let host = state.borrow::<JsHostState>();
+        (host.renderer.clone(), host.executed_scripts.clone())
+    };
+
+    let script_to_run = {
+        let mut renderer = renderer.borrow_mut();
+        if before_reference_idx.is_some_and(|idx| idx == node_idx) {
+            return Ok(());
         }
-    }
-    renderer
-        .nodes
-        .get_mut(node_idx)
-        .unwrap()
-        .set_parent(Some(parent_idx));
-    let children = renderer
-        .dom_indexes
-        .children_index
-        .entry(parent_idx)
-        .or_default();
-    let insert_pos = before_reference_idx
-        .and_then(|before_idx| children.iter().position(|idx| *idx == before_idx))
-        .unwrap_or(children.len());
-    children.insert(insert_pos, node_idx);
-    renderer
-        .dom_indexes
-        .children_index
-        .entry(node_idx)
-        .or_default();
-
-    if let Some(before_reference_idx) = before_reference_idx {
-        let mut node_pos = None;
-        let mut before_pos = None;
-        for (pos, idx) in renderer.nodes_idxs.iter().enumerate() {
-            if *idx == node_idx {
-                node_pos = Some(pos);
-            } else if *idx == before_reference_idx {
-                before_pos = Some(pos);
-            }
-
-            if node_pos.is_some() && before_pos.is_some() {
-                break;
+        if let Some(old_parent_idx) = renderer.nodes.get(node_idx).unwrap().get_parent() {
+            if let Some(children) = renderer.dom_indexes.children_index.get_mut(&old_parent_idx) {
+                children.retain(|idx| *idx != node_idx);
             }
         }
+        renderer
+            .nodes
+            .get_mut(node_idx)
+            .unwrap()
+            .set_parent(Some(parent_idx));
+        let children = renderer
+            .dom_indexes
+            .children_index
+            .entry(parent_idx)
+            .or_default();
+        let insert_pos = before_reference_idx
+            .and_then(|before_idx| children.iter().position(|idx| *idx == before_idx))
+            .unwrap_or(children.len());
+        children.insert(insert_pos, node_idx);
+        renderer
+            .dom_indexes
+            .children_index
+            .entry(node_idx)
+            .or_default();
 
-        let node_pos = node_pos.unwrap();
-        let before_pos = before_pos.unwrap();
-        if node_pos != before_pos {
-            let idx = renderer.nodes_idxs.remove(node_pos);
-            let before_pos = if node_pos < before_pos {
-                before_pos - 1
-            } else {
-                before_pos
-            };
-            renderer.nodes_idxs.insert(before_pos, idx);
+        if let Some(before_reference_idx) = before_reference_idx {
+            let mut node_pos = None;
+            let mut before_pos = None;
+            for (pos, idx) in renderer.nodes_idxs.iter().enumerate() {
+                if *idx == node_idx {
+                    node_pos = Some(pos);
+                } else if *idx == before_reference_idx {
+                    before_pos = Some(pos);
+                }
+
+                if node_pos.is_some() && before_pos.is_some() {
+                    break;
+                }
+            }
+
+            let node_pos = node_pos.unwrap();
+            let before_pos = before_pos.unwrap();
+            if node_pos != before_pos {
+                let idx = renderer.nodes_idxs.remove(node_pos);
+                let before_pos = if node_pos < before_pos {
+                    before_pos - 1
+                } else {
+                    before_pos
+                };
+                renderer.nodes_idxs.insert(before_pos, idx);
+            }
         }
+        renderer.update_bitset_capacity();
+        renderer.recompute_children_index();
+        renderer.schedule_dom_update();
+
+        match renderer.extract_script_from_idx(node_idx) {
+            Some(Script {
+                script_type: ScriptType::Classic,
+                content: ScriptContent::Code(code),
+                ..
+            }) => {
+                let mut executed_scripts = executed_scripts.borrow_mut();
+                if executed_scripts.nodes.contains(&node_idx) {
+                    None
+                } else {
+                    executed_scripts.nodes.push(node_idx);
+                    Some(code)
+                }
+            }
+            _ => None,
+        }
+    };
+
+    if let Some(code) = script_to_run {
+        run_v8_source(
+            scope,
+            "set current script",
+            &format!("__set_current_script_node_idx({node_idx})"),
+        )?;
+        let script_result = run_v8_source(scope, "dynamic inline script", &code);
+        let clear_result = run_v8_source(
+            scope,
+            "clear current script",
+            "__set_current_script_node_idx(null)",
+        );
+
+        clear_result?;
+        script_result?;
+
+        let load_code = format!(
+            "runEventListeners(`${{{}}}:load`, new Event('load'))",
+            node_idx
+        );
+        run_v8_source(scope, "script onload", &load_code)?;
     }
-    renderer.update_bitset_capacity();
-    renderer.recompute_children_index();
-    renderer.schedule_dom_update();
+
     Ok(())
 }
 
@@ -3976,7 +4053,7 @@ pub enum ScriptContent {
     Code(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ScriptType {
     Classic,
     Module,
@@ -4755,6 +4832,72 @@ impl Renderer {
         }
     }
 
+    pub fn extract_script_from_idx(&self, idx: usize) -> Option<Script> {
+        match self.nodes.get(idx).unwrap() {
+            Node::Element(element) => {
+                if element.tag != "script" || !self.node_is_connected(idx) {
+                    return None;
+                }
+
+                let script_type =
+                    parse_script_type_attr(element.attributes.get_str("type").as_deref())?;
+                let src = element.attributes.get_str("src");
+                let has_src = src.is_some();
+                let is_async = has_src && element.attributes.get_str("async").is_some();
+                let defer = has_src && !is_async && element.attributes.get_str("defer").is_some();
+                if let Some(src) = src {
+                    return Some(Script {
+                        content: ScriptContent::Link(src.to_string()),
+                        script_type,
+                        node_idx: Some(idx),
+                        defer,
+                        is_async,
+                    });
+                }
+
+                let children = &self.dom_indexes.children_index.get(&idx).unwrap();
+                if children.len() != 1 {
+                    println!("Unexpected children count: {}", children.len());
+                    return None;
+                }
+                let child = children.first().unwrap();
+                let child_node = &self.nodes.get(*child).unwrap();
+
+                let text = match child_node {
+                    Node::Element(element) => {
+                        println!("Got element when expecting JS text {:?}", element);
+                        return None;
+                    }
+                    Node::Text(text_element) => Some(Script {
+                        content: ScriptContent::Code(text_element.text.clone()),
+                        script_type,
+                        node_idx: Some(idx),
+                        defer,
+                        is_async,
+                    }),
+                    Node::Comment(_) => {
+                        return None;
+                    }
+                };
+
+                text
+            }
+            Node::Text(_) | Node::Comment(_) => None,
+        }
+    }
+
+    fn node_is_connected(&self, idx: usize) -> bool {
+        if idx == self.dom_indexes.root_indice {
+            return true;
+        }
+
+        let Some(parent) = self.nodes.get(idx).and_then(|node| node.get_parent()) else {
+            return false;
+        };
+
+        self.node_is_connected(parent)
+    }
+
     pub fn get_scripts(&mut self) -> Vec<Script> {
         let mut scripts: Vec<Script> = self
             .nodes_idxs
@@ -4763,56 +4906,7 @@ impl Renderer {
                 Node::Element(element) => element.tag == "script",
                 _ => false,
             })
-            .map(|idx| -> Option<Script> {
-                match self.nodes.get(*idx).unwrap() {
-                    Node::Element(element) => {
-                        let script_type =
-                            parse_script_type_attr(element.attributes.get_str("type").as_deref())?;
-                        let src = element.attributes.get_str("src");
-                        let has_src = src.is_some();
-                        let is_async = has_src && element.attributes.get_str("async").is_some();
-                        let defer =
-                            has_src && !is_async && element.attributes.get_str("defer").is_some();
-                        if let Some(src) = src {
-                            return Some(Script {
-                                content: ScriptContent::Link(src.to_string()),
-                                script_type,
-                                node_idx: Some(*idx),
-                                defer,
-                                is_async,
-                            });
-                        }
-
-                        let children = &self.dom_indexes.children_index.get(idx).unwrap();
-                        if children.len() != 1 {
-                            println!("Unexpected children count: {}", children.len());
-                            return None;
-                        }
-                        let child = children.first().unwrap();
-                        let child_node = &self.nodes.get(*child).unwrap();
-
-                        let text = match child_node {
-                            Node::Element(element) => {
-                                println!("Got element when expecting JS text {:?}", element);
-                                return None;
-                            }
-                            Node::Text(text_element) => Some(Script {
-                                content: ScriptContent::Code(text_element.text.clone()),
-                                script_type,
-                                node_idx: Some(*idx),
-                                defer,
-                                is_async,
-                            }),
-                            Node::Comment(_) => {
-                                return None;
-                            }
-                        };
-
-                        text
-                    }
-                    Node::Text(_) | Node::Comment(_) => None,
-                }
-            })
+            .map(|idx| -> Option<Script> { self.extract_script_from_idx(*idx) })
             .flatten()
             .collect();
 
@@ -8463,7 +8557,7 @@ struct Frame {
     font_handler: Rc<FontHandler>,
     layout_dirty: bool,
     layout_booted: bool,
-    executed_scripts: ExecutedScripts,
+    executed_scripts: Rc<RefCell<ExecutedScripts>>,
     network_fetch: Rc<RefCell<NetworkFetch>>,
     document_id: u64,
     dom_content_loaded_dispatched: bool,
@@ -8516,7 +8610,7 @@ impl Frame {
             tokio: None,
             html_parser: None,
             font_handler,
-            executed_scripts: ExecutedScripts::new(),
+            executed_scripts: Rc::new(RefCell::new(ExecutedScripts::new())),
             layout_dirty: true,
             layout_booted: false,
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
@@ -8858,51 +8952,83 @@ impl Frame {
             })
     }
 
-    async fn execute_js(&mut self, scripts: Vec<Script>) -> Result<()> {
+    async fn execute_js_script(&mut self, js: &Script) -> Result<()> {
         let document_id = self.document_id;
         let Some(mut runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) else {
             return Ok(());
         };
-        for (idx, js) in scripts.iter().enumerate() {
+
+        let should_run = {
+            let mut executed_scripts = self.executed_scripts.borrow_mut();
             if let ScriptContent::Link(link) = &js.content {
-                if self.executed_scripts.links.contains(&link) {
+                if executed_scripts.links.contains(&link) {
                     // println!("Script has already been ran, ignoring: {}", link);
-                    continue;
+                    false
+                } else {
+                    executed_scripts.links.push(link.to_string());
+                    true
                 }
-
-                self.executed_scripts.links.push(link.to_string());
             } else if let Some(node_idx) = js.node_idx {
-                if self.executed_scripts.nodes.contains(&node_idx) {
+                if executed_scripts.nodes.contains(&node_idx) {
                     // println!("Script has already been ran, ignoring: {}", node_idx);
-                    continue;
+                    false
+                } else {
+                    executed_scripts.nodes.push(node_idx);
+                    true
                 }
-
-                self.executed_scripts.nodes.push(node_idx);
+            } else {
+                true
             }
+        };
 
-            match &js.content {
-                ScriptContent::Code(code) => {
-                    let code_context: String = code.chars().take(40).collect();
-                    Self::set_current_script(&mut runtime, js.node_idx)?;
-                    let result = runtime.execute_script(
-                        format!("injected code {} ({})", idx, code_context),
-                        code.clone(),
-                    );
-                    Self::set_current_script(&mut runtime, None)?;
-                    match result {
-                        Ok(_) => Self::drain_microtasks(&mut runtime),
-                        Err(err) => eprintln!("Failed to execute JS with error: {}", err),
-                    };
-                }
-                ScriptContent::Link(link) => {
-                    let Ok(base) = ReqwestUrl::parse(&self.url) else {
-                        continue;
-                    };
-                    let Ok(url) = resolve_url(&link, Some(&base)) else {
-                        continue;
-                    };
-                    match js.script_type {
-                        ScriptType::Classic => {
+        if !should_run {
+            return Ok(());
+        }
+
+        match &js.content {
+            ScriptContent::Code(code) => {
+                let code_context: String = code.chars().take(40).collect();
+                Self::set_current_script(&mut runtime, js.node_idx)?;
+                let result = runtime
+                    .execute_script(format!("injected code ({})", code_context), code.clone());
+                Self::set_current_script(&mut runtime, None)?;
+                match result {
+                    Ok(_) => Self::drain_microtasks(&mut runtime),
+                    Err(err) => eprintln!("Failed to execute JS with error: {}", err),
+                };
+            }
+            ScriptContent::Link(link) => {
+                let Ok(base) = ReqwestUrl::parse(&self.url) else {
+                    return Ok(());
+                };
+                let Ok(url) = resolve_url(&link, Some(&base)) else {
+                    return Ok(());
+                };
+                match js.script_type {
+                    ScriptType::Classic => {
+                        let code = self
+                            .network_fetch
+                            .borrow_mut()
+                            .client
+                            .get(url.clone())
+                            .send()
+                            .await?
+                            .text()
+                            .await?;
+                        Self::set_current_script(&mut runtime, js.node_idx)?;
+                        let result = runtime.execute_script(url.to_string(), code);
+                        Self::set_current_script(&mut runtime, None)?;
+                        match result {
+                            Ok(_) => Self::drain_microtasks(&mut runtime),
+                            Err(err) => {
+                                eprintln!("Failed to execute JS at {} with error: {}", link, err)
+                            }
+                        };
+                    }
+                    ScriptType::Module => {
+                        let module_id = if document_id == 0 {
+                            runtime.load_side_es_module(&url).await
+                        } else {
                             let code = self
                                 .network_fetch
                                 .borrow_mut()
@@ -8912,66 +9038,46 @@ impl Frame {
                                 .await?
                                 .text()
                                 .await?;
-                            Self::set_current_script(&mut runtime, js.node_idx)?;
-                            let result = runtime.execute_script(url.to_string(), code);
-                            Self::set_current_script(&mut runtime, None)?;
-                            match result {
-                                Ok(_) => Self::drain_microtasks(&mut runtime),
-                                Err(err) => eprintln!(
-                                    "Failed to execute JS at {} with error: {}",
-                                    link, err
-                                ),
-                            };
-                        }
-                        ScriptType::Module => {
-                            let module_id = if document_id == 0 {
-                                runtime.load_side_es_module(&url).await
-                            } else {
-                                let code = self
-                                    .network_fetch
-                                    .borrow_mut()
-                                    .client
-                                    .get(url.clone())
-                                    .send()
-                                    .await?
-                                    .text()
-                                    .await?;
-                                let mut module_url = url.clone();
-                                module_url
-                                    .query_pairs_mut()
-                                    .append_pair("__frame_document", &document_id.to_string());
-                                runtime
-                                    .load_side_es_module_from_code(&module_url, code)
-                                    .await
-                            };
-                            if let Ok(module_id) = module_id.inspect_err(|err| {
-                                eprintln!("Failed to load JS module at {} with error: {}", url, err)
-                            }) {
-                                let result = runtime.mod_evaluate(module_id);
-                                let _ = runtime
-                                    .with_event_loop_promise(result, Default::default())
-                                    .await
-                                    .inspect_err(|err| {
-                                        eprintln!(
-                                            "Failed to execute JS at {} with error: {}",
-                                            url, err
-                                        )
-                                    });
-                            }
+                            let mut module_url = url.clone();
+                            module_url
+                                .query_pairs_mut()
+                                .append_pair("__frame_document", &document_id.to_string());
+                            runtime
+                                .load_side_es_module_from_code(&module_url, code)
+                                .await
+                        };
+                        if let Ok(module_id) = module_id.inspect_err(|err| {
+                            eprintln!("Failed to load JS module at {} with error: {}", url, err)
+                        }) {
+                            let result = runtime.mod_evaluate(module_id);
+                            let _ = runtime
+                                .with_event_loop_promise(result, Default::default())
+                                .await
+                                .inspect_err(|err| {
+                                    eprintln!("Failed to execute JS at {} with error: {}", url, err)
+                                });
                         }
                     }
                 }
-            };
-
-            // Run onload handlers
-            if let Some(node_idx) = js.node_idx {
-                let code = format!(
-                    "runEventListeners(`${{{}}}:load`, new Event('load'))",
-                    node_idx
-                );
-                runtime.execute_script("script onload", code.clone())?;
-                Self::drain_microtasks(&mut runtime);
             }
+        };
+
+        // Run onload handlers
+        if let Some(node_idx) = js.node_idx {
+            let code = format!(
+                "runEventListeners(`${{{}}}:load`, new Event('load'))",
+                node_idx
+            );
+            runtime.execute_script("script onload", code.clone())?;
+            Self::drain_microtasks(&mut runtime);
+        }
+
+        Ok(())
+    }
+
+    async fn execute_js(&mut self, scripts: Vec<Script>) -> Result<()> {
+        for js in scripts {
+            self.execute_js_script(&js).await?;
         }
 
         Ok(())
@@ -9099,7 +9205,7 @@ impl Frame {
                 .borrow_mut()
                 .replace_document(self.url.clone(), nodes_table, nodes_idxs);
             self.document_id += 1;
-            self.executed_scripts = ExecutedScripts::new();
+            *self.executed_scripts.borrow_mut() = ExecutedScripts::new();
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
             self.reset_js_document_state()?;
@@ -9145,6 +9251,7 @@ impl Frame {
             js_runtime.op_state().borrow_mut().put(JsHostState {
                 renderer: self.renderer.as_mut().cloned().unwrap(),
                 proxy: proxy,
+                executed_scripts: self.executed_scripts.clone(),
             });
         }
         self.setup_js_dom()?;
@@ -10345,7 +10452,7 @@ fn main() -> Result<()> {
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     Browser::open(
-        "https://widget.swapped.com".to_string(),
+        "file:///home/pontus/browser/pages/test.html".to_string(),
         hover_debugging,
     )?;
 
