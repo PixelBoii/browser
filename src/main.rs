@@ -7463,10 +7463,11 @@ impl Renderer {
                     StyleFlexDirection::Row => max_height,
                     StyleFlexDirection::Column => max_width,
                 };
+                let base_size = (size as f32).min(max_size as f32);
                 base_items.push(FlexItem {
                     node_idx: *child_idx,
-                    target_size: size as f32,
-                    base_size: (size as f32).min(max_size as f32),
+                    target_size: base_size,
+                    base_size,
                     max_size: max_size as f32,
                     cross_size: (cross_size as f32).min(max_cross_size as f32),
                     max_cross_size: max_cross_size as f32,
@@ -7732,7 +7733,8 @@ impl Renderer {
                             max_affecting_child_width =
                                 max_affecting_child_width.max(child_box.rect.width);
                             content_position.y += child_box.rect.height as i32 + margin_bottom_size;
-                            children_rows.new_row(child, cross_offset as i32);
+                            // The flex cross-axis offset is already applied above.
+                            children_rows.new_row(child, 0);
                             // Don't add gap for last item
                             if !last {
                                 content_position.y += main_gap as i32;

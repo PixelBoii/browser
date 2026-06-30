@@ -1298,6 +1298,13 @@ class CSSStyleDeclaration {
         this.cssText = style
 
         return new Proxy(this, {
+            get(target, key, receiver) {
+                if (typeof key === "string" && !(key in target)) {
+                    return target.getPropertyValue(key)
+                }
+
+                return Reflect.get(target, key, receiver)
+            },
             set(target, key, value) {
                 if (String(key).startsWith("__")) {
                     return Reflect.set(target, key, value)
@@ -1310,7 +1317,6 @@ class CSSStyleDeclaration {
     }
 
     get cssText() {
-        const keys = Object.keys(this)
         let out = ""
         for (const [key, value] of Object.entries(this.__properties)) {
             out += `${key}:${value};`
@@ -1322,20 +1328,24 @@ class CSSStyleDeclaration {
         this.__properties = {}
         let pairs = style ? style.split(";") : []
         for (const pair of pairs) {
-            let [key, value] = pair.split(":")
+            const separator = pair.indexOf(":")
+            if (separator === -1) continue
+
+            let key = pair.slice(0, separator)
+            let value = pair.slice(separator + 1)
             key = key?.trim()
             value = value?.trim()
             if (!key || !value) continue
-            this.__properties[key] = value
+            this.__properties[cssPropertyName(key)] = value
         }
     }
 
     getProperty(key) {
-        return this.__properties[key]
+        return this.__properties[cssPropertyName(key)]
     }
 
     getPropertyValue(key) {
-        return this.__properties[key] ?? ""
+        return this.__properties[cssPropertyName(key)] ?? ""
     }
 
     setProperty(key, value) {
@@ -1344,6 +1354,7 @@ class CSSStyleDeclaration {
             this.sync()
             return
         }
+        key = cssPropertyName(key)
         if (this.__properties[key] === value) {
             return
         }
@@ -1351,12 +1362,20 @@ class CSSStyleDeclaration {
         this.sync()
     }
 
-    // TODO: Need to convert property names into correct format. For example, background_color to background-color
     sync() {
         const out = this.cssText
         this.__element.__style = out
         core.ops.op_update_attributes(this.__element.__node_idx, { style: out }, this.__element.ownerDocument.__frameId)
     }
+}
+
+function cssPropertyName(key) {
+    const keyString = String(key)
+    if (keyString.startsWith("--")) {
+        return keyString
+    }
+
+    return keyString.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)
 }
 
 class SVGElement extends HtmlElement {
