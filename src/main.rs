@@ -5066,6 +5066,7 @@ impl Renderer {
             self.apply_overflow_constraints();
         }
         let mut new_rendered_nodes_ordered = vec![];
+        let mut deferred_z_index = vec![];
         for layout_box_idx in self.layout_roots.clone().iter() {
             let scroll_y = self
                 .scroll_y
@@ -5080,8 +5081,17 @@ impl Renderer {
                 0,
                 scroll_y,
                 &mut new_rendered_nodes_ordered,
+                &mut deferred_z_index,
+                true,
             );
         }
+        self.paint_deferred_z_index(
+            &mut deferred_z_index,
+            buffer,
+            width,
+            height,
+            &mut new_rendered_nodes_ordered,
+        );
         self.rendered_nodes_ordered = new_rendered_nodes_ordered;
     }
 
@@ -8034,9 +8044,16 @@ impl Renderer {
         parent_offset_x: i32,
         parent_offset_y: i32,
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
+        deferred_z_index: &mut Vec<(usize, i32, i32)>,
+        defer_positive_z_index: bool,
     ) {
         let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
         let style = self.node_styles.get(&layout_box.node_idx).cloned();
+        let creates_stacking_context = style.as_ref().is_some_and(Self::creates_stacking_context);
+        if defer_positive_z_index && layout_box.z_index > 0 && creates_stacking_context {
+            deferred_z_index.push((layout_box_idx, parent_offset_x, parent_offset_y));
+            return;
+        }
         let (transform_x, transform_y) = style
             .as_ref()
             .map(|style| self.resolve_transform_offset(style, layout_box))
@@ -8201,6 +8218,12 @@ impl Renderer {
             }
         }
 
+        let mut local_deferred_z_index = vec![];
+        let child_deferred_z_index = if creates_stacking_context {
+            &mut local_deferred_z_index
+        } else {
+            deferred_z_index
+        };
         for child in layout_box.children.clone() {
             self.paint_layout_box(
                 child,
@@ -8210,6 +8233,54 @@ impl Renderer {
                 offset_x,
                 offset_y,
                 rendered_nodes_ordered,
+                child_deferred_z_index,
+                true,
+            );
+        }
+        if creates_stacking_context {
+            self.paint_deferred_z_index(
+                &mut local_deferred_z_index,
+                buffer,
+                width,
+                height,
+                rendered_nodes_ordered,
+            );
+        }
+    }
+
+    fn creates_stacking_context(style: &Style) -> bool {
+        matches!(style.position, StylePosition::Fixed | StylePosition::Sticky)
+            || style.opacity < 1.0
+            || style.transform != StyleTransform::None
+            || (matches!(style.z_index, StyleZIndex::Number(_))
+                && style.position != StylePosition::Static)
+    }
+
+    fn paint_deferred_z_index(
+        &mut self,
+        deferred_z_index: &mut Vec<(usize, i32, i32)>,
+        buffer: &mut [u32],
+        width: u32,
+        height: u32,
+        rendered_nodes_ordered: &mut Vec<RenderedNode>,
+    ) {
+        deferred_z_index.sort_by(|(a, ..), (b, ..)| {
+            let a_z = self.layout_table.get(a).unwrap().z_index;
+            let b_z = self.layout_table.get(b).unwrap().z_index;
+            a_z.cmp(&b_z)
+        });
+        let deferred_z_index_to_paint = std::mem::take(deferred_z_index);
+        for (child, child_parent_offset_x, child_parent_offset_y) in deferred_z_index_to_paint {
+            self.paint_layout_box(
+                child,
+                buffer,
+                width,
+                height,
+                child_parent_offset_x,
+                child_parent_offset_y,
+                rendered_nodes_ordered,
+                deferred_z_index,
+                false,
             );
         }
     }
