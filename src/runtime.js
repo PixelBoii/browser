@@ -370,6 +370,8 @@ Object.defineProperty(globalThis, "Text", {
     writable: true,
 })
 
+const __trustedEvents = new WeakSet()
+
 class Event {
     constructor(type, options = {}) {
         this.type = String(type)
@@ -385,6 +387,10 @@ class Event {
         this.__stopped = false
         this.__immediateStopped = false
         this.__path = []
+    }
+
+    get isTrusted() {
+        return __trustedEvents.has(this)
     }
 
     preventDefault() {
@@ -433,6 +439,29 @@ class MouseEvent extends Event {
 
 Object.defineProperty(globalThis, "MouseEvent", {
     value: MouseEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
+class PointerEvent extends MouseEvent {
+    constructor(type, options = {}) {
+        super(type, options)
+        this.pointerId = options.pointerId ?? 1
+        this.width = options.width ?? 1
+        this.height = options.height ?? 1
+        this.pressure = options.pressure ?? 0
+        this.tangentialPressure = options.tangentialPressure ?? 0
+        this.tiltX = options.tiltX ?? 0
+        this.tiltY = options.tiltY ?? 0
+        this.twist = options.twist ?? 0
+        this.pointerType = options.pointerType ?? "mouse"
+        this.isPrimary = options.isPrimary ?? true
+    }
+}
+
+Object.defineProperty(globalThis, "PointerEvent", {
+    value: PointerEvent,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -2385,15 +2414,26 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
     path.push(globalThis.document, globalThis)
 
     const target = path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? __elementFromNodeIdx(targetNodeIdx)
-    const event = new MouseEvent("click", {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        detail: 1,
-    })
-
-    dispatchEventToPath(path, event, target)
-    return event.defaultPrevented
+    let clickEvent = null
+    for (const eventType of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+        const eventOptions = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            detail: eventType === "click" ? 1 : 0,
+            button: 0,
+            buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
+        }
+        const event = eventType.startsWith("pointer")
+            ? new PointerEvent(eventType, eventOptions)
+            : new MouseEvent(eventType, eventOptions)
+        __trustedEvents.add(event)
+        dispatchEventToPath(path, event, target)
+        if (eventType === "click") {
+            clickEvent = event
+        }
+    }
+    return clickEvent?.defaultPrevented ?? false
 }
 
 Object.defineProperty(globalThis, "hasEventListeners", {
