@@ -627,7 +627,6 @@ struct ContainerSizes {
     min_width: Option<u32>,
     max_width: Option<u32>,
     padding_x: u32,
-    has_specified_width: bool,
     has_specified_height: bool,
 }
 
@@ -6410,7 +6409,6 @@ impl Renderer {
             max_width,
             padding_x: (padding_left_size + padding_right_size) as u32,
             has_specified_height: specified_height.is_some(),
-            has_specified_width: specified_width.is_some(),
         }
     }
 
@@ -7550,6 +7548,17 @@ impl Renderer {
             StyleFlexDirection::Column => container_sizes.inner_width,
             StyleFlexDirection::Row => container_sizes.inner_height,
         };
+        let has_explicit_main_size = match style.flex_direction {
+            StyleFlexDirection::Row => container_sizes.container_width_non_filling.is_some(),
+            StyleFlexDirection::Column => container_sizes.container_height_non_filling.is_some(),
+        };
+        let fills_main_axis = match style.flex_direction {
+            StyleFlexDirection::Row => allow_fill && style.display != StyleDisplay::InlineFlex,
+            StyleFlexDirection::Column => {
+                has_definite_height && style.display != StyleDisplay::InlineFlex
+            }
+        };
+        let distributes_main_space = has_explicit_main_size || fills_main_axis;
         let overflow = total_base - flex_available_size as f32;
 
         if overflow > 0. {
@@ -7565,7 +7574,7 @@ impl Renderer {
                     item.target_size = (item.base_size - reduction).max(0.).min(item.max_size);
                 }
             }
-        } else if overflow < 0. && allow_fill {
+        } else if overflow < 0. && distributes_main_space {
             let left_to_grow: f32 = -overflow;
             let total_grow: u32 = base_items.iter().map(|i| i.grow).sum();
             if total_grow > 0 {
@@ -7625,11 +7634,11 @@ impl Renderer {
             .sum::<u32>()
             + gap_total as u32;
         let main_free_space = match style.flex_direction {
-            StyleFlexDirection::Row if allow_fill => {
+            StyleFlexDirection::Row if distributes_main_space => {
                 container_sizes.inner_width.saturating_sub(used_main)
             }
             StyleFlexDirection::Row => 0,
-            StyleFlexDirection::Column if has_definite_height => {
+            StyleFlexDirection::Column if distributes_main_space => {
                 container_sizes.inner_height.saturating_sub(used_main)
             }
             StyleFlexDirection::Column => 0,
