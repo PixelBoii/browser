@@ -549,6 +549,7 @@ struct Renderer {
     layout_roots: Vec<usize>,
     resolved_specified_heights: HashMap<usize, Option<u32>>,
     resolved_specified_widths: HashMap<usize, Option<u32>>,
+    resolved_content_sizes: HashMap<usize, OptionalSize>,
     resolved_heights: HashMap<usize, u32>,
     resolved_widths: HashMap<usize, u32>,
     dom_indexes: DomIndexes,
@@ -626,6 +627,8 @@ struct ContainerSizes {
     min_width: Option<u32>,
     max_width: Option<u32>,
     padding_x: u32,
+    has_specified_width: bool,
+    has_specified_height: bool,
 }
 
 impl ContainerSizes {
@@ -4460,6 +4463,7 @@ impl Renderer {
             layout_roots: vec![],
             resolved_specified_heights: HashMap::new(),
             resolved_specified_widths: HashMap::new(),
+            resolved_content_sizes: HashMap::new(),
             resolved_heights: HashMap::new(),
             resolved_widths: HashMap::new(),
             dom_indexes,
@@ -4741,6 +4745,7 @@ impl Renderer {
         self.layout_roots.clear();
         self.resolved_specified_heights.clear();
         self.resolved_specified_widths.clear();
+        self.resolved_content_sizes.clear();
         self.resolved_heights.clear();
         self.resolved_widths.clear();
     }
@@ -6404,6 +6409,8 @@ impl Renderer {
             min_width,
             max_width,
             padding_x: (padding_left_size + padding_right_size) as u32,
+            has_specified_height: specified_height.is_some(),
+            has_specified_width: specified_width.is_some(),
         }
     }
 
@@ -6588,6 +6595,17 @@ impl Renderer {
             .insert(node_idx, specified_height);
         self.resolved_specified_widths
             .insert(node_idx, specified_width);
+        self.resolved_content_sizes.insert(
+            node_idx,
+            OptionalSize {
+                width: Some(container_sizes.inner_width),
+                height: if container_sizes.has_specified_height {
+                    Some(container_sizes.inner_height)
+                } else {
+                    None
+                },
+            },
+        );
         let mut max_child_height = 0;
         let mut longest_row_width = 0;
         let width_to_distribute = container_sizes.inner_width;
@@ -6873,32 +6891,53 @@ impl Renderer {
                 self.nodes.get(node_idx).unwrap().get_parent()
             }
         };
-        let containing_block_height = containing_block
-            .and_then(|idx| {
-                self.resolved_heights
-                    .get(&idx)
-                    .or(self
-                        .resolved_specified_heights
-                        .get(&idx)
-                        .and_then(|v| *v)
-                        .as_ref())
-                    .cloned()
-            })
-            .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.height));
-        let containing_block_width = containing_block
-            .and_then(|idx| {
-                self.resolved_widths
-                    .get(&idx)
-                    .or(self
-                        .resolved_specified_widths
-                        .get(&idx)
-                        .and_then(|v| *v)
-                        .as_ref())
-                    .cloned()
-            })
-            .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.width));
 
-        (containing_block_height, containing_block_width)
+        if matches!(
+            style.position,
+            StylePosition::Relative | StylePosition::Static | StylePosition::Sticky
+        ) && let Some(containing_block_idx) = containing_block
+        {
+            let containing_block_sizes = self
+                .resolved_content_sizes
+                .get(&containing_block_idx)
+                .cloned();
+
+            let containing_block_width = containing_block_sizes
+                .and_then(|v| v.width)
+                .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.width));
+            let containing_block_height = containing_block_sizes
+                .and_then(|v| v.height)
+                .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.height));
+
+            (containing_block_height, containing_block_width)
+        } else {
+            let containing_block_height = containing_block
+                .and_then(|idx| {
+                    self.resolved_heights
+                        .get(&idx)
+                        .or(self
+                            .resolved_specified_heights
+                            .get(&idx)
+                            .and_then(|v| *v)
+                            .as_ref())
+                        .cloned()
+                })
+                .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.height));
+            let containing_block_width = containing_block
+                .and_then(|idx| {
+                    self.resolved_widths
+                        .get(&idx)
+                        .or(self
+                            .resolved_specified_widths
+                            .get(&idx)
+                            .and_then(|v| *v)
+                            .as_ref())
+                        .cloned()
+                })
+                .or((node_idx == self.dom_indexes.root_indice).then_some(self.window_size.width));
+
+            (containing_block_height, containing_block_width)
+        }
     }
 
     fn layout_block(
@@ -6950,14 +6989,6 @@ impl Renderer {
         self.resolved_specified_widths
             .insert(node_idx, specified_width);
 
-        if *mode == LayoutMode::BaseCalculation
-            && let (Some(height), Some(width)) = (specified_height, specified_width)
-            && height > 0
-            && width > 0
-        {
-            return Some((width, height, vec![], height));
-        }
-
         let container_sizes = self.get_container_sizes(
             node_idx,
             &forced_size,
@@ -6965,6 +6996,26 @@ impl Renderer {
             &available_size,
             containing_node_idx,
         );
+
+        self.resolved_content_sizes.insert(
+            node_idx,
+            OptionalSize {
+                width: Some(container_sizes.inner_width),
+                height: if container_sizes.has_specified_height {
+                    Some(container_sizes.inner_height)
+                } else {
+                    None
+                },
+            },
+        );
+
+        if *mode == LayoutMode::BaseCalculation
+            && let (Some(height), Some(width)) = (specified_height, specified_width)
+            && height > 0
+            && width > 0
+        {
+            return Some((width, height, vec![], height));
+        }
 
         let children_idxs: Vec<usize> = self
             .dom_indexes
@@ -7334,6 +7385,17 @@ impl Renderer {
             .insert(node_idx, specified_height);
         self.resolved_specified_widths
             .insert(node_idx, specified_width);
+        self.resolved_content_sizes.insert(
+            node_idx,
+            OptionalSize {
+                width: Some(container_sizes.inner_width),
+                height: if container_sizes.has_specified_height {
+                    Some(container_sizes.inner_height)
+                } else {
+                    None
+                },
+            },
+        );
 
         if *mode == LayoutMode::BaseCalculation {
             if let (Some(height), Some(width)) = (specified_height, specified_width) {
@@ -8316,7 +8378,7 @@ impl Renderer {
         style: &Style,
         containing_node_idx: usize,
     ) -> (i32, i32, i32, i32) {
-        let (containing_block_height, containing_block_width) =
+        let (_, containing_block_width) =
             self.get_containing_block_size(containing_node_idx, node_idx, &style);
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let padding_left_size = get_specified_size(
@@ -8338,7 +8400,7 @@ impl Renderer {
         let padding_top_size = get_specified_size(
             font_size,
             &style.padding_top,
-            containing_block_height,
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -8346,7 +8408,7 @@ impl Renderer {
         let padding_bottom_size = get_specified_size(
             font_size,
             &style.padding_bottom,
-            containing_block_height,
+            containing_block_width,
             None,
             &self.window_size,
         )
@@ -10475,10 +10537,7 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    Browser::open(
-        "https://widget.swapped.com".to_string(),
-        hover_debugging,
-    )?;
+    Browser::open("https://widget.swapped.com".to_string(), hover_debugging)?;
 
     Ok(())
 }
