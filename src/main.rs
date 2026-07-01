@@ -602,15 +602,13 @@ struct Position {
 
 #[derive(Debug, Clone, Copy)]
 struct ResumableNode {
-    parent_idx: usize,
     node_idx: usize,
-    available_size: Size,
-    cursor: Position,
 }
 
 #[derive(Debug, Clone)]
 struct ContainingNode {
     node_idx: usize,
+    cursor: Position,
     waiters: Vec<ResumableNode>,
 }
 
@@ -658,6 +656,25 @@ impl ContainingNode {
                 height: None,
                 width: None,
             };
+            let positioning_width = if style.position == StylePosition::Fixed {
+                renderer.window_size.width
+            } else {
+                width
+            };
+            let positioning_height = if style.position == StylePosition::Fixed {
+                renderer.window_size.height
+            } else {
+                height
+            };
+            let available_size = Size {
+                width: positioning_width,
+                height: positioning_height,
+            };
+            let cursor = if style.position == StylePosition::Fixed {
+                Position { x: 0, y: 0 }
+            } else {
+                self.cursor
+            };
             let resolved_parent_font_size = renderer.get_parent_font_size(waiter.node_idx);
             let font_size = get_specified_size(
                 resolved_parent_font_size,
@@ -673,28 +690,28 @@ impl ContainingNode {
             let top = get_specified_size(
                 font_size,
                 &style.top,
-                Some(waiter.available_size.height),
+                Some(positioning_height),
                 None,
                 &renderer.window_size,
             );
             let right = get_specified_size(
                 font_size,
                 &style.right,
-                Some(waiter.available_size.width),
+                Some(positioning_width),
                 None,
                 &renderer.window_size,
             );
             let bottom = get_specified_size(
                 font_size,
                 &style.bottom,
-                Some(waiter.available_size.height),
+                Some(positioning_height),
                 None,
                 &renderer.window_size,
             );
             let left = get_specified_size(
                 font_size,
                 &style.left,
-                Some(waiter.available_size.width),
+                Some(positioning_width),
                 None,
                 &renderer.window_size,
             );
@@ -702,28 +719,17 @@ impl ContainingNode {
             let margin_right = get_specified_size(
                 font_size,
                 &style.margin_right,
-                Some(waiter.available_size.width),
+                Some(positioning_width),
                 None,
                 &renderer.window_size,
             );
             let margin_left = get_specified_size(
                 font_size,
                 &style.margin_left,
-                Some(waiter.available_size.width),
+                Some(positioning_width),
                 None,
                 &renderer.window_size,
             );
-
-            let positioning_width = if style.position == StylePosition::Fixed {
-                waiter.available_size.width
-            } else {
-                width
-            };
-            let positioning_height = if style.position == StylePosition::Fixed {
-                waiter.available_size.height
-            } else {
-                height
-            };
 
             if style.position.is_free()
                 && style.width == StyleSize::Auto
@@ -744,8 +750,8 @@ impl ContainingNode {
 
             if let Some(layout_idx) = renderer.layout_node(
                 waiter.node_idx,
-                waiter.cursor,
-                waiter.available_size,
+                cursor,
+                available_size,
                 forced_size,
                 self.node_idx,
                 true,
@@ -791,19 +797,7 @@ impl ContainingNode {
                     }
                 }
 
-                // If the waiter's parent is us, we haven't been laid out yet, so just add to children vector
-                if waiter.parent_idx == self.node_idx {
-                    children.push(layout_idx);
-                } else if let Some(parent_layout_idx) =
-                    renderer.node_layout_mapping.get(&waiter.parent_idx)
-                {
-                    renderer
-                        .layout_table
-                        .get_mut(parent_layout_idx)
-                        .unwrap()
-                        .children
-                        .push(layout_idx);
-                }
+                children.push(layout_idx);
             }
         }
         self.waiters.clear();
@@ -5013,11 +5007,23 @@ impl Renderer {
         layout_box_id: usize,
         mut overflow_box: Option<(u32, u32, u32, u32)>,
     ) {
+        let layout_box = self.layout_table.get(&layout_box_id).unwrap();
+        let style = self.node_styles.get(&layout_box.node_idx);
+
+        let (transform_x, transform_y) = style
+            .as_ref()
+            .map(|style| self.resolve_transform_offset(style, &layout_box))
+            .unwrap_or((0, 0));
+
         let layout_box = self.layout_table.get_mut(&layout_box_id).unwrap();
 
         if let Some((start_x, start_y, end_x, end_y)) = overflow_box {
-            layout_box.rect.x = layout_box.rect.x.max(start_x as i32);
-            layout_box.rect.y = layout_box.rect.y.max(start_y as i32);
+            if layout_box.rect.x + transform_x < start_x as i32 {
+                layout_box.rect.x = start_x as i32;
+            }
+            if layout_box.rect.y + transform_y < start_y as i32 {
+                layout_box.rect.y = start_y as i32;
+            }
             let target_end_x = layout_box.rect.x + layout_box.rect.width as i32;
             let overflow_right = target_end_x - end_x as i32;
             layout_box.rect.width = layout_box
@@ -5340,6 +5346,7 @@ impl Renderer {
             self.dom_indexes.root_indice,
             ContainingNode {
                 node_idx: self.dom_indexes.root_indice,
+                cursor: Position { x: 0, y: 0 },
                 waiters: vec![],
             },
         );
@@ -6562,11 +6569,12 @@ impl Renderer {
             &available_size,
             containing_node_idx,
         );
-        if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
+        if style.position != StylePosition::Static {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
                     node_idx,
+                    cursor,
                     waiters: vec![],
                 },
             );
@@ -6624,6 +6632,22 @@ impl Renderer {
             .get(&node_idx)
             .cloned()
             .unwrap();
+        let immediate_children: Vec<usize> = children_idxs
+            .iter()
+            .copied()
+            .filter(|c| {
+                let style = &self.node_styles.get(c);
+                style.is_some_and(|style| !style.position.is_free())
+            })
+            .collect();
+        let free_children: Vec<usize> = children_idxs
+            .iter()
+            .copied()
+            .filter(|c| {
+                let style = &self.node_styles.get(c);
+                style.is_some_and(|style| style.position.is_free())
+            })
+            .collect();
         let mut current_column = 0;
         let mut definitely_used_width = 0;
         let mut definitely_used_height = 0;
@@ -6703,7 +6727,7 @@ impl Renderer {
         let mut row_count = 1usize;
         let mut current_row: usize = 0;
         // Compute base items and their ideal sizes
-        for child_idx in children_idxs.iter() {
+        for child_idx in immediate_children.iter() {
             let wrap = match grid_template_columns {
                 GridTemplateColumns::Values(ref template_columns) => {
                     self.get_grid_column(current_column, &template_columns)
@@ -6883,6 +6907,24 @@ impl Renderer {
         };
         self.resolved_heights.insert(node_idx, height);
         self.resolved_widths.insert(node_idx, width);
+        if *mode != LayoutMode::BaseCalculation {
+            for child_idx in free_children {
+                self.queue_free_child_for_layout(containing_node_idx, child_idx);
+            }
+
+            if containing_node_idx == node_idx {
+                let mut containing_node = self
+                    .containing_nodes
+                    .get_mut(&containing_node_idx)
+                    .unwrap()
+                    .clone();
+                containing_node
+                    .layout_waiters(self, height, width, &mut children, mode)
+                    .ok()?;
+                self.containing_nodes
+                    .insert(containing_node_idx, containing_node);
+            }
+        }
         Some((width as u32, height as u32, children, content_height as u32))
     }
 
@@ -7049,11 +7091,12 @@ impl Renderer {
             })
             .collect();
 
-        if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
+        if style.position != StylePosition::Static {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
                     node_idx,
+                    cursor,
                     waiters: vec![],
                 },
             );
@@ -7238,27 +7281,23 @@ impl Renderer {
             free_space_y,
         );
 
-        for child_idx in free_children {
-            self.queue_free_child_for_layout(
-                containing_node_idx,
-                node_idx,
-                child_idx,
-                Size { height, width },
-                original_cursor.clone(),
-            );
-        }
+        if *mode != LayoutMode::BaseCalculation {
+            for child_idx in free_children {
+                self.queue_free_child_for_layout(containing_node_idx, child_idx);
+            }
 
-        if containing_node_idx == node_idx {
-            let mut containing_node = self
-                .containing_nodes
-                .get_mut(&containing_node_idx)
-                .unwrap()
-                .clone();
-            containing_node
-                .layout_waiters(self, height, width, &mut children, mode)
-                .ok()?;
-            self.containing_nodes
-                .insert(containing_node_idx, containing_node);
+            if containing_node_idx == node_idx {
+                let mut containing_node = self
+                    .containing_nodes
+                    .get_mut(&containing_node_idx)
+                    .unwrap()
+                    .clone();
+                containing_node
+                    .layout_waiters(self, height, width, &mut children, mode)
+                    .ok()?;
+                self.containing_nodes
+                    .insert(containing_node_idx, containing_node);
+            }
         }
 
         Some((width, height, children, content_height))
@@ -7411,11 +7450,12 @@ impl Renderer {
             }
         }
 
-        if style.position == StylePosition::Relative || style.position == StylePosition::Sticky {
+        if style.position != StylePosition::Static {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
                     node_idx,
+                    cursor,
                     waiters: vec![],
                 },
             );
@@ -7864,27 +7904,23 @@ impl Renderer {
         self.resolved_heights.insert(node_idx, height);
         self.resolved_widths.insert(node_idx, width);
 
-        for child_idx in free_children {
-            self.queue_free_child_for_layout(
-                containing_node_idx,
-                node_idx,
-                *child_idx,
-                Size { height, width },
-                original_content_cursor.clone(),
-            );
-        }
+        if *mode != LayoutMode::BaseCalculation {
+            for child_idx in free_children {
+                self.queue_free_child_for_layout(containing_node_idx, *child_idx);
+            }
 
-        if containing_node_idx == node_idx {
-            let mut containing_node = self
-                .containing_nodes
-                .get_mut(&containing_node_idx)
-                .unwrap()
-                .clone();
-            containing_node
-                .layout_waiters(self, height, width, &mut children, mode)
-                .ok()?;
-            self.containing_nodes
-                .insert(containing_node_idx, containing_node);
+            if containing_node_idx == node_idx {
+                let mut containing_node = self
+                    .containing_nodes
+                    .get_mut(&containing_node_idx)
+                    .unwrap()
+                    .clone();
+                containing_node
+                    .layout_waiters(self, height, width, &mut children, mode)
+                    .ok()?;
+                self.containing_nodes
+                    .insert(containing_node_idx, containing_node);
+            }
         }
 
         Some((width, height, children, content_height))
@@ -8415,41 +8451,19 @@ impl Renderer {
         self.recompute_styles();
     }
 
-    fn queue_free_child_for_layout(
-        &mut self,
-        containing_node_idx: usize,
-        parent_idx: usize,
-        child_idx: usize,
-        available_size: Size,
-        cursor: Position,
-    ) {
+    fn queue_free_child_for_layout(&mut self, containing_node_idx: usize, child_idx: usize) {
         let child_style = self.node_styles.get(&child_idx).unwrap();
-        let (containing_node_idx, parent_idx, available_size, cursor) =
-            if child_style.position == StylePosition::Fixed {
-                (
-                    self.dom_indexes.root_indice,
-                    self.dom_indexes.root_indice,
-                    Size {
-                        height: self.window_size.height,
-                        width: self.window_size.width,
-                    },
-                    Position { x: 0, y: 0 },
-                )
-            } else {
-                (containing_node_idx, parent_idx, available_size, cursor)
-            };
+        let containing_node_idx = if child_style.position == StylePosition::Fixed {
+            self.dom_indexes.root_indice
+        } else {
+            containing_node_idx
+        };
 
         let containing_node = self.containing_nodes.get_mut(&containing_node_idx).unwrap();
 
-        containing_node
-            .waiters
-            // Note: We use the cursor here rather than content_position as free children are not affected by padding
-            .push(ResumableNode {
-                parent_idx,
-                node_idx: child_idx,
-                available_size,
-                cursor,
-            });
+        containing_node.waiters.push(ResumableNode {
+            node_idx: child_idx,
+        });
     }
 
     pub fn get_paddings(
