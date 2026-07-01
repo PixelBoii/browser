@@ -341,6 +341,7 @@ class TextNode extends BaseNode {
 
     registerInBackend() {
         this.__node_idx = core.ops.op_create_text_element(this.text)
+        cacheNodeElement(this.__node_idx, this)
     }
 
     get data() { return this.text }
@@ -479,6 +480,7 @@ class HtmlElement extends BaseNode {
 
     registerInBackend() {
         this.__node_idx = core.ops.op_create_element(this.tag, this.ownerDocument.__frameId)
+        cacheNodeElement(this.__node_idx, this)
     }
 
     addEventListener(event, cb) {
@@ -1424,6 +1426,7 @@ class CommentNode extends BaseNode {
 
     registerInBackend() {
         this.__node_idx = core.ops.op_create_comment_element(this.data)
+        cacheNodeElement(this.__node_idx, this)
     }
 
     get nodeValue() { return this.data }
@@ -1525,6 +1528,12 @@ function nodeMapKey(nodeIdx) {
 
 function clearNodeMap() {
     nodeMap.clear()
+}
+
+function cacheNodeElement(nodeIdx, element) {
+    if (nodeIdx != null) {
+        nodeMap.set(nodeMapKey(nodeIdx), element)
+    }
 }
 
 Object.defineProperty(globalThis, "__clear_node_map", {
