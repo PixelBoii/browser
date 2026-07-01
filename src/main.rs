@@ -986,8 +986,13 @@ fn rasterize_svg(
             svg_str.as_bytes()
         };
         let mut opt = usvg::Options::default();
-        opt.style_sheet =
-            Some(format!("svg {{ color: #{:08X}; fill: currentColor }}", color_hex).into());
+        opt.style_sheet = Some(
+            format!(
+                "svg {{ color: #{:08X} !important; fill: currentColor }}",
+                color_hex
+            )
+            .into(),
+        );
 
         let tree = usvg::Tree::from_data(&svg_data, &opt)?;
         cached_rasterizations.decoded_svgs.insert(key.clone(), tree);
@@ -1006,7 +1011,7 @@ fn rasterize_svg(
     (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
     (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
 
-    let key = (svg_str.clone(), target_h, target_w);
+    let key = (svg_str.clone(), color_hex, target_h, target_w);
     if let Some(cached) = cached_rasterizations.svgs.get(&key) {
         Ok((cached.clone(), target_h, target_w, false))
     } else {
@@ -4228,7 +4233,7 @@ struct CachedRasterizations {
     decoded_svgs: HashMap<(String, u32), Tree>,
     jpegs: HashMap<(String, u32, u32), Pixmap>,
     gifs: HashMap<(String, u32, u32), Pixmap>,
-    svgs: HashMap<(String, u32, u32), Pixmap>,
+    svgs: HashMap<(String, u32, u32, u32), Pixmap>,
 }
 
 impl CachedRasterizations {
