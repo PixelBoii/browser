@@ -6020,28 +6020,36 @@ impl Renderer {
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                            )? as u32,
+                            )
+                            .unwrap_or(0)
+                            .max(0) as u32,
                             top_right: get_specified_size(
                                 resolved_font_size,
                                 &style.border_radius_top_right,
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                            )? as u32,
+                            )
+                            .unwrap_or(0)
+                            .max(0) as u32,
                             bottom_right: get_specified_size(
                                 resolved_font_size,
                                 &style.border_radius_bottom_right,
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                            )? as u32,
+                            )
+                            .unwrap_or(0)
+                            .max(0) as u32,
                             bottom_left: get_specified_size(
                                 resolved_font_size,
                                 &style.border_radius_bottom_left,
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                            )? as u32,
+                            )
+                            .unwrap_or(0)
+                            .max(0) as u32,
                         };
 
                         if let StyleBackground::DataUrl((format, data)) = &style_bg {
@@ -7425,9 +7433,7 @@ impl Renderer {
             &self.window_size,
         )
         .and_then(|v| Some(v as u32)));
-        let has_definite_height = forced_size.height.is_some()
-            || specified_height.is_some()
-            || container_sizes.min_height.is_some();
+        let has_definite_height = forced_size.height.is_some() || specified_height.is_some();
         self.resolved_specified_heights
             .insert(node_idx, specified_height);
         self.resolved_specified_widths
@@ -7830,7 +7836,7 @@ impl Renderer {
                             height: item.target_size as u32,
                         },
                         OptionalSize {
-                            height: Some(item.target_size as u32),
+                            height: has_definite_height.then_some(item.target_size as u32),
                             width: definite_cross_size.then_some(item.cross_size as u32),
                         },
                         containing_node_idx,
