@@ -1089,6 +1089,44 @@ fn parse_hsl_color(raw: &str) -> Result<StyleBackground> {
     ))))
 }
 
+// TODO: Come back to this and add a more complete implementation
+fn parse_color_mix(raw: &str) -> Result<StyleBackground> {
+    let cleaned = raw.strip_suffix(')').unwrap_or(raw).trim();
+    let rest = cleaned
+        .strip_prefix("in oklab,")
+        .or_else(|| cleaned.strip_prefix("in srgb,"))
+        .ok_or_else(|| anyhow!("Unsupported color-mix space: {}", raw))?;
+    let Some((color_and_percentage, transparent)) = rest.rsplit_once(',') else {
+        return Err(anyhow!("Unsupported color-mix: {}", raw));
+    };
+    if transparent.trim() != "transparent" {
+        return Err(anyhow!("Unsupported color-mix: {}", raw));
+    }
+
+    let color_and_percentage = color_and_percentage.trim();
+    let (color, percentage) = if let Some(end) = color_and_percentage.rfind(')') {
+        color_and_percentage.split_at(end + 1)
+    } else {
+        color_and_percentage
+            .rsplit_once(' ')
+            .ok_or_else(|| anyhow!("Expected color and mix percentage, got {}", raw))?
+    };
+    let percentage = percentage.trim();
+    if !percentage.ends_with('%') {
+        return Err(anyhow!("Expected color and mix percentage, got {}", raw));
+    }
+
+    let mix = parse_percent(percentage)?;
+    match parse_color(color.to_string())? {
+        StyleBackground::Hex(hex) => {
+            let alpha = ((hex & 0xFF) as f32 * mix).round() as u32;
+            Ok(StyleBackground::Hex((hex & 0xFF_FF_FF_00) | alpha.min(255)))
+        }
+        StyleBackground::Transparent => Ok(StyleBackground::Transparent),
+        _ => Err(anyhow!("Unsupported color-mix color: {}", color)),
+    }
+}
+
 fn parse_color(value: String) -> Result<StyleBackground> {
     let value = value.trim();
     if value.starts_with("#") {
@@ -1152,6 +1190,8 @@ fn parse_color(value: String) -> Result<StyleBackground> {
         Ok(StyleBackground::Hex(hex))
     } else if let Some(raw) = value.strip_prefix("hsla(").or(value.strip_prefix("hsl(")) {
         parse_hsl_color(raw)
+    } else if let Some(raw) = value.strip_prefix("color-mix(") {
+        parse_color_mix(raw)
     } else {
         match value.to_ascii_lowercase().as_str() {
             "black" | "buttontext" | "canvastext" | "linktext" => {
