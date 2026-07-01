@@ -1517,8 +1517,11 @@ class ClassList {
     }
 }
 
-// TODO: Might want to key this by frame/document id too
 const nodeMap = new Map()
+
+function nodeMapKey(nodeIdx) {
+    return `${currentDocument?.__frameId ?? "main"}:${nodeIdx}`
+}
 
 function clearNodeMap() {
     nodeMap.clear()
@@ -1534,7 +1537,8 @@ Object.defineProperty(globalThis, "__clear_node_map", {
 function nodeToElement(pair) {
     const node_idx = pair[0]
     const node = pair[1]
-    const existing = nodeMap.get(node_idx)
+    const key = nodeMapKey(node_idx)
+    const existing = nodeMap.get(key)
     if (existing) {
         return existing
     }
@@ -1548,7 +1552,7 @@ function nodeToElement(pair) {
         element = withoutAutoRegisterNode(() => new TextNode(node.text))
     }
     element.__node_idx = node_idx
-    nodeMap.set(node_idx, element)
+    nodeMap.set(key, element)
     return element
 }
 
