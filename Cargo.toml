@@ -29,3 +29,6 @@ image = "0.25.10"
 fixedbitset = "0.5.7"
 deno_error = "=0.7.1"
 palette = "0.7.6"
+
+[patch.crates-io]
+resvg = { path = "vendor/resvg" }
