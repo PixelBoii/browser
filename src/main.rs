@@ -556,7 +556,7 @@ struct Renderer {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
-    cached_text_buffers: HashMap<(String, u32, Option<u32>, u32), (Pixmap, u32, u32)>,
+    cached_text_buffers: HashMap<(String, u32, Option<u32>, Option<u32>, u32), (Pixmap, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     variable_definitions: VariableDefinitions,
     event_loop_proxy: Option<RendererProxy>,
@@ -600,8 +600,21 @@ struct Position {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum SizeDependentStaticOffset {
+    CenterY(u32),
+    EndY(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StaticPositionOffset {
+    offset: Position,
+    size_dependent_offset: Option<SizeDependentStaticOffset>,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ResumableNode {
     node_idx: usize,
+    static_position_offset: Option<StaticPositionOffset>,
 }
 
 #[derive(Debug, Clone)]
@@ -669,11 +682,6 @@ impl ContainingNode {
                 width: positioning_width,
                 height: positioning_height,
             };
-            let cursor = if style.position == StylePosition::Fixed {
-                Position { x: 0, y: 0 }
-            } else {
-                self.cursor
-            };
             let resolved_parent_font_size = renderer.get_parent_font_size(waiter.node_idx);
             let font_size = get_specified_size(
                 resolved_parent_font_size,
@@ -714,6 +722,22 @@ impl ContainingNode {
                 None,
                 &renderer.window_size,
             );
+            let auto_left = left.is_none() && right.is_none();
+            let auto_top = top.is_none() && bottom.is_none();
+            let static_position_offset = (style.position == StylePosition::Absolute)
+                .then_some(waiter.static_position_offset)
+                .flatten();
+            let static_offset = static_position_offset
+                .map(|position| position.offset)
+                .unwrap_or(Position { x: 0, y: 0 });
+            let cursor = if style.position == StylePosition::Fixed {
+                Position { x: 0, y: 0 }
+            } else {
+                Position {
+                    x: self.cursor.x + if auto_left { static_offset.x } else { 0 },
+                    y: self.cursor.y + if auto_top { static_offset.y } else { 0 },
+                }
+            };
 
             let margin_right = get_specified_size(
                 font_size,
@@ -781,6 +805,29 @@ impl ContainingNode {
                         let free_space =
                             positioning_width.saturating_sub(waiter_layout_box.rect.width);
                         renderer.move_entire_box(layout_idx, (free_space / 2) as i32, 0);
+                    }
+
+                    if auto_top
+                        && let Some(size_dependent_offset) =
+                            static_position_offset.and_then(|offset| offset.size_dependent_offset)
+                    {
+                        let (_, _, margin_top, margin_bottom) =
+                            renderer.get_margins(waiter.node_idx, &style, available_size);
+                        let margin_y = (margin_top + margin_bottom).max(0) as u32;
+                        let used_height = waiter_layout_box.rect.height.saturating_add(margin_y);
+                        let offset_y = match size_dependent_offset {
+                            SizeDependentStaticOffset::CenterY(available) => {
+                                available.saturating_sub(used_height) / 2
+                            }
+                            SizeDependentStaticOffset::EndY(available) => {
+                                available.saturating_sub(used_height)
+                            }
+                        };
+                        renderer.move_entire_box(
+                            layout_idx,
+                            0,
+                            offset_y as i32 + margin_top.max(0),
+                        );
                     }
 
                     if top.is_some() && bottom.is_some() {
@@ -5506,6 +5553,17 @@ impl Renderer {
         *resolved_parent_font_size
     }
 
+    fn get_line_height(&self, style: &Style, font_size: u32) -> Option<u32> {
+        get_specified_size(
+            font_size,
+            &style.line_height,
+            Some(font_size),
+            None,
+            &self.window_size,
+        )
+        .and_then(|value| (value > 0).then_some(value as u32))
+    }
+
     fn resolve_transform_offset(&self, style: &Style, layout_box: &LayoutBox) -> (i32, i32) {
         let StyleTransform::Operations(operations) = &style.transform else {
             return (0, 0);
@@ -5571,17 +5629,25 @@ impl Renderer {
                     _ => None,
                 }?;
                 let max_width = Some(available_size.width);
-                let cache_key = (text.clone(), resolved_font_size, max_width, text_hex);
+                let line_height = self.get_line_height(style, resolved_font_size);
+                let cache_key = (
+                    text.clone(),
+                    resolved_font_size,
+                    max_width,
+                    line_height,
+                    text_hex,
+                );
                 let (buffer, width, height) =
                     if let Some(cached) = self.cached_text_buffers.get(&cache_key) {
                         cached
                     } else {
-                        let result = text_to_buffer(
+                        let result = text_to_buffer_with_line_height(
                             &self.font_handler,
                             text_hex,
                             &text.clone(),
                             resolved_font_size,
                             max_width,
+                            line_height,
                         )?;
                         self.cached_text_buffers.insert(cache_key.clone(), result);
                         self.cached_text_buffers.get(&cache_key)?
@@ -6464,7 +6530,7 @@ impl Renderer {
             _ => None,
         }
         .with_context(|| "No color was specified for text")?;
-        let cache_key = (text.clone(), font_size, None, text_hex);
+        let cache_key = (text.clone(), font_size, None, None, text_hex);
         let (buffer, width, height) = if let Some(cached) = self.cached_text_buffers.get(&cache_key)
         {
             cached
@@ -6929,7 +6995,7 @@ impl Renderer {
         self.resolved_widths.insert(node_idx, width);
         if *mode != LayoutMode::BaseCalculation {
             for child_idx in free_children {
-                self.queue_free_child_for_layout(containing_node_idx, child_idx);
+                self.queue_free_child_for_layout(containing_node_idx, child_idx, None);
             }
 
             if containing_node_idx == node_idx {
@@ -7303,7 +7369,7 @@ impl Renderer {
 
         if *mode != LayoutMode::BaseCalculation {
             for child_idx in free_children {
-                self.queue_free_child_for_layout(containing_node_idx, child_idx);
+                self.queue_free_child_for_layout(containing_node_idx, child_idx, None);
             }
 
             if containing_node_idx == node_idx {
@@ -7923,8 +7989,46 @@ impl Renderer {
         self.resolved_widths.insert(node_idx, width);
 
         if *mode != LayoutMode::BaseCalculation {
+            let static_position_available_height =
+                height.saturating_sub((padding_top_size + padding_bottom_size).max(0) as u32);
             for child_idx in free_children {
-                self.queue_free_child_for_layout(containing_node_idx, *child_idx);
+                let static_position_offset = self
+                    .containing_nodes
+                    .get(&containing_node_idx)
+                    .filter(|_| {
+                        self.node_styles.get(child_idx).unwrap().position
+                            == StylePosition::Absolute
+                    })
+                    .map(|containing_node| {
+                        let size_dependent_offset = match style.flex_direction {
+                            StyleFlexDirection::Column => match style.justify_content {
+                                StyleJustifyContent::Center => {
+                                    Some(SizeDependentStaticOffset::CenterY(
+                                        static_position_available_height,
+                                    ))
+                                }
+                                StyleJustifyContent::FlexEnd => {
+                                    Some(SizeDependentStaticOffset::EndY(
+                                        static_position_available_height,
+                                    ))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        StaticPositionOffset {
+                            offset: Position {
+                                x: original_content_cursor.x - containing_node.cursor.x,
+                                y: original_content_cursor.y - containing_node.cursor.y,
+                            },
+                            size_dependent_offset,
+                        }
+                    });
+                self.queue_free_child_for_layout(
+                    containing_node_idx,
+                    *child_idx,
+                    static_position_offset,
+                );
             }
 
             if containing_node_idx == node_idx {
@@ -8469,7 +8573,12 @@ impl Renderer {
         self.recompute_styles();
     }
 
-    fn queue_free_child_for_layout(&mut self, containing_node_idx: usize, child_idx: usize) {
+    fn queue_free_child_for_layout(
+        &mut self,
+        containing_node_idx: usize,
+        child_idx: usize,
+        static_position_offset: Option<StaticPositionOffset>,
+    ) {
         let child_style = self.node_styles.get(&child_idx).unwrap();
         let containing_node_idx = if child_style.position == StylePosition::Fixed {
             self.dom_indexes.root_indice
@@ -8481,6 +8590,7 @@ impl Renderer {
 
         containing_node.waiters.push(ResumableNode {
             node_idx: child_idx,
+            static_position_offset,
         });
     }
 
@@ -10749,6 +10859,17 @@ fn text_to_buffer(
     font_px: u32,
     max_width: Option<u32>,
 ) -> Option<(Pixmap, u32, u32)> {
+    text_to_buffer_with_line_height(font_handler, color, text, font_px, max_width, None)
+}
+
+fn text_to_buffer_with_line_height(
+    font_handler: &Rc<FontHandler>,
+    color: u32,
+    text: &String,
+    font_px: u32,
+    max_width: Option<u32>,
+    line_height_px: Option<u32>,
+) -> Option<(Pixmap, u32, u32)> {
     let scaled_font = font_handler.font.as_scaled(font_px as f32);
     let mut width = 0f32;
     let x = 0;
@@ -10759,7 +10880,11 @@ fn text_to_buffer(
 
     let mut glyph_positions = vec![];
 
-    let line_height = scaled_font.height() + scaled_font.line_gap();
+    let default_line_height = scaled_font.height() + scaled_font.line_gap();
+    let line_height = line_height_px
+        .map(|line_height| line_height as f32)
+        .unwrap_or(default_line_height);
+    let leading = ((line_height - default_line_height) / 2.).max(0.);
     for ch in text.chars() {
         let glyph_id = font_handler.font.glyph_id(ch);
         if let Some(previous_id) = previous {
@@ -10792,7 +10917,8 @@ fn text_to_buffer(
             width,
             height,
             glyph_pos.x as i32,
-            (glyph_pos.y + scaled_font.ascent() + glyph_pos.glyph.px_bounds().min.y) as i32,
+            (glyph_pos.y + leading + scaled_font.ascent() + glyph_pos.glyph.px_bounds().min.y)
+                as i32,
             &glyph_pos.glyph,
             color,
         );

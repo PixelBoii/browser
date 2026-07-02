@@ -223,6 +223,7 @@ pub struct Style {
     pub text_align: StyleAlign,
     pub variables: Rc<HashMap<usize, String>>,
     pub font_size: StyleSize,
+    pub line_height: StyleSize,
     pub align_self: StyleJustifyContent,
     pub border_left: StyleSizeAndColor,
     pub border_top: StyleSizeAndColor,
@@ -279,6 +280,7 @@ impl Style {
             text_align: self.text_align,
             variables: Rc::new(HashMap::new()),
             font_size: self.font_size.clone(),
+            line_height: self.line_height.clone(),
             align_self: self.align_self,
             border_left: self.border_left.clone(),
             border_top: self.border_top.clone(),
@@ -437,6 +439,10 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             .clone()
             .and_then(|v| Some(v.font_size.clone()))
             .unwrap_or(StyleSize::Px(16.)),
+        line_height: parent_style
+            .clone()
+            .and_then(|v| Some(v.line_height.clone()))
+            .unwrap_or(StyleSize::Auto),
         align_self: StyleJustifyContent::Auto,
         // TODO: This should default to currentColor
         border_left: StyleSizeAndColor {
@@ -609,6 +615,15 @@ fn parse_transform(value: &str) -> Result<Option<StyleTransform>> {
     }
 }
 
+fn parse_translate(value: &str) -> Result<Option<StyleTransform>> {
+    if value.trim() == "none" {
+        return Ok(Some(StyleTransform::None));
+    }
+
+    Ok(parse_transform_operation("translate", value)?
+        .map(|operation| StyleTransform::Operations(vec![operation])))
+}
+
 fn parse_combined_style<T, F>(value: String, parse: F) -> Result<(T, T, T, T)>
 where
     T: Clone,
@@ -699,7 +714,11 @@ pub fn parse_calc(value: &str) -> Result<StyleSize> {
     for char in value.chars() {
         if char == '(' {
             nesting += 1;
-            flush_calc_value(&mut buffer, &mut parts, nesting)?;
+            if buffer == "calc" {
+                buffer.clear();
+            } else {
+                flush_calc_value(&mut buffer, &mut parts, nesting)?;
+            }
             add_part_to_calc(&mut parts, CalcExpression::Nesting(vec![]), nesting);
         } else if char == ')' {
             flush_calc_value(&mut buffer, &mut parts, nesting)?;
@@ -848,6 +867,24 @@ fn parse_style_size(value: impl AsRef<str>) -> Result<StyleSize> {
     }
     println!("Failed to parse style size \"{}\"", value);
     Ok(StyleSize::Auto)
+}
+
+fn parse_line_height(value: String) -> Result<StyleSize> {
+    let value = value.trim();
+    if value == "normal" {
+        return Ok(StyleSize::Auto);
+    }
+
+    let adjusted = if value.starts_with('.') {
+        format!("0{}", value)
+    } else {
+        value.to_string()
+    };
+    if let Ok(parsed) = adjusted.parse::<f32>() {
+        return Ok(StyleSize::Em(parsed));
+    }
+
+    parse_style_size(value)
 }
 
 fn parse_grid_size(value: String) -> Result<GridColumnSize> {
@@ -1380,21 +1417,31 @@ fn resolve_variable_template(
     variable_definitions: &VariableDefinitions,
 ) -> String {
     let mut out = String::new();
+    let mut previous_was_var = false;
     for el in template.iter() {
         match el {
             VariableTemplatePart::Text(text) => {
                 out += text;
+                previous_was_var = false;
             }
             VariableTemplatePart::Var((name, default)) => {
-                if let Some(value) = variable_definitions
+                let value = if let Some(value) = variable_definitions
                     .variable_to_idx
                     .get(name)
                     .and_then(|name| resolved_variables.get(name))
                 {
-                    out += value;
+                    value.as_str()
                 } else {
-                    out += default.clone().unwrap_or(name.to_string()).as_str();
+                    default.as_deref().unwrap_or(name.as_str())
+                };
+                if previous_was_var
+                    && !out.ends_with(char::is_whitespace)
+                    && !value.starts_with(char::is_whitespace)
+                {
+                    out.push(' ');
                 }
+                out += value;
+                previous_was_var = true;
             }
         };
     }
@@ -1718,6 +1765,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             | "padding-block-end"
             | "padding-inline-start"
             | "padding-inline-end" => PropertyValue::Size(parse_style_size(value)?),
+            "line-height" => PropertyValue::Size(parse_line_height(value)?),
             "margin" | "padding" | "inset" | "border-radius" => {
                 PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?)
             }
@@ -1877,6 +1925,9 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             "transform" => parse_transform(&value)?
                 .map(PropertyValue::Transform)
                 .unwrap_or(PropertyValue::Raw(value)),
+            "translate" => parse_translate(&value)?
+                .map(PropertyValue::Transform)
+                .unwrap_or(PropertyValue::Raw(value)),
             "initial-value" | "syntax" | "inherits" => PropertyValue::Raw(value),
             _ => {
                 // println!("Failed to parse style \"{}\"", property);
@@ -1973,6 +2024,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("font-size", PropertyValue::Size(value)) => {
             style.font_size = value;
+        }
+        ("line-height", PropertyValue::Size(value)) => {
+            style.line_height = value;
         }
         ("inset", PropertyValue::CombinedSize((top, right, bottom, left))) => {
             style.top = top;
@@ -2190,7 +2244,7 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         ("pointer-events", PropertyValue::PointerEvents(value)) => {
             style.pointer_events = value;
         }
-        ("transform", PropertyValue::Transform(value)) => {
+        ("transform" | "translate", PropertyValue::Transform(value)) => {
             style.transform = value;
         }
         ("opacity", PropertyValue::Raw(value)) => {
