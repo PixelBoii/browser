@@ -11242,15 +11242,40 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
+        let pump_limit = Duration::from_secs(10);
         let pump_start = Instant::now();
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        println!("renders_swapped_com pump={}ms", pump_start.elapsed().as_millis());
+        frame.pump_with_limit(Instant::now().add(pump_limit))?;
+        println!(
+            "renders_swapped_com pump={}ms limit={}ms",
+            pump_start.elapsed().as_millis(),
+            pump_limit.as_millis()
+        );
         let mut buffer = vec![0; 1920 * 1080];
         let render_start = Instant::now();
         frame.render_into(&mut buffer, 1920, 1080, true);
         println!(
-            "renders_swapped_com render_into={}us",
+            "renders_swapped_com render_into_cold={}us",
             render_start.elapsed().as_micros()
+        );
+
+        const HOT_RENDER_RUNS: usize = 100;
+        let mut hot_render_times = Vec::with_capacity(HOT_RENDER_RUNS);
+        for _ in 0..HOT_RENDER_RUNS {
+            let render_start = Instant::now();
+            frame.render_into(&mut buffer, 1920, 1080, true);
+            let elapsed = render_start.elapsed().as_micros();
+            hot_render_times.push(elapsed);
+        }
+        let hot_render_mean =
+            hot_render_times.iter().sum::<u128>() / hot_render_times.len() as u128;
+        let hot_render_min = hot_render_times.iter().min().copied().unwrap_or_default();
+        let hot_render_max = hot_render_times.iter().max().copied().unwrap_or_default();
+        println!(
+            "renders_swapped_com render_into_hot_runs={} mean={}us min={}us max={}us",
+            hot_render_times.len(),
+            hot_render_mean,
+            hot_render_min,
+            hot_render_max
         );
         ensure_snapshot_matches(&buffer, "widgetswappedcom", 1920, 1080)
     }
