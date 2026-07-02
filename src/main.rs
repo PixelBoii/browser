@@ -5235,11 +5235,11 @@ impl Renderer {
             })
             .collect();
 
-        println!("Pre-fetching {} images", requests.len());
-
         if requests.is_empty() {
             return;
         }
+
+        println!("Pre-fetching {} images", requests.len());
 
         let client = self.network_fetch.borrow().client.clone();
         let results = self.tokio.clone().borrow_mut().block_on(async move {
@@ -8720,6 +8720,28 @@ impl ExecutedScripts {
             nodes: vec![],
         }
     }
+
+    pub fn upsert_script(&mut self, js: &Script) -> bool {
+        if let ScriptContent::Link(link) = &js.content {
+            if self.links.contains(&link) {
+                // println!("Script has already been ran, ignoring: {}", link);
+                false
+            } else {
+                self.links.push(link.to_string());
+                true
+            }
+        } else if let Some(node_idx) = js.node_idx {
+            if self.nodes.contains(&node_idx) {
+                // println!("Script has already been ran, ignoring: {}", node_idx);
+                false
+            } else {
+                self.nodes.push(node_idx);
+                true
+            }
+        } else {
+            true
+        }
+    }
 }
 
 struct Frame {
@@ -9137,33 +9159,6 @@ impl Frame {
             return Ok(());
         };
 
-        let should_run = {
-            let mut executed_scripts = self.executed_scripts.borrow_mut();
-            if let ScriptContent::Link(link) = &js.content {
-                if executed_scripts.links.contains(&link) {
-                    // println!("Script has already been ran, ignoring: {}", link);
-                    false
-                } else {
-                    executed_scripts.links.push(link.to_string());
-                    true
-                }
-            } else if let Some(node_idx) = js.node_idx {
-                if executed_scripts.nodes.contains(&node_idx) {
-                    // println!("Script has already been ran, ignoring: {}", node_idx);
-                    false
-                } else {
-                    executed_scripts.nodes.push(node_idx);
-                    true
-                }
-            } else {
-                true
-            }
-        };
-
-        if !should_run {
-            return Ok(());
-        }
-
         match &js.content {
             ScriptContent::Code(code) => {
                 let code_context: String = code.chars().take(40).collect();
@@ -9263,7 +9258,18 @@ impl Frame {
     }
 
     pub fn run_js(&mut self) -> Result<()> {
-        let scripts = self.renderer.as_ref().unwrap().borrow_mut().get_scripts();
+        let scripts: Vec<Script> = self.renderer
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .get_scripts()
+            .into_iter()
+            .filter(|js| self.executed_scripts.borrow_mut().upsert_script(js))
+            .collect();
+
+        if scripts.len() == 0 {
+            return Ok(());
+        }
 
         println!("Running {} JS scripts", scripts.len());
 
