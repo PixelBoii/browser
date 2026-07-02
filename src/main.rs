@@ -10731,6 +10731,17 @@ struct GlyphPosition {
     glyph: OutlinedGlyph,
 }
 
+fn premul_rgba_buffer_to_bytes(buffer: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(buffer.len() * 4);
+
+    for pixel in buffer {
+        let [r, g, b, a] = pixel.to_be_bytes();
+        bytes.extend_from_slice(&[r, g, b, a]);
+    }
+
+    bytes
+}
+
 fn text_to_buffer(
     font_handler: &Rc<FontHandler>,
     color: u32,
@@ -10787,7 +10798,7 @@ fn text_to_buffer(
         );
     }
     let pixmap = Pixmap::from_vec(
-        rgba_buffer_to_premul_bytes(&buffer),
+        premul_rgba_buffer_to_bytes(&buffer),
         IntSize::from_wh(width, height)?,
     )?;
     Some((pixmap, width, height))
