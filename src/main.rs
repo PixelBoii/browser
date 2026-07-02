@@ -11088,8 +11088,9 @@ pub fn draw_rect_filled(
         || border_radius.top_right > 0
         || border_radius.bottom_right > 0
         || border_radius.bottom_left > 0;
-    let mut mask = vec![true; (w * h) as usize];
+    let mut mask = vec![];
     if has_border_radius {
+        mask.resize((w * h) as usize, true);
         let radius = border_radius.top_left.min(w / 2).min(h / 2) as usize;
         for row in 0..radius {
             for col in 0..radius {
@@ -11241,9 +11242,16 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
+        let pump_start = Instant::now();
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        println!("renders_swapped_com pump={}ms", pump_start.elapsed().as_millis());
         let mut buffer = vec![0; 1920 * 1080];
+        let render_start = Instant::now();
         frame.render_into(&mut buffer, 1920, 1080, true);
+        println!(
+            "renders_swapped_com render_into={}us",
+            render_start.elapsed().as_micros()
+        );
         ensure_snapshot_matches(&buffer, "widgetswappedcom", 1920, 1080)
     }
 
