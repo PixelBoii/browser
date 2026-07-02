@@ -11088,66 +11088,74 @@ pub fn draw_rect_filled(
         || border_radius.top_right > 0
         || border_radius.bottom_right > 0
         || border_radius.bottom_left > 0;
-    let mut mask = vec![];
-    if has_border_radius {
-        mask.resize((w * h) as usize, true);
-        let radius = border_radius.top_left.min(w / 2).min(h / 2) as usize;
-        for row in 0..radius {
-            for col in 0..radius {
-                let dx = radius as i32 - col as i32;
-                let dy = radius as i32 - row as i32;
-
-                if dx * dx + dy * dy > (radius * radius) as i32 {
-                    mask[row * w as usize + col] = false;
+    let color_tuple = rgba_to_premul_tuple(color);
+    if !has_border_radius {
+        for py in start_y..end_y {
+            let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
+            for px in start_x..end_x {
+                if buffer_rgba {
+                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                } else {
+                    row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
                 }
             }
         }
-        let radius = border_radius.top_right.min(w / 2).min(h / 2) as usize;
-        for row in 0..radius {
-            for col in 0..radius {
-                let dx = col as i32;
-                let dy = radius as i32 - row as i32;
+        return;
+    }
 
-                if dx * dx + dy * dy > (radius * radius) as i32 {
-                    mask[row * w as usize + col + w as usize - radius] = false;
-                }
+    let mut mask = vec![true; (w * h) as usize];
+    let radius = border_radius.top_left.min(w / 2).min(h / 2) as usize;
+    for row in 0..radius {
+        for col in 0..radius {
+            let dx = radius as i32 - col as i32;
+            let dy = radius as i32 - row as i32;
+
+            if dx * dx + dy * dy > (radius * radius) as i32 {
+                mask[row * w as usize + col] = false;
             }
         }
-        let radius = border_radius.bottom_left.min(w / 2).min(h / 2) as usize;
-        for row in 0..radius {
-            for col in 0..radius {
-                let dx = radius as i32 - col as i32;
-                let dy = row as i32;
+    }
+    let radius = border_radius.top_right.min(w / 2).min(h / 2) as usize;
+    for row in 0..radius {
+        for col in 0..radius {
+            let dx = col as i32;
+            let dy = radius as i32 - row as i32;
 
-                if dx * dx + dy * dy > (radius * radius) as i32 {
-                    mask[(row + h as usize - radius) * w as usize + col] = false;
-                }
+            if dx * dx + dy * dy > (radius * radius) as i32 {
+                mask[row * w as usize + col + w as usize - radius] = false;
             }
         }
-        let radius = border_radius.bottom_right.min(w / 2).min(h / 2) as usize;
-        for row in 0..radius {
-            for col in 0..radius {
-                let dx = col as i32;
-                let dy = row as i32;
+    }
+    let radius = border_radius.bottom_left.min(w / 2).min(h / 2) as usize;
+    for row in 0..radius {
+        for col in 0..radius {
+            let dx = radius as i32 - col as i32;
+            let dy = row as i32;
 
-                if dx * dx + dy * dy > (radius * radius) as i32 {
-                    mask[(row + h as usize - radius) * w as usize + col + w as usize - radius] =
-                        false;
-                }
+            if dx * dx + dy * dy > (radius * radius) as i32 {
+                mask[(row + h as usize - radius) * w as usize + col] = false;
+            }
+        }
+    }
+    let radius = border_radius.bottom_right.min(w / 2).min(h / 2) as usize;
+    for row in 0..radius {
+        for col in 0..radius {
+            let dx = col as i32;
+            let dy = row as i32;
+
+            if dx * dx + dy * dy > (radius * radius) as i32 {
+                mask[(row + h as usize - radius) * w as usize + col + w as usize - radius] = false;
             }
         }
     }
 
-    let color_tuple = rgba_to_premul_tuple(color);
     for py in start_y..end_y {
         let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
         for px in start_x..end_x {
-            if has_border_radius {
-                let local_x = (px - x) as usize;
-                let local_y = (py - y) as usize;
-                if !mask[local_y * w as usize + local_x] {
-                    continue;
-                }
+            let local_x = (px - x) as usize;
+            let local_y = (py - y) as usize;
+            if !mask[local_y * w as usize + local_x] {
+                continue;
             }
 
             if buffer_rgba {
