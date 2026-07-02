@@ -449,7 +449,7 @@ struct FrameHandle {
 
 #[derive(Debug, Clone)]
 enum RendererProxy {
-    WindowLoop(EventLoopProxy<UserEvent>),
+    WindowLoop { proxy: EventLoopProxy<UserEvent>, tab_idx: usize },
     FrameLoop(std::sync::mpsc::Sender<FrameCommand>),
 }
 
@@ -457,8 +457,18 @@ impl RendererProxy {
     fn fire_user_event(&self, event: UserEvent) -> Result<()> {
         match self {
             RendererProxy::FrameLoop(tx) => tx.send(FrameCommand::UserEvent(event))?,
-            RendererProxy::WindowLoop(proxy) => proxy.send_event(event)?,
+            RendererProxy::WindowLoop { proxy, .. } => proxy.send_event(event)?,
         };
+        Ok(())
+    }
+
+    fn fire_tab_url_updated(&self, url: String) -> Result<()> {
+        if let RendererProxy::WindowLoop { proxy, tab_idx } = self {
+            proxy.send_event(UserEvent::TabUrlUpdated {
+                tab_idx: *tab_idx,
+                url,
+            })?;
+        }
         Ok(())
     }
 }
@@ -2884,6 +2894,7 @@ enum UserEvent {
     Navigate((UserNavigateUrl, bool)),
     FrameUpdated,
     TabUpdated(Vec<u32>),
+    TabUrlUpdated { tab_idx: usize, url: String },
     ChildMessage(String),
     ParentMessage(String),
     Hover(Position),
@@ -10160,11 +10171,14 @@ impl Frame {
                 if reload {
                     if let Err(err) = self.navigate_with_request(navigation) {
                         eprintln!("Navigation failed: {err:?}");
+                    } else {
+                        let _ = proxy.fire_tab_url_updated(self.url.clone());
                     }
                 } else {
                     self.url = navigation.url.to_string();
                     self.renderer.as_mut().unwrap().borrow_mut().url = self.url.clone();
                     self.setup_js_dom().unwrap();
+                    let _ = proxy.fire_tab_url_updated(self.url.clone());
                 }
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
@@ -10354,6 +10368,7 @@ pub struct Browser {
 
 pub struct TabHandle {
     tx: Sender<FrameCommand>,
+    url: String,
 }
 
 enum BrowserAction {
@@ -10459,9 +10474,9 @@ impl Browser {
         Ok(runtime)
     }
 
-    pub fn open_tab(&self, url: String, hover_debugging: bool) -> Result<TabHandle> {
+    pub fn open_tab(&self, url: String, hover_debugging: bool, tab_idx: usize) -> Result<TabHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = TabHandle { tx: tx.clone() };
+        let handle = TabHandle { tx: tx.clone(), url: url.clone() };
         let proxy = self.event_loop_proxy.clone();
         let tab_window = Some(self.window.clone());
         std::thread::spawn(move || {
@@ -10476,7 +10491,7 @@ impl Browser {
             tab.window = tab_window;
             match tab.open() {
                 Ok(params) => {
-                    let window_proxy = RendererProxy::WindowLoop(proxy);
+                    let window_proxy = RendererProxy::WindowLoop { proxy, tab_idx };
                     let frame_proxy = RendererProxy::FrameLoop(tx);
                     tab.set_up_without_event_loop(params, frame_proxy).unwrap();
                     tab.start_main_loop(window_proxy, rx);
@@ -10496,10 +10511,11 @@ impl Browser {
     ) {
         while let Ok(action) = header_comms_rx.try_recv() {
             match action {
-                BrowserAction::OpenTab(url) => match self.open_tab(url.clone(), hover_debugging) {
+                BrowserAction::OpenTab(url) => match self.open_tab(url.clone(), hover_debugging, self.tabs.len()) {
                     Ok(handle) => {
                         self.tabs.push(handle);
                         self.current_tab_idx = self.tabs.len() - 1;
+                        header.state.borrow_mut().url = self.current_tab().url.clone();
                         let comms_tx = header.builder.comms_tx.clone();
                         self.build_header(&mut header.builder, &header.state, comms_tx)
                             .unwrap();
@@ -10518,6 +10534,7 @@ impl Browser {
                 },
                 BrowserAction::SelectTab(tab_idx) => {
                     self.current_tab_idx = tab_idx;
+                    header.state.borrow_mut().url = self.current_tab().url.clone();
                     let comms_tx = header.builder.comms_tx.clone();
                     self.build_header(&mut header.builder, &header.state, comms_tx)
                         .unwrap();
@@ -10547,6 +10564,11 @@ impl Browser {
                     let Ok(url) = ReqwestUrl::parse(&text) else {
                         return;
                     };
+                    let url_text = url.to_string();
+                    if let Some(tab) = self.tabs.get_mut(self.current_tab_idx) {
+                        tab.url = url_text.clone();
+                    }
+                    header.state.borrow_mut().url = url_text;
                     let _ =
                         self.current_tab()
                             .tx
@@ -10589,7 +10611,7 @@ impl Browser {
             window: window.clone(),
             event_loop_proxy: event_loop.create_proxy(),
         };
-        let handle = browser.open_tab(url.clone(), hover_debugging)?;
+        let handle = browser.open_tab(url.clone(), hover_debugging, 0)?;
         browser.tabs.push(handle);
 
         let mut tab_buffer = vec![0; WINDOW_WIDTH as usize * HEADER_HEIGHT as usize];
@@ -10725,6 +10747,28 @@ impl Browser {
                         buffer[0..offset].copy_from_slice(&header.buffer);
 
                         buffer.present().expect("Failed to present");
+                    }
+                    Event::UserEvent(UserEvent::TabUrlUpdated { tab_idx, url }) => {
+                        let is_current = tab_idx == browser.current_tab_idx;
+                        if let Some(tab) = browser.tabs.get_mut(tab_idx) {
+                            tab.url = url.clone();
+                        }
+
+                        if is_current {
+                            header.state.borrow_mut().url = url;
+                            let comms_tx = header.builder.comms_tx.clone();
+                            browser
+                                .build_header(&mut header.builder, &header.state, comms_tx)
+                                .unwrap();
+                            match header.rerender() {
+                                Ok(_) => {
+                                    window.request_redraw();
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to render header: {err:?}");
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
