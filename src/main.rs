@@ -41,7 +41,7 @@ use resvg::{tiny_skia, usvg};
 use softbuffer::{Context as SoftContext, Surface};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use winit::event_loop::{EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 
 use crate::css::{
@@ -439,7 +439,6 @@ enum FrameCommand {
     UserEvent(UserEvent),
     Dom(FrameDomCommand),
     Resized(PhysicalSize<u32>),
-    PumpJs(std::sync::mpsc::Sender<bool>),
 }
 
 #[derive(Debug)]
@@ -6162,23 +6161,31 @@ impl Renderer {
 
             let mut js_pending = true;
             loop {
-                let cmd = rx.recv();
-                let had_command = cmd.is_ok();
-                match cmd {
-                    Ok(cmd) => {
-                        frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
-
-                        while let Ok(cmd) = rx.try_recv() {
-                            frame.handle_frame_command(
-                                cmd,
-                                &parent_proxy,
-                                &size,
-                                &bitmap_for_thread,
-                            );
-                        }
+                let cmd = if js_pending {
+                    match rx.recv_timeout(Duration::from_millis(16)) {
+                        Ok(cmd) => Some(cmd),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
-                    Err(_) => break,
+                } else {
+                    match rx.recv() {
+                        Ok(cmd) => Some(cmd),
+                        Err(_) => break,
+                    }
                 };
+                let had_command = cmd.is_some();
+                if let Some(cmd) = cmd {
+                    frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
+
+                    while let Ok(cmd) = rx.try_recv() {
+                        frame.handle_frame_command(
+                            cmd,
+                            &parent_proxy,
+                            &size,
+                            &bitmap_for_thread,
+                        );
+                    }
+                }
                 if had_command || js_pending {
                     js_pending = frame
                         .pump_js_event_loop_once()
@@ -8763,6 +8770,7 @@ struct Frame {
     hover_debugging: bool,
     render_size: PhysicalSize<u32>,
     loaded_nodes: Vec<usize>,
+    last_hover_position: Option<Position>,
 }
 
 struct BootParams {
@@ -8820,6 +8828,7 @@ impl Frame {
             hover_debugging,
             render_size,
             loaded_nodes: vec![],
+            last_hover_position: None,
         }
     }
 
@@ -9449,18 +9458,26 @@ impl Frame {
     pub fn start_main_loop(&mut self, proxy: RendererProxy, rx: Receiver<FrameCommand>) {
         let mut js_pending = true;
         loop {
-            let cmd = rx.recv();
-            let had_command = cmd.is_ok();
-            match cmd {
-                Ok(cmd) => {
-                    self.handle_main_event(&proxy, cmd);
-
-                    while let Ok(cmd) = rx.try_recv() {
-                        self.handle_main_event(&proxy, cmd);
-                    }
+            let cmd = if js_pending {
+                match rx.recv_timeout(Duration::from_millis(16)) {
+                    Ok(cmd) => Some(cmd),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(_) => break,
+            } else {
+                match rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                }
             };
+            let had_command = cmd.is_some();
+            if let Some(cmd) = cmd {
+                self.handle_main_event(&proxy, cmd);
+
+                while let Ok(cmd) = rx.try_recv() {
+                    self.handle_main_event(&proxy, cmd);
+                }
+            }
             if had_command || js_pending {
                 js_pending = self
                     .pump_js_event_loop_once()
@@ -9781,11 +9798,20 @@ impl Frame {
             .inspect_err(|err| eprintln!("Element load handler failed with err: {}", err));
     }
 
+    fn refresh_hover_after_render(&mut self) {
+        let Some(cursor) = self.last_hover_position else {
+            return;
+        };
+
+        self.apply_hovering(&cursor);
+    }
+
     fn render_loop(&mut self) -> Vec<u32> {
         let animation_redraw = self.tick_animations();
         let mut buffer =
             vec![0; self.render_size.width as usize * self.render_size.height as usize];
         let first_boot = self.render(&mut buffer);
+        self.refresh_hover_after_render();
         if first_boot {
             let start = Instant::now();
             let js_result = self.run_js();
@@ -9875,6 +9901,7 @@ impl Frame {
     }
 
     fn apply_hovering(&mut self, cursor: &Position) {
+        self.last_hover_position = Some(*cursor);
         let (should_re_render, hovering, iframe_hover) = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             let old_value = renderer.hovering.clone();
@@ -10041,24 +10068,6 @@ impl Frame {
             }
             FrameCommand::UserEvent(UserEvent::ScrollBy((_, y))) => {
                 self.scroll_y_by(y);
-            }
-            FrameCommand::PumpJs(reply) => {
-                match self.pump_js_event_loop_once() {
-                    Ok(js_pending) => {
-                        let dom_pending =
-                            self.renderer.as_ref().unwrap().borrow().pending_dom_update;
-
-                        if dom_pending {
-                            self.execute_dom_update();
-                        }
-
-                        let _ = reply.send(js_pending);
-                    }
-                    Err(err) => {
-                        eprintln!("JS event loop error: {err:?}");
-                        let _ = reply.send(false);
-                    }
-                };
             }
             _ => {}
         };
@@ -10606,28 +10615,6 @@ impl Browser {
                         buffer[0..offset].copy_from_slice(&header.buffer);
 
                         buffer.present().expect("Failed to present");
-                    }
-                    Event::AboutToWait => {
-                        for tab in browser.tabs.iter() {
-                            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-                            let _ = tab.tx.send(FrameCommand::PumpJs(reply_tx));
-
-                            match reply_rx.recv_timeout(Duration::from_secs(1)) {
-                                Ok(js_pending) => {
-                                    if js_pending {
-                                        elwt.set_control_flow(ControlFlow::WaitUntil(
-                                            Instant::now() + Duration::from_millis(16),
-                                        ));
-                                    } else {
-                                        elwt.set_control_flow(ControlFlow::Wait);
-                                    }
-                                }
-                                Err(err) => {
-                                    eprintln!("Failed to get tab reply: {}", err);
-                                }
-                            }
-                        }
                     }
                     _ => {}
                 }

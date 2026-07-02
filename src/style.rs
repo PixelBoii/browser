@@ -846,7 +846,7 @@ fn parse_style_size(value: impl AsRef<str>) -> Result<StyleSize> {
     if let Ok(parsed) = adjusted.parse::<f32>() {
         return Ok(StyleSize::Px(parsed));
     }
-    println!("Failed to parse style value \"{}\"", value);
+    println!("Failed to parse style size \"{}\"", value);
     Ok(StyleSize::Auto)
 }
 
@@ -885,7 +885,7 @@ fn parse_grid_size(value: String) -> Result<GridColumnSize> {
     if let Ok(parsed) = value.parse::<i32>() {
         return Ok(GridColumnSize::Px(parsed));
     }
-    Err(anyhow!("Failed to parse style value \"{}\"", value))
+    Err(anyhow!("Failed to parse grid size value \"{}\"", value))
 }
 
 fn get_inline_nodes(element: &HtmlElement) -> Result<Vec<Node>> {
