@@ -1249,31 +1249,37 @@ fn parse_color(value: String) -> Result<StyleBackground> {
 fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
     let mut out = vec![];
     let mut buffer = String::new();
-    let mut inside = false;
+    let mut inside_depth = 0;
     for char in value.trim().chars() {
-        if inside && char == ')' {
-            let collected: String = buffer.drain(..).collect();
-            let (name, default) = if let Some(collected) = collected.split_once(",") {
-                (
-                    collected.0.trim().to_owned(),
-                    Some(collected.1.trim().to_owned()),
-                )
-            } else {
-                (collected.trim().to_string(), None)
-            };
-            out.push(VariableTemplatePart::Var((name, default)));
-            inside = false;
-            buffer.clear();
-            continue;
+        if char == ')' {
+            inside_depth -= 1;
+            if inside_depth == 0 {
+                let collected: String = buffer.drain(..).collect();
+                let (name, default) = if let Some(collected) = collected.split_once(",") {
+                    let default_parts = parse_variable_template(collected.1.trim());
+                    (
+                        collected.0.trim().to_owned(),
+                        Some(default_parts),
+                    )
+                } else {
+                    (collected.trim().to_string(), None)
+                };
+                out.push(VariableTemplatePart::Var((name, default)));
+                buffer.clear();
+                continue;
+            }
         }
         buffer.push(char);
         if let Some(stripped) = buffer.strip_suffix("var(") {
-            inside = true;
-            if stripped.len() > 0 {
-                out.push(VariableTemplatePart::Text(stripped.to_string()));
+            if inside_depth == 0 {
+                if stripped.len() > 0 {
+                    out.push(VariableTemplatePart::Text(stripped.to_string()));
+                }
+                buffer.clear();
             }
-            buffer.clear();
-            continue;
+            inside_depth += 1;
+        } else if char == '(' && inside_depth > 0 {
+            inside_depth += 1;
         }
     }
     if buffer.len() > 0 {
@@ -1430,9 +1436,12 @@ fn resolve_variable_template(
                     .get(name)
                     .and_then(|name| resolved_variables.get(name))
                 {
-                    value.as_str()
+                    value.clone()
                 } else {
-                    default.as_deref().unwrap_or(name.as_str())
+                    default
+                        .as_ref()
+                        .map(|v| resolve_variable_template(&v, resolved_variables, variable_definitions))
+                        .unwrap_or(name.to_string())
                 };
                 if previous_was_var
                     && !out.ends_with(char::is_whitespace)
@@ -1440,7 +1449,7 @@ fn resolve_variable_template(
                 {
                     out.push(' ');
                 }
-                out += value;
+                out += &value;
                 previous_was_var = true;
             }
         };

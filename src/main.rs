@@ -911,6 +911,9 @@ fn solve_calc(
         CalcExpression::Size(size) => {
             get_specified_size(font_size, &size, available_size, auto_size, window_size)?
         }
+        CalcExpression::Nesting(nesting) => {
+            solve_calc(nesting, font_size, available_size, auto_size, window_size)?
+        }
         _ => panic!("Expected first calc expression to be value"),
     };
     let mut exp_idx = 1;
@@ -11232,7 +11235,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_into(&mut buffer, 1920, 1080, true);
-        frame.apply_hovering(&Position { x: 865, y: 652 });
+        frame.apply_hovering(&Position { x: 864, y: 770 });
         frame.on_click()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_into(&mut buffer, 1920, 1080, true);

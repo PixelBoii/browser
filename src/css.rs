@@ -138,7 +138,7 @@ impl Overflow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VariableTemplatePart {
     Text(String),
-    Var((String, Option<String>)),
+    Var((String, Option<Vec<VariableTemplatePart>>)),
 }
 
 #[derive(Debug, Clone, PartialEq)]
