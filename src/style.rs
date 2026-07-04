@@ -28,6 +28,7 @@ pub enum CalcExpression {
     Size(StyleSize),
     Operator(StyleCalcOperator),
     Nesting(Vec<CalcExpression>),
+    Solved(f32),
 }
 
 #[derive(Debug, Clone, PartialEq)]

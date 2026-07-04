@@ -545,6 +545,7 @@ struct Renderer {
     node_layout_mapping: HashMap<usize, usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
     request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
+    pending_image_fetches: HashSet<ReqwestUrl>,
     rendered_nodes_ordered: Vec<RenderedNode>,
     pub hovering: Option<usize>,
     pub focusable: Option<usize>,
@@ -899,7 +900,25 @@ fn get_specified_size(
     }
 }
 
-// TODO: Make this handle order of operations
+fn get_calc_exp_value(
+    exp: &CalcExpression,
+    font_size: u32,
+    available_size: Option<u32>,
+    auto_size: Option<i32>,
+    window_size: &PhysicalSize<u32>,
+) -> Option<i32> {
+    match exp {
+        CalcExpression::Size(size) => {
+            get_specified_size(font_size, &size, available_size, auto_size, window_size)
+        }
+        CalcExpression::Nesting(nesting) => {
+            solve_calc(nesting, font_size, available_size, auto_size, window_size)
+        }
+        CalcExpression::Solved(value) => Some(*value as i32),
+        _ => panic!("Expected calc expression to be value"),
+    }
+}
+
 fn solve_calc(
     calc: &Vec<CalcExpression>,
     font_size: u32,
@@ -907,43 +926,49 @@ fn solve_calc(
     auto_size: Option<i32>,
     window_size: &PhysicalSize<u32>,
 ) -> Option<i32> {
-    let mut value = match &calc[0] {
-        CalcExpression::Size(size) => {
-            get_specified_size(font_size, &size, available_size, auto_size, window_size)?
+    let mut calc = calc.clone();
+    while calc.len() > 1 {
+        let exp = calc
+            .iter()
+            .position(|exp| matches!(exp, CalcExpression::Operator(StyleCalcOperator::Multiply | StyleCalcOperator::Divide)))
+            .or_else(|| {
+                calc
+                    .iter()
+                    .position(|exp| matches!(exp, CalcExpression::Operator(StyleCalcOperator::Plus | StyleCalcOperator::Minus)))
+            });
+
+        if let Some(exp) = exp && exp > 0 && exp < calc.len() - 1 {
+            let prev = &calc[exp - 1];
+            let curr = &calc[exp];
+            let next = &calc[exp + 1];
+
+            let prev_value = get_calc_exp_value(prev, font_size, available_size, auto_size, window_size)?;
+            let next_value = get_calc_exp_value(next, font_size, available_size, auto_size, window_size)?;
+
+            let CalcExpression::Operator(operator) = curr else {
+                unreachable!();
+            };
+
+            let value = match operator {
+                StyleCalcOperator::Plus => prev_value + next_value,
+                StyleCalcOperator::Minus => prev_value - next_value,
+                StyleCalcOperator::Divide => prev_value / next_value.max(1),
+                StyleCalcOperator::Multiply => prev_value * next_value,
+            };
+
+            calc.splice(exp - 1..=exp + 1, [CalcExpression::Solved(value as f32)]);
+        } else {
+            break;
         }
-        CalcExpression::Nesting(nesting) => {
-            solve_calc(nesting, font_size, available_size, auto_size, window_size)?
-        }
-        _ => panic!("Expected first calc expression to be value"),
-    };
-    let mut exp_idx = 1;
-    while exp_idx < calc.len() {
-        let loop_operator = match &calc[exp_idx] {
-            CalcExpression::Operator(operator) => operator,
-            _ => panic!("Expected calc expression to be operator"),
-        };
-        let loop_value = match &calc[exp_idx + 1] {
-            CalcExpression::Size(size) => {
-                get_specified_size(font_size, &size, available_size, auto_size, window_size)?
-            }
-            CalcExpression::Nesting(nesting) => {
-                solve_calc(nesting, font_size, available_size, auto_size, window_size)?
-            }
-            _ => panic!(
-                "Expected calc expression to be size. Got: {:?} [{}]",
-                calc,
-                exp_idx + 1
-            ),
-        };
-        value = match loop_operator {
-            StyleCalcOperator::Plus => value + loop_value,
-            StyleCalcOperator::Minus => value - loop_value,
-            StyleCalcOperator::Divide => value / loop_value,
-            StyleCalcOperator::Multiply => value * loop_value,
-        };
-        exp_idx += 2;
     }
-    Some(value)
+
+    if calc.len() == 1 && let CalcExpression::Solved(value) = calc[0] {
+        Some(value as i32)
+    } else if calc.len() == 1 && let CalcExpression::Size(StyleSize::Px(size)) = calc[0] {
+        Some(size as i32)
+    } else {
+        None
+    }
 }
 
 fn infer_image_size(base_size: Size, input_w: Option<u32>, input_h: Option<u32>) -> (u32, u32) {
@@ -2894,6 +2919,7 @@ struct FormNavigation {
 #[derive(Debug, Clone)]
 enum UserEvent {
     DomUpdated,
+    ImagesPrefetched(Vec<(ReqwestUrl, RequestCacheEntry)>),
     Navigate((UserNavigateUrl, bool)),
     FrameUpdated,
     TabUpdated(Vec<u32>),
@@ -4509,6 +4535,7 @@ impl Renderer {
             node_layout_mapping,
             containing_nodes,
             request_cache,
+            pending_image_fetches: HashSet::new(),
             rendered_nodes_ordered,
             hovering,
             tokio,
@@ -5259,7 +5286,6 @@ impl Renderer {
                 return;
             }
         };
-        let mut seen = HashSet::new();
         let requests: Vec<(ReqwestUrl, &'static str)> = self
             .nodes
             .iter()
@@ -5287,7 +5313,9 @@ impl Renderer {
                         return None;
                     }
                 };
-                if self.request_cache.contains_key(&url) || !seen.insert(url.clone()) {
+                if self.request_cache.contains_key(&url)
+                    || !self.pending_image_fetches.insert(url.clone())
+                {
                     return None;
                 }
 
@@ -5302,34 +5330,55 @@ impl Renderer {
         println!("Pre-fetching {} images", requests.len());
 
         let client = self.network_fetch.borrow().client.clone();
-        let results = self.tokio.clone().borrow_mut().block_on(async move {
-            let mut join_set = tokio::task::JoinSet::new();
-            for (url, src_extension) in requests {
-                let client = client.clone();
-                join_set.spawn(Self::fetch_img_src_data_url(client, url, src_extension));
-            }
+        let proxy = self.event_loop_proxy.clone();
+        for (url, _) in &requests {
+            self.pending_image_fetches.insert(url.clone());
+        }
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for image prefetch");
 
-            let mut results = Vec::new();
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok(result) => results.push(result),
-                    Err(err) => println!("Failed to join image fetch task: {}", err),
+            let entries = runtime.block_on(async move {
+                let mut join_set = tokio::task::JoinSet::new();
+                for (url, src_extension) in requests {
+                    let client = client.clone();
+                    join_set.spawn(Self::fetch_img_src_data_url(client, url, src_extension));
                 }
+
+                let mut entries = Vec::new();
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok((url, cache_entry)) => {
+                            let entry = match cache_entry {
+                                Ok(entry) => entry,
+                                Err(err) => {
+                                    println!("Failed to prefetch img src {}: {}", url, err);
+                                    RequestCacheEntry::Unsupported
+                                }
+                            };
+                            entries.push((url, entry));
+                        }
+                        Err(err) => println!("Failed to join image fetch task: {}", err),
+                    }
+                }
+                entries
+            });
+
+            if entries.is_empty() {
+                return;
             }
-            results
+            if let Some(proxy) = proxy {
+                let _ = proxy.fire_user_event(UserEvent::ImagesPrefetched(entries));
+            }
         });
+    }
 
-        for (url, cache_entry) in results {
-            match cache_entry {
-                Ok(entry) => {
-                    self.request_cache.insert(url, entry);
-                }
-                Err(err) => {
-                    println!("Failed to prefetch img src {}: {}", url, err);
-                    self.request_cache
-                        .insert(url, RequestCacheEntry::Unsupported);
-                }
-            }
+    fn finish_image_prefetch(&mut self, entries: Vec<(ReqwestUrl, RequestCacheEntry)>) {
+        for (url, entry) in entries {
+            self.pending_image_fetches.remove(&url);
+            self.request_cache.insert(url, entry);
         }
     }
 
@@ -5512,30 +5561,12 @@ impl Renderer {
         str
     }
 
-    async fn get_img_src_data(&mut self, src: &str) -> Result<RequestCacheEntry> {
-        let base = ReqwestUrl::parse(&self.url)?;
-        let url = resolve_url(src, Some(&base))?;
-        let src_extension = Self::img_src_extension(src)
-            .with_context(|| format!("Unsupported img extension: {}", src))?;
-        if let Some(cache) = self.request_cache.get(&url) {
-            match cache {
-                RequestCacheEntry::Unsupported => Err(anyhow!("Unsupported image")),
-                v => Ok(v.clone()),
-            }
-        } else {
-            let (url, cache_entry) = Self::fetch_img_src_data_url(
-                self.network_fetch.borrow().client.clone(),
-                url,
-                src_extension,
-            )
-            .await;
-            if let Ok(ref entry) = cache_entry {
-                self.request_cache.insert(url, entry.clone());
-            } else {
-                self.request_cache
-                    .insert(url, RequestCacheEntry::Unsupported);
-            }
-            cache_entry
+    fn get_img_src_data(&self, src: &str) -> Option<RequestCacheEntry> {
+        let base = ReqwestUrl::parse(&self.url).ok()?;
+        let url = resolve_url(src, Some(&base)).ok()?;
+        match self.request_cache.get(&url) {
+            Some(RequestCacheEntry::Unsupported) | None => None,
+            Some(entry) => Some(entry.clone()),
         }
     }
 
@@ -5833,12 +5864,7 @@ impl Renderer {
                                     return None;
                                 }
                             } else {
-                                let img_data = self
-                                    .tokio
-                                    .clone()
-                                    .borrow_mut()
-                                    .block_on(self.get_img_src_data(&src))
-                                    .ok()?;
+                                let img_data = self.get_img_src_data(&src)?;
                                 let result = match img_data {
                                     RequestCacheEntry::PngData(bytes) => rasterize_png(
                                         &mut self.cached_rasterizations,
@@ -9109,7 +9135,14 @@ impl Frame {
         bitmap_for_thread: &Arc<Mutex<Vec<u32>>>,
     ) {
         match cmd {
-            FrameCommand::Render | FrameCommand::UserEvent(UserEvent::DomUpdated) => {
+            cmd @ (FrameCommand::Render
+            | FrameCommand::UserEvent(UserEvent::DomUpdated)
+            | FrameCommand::UserEvent(UserEvent::ImagesPrefetched(_))) => {
+                if let FrameCommand::UserEvent(UserEvent::ImagesPrefetched(urls)) = cmd
+                    && let Some(renderer) = self.renderer.as_ref()
+                {
+                    renderer.borrow_mut().finish_image_prefetch(urls);
+                }
                 if self
                     .renderer
                     .as_ref()
@@ -10137,7 +10170,13 @@ impl Frame {
                 let buffer = self.render_loop();
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
             }
-            FrameCommand::UserEvent(UserEvent::FrameUpdated) => {
+            FrameCommand::UserEvent(event @ (UserEvent::FrameUpdated | UserEvent::ImagesPrefetched(_))) => {
+                if let UserEvent::ImagesPrefetched(urls) = event {
+                    if let Some(renderer) = self.renderer.as_ref() {
+                        renderer.borrow_mut().finish_image_prefetch(urls);
+                    }
+                    self.layout_dirty = true;
+                }
                 let buffer = self.render_loop();
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
             }
@@ -11388,6 +11427,32 @@ mod tests {
                     CalcExpression::Size(StyleSize::Em(2.)),
                 ]),
             ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn solve_calc_single() -> Result<()> {
+        let StyleSize::Calc(calc) = parse_calc("2px")? else {
+            unreachable!();
+        };
+
+        assert_eq!(
+            super::solve_calc(&calc, 16, None, None, &PhysicalSize::new(100, 100)),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn solve_calc_uses_order_of_operations() -> Result<()> {
+        let StyleSize::Calc(calc) = parse_calc("2px + 3px * 4px")? else {
+            unreachable!();
+        };
+
+        assert_eq!(
+            super::solve_calc(&calc, 16, None, None, &PhysicalSize::new(100, 100)),
+            Some(14)
         );
         Ok(())
     }
