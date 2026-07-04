@@ -9989,6 +9989,14 @@ impl Frame {
     }
 
     fn render(&mut self, buffer: &mut Vec<u32>) -> bool {
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.borrow().pending_dom_update)
+        {
+            self.process_dom_update();
+        }
+
         let start = Instant::now();
 
         self.renderer.as_mut().unwrap().borrow_mut().render_into(
