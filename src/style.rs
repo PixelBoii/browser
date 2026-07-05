@@ -695,9 +695,13 @@ fn flush_calc_value(
     nesting: i32,
 ) -> Result<()> {
     if buffer.len() > 0 {
-        let size = parse_style_size(buffer.clone())?;
+        let size = if let Ok(parsed) = buffer.parse::<f32>() {
+            CalcExpression::Solved(parsed)
+        } else {
+            CalcExpression::Size(parse_style_size(buffer.clone())?)
+        };
         buffer.clear();
-        add_part_to_calc(parts, CalcExpression::Size(size), nesting);
+        add_part_to_calc(parts, size, nesting);
     }
     Ok(())
 }
