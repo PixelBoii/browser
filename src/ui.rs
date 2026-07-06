@@ -136,6 +136,7 @@ impl<T> UiRuntime<T> {
 
     pub fn on_click(&mut self) {
         let Some(hovering) = self.hovering else {
+            self.focused = None;
             return;
         };
         let mut outer_node = Some((hovering, &self.builder.nodes[hovering]));
