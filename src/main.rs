@@ -9933,6 +9933,9 @@ impl Frame {
                     self.navigate(resolved_url.to_string()).unwrap();
                 }
             }
+        } else {
+            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+            renderer.focusable = None;
         }
 
         Ok(())
