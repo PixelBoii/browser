@@ -7817,6 +7817,10 @@ impl Renderer {
         // Stretch children on cross-axis if appropiate
         let mut definite_cross_size = false;
         if style.align_items == StyleJustifyContent::Stretch && allow_fill {
+            let row_cross_size = base_items
+                .iter()
+                .map(|item| item.cross_size)
+                .fold(0., f32::max);
             for item in &mut base_items {
                 let child_style: &Style = &self.node_styles.get(&item.node_idx).unwrap();
                 let align = match child_style.align_self {
@@ -7835,9 +7839,13 @@ impl Renderer {
                         }
                     }
                     StyleFlexDirection::Row => {
-                        if child_style.height == StyleSize::Auto && has_definite_height {
-                            item.cross_size =
-                                (cross_available_size as f32).min(item.max_cross_size);
+                        if child_style.height == StyleSize::Auto {
+                            let cross_size = if has_definite_height {
+                                cross_available_size as f32
+                            } else {
+                                row_cross_size
+                            };
+                            item.cross_size = cross_size.min(item.max_cross_size);
                             definite_cross_size = true;
                         }
                     }
