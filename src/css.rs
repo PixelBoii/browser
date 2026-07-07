@@ -37,11 +37,14 @@ pub enum PseudoClass {
     Host,
     Is(Vec<Vec<ClassNamePart>>),
     Where(Vec<Vec<ClassNamePart>>),
+    IndexedIs(Vec<usize>),
+    IndexedWhere(Vec<usize>),
     NthChild(String),
     NthOfType(String),
     NthLastChild(String),
     Has(Vec<ClassNamePart>),
     Not(Vec<ClassNamePart>),
+    IndexedNot(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -1568,7 +1568,7 @@ fn move_up_ancestor_chain(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
+    precomputed_selectors: &Vec<FixedBitSet>,
 ) -> bool {
     let parent = css_node.get_parent();
     if let Some(parent) = parent {
@@ -1642,7 +1642,7 @@ fn move_up_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
+    precomputed_selectors: &Vec<FixedBitSet>,
 ) -> bool {
     let node = css_nodes[css_node].1;
     // If we've reached the beginning, that means this node is done, so move up the chain
@@ -1759,7 +1759,7 @@ fn element_matches_class_part(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
+    precomputed_selectors: &Vec<FixedBitSet>,
 ) -> bool {
     match part {
         ClassNamePart::Class(class) => class_name_part_match_class(|| {
@@ -1786,18 +1786,18 @@ fn element_matches_class_part(
             match class {
                 // All elements are children of root
                 PseudoClass::Root => true,
-                PseudoClass::Not(selector) => {
-                    let negative_matches = precomputed_selectors.get(selector).unwrap();
+                PseudoClass::IndexedNot(selector) => {
+                    let negative_matches = &precomputed_selectors[*selector];
                     !negative_matches.contains(element)
                 }
-                PseudoClass::Is(selectors) | PseudoClass::Where(selectors) => {
+                PseudoClass::IndexedIs(selectors) | PseudoClass::IndexedWhere(selectors) => {
                     selectors.iter().any(|selector| {
-                        precomputed_selectors
-                        .get(selector)
-                        .unwrap()
-                        .contains(element)
+                        precomputed_selectors[*selector].contains(element)
                     })
                 }
+                PseudoClass::Not(_)
+                | PseudoClass::Is(_)
+                | PseudoClass::Where(_) => unreachable!("selectors must be indexed before matching"),
                 PseudoClass::Hover => {
                     hovering_has_impact.insert(element);
                     hovering_chain.contains(&element)
@@ -1947,7 +1947,7 @@ fn narrow_elements_by_ancestors(
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     hovering_has_impact: &mut HashSet<usize>,
-    precomputed_selectors: &HashMap<Vec<ClassNamePart>, FixedBitSet>,
+    precomputed_selectors: &Vec<FixedBitSet>,
 ) -> bool {
     let walk_quota = if require_immediate_match {
         Some(1)
@@ -2128,7 +2128,7 @@ fn get_parent_html_idx(node_idx: usize, html_nodes: &NodesTable) -> Option<usize
 // Wrapper around search_elements_for_css_nodes that narrows the css_nodes down to only nodes that have property/variable children
 // Query selectors skip this step
 fn collect_class_nodes_for_elements(
-    css_nodes: &Vec<(usize, &CssNode)>,
+    css_nodes: &mut Vec<CssNode>,
     raw_html_nodes: &NodesTable,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
@@ -2140,7 +2140,7 @@ fn collect_class_nodes_for_elements(
 ) {
     // All class names and media queries that have properties/children and need to be resolved
     let mut to_resolve = HashSet::new();
-    for (idx, n) in css_nodes.iter() {
+    for (idx, n) in css_nodes.iter().enumerate() {
         match n {
             CssNode::Property(_) | CssNode::Variable(_) => {
                 // TODO: Should probably add back the variables and properties that are at the root at the end, if that's even a thing?
@@ -2253,37 +2253,61 @@ fn walk_into_part(part: &ClassNamePart) -> bool {
     !matches!(part, ClassNamePart::Tilde | ClassNamePart::AdjacentSibling)
 }
 
-fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &ClassNamePart) {
+fn selector_index(
+    selectors: &mut Vec<Vec<ClassNamePart>>,
+    selector_indexes: &mut HashMap<Vec<ClassNamePart>, usize>,
+    selector: &Vec<ClassNamePart>,
+) -> usize {
+    if let Some(idx) = selector_indexes.get(selector) {
+        *idx
+    } else {
+        let idx = selectors.len();
+        selector_indexes.insert(selector.clone(), idx);
+        selectors.push(selector.clone());
+        idx
+    }
+}
+
+fn walk_selectors(
+    selectors: &mut Vec<Vec<ClassNamePart>>,
+    selector_indexes: &mut HashMap<Vec<ClassNamePart>, usize>,
+    part: &mut ClassNamePart,
+) {
     match part {
         ClassNamePart::PseudoClass(pseudo_class) => match pseudo_class {
-            PseudoClass::Is(selectors) => {
-                for selector in selectors {
-                    collected_selectors.insert(selector.clone());
+            PseudoClass::Is(nested_selectors) => {
+                let mut indexes = vec![];
+                for selector in nested_selectors {
+                    indexes.push(selector_index(selectors, selector_indexes, selector));
                     for part in selector {
-                        walk_selectors(collected_selectors, part);
+                        walk_selectors(selectors, selector_indexes, part);
                     }
                 }
+                *pseudo_class = PseudoClass::IndexedIs(indexes);
             }
             // TODO: Consider whether this needs to be a vector of selectors instead
             PseudoClass::Not(selector) => {
-                collected_selectors.insert(selector.clone());
+                let index = selector_index(selectors, selector_indexes, selector);
                 for part in selector {
-                    walk_selectors(collected_selectors, part);
+                    walk_selectors(selectors, selector_indexes, part);
                 }
+                *pseudo_class = PseudoClass::IndexedNot(index);
             }
-            PseudoClass::Where(selectors) => {
-                for selector in selectors {
-                    collected_selectors.insert(selector.clone());
+            PseudoClass::Where(nested_selectors) => {
+                let mut indexes = vec![];
+                for selector in nested_selectors {
+                    indexes.push(selector_index(selectors, selector_indexes, selector));
                     for part in selector {
-                        walk_selectors(collected_selectors, part);
+                        walk_selectors(selectors, selector_indexes, part);
                     }
                 }
+                *pseudo_class = PseudoClass::IndexedWhere(indexes);
             }
             _ => {}
         },
         ClassNamePart::Combined(combined) => {
             for part in combined {
-                walk_selectors(collected_selectors, part);
+                walk_selectors(selectors, selector_indexes, part);
             }
         }
         _ => {}
@@ -2292,7 +2316,7 @@ fn walk_selectors(collected_selectors: &mut HashSet<Vec<ClassNamePart>>, part: &
 
 fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
-    css_nodes: &Vec<(usize, &CssNode)>,
+    css_nodes: &mut Vec<CssNode>,
     html_nodes: &NodesTable,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
@@ -2311,13 +2335,14 @@ fn search_elements_for_css_nodes(
 
     let mut hovering_has_impact = HashSet::new();
 
-    let mut unique_selectors = HashSet::new();
-    for (_, node) in css_nodes.iter() {
+    let mut unique_selectors = vec![];
+    let mut selector_indexes = HashMap::new();
+    for node in css_nodes.iter_mut() {
         match node {
             CssNode::ClassName(class) => {
-                for selector in &class.name_parts {
+                for selector in &mut class.name_parts {
                     for part in selector {
-                        walk_selectors(&mut unique_selectors, part);
+                        walk_selectors(&mut unique_selectors, &mut selector_indexes, part);
                     }
                 }
             }
@@ -2332,8 +2357,8 @@ fn search_elements_for_css_nodes(
         .map(|v| v + 1)
         .unwrap_or(0);
 
-    let mut precomputed_selectors: HashMap<Vec<ClassNamePart>, FixedBitSet> = HashMap::new();
-    for selector in unique_selectors {
+    let mut precomputed_selectors: Vec<FixedBitSet> = vec![];
+    for selector in &unique_selectors {
         let mut results = FixedBitSet::with_capacity(max_element_idx);
         for idx in query_selector_all(
             html_nodes,
@@ -2348,8 +2373,10 @@ fn search_elements_for_css_nodes(
         ) {
             results.insert(idx);
         }
-        precomputed_selectors.insert(selector, results);
+        precomputed_selectors.push(results);
     }
+    let css_nodes: Vec<(usize, &CssNode)> = css_nodes.iter().enumerate().collect();
+    let css_nodes = &css_nodes;
 
     for css_node_idx in to_resolve {
         let node = css_nodes[css_node_idx].1;
@@ -2387,9 +2414,8 @@ fn search_elements_for_css_nodes(
                                     }
                                     Some(bitset)
                                 }
-                                PseudoClass::Not(selector) => {
-                                    let negative_matches =
-                                        precomputed_selectors.get(selector).unwrap();
+                                PseudoClass::IndexedNot(selector) => {
+                                    let negative_matches = &precomputed_selectors[*selector];
                                     let mut bitset = FixedBitSet::with_capacity(max_element_idx);
                                     for idx in element_indexes.iter() {
                                         if !negative_matches.contains(*idx) {
@@ -2852,7 +2878,7 @@ fn compute_node_styles(
     HashSet<usize>,
 ) {
     let start = Instant::now();
-    let parsed_css_nodes = get_css_nodes(
+    let mut parsed_css_nodes = get_css_nodes(
         base_url,
         tokio,
         network_fetch,
@@ -2874,7 +2900,7 @@ fn compute_node_styles(
     let start = Instant::now();
     let (collected_class_nodes, class_node_specificity, hovering_impact) =
         collect_class_nodes_for_elements(
-            &parsed_css_nodes.iter().enumerate().collect(),
+            &mut parsed_css_nodes,
             &nodes,
             window_size,
             dom_indexes,
@@ -4019,13 +4045,12 @@ fn query_selector_all(
         name_parts: vec![selector],
         parent: None,
     });
-    let css_vec = vec![class];
-    let css_nodes: Vec<(usize, &CssNode)> = css_vec.iter().enumerate().collect();
+    let mut css_vec = vec![class];
     let mut to_resolve = HashSet::new();
     to_resolve.insert(0);
     let (collected, _, _) = search_elements_for_css_nodes(
         to_resolve,
-        &css_nodes,
+        &mut css_vec,
         nodes_table,
         window_size,
         dom_indexes,
