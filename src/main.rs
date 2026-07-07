@@ -2642,41 +2642,37 @@ fn compute_css_node_ranking(
     class_node_specificity: &HashMap<usize, [i32; 3]>,
 ) -> Vec<usize> {
     let nodes: Vec<(usize, &CssNode)> = raw_nodes.into_iter().enumerate().collect();
-    let node_idxs: Vec<&usize> = nodes
+    let node_idxs: Vec<usize> = nodes
         .iter()
         .filter(|(_, node)| matches!(node, CssNode::Property(_) | CssNode::Variable(_)))
-        .map(|(idx, _)| idx)
+        .map(|(idx, _)| *idx)
         .collect();
-    let mut chains: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut chains = vec![Vec::new(); raw_nodes.len()];
     let mut important_scores = vec![0; raw_nodes.len()];
     let mut parent_layers = vec![None; raw_nodes.len()];
     let mut specificities = vec![[0; 3]; raw_nodes.len()];
 
-    for idx in node_idxs.iter() {
-        let idx = **idx;
-        let mut chain = vec![];
-        get_parent_chain(&nodes, idx, &mut chain);
+    for idx in node_idxs.iter().copied() {
+        get_parent_chain(&nodes, idx, &mut chains[idx]);
 
         important_scores[idx] = match nodes[idx].1 {
             CssNode::Property(property) => property.important as i32,
             _ => 0i32,
         };
         parent_layers[idx] = get_parent_layer(&nodes, idx);
-        if let Some(specificity) = chain
+        if let Some(specificity) = chains[idx]
             .get(1)
             .and_then(|parent| class_node_specificity.get(parent))
         {
             specificities[idx] = *specificity;
         }
-
-        chains.insert(idx, chain);
     }
 
-    let mut sorted_idxs = node_idxs.clone();
-    sorted_idxs.sort_by(|a, b| {
-        match important_scores[**a].cmp(&important_scores[**b]) {
+    let mut sorted_idxs = node_idxs;
+    sorted_idxs.sort_unstable_by(|a, b| {
+        match important_scores[*a].cmp(&important_scores[*b]) {
             Ordering::Equal => {
-                let layer_ordering = match (parent_layers[**a], parent_layers[**b]) {
+                let layer_ordering = match (parent_layers[*a], parent_layers[*b]) {
                     (Some(a), Some(b)) => a.cmp(&b),
                     (None, Some(_)) => Ordering::Greater,
                     (Some(_), None) => Ordering::Less,
@@ -2689,12 +2685,10 @@ fn compute_css_node_ranking(
                 }
 
                 let specificity_order =
-                    get_specificity_order(&specificities[**a], &specificities[**b]);
+                    get_specificity_order(&specificities[*a], &specificities[*b]);
 
                 match specificity_order {
-                    Ordering::Equal => {
-                        get_chain_order(chains.get(&**a).unwrap(), chains.get(&**b).unwrap())
-                    }
+                    Ordering::Equal => get_chain_order(&chains[*a], &chains[*b]),
                     ordering => ordering,
                 }
             }
@@ -2703,7 +2697,7 @@ fn compute_css_node_ranking(
     });
     let mut rankings = vec![0; raw_nodes.len()];
     for (ranking, idx) in sorted_idxs.into_iter().enumerate() {
-        rankings[*idx] = ranking;
+        rankings[idx] = ranking;
     }
     rankings
 }
