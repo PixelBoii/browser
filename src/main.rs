@@ -666,6 +666,24 @@ impl ContainerSizes {
         self.container_width_non_filling
             .unwrap_or(self.clamp_width(used_width) + self.padding_x)
     }
+
+    pub fn image_placeholder_size(&self, max_width: u32, max_height: u32) -> (u32, u32) {
+        let (height, width) = match (
+            self.container_height_non_filling,
+            self.container_width_non_filling,
+        ) {
+            (Some(height), Some(width)) => (height, width),
+            (Some(height), None) => (height, height.saturating_mul(2)),
+            (None, Some(width)) => (width / 2, width),
+            (None, None) => (150, 300),
+        };
+        (
+            height
+                .max(self.min_height.unwrap_or(0))
+                .min(max_height),
+            width.max(self.min_width.unwrap_or(0)).min(max_width),
+        )
+    }
 }
 
 impl ContainingNode {
@@ -5949,9 +5967,8 @@ impl Renderer {
                                     return None;
                                 }
                             } else {
-                                let img_data = self.get_img_src_data(&src)?;
-                                let result = match img_data {
-                                    RequestCacheEntry::PngData(bytes) => rasterize_png(
+                                let result = match self.get_img_src_data(&src) {
+                                    Some(RequestCacheEntry::PngData(bytes)) => rasterize_png(
                                         &mut self.cached_rasterizations,
                                         &src,
                                         &bytes,
@@ -5962,7 +5979,7 @@ impl Renderer {
                                         mode,
                                     )
                                     .unwrap(),
-                                    RequestCacheEntry::JpegData(bytes) => {
+                                    Some(RequestCacheEntry::JpegData(bytes)) => {
                                         let (target_h, target_w) = prepare_jpeg(
                                             &mut self.cached_rasterizations,
                                             &src,
@@ -5993,7 +6010,7 @@ impl Renderer {
                                             )
                                         }
                                     }
-                                    RequestCacheEntry::SvgData(svg_data) => {
+                                    Some(RequestCacheEntry::SvgData(svg_data)) => {
                                         let mut injected = svg_data.clone();
                                         self.inject_css_variables_into_str(
                                             &mut injected,
@@ -6017,7 +6034,7 @@ impl Renderer {
                                             Ok(res) => res,
                                         }
                                     }
-                                    RequestCacheEntry::GifData(bytes) => {
+                                    Some(RequestCacheEntry::GifData(bytes)) => {
                                         let (target_h, target_w) = prepare_gif(
                                             &mut self.cached_rasterizations,
                                             &src,
@@ -6048,7 +6065,12 @@ impl Renderer {
                                             )
                                         }
                                     }
-                                    _ => panic!(),
+                                    None if element.tag == "img" => {
+                                        let (height, width) =
+                                            container_size.image_placeholder_size(max_w, max_h);
+                                        (Pixmap::new(1, 1).unwrap(), height, width, false)
+                                    }
+                                    _ => return None,
                                 };
                                 result
                             }
