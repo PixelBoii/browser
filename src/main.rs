@@ -62,6 +62,7 @@ use crate::ui::{Typeable, UiBuilder, UiRuntime};
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
 const HEADER_HEIGHT: u32 = 100;
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 // Many websites rely on the user-agent to be one of the major frames, so we don't use our own for now
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -556,6 +557,7 @@ struct Renderer {
     window_size: PhysicalSize<u32>,
     font_handler: Rc<FontHandler>,
     pending_dom_update: bool,
+    event_loop_notify: Rc<tokio::sync::Notify>,
     scroll_y: HashMap<usize, i32>,
     layout_roots: Vec<usize>,
     resolved_specified_heights: HashMap<usize, Option<u32>>,
@@ -2982,6 +2984,7 @@ enum UserEvent {
     Keyup(KeyEvent),
     ScrollBy((f32, f32)),
     FrameLoaded(usize),
+    AnimationFrameRequested,
 }
 
 #[derive(Debug, Clone)]
@@ -3013,6 +3016,16 @@ fn op_set_location_href(
         .fire_user_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), reload)))
         .unwrap();
 
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_request_animation_frame(state: &mut OpState) -> Result<(), JsError> {
+    let host = state.borrow::<JsHostState>();
+    host.proxy
+        .fire_user_event(UserEvent::AnimationFrameRequested)
+        .unwrap();
+    host.renderer.borrow().event_loop_notify.notify_one();
     Ok(())
 }
 
@@ -4122,6 +4135,7 @@ extension!(
     op_clone_node,
     op_spawn_frame,
     op_spawn_worker,
+    op_request_animation_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
   esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js"],
@@ -4594,6 +4608,7 @@ impl Renderer {
             window_size,
             font_handler,
             pending_dom_update: false,
+            event_loop_notify: Rc::new(tokio::sync::Notify::new()),
             scroll_y: HashMap::new(),
             layout_roots: vec![],
             resolved_specified_heights: HashMap::new(),
@@ -6326,8 +6341,8 @@ impl Renderer {
 
             let mut js_pending = true;
             loop {
-                let cmd = if js_pending {
-                    match rx.recv_timeout(Duration::from_millis(16)) {
+                let cmd = if let Some(timeout) = frame.command_wait_timeout(js_pending) {
+                    match rx.recv_timeout(timeout) {
                         Ok(cmd) => Some(cmd),
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -6359,6 +6374,9 @@ impl Renderer {
                         })
                         .unwrap_or(false);
                 }
+                let _ = frame.run_animation_frame_if_due().inspect_err(|err| {
+                    eprintln!("Error occurred while running animation frame: {}", err)
+                });
             }
         });
         Ok(FrameHandle {
@@ -8912,6 +8930,7 @@ impl Renderer {
         {
             proxy.fire_user_event(UserEvent::DomUpdated).unwrap();
             self.pending_dom_update = true;
+            self.event_loop_notify.notify_one();
         }
     }
 }
@@ -9015,6 +9034,8 @@ struct Frame {
     render_size: PhysicalSize<u32>,
     loaded_nodes: Vec<usize>,
     last_hover_position: Option<Position>,
+    animation_frame_requested: bool,
+    last_animation_frame: Instant,
 }
 
 struct BootParams {
@@ -9073,6 +9094,8 @@ impl Frame {
             render_size,
             loaded_nodes: vec![],
             last_hover_position: None,
+            animation_frame_requested: false,
+            last_animation_frame: Instant::now(),
         }
     }
 
@@ -9383,11 +9406,65 @@ impl Frame {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let _ = reply.send(renderer.update_element_attributes(node_idx, attributes));
             }
+            FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
+                self.animation_frame_requested = true;
+            }
             _ => {}
         }
     }
 
+    fn animation_frame_delay(&self) -> Option<Duration> {
+        self.animation_frame_requested.then(|| {
+            self.last_animation_frame
+                .checked_add(ANIMATION_FRAME_INTERVAL)
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+        })
+    }
+
+    fn command_wait_timeout(&self, js_pending: bool) -> Option<Duration> {
+        match (js_pending, self.animation_frame_delay()) {
+            (true, Some(animation_delay)) => {
+                Some(Duration::from_millis(16).min(animation_delay))
+            }
+            (true, None) => Some(Duration::from_millis(16)),
+            (false, Some(animation_delay)) => Some(animation_delay),
+            (false, None) => None,
+        }
+    }
+
+    fn run_animation_frame_if_due(&mut self) -> Result<bool> {
+        if self
+            .animation_frame_delay()
+            .is_none_or(|delay| !delay.is_zero())
+        {
+            return Ok(false);
+        }
+
+        self.animation_frame_requested = false;
+        self.last_animation_frame = Instant::now();
+        self.execute_host_script(
+            "requestAnimationFrame callbacks",
+            "__run_animation_frame(performance.now())".to_string(),
+        )?;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        Ok(true)
+    }
+
     fn pump_js_event_loop_once(&mut self) -> Result<bool> {
+        let event_loop_notify = self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .event_loop_notify
+            .clone();
+        let event_loop_wait = self
+            .animation_frame_delay()
+            .unwrap_or(Duration::from_millis(10))
+            .min(Duration::from_millis(10));
         let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
 
         // The current-thread Tokio runtime only drives network/timer IO while block_on is active,
@@ -9398,18 +9475,16 @@ impl Frame {
             .clone()
             .borrow_mut()
             .block_on(async {
-                match tokio::time::timeout(
-                    Duration::from_millis(10),
-                    runtime.run_event_loop(Default::default()),
-                )
-                .await
-                {
-                    Ok(Ok(())) => Ok(false),
-                    Ok(Err(err)) => {
-                        eprintln!("Error occurred while pumping JS loop: {}", err);
-                        Ok(true)
-                    }
-                    Err(_) => Ok(true),
+                tokio::select! {
+                    result = runtime.run_event_loop(Default::default()) => match result {
+                        Ok(()) => Ok(false),
+                        Err(err) => {
+                            eprintln!("Error occurred while pumping JS loop: {}", err);
+                            Ok(true)
+                        }
+                    },
+                    _ = event_loop_notify.notified() => Ok(true),
+                    _ = tokio::time::sleep(event_loop_wait) => Ok(true),
                 }
             })
     }
@@ -9655,6 +9730,8 @@ impl Frame {
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
             self.loaded_nodes.clear();
+            self.animation_frame_requested = false;
+            self.last_animation_frame = Instant::now();
             self.reset_js_document_state()?;
             self.setup_js_dom()?;
             let start = Instant::now();
@@ -9710,8 +9787,8 @@ impl Frame {
     pub fn start_main_loop(&mut self, proxy: RendererProxy, rx: Receiver<FrameCommand>) {
         let mut js_pending = true;
         loop {
-            let cmd = if js_pending {
-                match rx.recv_timeout(Duration::from_millis(16)) {
+            let cmd = if let Some(timeout) = self.command_wait_timeout(js_pending) {
+                match rx.recv_timeout(timeout) {
                     Ok(cmd) => Some(cmd),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -9736,6 +9813,9 @@ impl Frame {
                     .inspect_err(|err| eprintln!("Error occurred while pumping JS loop: {}", err))
                     .unwrap_or(false);
             }
+            let _ = self.run_animation_frame_if_due().inspect_err(|err| {
+                eprintln!("Error occurred while running animation frame: {}", err)
+            });
         }
     }
 
@@ -10289,6 +10369,9 @@ impl Frame {
             FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
                 self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
             }
+            FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
+                self.animation_frame_requested = true;
+            }
             FrameCommand::UserEvent(UserEvent::DomUpdated) => self.execute_dom_update(),
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let data = js_string_literal(&message);
@@ -10762,8 +10845,6 @@ impl Browser {
         let handle = browser.open_tab(url.clone(), hover_debugging, 0)?;
         browser.tabs.push(handle);
 
-        let mut tab_buffer = vec![0; WINDOW_WIDTH as usize * HEADER_HEIGHT as usize];
-
         let (browser_action_tx, browser_action_rx) = std::sync::mpsc::channel();
         let mut header = browser.get_header_buffer(&url, browser_action_tx.clone())?;
 
@@ -10792,17 +10873,6 @@ impl Browser {
                             let height =
                                 NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
                             surf.resize(width, height).expect("Resize failed");
-
-                            let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
-
-                            // Apply data to buffer
-                            let offset = (HEADER_HEIGHT * width.get()) as usize;
-                            buffer[offset..offset + tab_buffer.len()].copy_from_slice(&tab_buffer);
-
-                            buffer[0..offset].copy_from_slice(&header.buffer);
-
-                            buffer.present().expect("Failed to present");
-
                             let _ = browser.current_tab().tx.send(FrameCommand::Render);
                         }
                         WindowEvent::CursorMoved {
@@ -10883,9 +10953,7 @@ impl Browser {
                         }
                         _ => {}
                     },
-                    Event::UserEvent(UserEvent::TabUpdated(buffer)) => {
-                        tab_buffer = buffer;
-
+                    Event::UserEvent(UserEvent::TabUpdated(tab_buffer)) => {
                         let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
 
                         // Apply data to buffer
@@ -11561,4 +11629,5 @@ mod tests {
         );
         Ok(())
     }
+
 }

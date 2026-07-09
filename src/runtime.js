@@ -35,6 +35,9 @@ denoEvent.saveGlobalThisReference(globalThis)
 const { core } = Deno
 let nextTimerId = 1
 const activeTimers = new Map()
+let nextAnimationFrameId = 1
+let animationFrameRequested = false
+const animationFrameCallbacks = new Map()
 
 function createTimer(callback, delay, args, repeat) {
     if (typeof callback !== "function") {
@@ -77,15 +80,45 @@ function clearAllTimers() {
         core.cancelTimer(timer)
     }
     activeTimers.clear()
+    animationFrameCallbacks.clear()
+    animationFrameRequested = false
 }
 
 function requestAnimationFrameImpl(callback) {
-    return setTimeoutImpl(() => callback(Date.now()), 16)
+    if (typeof callback !== "function") {
+        throw new TypeError("requestAnimationFrame callback must be a function")
+    }
+
+    const callbackId = nextAnimationFrameId++
+    animationFrameCallbacks.set(callbackId, callback)
+    if (!animationFrameRequested) {
+        animationFrameRequested = true
+        core.ops.op_request_animation_frame()
+    }
+    return callbackId
 }
 
-function cancelAnimationFrameImpl(timerId) {
-    clearTimeoutImpl(timerId)
+function cancelAnimationFrameImpl(callbackId) {
+    animationFrameCallbacks.delete(callbackId)
 }
+
+function runAnimationFrame(timestamp) {
+    animationFrameRequested = false
+    const callbacks = Array.from(animationFrameCallbacks.values())
+    animationFrameCallbacks.clear()
+    for (const callback of callbacks) {
+        try {
+            callback(timestamp)
+        } catch (err) {
+            console.error("requestAnimationFrame callback failed", err)
+        }
+    }
+}
+
+Object.defineProperty(globalThis, "__run_animation_frame", {
+    value: runAnimationFrame,
+    configurable: true,
+})
 
 function scrollToImpl(x = 0, y = 0) {
     //
@@ -2074,12 +2107,10 @@ Object.defineProperty(globalThis, "CSS", {
     writable: true,
 })
 
-// TODO: This is quite naive, improve this
-const browserPerformance = performance.Performance
+const browserPerformance = performance.performance
 browserPerformance.timing = {
     navigationStart: Date.now(),
 }
-browserPerformance.now = Date.now
 
 Object.defineProperties(globalThis, {
     URL: { value: url.URL, configurable: true, writable: true },
