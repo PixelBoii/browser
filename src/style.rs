@@ -2269,7 +2269,7 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         ("visibility", PropertyValue::Visibility(value)) => {
             style.visibility = value;
         }
-        (_, PropertyValue::Raw(_)) => {}
+        (_, PropertyValue::Raw(_) | PropertyValue::VariableTemplate(_)) => {}
         (_, value) => {
             println!(
                 "Failed to apply style \"{}\" with value {:?}",

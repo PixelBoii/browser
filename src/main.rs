@@ -5441,7 +5441,7 @@ impl Renderer {
             let blob_store = Arc::new(BlobStore::default());
             let broadcast_channel = InMemoryBroadcastChannel::default();
             let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-                module_loader: Some(Rc::new(HttpModuleLoader::new())),
+                module_loader: Some(Rc::new(HttpModuleLoader::new(network.client.clone()))),
                 extensions: vec![
                     browser_worker::init(),
                     deno_webidl::deno_webidl::init(),
@@ -9129,9 +9129,10 @@ impl Frame {
     pub fn install_js_host(&mut self) {
         let blob_store = Arc::new(BlobStore::default());
         let broadcast_channel = InMemoryBroadcastChannel::default();
+        let client = self.network_fetch.borrow().client.clone();
         self.js_runtime = Some(Rc::new(RefCell::new(deno_core::JsRuntime::new(
             deno_core::RuntimeOptions {
-                module_loader: Some(Rc::new(HttpModuleLoader::new())),
+                module_loader: Some(Rc::new(HttpModuleLoader::new(client))),
                 extensions: vec![
                     browser::init(),
                     deno_webidl::deno_webidl::init(),

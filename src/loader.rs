@@ -11,13 +11,8 @@ pub struct HttpModuleLoader {
 }
 
 impl HttpModuleLoader {
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::limited(10))
-                .build()
-                .unwrap(),
-        }
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
     }
 
     fn infer_module_type(
