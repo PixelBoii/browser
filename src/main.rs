@@ -572,6 +572,7 @@ struct Renderer {
     animations: Vec<Animation>,
     cached_text_buffers: HashMap<(String, u32, Option<u32>, Option<u32>, u32), (Pixmap, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
+    flattened_css_cache: Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     variable_definitions: VariableDefinitions,
     event_loop_proxy: Option<RendererProxy>,
     hovering_impact: HashSet<usize>,
@@ -2729,9 +2730,16 @@ fn get_css_nodes(
     root_indice: usize,
     dom_indexes: &DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
+    flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     css_parser: &mut CssParser,
 ) -> Vec<CssNode> {
     let expandable = get_expandable_css_nodes(nodes, root_indice, &dom_indexes.children_index);
+    if let Some((cached_base_url, cached_expandable, cached_nodes)) = flattened_css_cache
+        && cached_base_url == base_url
+        && cached_expandable == &expandable
+    {
+        return cached_nodes.clone();
+    }
     let mut parsed_css_chunks = vec![];
     let mut needs_fetching = vec![];
     for (idx, exp) in expandable.iter().enumerate() {
@@ -2759,7 +2767,9 @@ fn get_css_nodes(
             parsed_css_chunks.push((idx, nodes));
         }
     }
-    flatten_css_chunks(parsed_css_chunks)
+    let parsed_css_nodes = flatten_css_chunks(parsed_css_chunks);
+    *flattened_css_cache = Some((base_url.clone(), expandable, parsed_css_nodes.clone()));
+    parsed_css_nodes
 }
 
 #[derive(Debug)]
@@ -2865,6 +2875,7 @@ fn compute_node_styles(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &mut DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
+    flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     hovering_chain: &Vec<usize>,
     css_parser: &mut CssParser,
 ) -> (
@@ -2882,6 +2893,7 @@ fn compute_node_styles(
         root_indice,
         dom_indexes,
         css_parse_cache,
+        flattened_css_cache,
         css_parser,
     );
     println!(
@@ -4573,6 +4585,7 @@ impl Renderer {
         let hovering = None;
 
         let mut css_parse_cache = HashMap::new();
+        let mut flattened_css_cache = None;
         let mut css_parser = CssParser::new();
 
         let (node_styles, resolved_font_sizes, variable_definitions, hovering_impact) =
@@ -4586,6 +4599,7 @@ impl Renderer {
                 &window_size,
                 &mut dom_indexes,
                 &mut css_parse_cache,
+                &mut flattened_css_cache,
                 &vec![],
                 &mut css_parser,
             );
@@ -4623,6 +4637,7 @@ impl Renderer {
             animations: vec![],
             cached_text_buffers: HashMap::new(),
             css_parse_cache,
+            flattened_css_cache,
             variable_definitions,
             focusable: None,
             event_loop_proxy: None,
@@ -8703,6 +8718,7 @@ impl Renderer {
             &self.window_size,
             &mut self.dom_indexes,
             &mut self.css_parse_cache,
+            &mut self.flattened_css_cache,
             &hover_chain,
             &mut self.css_parser,
         );
@@ -10565,6 +10581,7 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
     let window_size = PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
     let hovering_chain = vec![];
     let mut css_parse_cache = HashMap::new();
+    let mut flattened_css_cache = None;
     let mut css_parser = CssParser::new();
     let mut compute = || {
         compute_node_styles(
@@ -10577,6 +10594,7 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
             &window_size,
             &mut params.dom_indexes,
             &mut css_parse_cache,
+            &mut flattened_css_cache,
             &hovering_chain,
             &mut css_parser,
         )
@@ -10595,6 +10613,7 @@ pub struct Browser {
     window: Arc<Window>,
     event_loop_proxy: EventLoopProxy<UserEvent>,
     current_tab_idx: usize,
+    fps_counter: Option<FpsCounter>,
 }
 
 pub struct TabHandle {
@@ -10611,6 +10630,36 @@ enum BrowserAction {
 
 struct HeaderState {
     url: String,
+    fps: Option<u32>,
+}
+
+struct FpsCounter {
+    window_started: Instant,
+    frames: u32,
+    fps: u32,
+}
+
+impl FpsCounter {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            frames: 0,
+            fps: 0,
+        }
+    }
+
+    fn record_present(&mut self) -> Option<u32> {
+        self.frames += 1;
+        let elapsed = self.window_started.elapsed();
+        if elapsed < Duration::from_millis(500) {
+            return None;
+        }
+
+        self.fps = (self.frames as f32 / elapsed.as_secs_f32()).round() as u32;
+        self.frames = 0;
+        self.window_started = Instant::now();
+        Some(self.fps)
+    }
 }
 
 impl Browser {
@@ -10666,6 +10715,19 @@ impl Browser {
         })?;
         builder.finish_element()?;
 
+        if self.fps_counter.is_some() {
+            builder.start_element();
+            builder.padding(10)?;
+            builder.width(100)?;
+            builder.height(40)?;
+            builder.bg(0x363636FF)?;
+            builder.text(match state.borrow().fps {
+                Some(fps) => format!("{fps} FPS"),
+                None => "-- FPS".to_string(),
+            })?;
+            builder.finish_element()?;
+        }
+
         builder.finish_element()?;
 
         builder.start_element();
@@ -10697,7 +10759,10 @@ impl Browser {
         url: &String,
         action_tx: Sender<BrowserAction>,
     ) -> Result<ui::UiRuntime<HeaderState>> {
-        let state = HeaderState { url: url.clone() };
+        let state = HeaderState {
+            url: url.clone(),
+            fps: None,
+        };
         let mut runtime =
             UiRuntime::new_empty(WINDOW_WIDTH, HEADER_HEIGHT, action_tx.clone(), state)?;
         self.build_header(&mut runtime.builder, &runtime.state, action_tx)?;
@@ -10816,7 +10881,7 @@ impl Browser {
         }
     }
 
-    pub fn open(url: String, hover_debugging: bool) -> Result<()> {
+    pub fn open(url: String, hover_debugging: bool, show_fps_counter: bool) -> Result<()> {
         let event_loop = EventLoopBuilder::with_user_event()
             .build()
             .expect("Failed to create event loop");
@@ -10841,6 +10906,7 @@ impl Browser {
             current_tab_idx: 0,
             window: window.clone(),
             event_loop_proxy: event_loop.create_proxy(),
+            fps_counter: show_fps_counter.then(FpsCounter::new),
         };
         let handle = browser.open_tab(url.clone(), hover_debugging, 0)?;
         browser.tabs.push(handle);
@@ -10963,6 +11029,22 @@ impl Browser {
                         buffer[0..offset].copy_from_slice(&header.buffer);
 
                         buffer.present().expect("Failed to present");
+
+                        if let Some(fps) = browser
+                            .fps_counter
+                            .as_mut()
+                            .and_then(FpsCounter::record_present)
+                        {
+                            header.state.borrow_mut().fps = Some(fps);
+                            let comms_tx = header.builder.comms_tx.clone();
+                            browser
+                                .build_header(&mut header.builder, &header.state, comms_tx)
+                                .unwrap();
+                            match header.rerender() {
+                                Ok(_) => window.request_redraw(),
+                                Err(err) => eprintln!("Failed to render header: {err:?}"),
+                            }
+                        }
                     }
                     Event::UserEvent(UserEvent::TabUrlUpdated { tab_idx, url }) => {
                         let is_current = tab_idx == browser.current_tab_idx;
@@ -11005,7 +11087,12 @@ fn main() -> Result<()> {
     }
 
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
-    Browser::open("https://widget.swapped.com".to_string(), hover_debugging)?;
+    let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
+    Browser::open(
+        "https://widget.swapped.com".to_string(),
+        hover_debugging,
+        show_fps_counter,
+    )?;
 
     Ok(())
 }
