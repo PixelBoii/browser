@@ -990,12 +990,48 @@ class CanvasRenderingContext2D {
         this.path.push(this.path[0])
     }
 
-    stroke() {
-        if (!this.path) {
+    stroke(suppliedPath = null) {
+        const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : this.path
+        const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
+        if (!path) {
             return
         }
 
-        core.ops.op_canvas_path_stroke(this.canvas.__node_idx, this.path, this.lineWidth)
+        core.ops.op_canvas_path_stroke(this.canvas.__node_idx, path, lineWidth)
+    }
+
+    fill(suppliedPath = null) {
+        const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : this.path
+        const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
+        if (!path) {
+            return
+        }
+
+        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path, lineWidth)
+    }
+}
+
+class Path2D {
+    constructor() {
+        this.path = []
+        this.lineWidth = 1
+        this.cursor = null
+    }
+
+    moveTo(x, y) {
+        this.cursor = [x, y]
+    }
+
+    lineTo(x, y) {
+        if (this.path.length === 0) {
+            this.path.push(this.cursor)
+        }
+        this.path.push([x, y])
+        this.cursor = [x, y]
+    }
+
+    closePath() {
+        this.path.push(this.path[0])
     }
 }
 
@@ -1218,6 +1254,13 @@ class HTMLAudioElement extends HTMLMediaElement {
         super("audio")
     }
 }
+
+Object.defineProperty(globalThis, "Path2D", {
+    value: Path2D,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
 
 Object.defineProperty(globalThis, "HTMLElement", {
     value: HtmlElement,

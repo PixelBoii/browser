@@ -342,7 +342,7 @@ struct CanvasBuffer {
 impl CanvasBuffer {
     fn new(width: u32, height: u32) -> Self {
         Self {
-            buffer: vec![0xFF_FF_FF_00; width as usize * height as usize],
+            buffer: vec![0x00_00_00_00; width as usize * height as usize],
             width,
             height,
         }
@@ -4025,13 +4025,96 @@ fn op_canvas_path_stroke(
                         .min(node_height as f64) as i32;
 
                     let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
-                    row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
+                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
                 }
             }
         }
 
         cursor.x = x.round() as i32;
         cursor.y = y.round() as i32;
+    }
+
+    renderer.schedule_dom_update();
+
+    Ok(())
+}
+
+#[op2]
+fn op_canvas_path_fill(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[serde] path: Vec<Vec<f64>>,
+    line_width: f64,
+) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let node = renderer.nodes.get(node_idx).unwrap();
+    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
+        return Ok(());
+    };
+
+    let canvas = renderer
+        .canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+
+    let mut cursor = Position {
+        x: path[0][0] as i32,
+        y: path[0][1] as i32,
+    };
+    let mut x_pixels = vec![vec![]; node_width as usize];
+    let mut y_pixels = vec![vec![]; node_height as usize];
+    let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
+    let stride = node_width as usize;
+    for line in path.iter().skip(1) {
+        let x = line[0];
+        let y = line[1];
+        let start_x = cursor.x as f64;
+        let start_y = cursor.y as f64;
+        let x_delta = x - cursor.x as f64;
+        let y_delta = y - cursor.y as f64;
+
+        let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+
+        let x_ratio = x_delta / hyp as f64;
+        let y_ratio = y_delta / hyp as f64;
+
+        let line_width_offset = -line_width as i32 / 2;
+        let line_width_end = line_width as i32 / 2;
+
+        for idx in 0..hyp {
+            for wxidx in line_width_offset..line_width_end {
+                for wyidx in line_width_offset..line_width_end {
+                    let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
+                        .round()
+                        .min(node_width as f64) as i32;
+                    let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
+                        .round()
+                        .min(node_height as f64) as i32;
+
+                    x_pixels[px as usize].push(py as usize);
+                    y_pixels[py as usize].push(px as usize);
+                }
+            }
+        }
+
+        cursor.x = x.round() as i32;
+        cursor.y = y.round() as i32;
+    }
+
+    // Fill it in. The process here is relatively simple:
+    // For each pixel, ask the question "Do I have a pixel above me, below me, on my left and on my right?"
+    // If we do, then that pixel is inside and we should fill it in.
+    for py in 0..node_height as usize {
+        let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
+        for px in 0..node_width as usize {
+            if x_pixels[px].iter().any(|ipy| *ipy < py) &&
+                x_pixels[px].iter().any(|ipy| *ipy > py) &&
+                y_pixels[py].iter().any(|ipx| *ipx < px) &&
+                y_pixels[py].iter().any(|ipx| *ipx > px) {
+                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                }
+        }
     }
 
     renderer.schedule_dom_update();
@@ -4173,6 +4256,7 @@ extension!(
     op_fill_canvas_rect,
     op_stroke_canvas_rect,
     op_canvas_path_stroke,
+    op_canvas_path_fill,
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
@@ -5976,7 +6060,7 @@ impl Renderer {
                                 .entry(node_idx)
                                 .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
                             canvas.resize_if_needed(canvas_width, canvas_height);
-                            let data = rgba_buffer_to_premul_bytes(&canvas.buffer);
+                            let data = premul_rgba_buffer_to_bytes(&canvas.buffer);
                             let pixmap = tiny_skia::Pixmap::from_vec(
                                 data,
                                 IntSize::from_wh(canvas_width, canvas_height)?,
