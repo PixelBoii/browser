@@ -1293,25 +1293,6 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
     out
 }
 
-fn order_variables(idxs: &Vec<&usize>, css_node_ranking: &[usize]) -> Vec<usize> {
-    let mut idxs = idxs.clone();
-    idxs.sort_by(|a, b| {
-        let a_rank = if **a == usize::MAX {
-            usize::MAX
-        } else {
-            css_node_ranking[**a]
-        };
-        let b_rank = if **b == usize::MAX {
-            usize::MAX
-        } else {
-            css_node_ranking[**b]
-        };
-        a_rank.cmp(&b_rank)
-    });
-
-    idxs.into_iter().copied().collect()
-}
-
 fn resolve_node_variable(
     value: &PropertyValue,
     map: &HashMap<String, PropertyValue>,
@@ -1386,10 +1367,11 @@ fn apply_node_variables(
     css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
 ) -> Rc<HashMap<usize, String>> {
-    let variables_to_parse: HashMap<usize, &Variable> = nodes
+    let mut variables_to_parse: Vec<(usize, usize, &Variable)> = nodes
         .iter()
-        .filter_map(|(idx, node)| match node.as_ref() {
-            Node::Variable(variable) => Some((*idx, variable)),
+        .enumerate()
+        .filter_map(|(source_order, (idx, node))| match node.as_ref() {
+            Node::Variable(variable) => Some((source_order, *idx, variable)),
             _ => None,
         })
         .collect();
@@ -1397,19 +1379,23 @@ fn apply_node_variables(
         return Rc::clone(variables);
     }
 
-    let unordered_collected_idxs = variables_to_parse.keys().collect::<Vec<&usize>>();
-    let ordered_idxs = order_variables(&unordered_collected_idxs, css_node_ranking);
+    variables_to_parse.sort_by_key(|(source_order, idx, _)| {
+        let rank = if *idx == usize::MAX {
+            usize::MAX
+        } else {
+            css_node_ranking[*idx]
+        };
+        (rank, *source_order)
+    });
 
     let mut map = HashMap::new();
-    for idx in ordered_idxs.iter() {
-        let var = variables_to_parse.get(idx).unwrap();
+    for (_, _, var) in variables_to_parse.iter() {
         map.insert(var.variable.clone(), var.value.clone());
     }
 
     let mut new_variables = (**variables).clone();
 
-    for idx in ordered_idxs {
-        let var = variables_to_parse.get(&idx).unwrap();
+    for (_, _, var) in variables_to_parse {
         if let Some(resolved) =
             resolve_node_variable(&var.value, &map, variables, variable_definitions)
         {
