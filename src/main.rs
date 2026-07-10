@@ -5404,6 +5404,7 @@ impl Renderer {
             })
             .filter(|src| !src.starts_with("data:"))
             .filter_map(|src| {
+                let src_extension = Self::img_src_extension(&src)?;
                 let url = match resolve_url(&src, Some(&base)) {
                     Ok(url) => url,
                     Err(err) => {
@@ -5417,7 +5418,7 @@ impl Renderer {
                     return None;
                 }
 
-                Some((url, Self::img_src_extension(&src)?))
+                Some((url, src_extension))
             })
             .collect();
 
@@ -5427,16 +5428,18 @@ impl Renderer {
 
         println!("Pre-fetching {} images", requests.len());
 
-        let client = self.network_fetch.borrow().client.clone();
+        let cookie_jar = Arc::clone(&self.network_fetch.borrow().cookie_jar);
         let proxy = self.event_loop_proxy.clone();
-        for (url, _) in &requests {
-            self.pending_image_fetches.insert(url.clone());
-        }
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime for image prefetch");
+            let client = reqwest::Client::builder()
+                .cookie_provider(cookie_jar)
+                .user_agent(USER_AGENT)
+                .build()
+                .expect("Failed to create HTTP client for image prefetch");
 
             let entries = runtime.block_on(async move {
                 let mut join_set = tokio::task::JoinSet::new();
@@ -11111,7 +11114,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://widget.swapped.com".to_string(),
+        "https://www.google.com".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
@@ -11529,22 +11532,93 @@ pub fn ensure_snapshot_matches(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use anyhow::{Result, anyhow, bail};
     use std::{
         ops::Add,
+        sync::mpsc::{Receiver, RecvTimeoutError},
         time::{Duration, Instant},
     };
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, Position, RendererProxy, SizeUnit, ensure_snapshot_matches, style::{
-            CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
+        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
+        style::{
+            CalcExpression, StyleCalcOperator, StyleSize, parse_calc,
+            split_ignoring_parentheses,
         },
     };
 
+    impl Frame {
+        fn wait_for_images_to_load(
+            &mut self,
+            frame_rx: &Receiver<FrameCommand>,
+            timeout: Duration,
+        ) -> Result<()> {
+            let deadline = Instant::now().add(timeout);
+            let mut ignored_events = 0;
+
+            loop {
+                let pending_images = self
+                    .renderer
+                    .as_ref()
+                    .map(|renderer| renderer.borrow().pending_image_fetches.len())
+                    .unwrap_or_default();
+                if pending_images == 0 {
+                    return Ok(());
+                }
+
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!(
+                        "Timed out waiting for {pending_images} image(s) to load after ignoring {ignored_events} already-applied frame event(s)"
+                    );
+                }
+
+                match frame_rx.recv_timeout(remaining) {
+                    Ok(FrameCommand::UserEvent(UserEvent::ImagesPrefetched(entries))) => {
+                        self.renderer
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .finish_image_prefetch(entries);
+                        self.layout_dirty = true;
+                    }
+                    // The headless tests drive JS and DOM updates directly, so their queued
+                    // notifications have already been applied and must not be replayed here.
+                    Ok(_) => ignored_events += 1,
+                    Err(RecvTimeoutError::Timeout) => {
+                        bail!(
+                            "Timed out waiting for {pending_images} image(s) to load after ignoring {ignored_events} already-applied frame event(s)"
+                        )
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(anyhow!(
+                            "Frame event channel disconnected with {pending_images} image(s) pending"
+                        ));
+                    }
+                }
+            }
+        }
+
+        fn render_for_snapshot(
+            &mut self,
+            frame_rx: &Receiver<FrameCommand>,
+            buffer: &mut [u32],
+            width: u32,
+            height: u32,
+            timeout: Duration,
+        ) -> Result<()> {
+            // The initial layout discovers image URLs and starts their asynchronous fetches.
+            self.render_into(buffer, width, height, true);
+            self.wait_for_images_to_load(frame_rx, timeout)?;
+            self.render_into(buffer, width, height, true);
+            Ok(())
+        }
+    }
+
     #[test]
     fn renders_google() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://www.google.com".to_string(),
             false,
@@ -11555,17 +11629,17 @@ mod tests {
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
-        frame.render_into(&mut buffer, 1920, 1080, true);
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         frame.apply_hovering(&Position { x: 864, y: 770 });
         frame.on_click()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        frame.render_into(&mut buffer, 1920, 1080, true);
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
     }
 
     #[test]
     fn renders_swapped_com() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://widget.swapped.com/".to_string(),
             false,
@@ -11589,6 +11663,7 @@ mod tests {
             "renders_swapped_com render_into_cold={}us",
             render_start.elapsed().as_micros()
         );
+        frame.wait_for_images_to_load(&rx, Duration::from_secs(5))?;
 
         const HOT_RENDER_RUNS: usize = 100;
         let mut hot_render_times = Vec::with_capacity(HOT_RENDER_RUNS);
@@ -11614,7 +11689,7 @@ mod tests {
 
     #[test]
     fn render_vite_dev() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://vite.dev".to_string(),
             false,
@@ -11624,13 +11699,13 @@ mod tests {
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 4320];
-        frame.render_into(&mut buffer, 1920, 4320, true);
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 4320, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "vitedev", 1920, 4320)
     }
 
     #[test]
     fn render_time_tracker() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://pixel-time-tracker.pages.dev/".to_string(),
             false,
@@ -11640,13 +11715,13 @@ mod tests {
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
-        frame.render_into(&mut buffer, 1920, 1080, true);
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "pixeltimetracker", 1920, 1080)
     }
 
     #[test]
     fn render_slack() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://slack.com/".to_string(),
             false,
@@ -11657,13 +11732,13 @@ mod tests {
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 8640];
-        frame.render_into(&mut buffer, 1920, 8640, true);
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 8640, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "slackcom", 1920, 8640)
     }
 
     #[test]
     fn render_nodejs() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://nodejs.org/en".to_string(),
             false,
@@ -11674,7 +11749,7 @@ mod tests {
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
-        frame.render_into(&mut buffer, 1920, 2160, true);
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "nodejsorg", 1920, 2160)
     }
 
