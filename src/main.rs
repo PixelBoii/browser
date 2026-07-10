@@ -579,6 +579,8 @@ struct Renderer {
     frames: HashMap<usize, FrameHandle>,
     css_parser: CssParser,
     workers: HashMap<String, WorkerHandle>,
+    tracking_intersection: Vec<usize>,
+    nodes_intersecting: HashSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -3015,6 +3017,7 @@ enum UserEvent {
     ScrollBy((f32, f32)),
     FrameLoaded(usize),
     AnimationFrameRequested,
+    IntersectionTracked,
 }
 
 #[derive(Debug, Clone)]
@@ -4059,6 +4062,15 @@ fn op_collect_data_for_form(
 }
 
 #[op2(fast)]
+fn op_track_intersection(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    renderer
+        .track_intersection(node_idx);
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -4165,6 +4177,7 @@ extension!(
     op_clone_node,
     op_spawn_frame,
     op_spawn_worker,
+    op_track_intersection,
     op_request_animation_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
@@ -4663,7 +4676,52 @@ impl Renderer {
             frames: HashMap::new(),
             css_parser,
             workers: HashMap::new(),
+            tracking_intersection: vec![],
+            nodes_intersecting: HashSet::new(),
         }
+    }
+
+    fn track_intersection(&mut self, node_idx: usize) {
+        self.tracking_intersection.push(node_idx);
+        let _ = self.event_loop_proxy.as_ref().unwrap().fire_user_event(UserEvent::IntersectionTracked);
+    }
+
+    fn layout_inside_viewport(&self, layout: &LayoutBox, layout_box_id: usize) -> bool {
+        let rendered_node = self.rendered_nodes_ordered.iter().find(|n| n.layout_box_idx == layout_box_id);
+        let offset_x = layout.rect.x + rendered_node.map(|n| n.offset_x).unwrap_or(0);
+        let offset_y = layout.rect.y + rendered_node.map(|n| n.offset_y).unwrap_or(0);
+        offset_x + layout.rect.width as i32 > 0 &&
+        offset_x < self.window_size.width as i32 &&
+        offset_y + layout.rect.height as i32 >= 0 &&
+        offset_y < self.window_size.height as i32
+    }
+
+    fn compute_intersections(&mut self) -> Vec<usize> {
+        let mut to_report = vec![];
+        for node_idx in self.tracking_intersection.iter() {
+            let Some(layout_idx) = self.node_layout_mapping.get(node_idx) else {
+                continue;
+            };
+            let Some(layout) = self.layout_table.get(layout_idx) else {
+                let changed = self.nodes_intersecting.remove(node_idx);
+                if changed {
+                    to_report.push(*node_idx);
+                }
+                continue;
+            };
+            if !self.layout_inside_viewport(layout, *layout_idx) {
+                let changed = self.nodes_intersecting.remove(node_idx);
+                if changed {
+                    to_report.push(*node_idx);
+                }
+                continue;
+            }
+            let new = self.nodes_intersecting.insert(*node_idx);
+            if new {
+                to_report.push(*node_idx);
+            }
+        }
+        to_report
     }
 
     fn element_has_loaded(&self, node_idx: usize, phase: &LoadPhase) -> bool {
@@ -10182,12 +10240,28 @@ impl Frame {
         self.apply_hovering(&cursor);
     }
 
+    fn refresh_intersections(&mut self) -> Result<()> {
+        let new = {
+            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+            renderer.compute_intersections()
+        };
+        if !new.is_empty() {
+            let new = deno_core::serde_json::to_string(&new)?;
+            self.execute_host_script(
+                "IntersectionObserver callbacks",
+                format!("__runIntersectionObservers({new})"),
+            )?;
+        }
+        Ok(())
+    }
+
     fn render_loop(&mut self) -> Vec<u32> {
         let animation_redraw = self.tick_animations();
         let mut buffer =
             vec![0; self.render_size.width as usize * self.render_size.height as usize];
         let first_boot = self.render(&mut buffer);
         self.refresh_hover_after_render();
+        let _ = self.refresh_intersections();
         if first_boot {
             let start = Instant::now();
             let js_result = self.run_js();
@@ -10464,6 +10538,9 @@ impl Frame {
             }
             FrameCommand::UserEvent(UserEvent::ScrollBy((_, y))) => {
                 self.scroll_y_by(y);
+            }
+            FrameCommand::UserEvent(UserEvent::IntersectionTracked) => {
+                let _ = self.refresh_intersections();
             }
             _ => {}
         };
@@ -11114,7 +11191,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://www.google.com".to_string(),
+        "file:///home/pontus/browser/pages/test.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;

@@ -1293,6 +1293,8 @@ Object.defineProperty(globalThis, "HTMLAudioElement", {
     writable: true,
 });
 
+const intersectionObserverMapping = {}
+
 class IntersectionObserver {
     constructor(callback) {
         if (typeof callback !== "function") {
@@ -1304,21 +1306,51 @@ class IntersectionObserver {
     }
 
     observe(target) {
+        if (!(target instanceof HTMLElement)) {
+            throw new Error("Target must be an element")
+        }
+        if (this.targets.has(target)) {
+            return
+        }
         this.targets.add(target)
+        intersectionObserverMapping[target.__node_idx] = this
+        core.ops.op_track_intersection(target.__node_idx)
     }
 
     unobserve(target) {
         this.targets.delete(target)
+        intersectionObserverMapping[target.__node_idx] = undefined
+        // TODO: Hook this up to rust
     }
 
     disconnect() {
+        for (const target of this.targets) {
+            intersectionObserverMapping[target.__node_idx] = undefined
+        }
         this.targets.clear()
+        // TODO: Hook this up to rust
     }
 
     takeRecords() {
         return []
     }
 }
+
+function runIntersectionObservers(nodeIdxs) {
+    for (const idx of nodeIdxs) {
+        const value = intersectionObserverMapping[idx]
+        if (value) {
+            value.callback();
+        }
+    }
+}
+
+Object.defineProperty(globalThis, "__runIntersectionObservers", {
+    value: runIntersectionObservers,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
 
 Object.defineProperty(globalThis, "IntersectionObserver", {
     value: IntersectionObserver,
