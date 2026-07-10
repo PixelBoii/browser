@@ -1002,11 +1002,16 @@ class CanvasRenderingContext2D {
 class HtmlCanvasElement extends HtmlElement {
     constructor(tag) {
         super(tag)
+
+        this.__contexts = {}
     }
 
     getContext(type) {
         if (type === "2d") {
-            return new CanvasRenderingContext2D(this)
+            if (!this.__contexts["2d"]) {
+                this.__contexts["2d"] = new CanvasRenderingContext2D(this)
+            }
+            return this.__contexts["2d"]
         } else {
             return null
         }
