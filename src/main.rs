@@ -4071,6 +4071,17 @@ fn op_track_intersection(state: &mut OpState, #[number] node_idx: usize) -> Resu
 }
 
 #[op2(fast)]
+fn op_untrack_intersection(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.untrack_intersection(node_idx);
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -4178,6 +4189,7 @@ extension!(
     op_spawn_frame,
     op_spawn_worker,
     op_track_intersection,
+    op_untrack_intersection,
     op_request_animation_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
@@ -4686,6 +4698,11 @@ impl Renderer {
         let _ = self.event_loop_proxy.as_ref().unwrap().fire_user_event(UserEvent::IntersectionTracked);
     }
 
+    fn untrack_intersection(&mut self, node_idx: usize) {
+        self.tracking_intersection.retain(|idx| *idx != node_idx);
+        self.nodes_intersecting.remove(&node_idx);
+    }
+
     fn layout_inside_viewport(&self, layout: &LayoutBox, layout_box_id: usize) -> bool {
         let rendered_node = self.rendered_nodes_ordered.iter().find(|n| n.layout_box_idx == layout_box_id);
         let offset_x = layout.rect.x + rendered_node.map(|n| n.offset_x).unwrap_or(0);
@@ -4696,8 +4713,9 @@ impl Renderer {
         offset_y < self.window_size.height as i32
     }
 
-    fn compute_intersections(&mut self) -> Vec<usize> {
-        let mut to_report = vec![];
+    fn compute_intersections(&mut self) -> (Vec<usize>, Vec<usize>) {
+        let mut intersecting = vec![];
+        let mut not_intersecting = vec![];
         for node_idx in self.tracking_intersection.iter() {
             let Some(layout_idx) = self.node_layout_mapping.get(node_idx) else {
                 continue;
@@ -4705,23 +4723,23 @@ impl Renderer {
             let Some(layout) = self.layout_table.get(layout_idx) else {
                 let changed = self.nodes_intersecting.remove(node_idx);
                 if changed {
-                    to_report.push(*node_idx);
+                    not_intersecting.push(*node_idx);
                 }
                 continue;
             };
             if !self.layout_inside_viewport(layout, *layout_idx) {
                 let changed = self.nodes_intersecting.remove(node_idx);
                 if changed {
-                    to_report.push(*node_idx);
+                    not_intersecting.push(*node_idx);
                 }
                 continue;
             }
             let new = self.nodes_intersecting.insert(*node_idx);
             if new {
-                to_report.push(*node_idx);
+                intersecting.push(*node_idx);
             }
         }
-        to_report
+        (intersecting, not_intersecting)
     }
 
     fn element_has_loaded(&self, node_idx: usize, phase: &LoadPhase) -> bool {
@@ -10241,15 +10259,16 @@ impl Frame {
     }
 
     fn refresh_intersections(&mut self) -> Result<()> {
-        let new = {
+        let (intersecting, not_intersecting) = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             renderer.compute_intersections()
         };
-        if !new.is_empty() {
-            let new = deno_core::serde_json::to_string(&new)?;
+        if !intersecting.is_empty() || !not_intersecting.is_empty() {
+            let intersecting = deno_core::serde_json::to_string(&intersecting)?;
+            let not_intersecting = deno_core::serde_json::to_string(&not_intersecting)?;
             self.execute_host_script(
                 "IntersectionObserver callbacks",
-                format!("__runIntersectionObservers({new})"),
+                format!("__runIntersectionObservers({intersecting}, {not_intersecting})"),
             )?;
         }
         Ok(())

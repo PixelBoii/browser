@@ -1318,17 +1318,19 @@ class IntersectionObserver {
     }
 
     unobserve(target) {
-        this.targets.delete(target)
+        if (!this.targets.delete(target)) {
+            return
+        }
         intersectionObserverMapping[target.__node_idx] = undefined
-        // TODO: Hook this up to rust
+        core.ops.op_untrack_intersection(target.__node_idx)
     }
 
     disconnect() {
         for (const target of this.targets) {
             intersectionObserverMapping[target.__node_idx] = undefined
+            core.ops.op_untrack_intersection(target.__node_idx)
         }
         this.targets.clear()
-        // TODO: Hook this up to rust
     }
 
     takeRecords() {
@@ -1336,12 +1338,30 @@ class IntersectionObserver {
     }
 }
 
-function runIntersectionObservers(nodeIdxs) {
-    for (const idx of nodeIdxs) {
-        const value = intersectionObserverMapping[idx]
-        if (value) {
-            value.callback();
+function runIntersectionObservers(intersectingNodeIdxs, notIntersectingNodeIdxs) {
+    const entriesByObserver = new Map()
+
+    for (const [nodeIdxs, isIntersecting] of [
+        [intersectingNodeIdxs, true],
+        [notIntersectingNodeIdxs, false],
+    ]) {
+        for (const idx of nodeIdxs) {
+            const observer = intersectionObserverMapping[idx]
+            if (!observer) {
+                continue
+            }
+
+            const entries = entriesByObserver.get(observer) ?? []
+            entries.push({
+                target: __elementFromNodeIdx(idx),
+                isIntersecting,
+            })
+            entriesByObserver.set(observer, entries)
         }
+    }
+
+    for (const [observer, entries] of entriesByObserver) {
+        observer.callback(entries, observer)
     }
 }
 
