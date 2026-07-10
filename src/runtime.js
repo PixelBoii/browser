@@ -1422,7 +1422,7 @@ class CSSStyleDeclaration {
                 return Reflect.get(target, key, receiver)
             },
             set(target, key, value) {
-                if (String(key).startsWith("__")) {
+                if (typeof key === "symbol" || String(key).startsWith("__")) {
                     return Reflect.set(target, key, value)
                 }
 
