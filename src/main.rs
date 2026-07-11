@@ -5827,7 +5827,8 @@ impl Renderer {
                 max_h,
                 mode,
             )
-            .unwrap(),
+            .inspect_err(|err| println!("Failed to rasterize PNG: {}", err))
+            .ok()?,
             Some(RequestCacheEntry::JpegData(bytes)) => {
                 let (target_h, target_w) = prepare_jpeg(
                     &mut self.cached_rasterizations,
