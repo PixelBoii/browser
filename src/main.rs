@@ -18,6 +18,7 @@ use style::{
     parse_style,
 };
 
+use std::borrow::Cow;
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -581,6 +582,8 @@ struct Renderer {
     workers: HashMap<String, WorkerHandle>,
     tracking_intersection: Vec<usize>,
     nodes_intersecting: HashSet<usize>,
+    blob_store: Arc<BlobStore>,
+    images_nodes_loaded: HashMap<usize, (u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1102,8 +1105,8 @@ fn rasterize_svg(
     svg_str: &String,
     input_w: Option<u32>,
     input_h: Option<u32>,
-    max_w: u32,
-    max_h: u32,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
     style: &Style,
     mode: &LayoutMode,
 ) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
@@ -1145,8 +1148,12 @@ fn rasterize_svg(
         input_w,
         input_h,
     );
-    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
-    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    if let Some(max_h) = max_h {
+        (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    }
+    if let Some(max_w) = max_w {
+        (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    }
 
     let key = (svg_str.clone(), color_hex, target_h, target_w);
     if let Some(cached) = cached_rasterizations.svgs.get(&key) {
@@ -1186,8 +1193,8 @@ fn rasterize_png(
     bytes: &[u8],
     input_w: Option<u32>,
     input_h: Option<u32>,
-    max_w: u32,
-    max_h: u32,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
     mode: &LayoutMode,
 ) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
     let pixmap = if let Some(cached) = cached_rasterizations.decoded_pngs.get(src) {
@@ -1212,8 +1219,12 @@ fn rasterize_png(
         input_w,
         input_h,
     );
-    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
-    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    if let Some(max_h) = max_h {
+        (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    }
+    if let Some(max_w) = max_w {
+        (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    }
 
     let mut dst = tiny_skia::Pixmap::new(target_w.max(1), target_h.max(1))
         .context("failed to allocate png pixmap")?;
@@ -1246,8 +1257,8 @@ fn prepare_jpeg(
     bytes: &[u8],
     input_w: Option<u32>,
     input_h: Option<u32>,
-    max_w: u32,
-    max_h: u32,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
 ) -> Result<(u32, u32)> {
     let result = if let Some(cached) = cached_rasterizations.decoded_jpegs.get(src) {
         cached
@@ -1268,8 +1279,12 @@ fn prepare_jpeg(
         input_w,
         input_h,
     );
-    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
-    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    if let Some(max_h) = max_h {
+        (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    }
+    if let Some(max_w) = max_w {
+        (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    }
 
     Ok((target_h, target_w))
 }
@@ -1309,8 +1324,8 @@ fn prepare_gif(
     bytes: &[u8],
     input_w: Option<u32>,
     input_h: Option<u32>,
-    max_w: u32,
-    max_h: u32,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
 ) -> Result<(u32, u32)> {
     let result = if let Some(cached) = cached_rasterizations.decoded_gifs.get(src) {
         cached
@@ -1331,8 +1346,12 @@ fn prepare_gif(
         input_w,
         input_h,
     );
-    (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
-    (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    if let Some(max_h) = max_h {
+        (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    }
+    if let Some(max_w) = max_w {
+        (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    }
 
     Ok((target_h, target_w))
 }
@@ -4701,6 +4720,7 @@ impl Renderer {
         network_fetch: Rc<RefCell<NetworkFetch>>,
         mut dom_indexes: DomIndexes,
         nodes_idxs: Vec<usize>,
+        blob_store: Arc<BlobStore>,
     ) -> Self {
         let request_cache = HashMap::new();
 
@@ -4774,6 +4794,8 @@ impl Renderer {
             workers: HashMap::new(),
             tracking_intersection: vec![],
             nodes_intersecting: HashSet::new(),
+            blob_store,
+            images_nodes_loaded: HashMap::new(),
         }
     }
 
@@ -4834,6 +4856,8 @@ impl Renderer {
             Node::Element(element) => {
                 if element.tag == "iframe" {
                     *phase == LoadPhase::IframeDone
+                } else if element.tag == "img" {
+                    self.images_nodes_loaded.contains_key(&node_idx)
                 } else {
                     *phase == LoadPhase::JsDone
                 }
@@ -5746,6 +5770,156 @@ impl Renderer {
         layout_roots
     }
 
+    fn decode_and_rasterize_img(&mut self, node_idx: usize, mode: &LayoutMode, input_h: Option<u32>, input_w: Option<u32>, max_h: Option<u32>, max_w: Option<u32>) -> Option<(Pixmap, u32, u32, bool)> {
+        let Some(node) = self.nodes.get(node_idx) else {
+            return None;
+        };
+        let Node::Element(element) = node else {
+            return None;
+        };
+        let style = self.node_styles
+            .get(&node_idx)
+            .map(|style| Cow::Borrowed(style))
+            .unwrap_or_else(|| Cow::Owned(get_base_style(node, None)));
+        let src = if element.tag == "video" {
+            element.attributes.get_str("poster")?
+        } else {
+            element.attributes.get_str("src")?
+        };
+        let entry = if src.starts_with("data:") {
+            if let Some(data) = src.strip_prefix("data:image/svg+xml,") {
+                let mut decoded = percent_encoding::percent_decode_str(data)
+                    .decode_utf8()
+                    .ok()?
+                    .to_string();
+                self.inject_css_variables_into_str(
+                    &mut decoded,
+                    &style.variables,
+                );
+                Some(RequestCacheEntry::SvgData(decoded))
+            } else {
+                None
+            }
+        } else if src.starts_with("blob") {
+            let url = url::Url::parse(&src).ok()?;
+            let blob = self.blob_store.get_object_url(url)?;
+            let bytes = self.tokio.borrow_mut().block_on(blob.read_all());
+            match blob.media_type.as_str() {
+                "image/png" => {
+                    Some(RequestCacheEntry::PngData(bytes.into()))
+                },
+                "image/svg+xml" => {
+                    Some(RequestCacheEntry::SvgData(String::from_utf8(bytes).ok()?))
+                },
+                _ => None
+            }
+        } else {
+            self.get_img_src_data(&src)
+        };
+        let result = match entry {
+            Some(RequestCacheEntry::PngData(bytes)) => rasterize_png(
+                &mut self.cached_rasterizations,
+                &src,
+                &bytes,
+                input_w,
+                input_h,
+                max_w,
+                max_h,
+                mode,
+            )
+            .unwrap(),
+            Some(RequestCacheEntry::JpegData(bytes)) => {
+                let (target_h, target_w) = prepare_jpeg(
+                    &mut self.cached_rasterizations,
+                    &src,
+                    &bytes,
+                    input_w,
+                    input_h,
+                    max_w,
+                    max_h,
+                )
+                .unwrap();
+                let (target_h, target_w) =
+                    (target_h.max(1), target_w.max(1));
+                if *mode == LayoutMode::Complete {
+                    let pixmap = rasterize_jpeg(
+                        &mut self.cached_rasterizations,
+                        &src,
+                        target_w,
+                        target_h,
+                    )
+                    .unwrap();
+                    (pixmap, target_h, target_w, true)
+                } else {
+                    (
+                        Pixmap::new(target_w, target_h).unwrap(),
+                        target_h,
+                        target_w,
+                        true,
+                    )
+                }
+            }
+            Some(RequestCacheEntry::SvgData(svg_data)) => {
+                let mut injected = svg_data.clone();
+                self.inject_css_variables_into_str(
+                    &mut injected,
+                    &style.variables,
+                );
+                let result = rasterize_svg(
+                    &mut self.cached_rasterizations,
+                    &injected,
+                    input_w,
+                    input_h,
+                    max_w,
+                    max_h,
+                    &style,
+                    mode,
+                );
+                match result {
+                    Err(err) => {
+                        println!("Failed to rasterize SVG data: {}", err);
+                        return None;
+                    }
+                    Ok(res) => res,
+                }
+            }
+            Some(RequestCacheEntry::GifData(bytes)) => {
+                let (target_h, target_w) = prepare_gif(
+                    &mut self.cached_rasterizations,
+                    &src,
+                    &bytes,
+                    input_w,
+                    input_h,
+                    max_w,
+                    max_h,
+                )
+                .unwrap();
+                let (target_h, target_w) =
+                    (target_h.max(1), target_w.max(1));
+                if *mode == LayoutMode::Complete {
+                    let pixmap = rasterize_gif(
+                        &mut self.cached_rasterizations,
+                        &src,
+                        target_w,
+                        target_h,
+                    )
+                    .unwrap();
+                    (pixmap, target_h, target_w, true)
+                } else {
+                    (
+                        Pixmap::new(target_w, target_h).unwrap(),
+                        target_h,
+                        target_w,
+                        true,
+                    )
+                }
+            }
+            _ => return None,
+        };
+        self.images_nodes_loaded.insert(node_idx, (result.1, result.2));
+        Some(result)
+    }
+
     fn inject_css_variables_into_str(&self, str: &mut String, variables: &HashMap<usize, String>) {
         // Return early if string doesn't need any vars
         if !str.contains("var(") {
@@ -6080,8 +6254,8 @@ impl Renderer {
                                 &svg_data,
                                 container_size.container_width_non_filling,
                                 container_size.container_height_non_filling,
-                                max_w,
-                                max_h,
+                                Some(max_w),
+                                Some(max_h),
                                 &style,
                                 mode,
                             );
@@ -6094,150 +6268,15 @@ impl Renderer {
                             }
                         }
                         "img" | "video" => {
-                            let src = if element.tag == "video" {
-                                element.attributes.get_str("poster")?
+                            let result = self.decode_and_rasterize_img(node_idx, mode, container_size.container_height_non_filling, container_size.container_width_non_filling, Some(max_h), Some(max_w));
+                            if result.is_none() && element.tag == "img" {
+                                let (height, width) =
+                                    container_size.image_placeholder_size(max_w, max_h);
+                                (Pixmap::new(1, 1).unwrap(), height, width, false)
                             } else {
-                                element.attributes.get_str("src")?
-                            };
-                            if src.starts_with("data:") {
-                                if let Some(data) = src.strip_prefix("data:image/svg+xml,") {
-                                    let mut decoded = percent_encoding::percent_decode_str(data)
-                                        .decode_utf8()
-                                        .ok()?
-                                        .to_string();
-                                    self.inject_css_variables_into_str(
-                                        &mut decoded,
-                                        &style.variables,
-                                    );
-                                    let result = rasterize_svg(
-                                        &mut self.cached_rasterizations,
-                                        &decoded,
-                                        container_size.container_width_non_filling,
-                                        container_size.container_height_non_filling,
-                                        max_w,
-                                        max_h,
-                                        &style,
-                                        mode,
-                                    );
-                                    match result {
-                                        Err(err) => {
-                                            println!("Failed to rasterize SVG data: {}", err);
-                                            return None;
-                                        }
-                                        Ok(res) => res,
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                let result = match self.get_img_src_data(&src) {
-                                    Some(RequestCacheEntry::PngData(bytes)) => rasterize_png(
-                                        &mut self.cached_rasterizations,
-                                        &src,
-                                        &bytes,
-                                        container_size.container_width_non_filling,
-                                        container_size.container_height_non_filling,
-                                        max_w,
-                                        max_h,
-                                        mode,
-                                    )
-                                    .unwrap(),
-                                    Some(RequestCacheEntry::JpegData(bytes)) => {
-                                        let (target_h, target_w) = prepare_jpeg(
-                                            &mut self.cached_rasterizations,
-                                            &src,
-                                            &bytes,
-                                            container_size.container_width_non_filling,
-                                            container_size.container_height_non_filling,
-                                            max_w,
-                                            max_h,
-                                        )
-                                        .unwrap();
-                                        let (target_h, target_w) =
-                                            (target_h.max(1), target_w.max(1));
-                                        if *mode == LayoutMode::Complete {
-                                            let pixmap = rasterize_jpeg(
-                                                &mut self.cached_rasterizations,
-                                                &src,
-                                                target_w,
-                                                target_h,
-                                            )
-                                            .unwrap();
-                                            (pixmap, target_h, target_w, true)
-                                        } else {
-                                            (
-                                                Pixmap::new(target_w, target_h).unwrap(),
-                                                target_h,
-                                                target_w,
-                                                true,
-                                            )
-                                        }
-                                    }
-                                    Some(RequestCacheEntry::SvgData(svg_data)) => {
-                                        let mut injected = svg_data.clone();
-                                        self.inject_css_variables_into_str(
-                                            &mut injected,
-                                            &style.variables,
-                                        );
-                                        let result = rasterize_svg(
-                                            &mut self.cached_rasterizations,
-                                            &injected,
-                                            container_size.container_width_non_filling,
-                                            container_size.container_height_non_filling,
-                                            max_w,
-                                            max_h,
-                                            &style,
-                                            mode,
-                                        );
-                                        match result {
-                                            Err(err) => {
-                                                println!("Failed to rasterize SVG data: {}", err);
-                                                return None;
-                                            }
-                                            Ok(res) => res,
-                                        }
-                                    }
-                                    Some(RequestCacheEntry::GifData(bytes)) => {
-                                        let (target_h, target_w) = prepare_gif(
-                                            &mut self.cached_rasterizations,
-                                            &src,
-                                            &bytes,
-                                            container_size.container_width_non_filling,
-                                            container_size.container_height_non_filling,
-                                            max_w,
-                                            max_h,
-                                        )
-                                        .unwrap();
-                                        let (target_h, target_w) =
-                                            (target_h.max(1), target_w.max(1));
-                                        if *mode == LayoutMode::Complete {
-                                            let pixmap = rasterize_gif(
-                                                &mut self.cached_rasterizations,
-                                                &src,
-                                                target_w,
-                                                target_h,
-                                            )
-                                            .unwrap();
-                                            (pixmap, target_h, target_w, true)
-                                        } else {
-                                            (
-                                                Pixmap::new(target_w, target_h).unwrap(),
-                                                target_h,
-                                                target_w,
-                                                true,
-                                            )
-                                        }
-                                    }
-                                    None if element.tag == "img" => {
-                                        let (height, width) =
-                                            container_size.image_placeholder_size(max_w, max_h);
-                                        (Pixmap::new(1, 1).unwrap(), height, width, false)
-                                    }
-                                    _ => return None,
-                                };
-                                result
+                                result?
                             }
-                        }
+                        },
                         _ => panic!(),
                     };
                     let z_index = match style.z_index {
@@ -6605,8 +6644,8 @@ impl Renderer {
                     &svg_data,
                     Some(container_size.container_width),
                     Some(container_size.container_height),
-                    container_size.container_width,
-                    container_size.container_height,
+                    Some(container_size.container_width),
+                    Some(container_size.container_height),
                     &style,
                     mode,
                 );
@@ -9237,6 +9276,7 @@ struct Frame {
     last_hover_position: Option<Position>,
     animation_frame_requested: bool,
     last_animation_frame: Instant,
+    blob_store: Arc<BlobStore>,
 }
 
 struct BootParams {
@@ -9297,6 +9337,7 @@ impl Frame {
             last_hover_position: None,
             animation_frame_requested: false,
             last_animation_frame: Instant::now(),
+            blob_store: Arc::new(BlobStore::default()),
         }
     }
 
@@ -9351,7 +9392,6 @@ impl Frame {
     }
 
     pub fn install_js_host(&mut self) {
-        let blob_store = Arc::new(BlobStore::default());
         let broadcast_channel = InMemoryBroadcastChannel::default();
         let client = self.network_fetch.borrow().client.clone();
         self.js_runtime = Some(Rc::new(RefCell::new(deno_core::JsRuntime::new(
@@ -9360,7 +9400,7 @@ impl Frame {
                 extensions: vec![
                     browser::init(),
                     deno_webidl::deno_webidl::init(),
-                    deno_web::deno_web::init(blob_store, None, broadcast_channel),
+                    deno_web::deno_web::init(Arc::clone(&self.blob_store), None, broadcast_channel),
                     deno_net::deno_net::init(None, None),
                     deno_fetch_without_telemetry(),
                     deno_node_crypto_shim::init(),
@@ -10284,6 +10324,7 @@ impl Frame {
             Rc::clone(&self.network_fetch),
             dom_indexes,
             nodes_idxs,
+            Arc::clone(&self.blob_store),
         ))));
     }
 
@@ -10358,13 +10399,75 @@ impl Frame {
         Ok(())
     }
 
+    fn decode_detached_images(&mut self) {
+        let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+        let mut detached_images = vec![];
+
+        for (idx, node) in renderer.nodes.iter() {
+            let Node::Element(element) = node else {
+                continue;
+            };
+            if element.tag == "img" && node.get_parent().is_none() {
+                detached_images.push(idx);
+            }
+        }
+
+        for idx in detached_images {
+            renderer.decode_and_rasterize_img(idx, &LayoutMode::Complete, None, None, None, None);
+        }
+    }
+
+    fn update_newly_loaded_images(&mut self, prev_state: &HashSet<usize>) {
+        let newly_loaded: Vec<(usize, u32, u32)> = {
+            let renderer = self.renderer.as_ref().unwrap().borrow();
+            renderer
+                .images_nodes_loaded
+                .iter()
+                .filter(|(idx, _)| !prev_state.contains(idx))
+                .map(|(&idx, &(height, width))| (idx, height, width))
+                .collect()
+        };
+
+        if newly_loaded.is_empty() {
+            return;
+        }
+
+        let images = newly_loaded
+            .iter()
+            .map(|(idx, height, width)| format!("[{idx}, {height}, {width}]"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        self.execute_host_script("update newly loaded images", format!(r#"
+        for (const [idx, height, width] of [{}]) {{
+            const node = __elementFromNodeIdx(idx)
+            if (!node) continue
+
+            node.naturalHeight = height
+            node.naturalWidth = width
+        }}
+        "#, images))
+        .unwrap();
+    }
+
     fn render_loop(&mut self) -> Vec<u32> {
         let animation_redraw = self.tick_animations();
+        let prev_loaded_images: HashSet<usize> = self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .images_nodes_loaded
+            .keys()
+            .copied()
+            .collect();
         let mut buffer =
             vec![0; self.render_size.width as usize * self.render_size.height as usize];
         let first_boot = self.render(&mut buffer);
         self.refresh_hover_after_render();
         let _ = self.refresh_intersections();
+        self.decode_detached_images();
+        self.update_newly_loaded_images(&prev_loaded_images);
         if first_boot {
             let start = Instant::now();
             let js_result = self.run_js();
@@ -11294,7 +11397,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pontus/browser/pages/test.html".to_string(),
+        "https://vite.dev".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
