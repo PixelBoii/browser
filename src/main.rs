@@ -4,6 +4,7 @@ mod parser;
 mod style;
 mod ui;
 
+use deno_core::serde::Deserialize;
 use deno_error::JsErrorBox;
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use fixedbitset::FixedBitSet;
@@ -4084,11 +4085,35 @@ fn op_stroke_canvas_rect(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum CanvasPathCommand {
+    Point {
+        point: [f64; 2],
+    },
+    BezierCurve {
+        cp1: [f64; 2],
+        cp2: [f64; 2],
+        endpoint: [f64; 2],
+    },
+}
+
+fn cubic_bezier(t: f32, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {
+    let result = (1. - t).powi(3) * p0 as f32 + 3. * (1. - t).powi(2) * t * p1 as f32 + 3. * (1. - t) * t.powi(2) * p2 as f32 + t.powi(3) * p3 as f32;
+    result.round() as i32
+}
+
+fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
 #[op2]
 fn op_canvas_path_stroke(
     state: &mut OpState,
     #[number] node_idx: usize,
-    #[serde] path: Vec<Vec<f64>>,
+    #[serde] path: Vec<CanvasPathCommand>,
     line_width: f64,
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
@@ -4104,45 +4129,79 @@ fn op_canvas_path_stroke(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
     let mut cursor = Position {
-        x: path[0][0] as i32,
-        y: path[0][1] as i32,
+        x: 0,
+        y: 0,
     };
     let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
-    for line in path.iter().skip(1) {
-        let x = line[0];
-        let y = line[1];
-        let start_x = cursor.x as f64;
-        let start_y = cursor.y as f64;
-        let x_delta = x - cursor.x as f64;
-        let y_delta = y - cursor.y as f64;
+    let line_width_offset = -line_width as i32 / 2;
+    let line_width_end = line_width as i32 / 2;
+    for (idx, line) in path.iter().enumerate() {
+        match line {
+            CanvasPathCommand::Point { point } => {
+                let x = point[0];
+                let y = point[1];
 
-        let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
-        let stride = node_width as usize;
-
-        let x_ratio = x_delta / hyp as f64;
-        let y_ratio = y_delta / hyp as f64;
-
-        let line_width_offset = -line_width as i32 / 2;
-        let line_width_end = line_width as i32 / 2;
-
-        for idx in 0..hyp {
-            for wxidx in line_width_offset..line_width_end {
-                for wyidx in line_width_offset..line_width_end {
-                    let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
-                        .round()
-                        .min(node_width as f64) as i32;
-                    let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
-                        .round()
-                        .min(node_height as f64) as i32;
-
-                    let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
-                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                if idx == 0 {
+                    cursor.x = x as i32;
+                    cursor.y = y as i32;
+                    continue;
                 }
+
+                let start_x = cursor.x as f64;
+                let start_y = cursor.y as f64;
+                let x_delta = x - cursor.x as f64;
+                let y_delta = y - cursor.y as f64;
+
+                let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+                let stride = node_width as usize;
+
+                let x_ratio = x_delta / hyp as f64;
+                let y_ratio = y_delta / hyp as f64;
+
+                for idx in 0..hyp {
+                    for wxidx in line_width_offset..line_width_end {
+                        for wyidx in line_width_offset..line_width_end {
+                            let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
+                                .round()
+                                .min(node_width as f64) as i32;
+                            let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
+                                .round()
+                                .min(node_height as f64) as i32;
+
+                            let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
+                            row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                        }
+                    }
+                }
+
+                cursor.x = x.round() as i32;
+                cursor.y = y.round() as i32;
+            },
+            CanvasPathCommand::BezierCurve { cp1, cp2, endpoint } => {
+                let stride = node_width as i32;
+                let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
+                    distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
+                    distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
+                for x_idx in 0..=steps {
+                    let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
+                    let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
+
+                    for wxidx in line_width_offset..line_width_end {
+                        for wyidx in line_width_offset..line_width_end {
+                            let cord = y * stride + wyidx * stride + x + wxidx;
+                            if cord < 0 || cord >= (node_width * node_height) as i32 {
+                                continue;
+                            }
+                            let px = &mut canvas.buffer[cord as usize];
+                            *px = blend_rgba_with_rgba(*px, color_tuple);
+                        }
+                    }
+                }
+
+                cursor.x = endpoint[0].round() as i32;
+                cursor.y = endpoint[1].round() as i32;
             }
         }
-
-        cursor.x = x.round() as i32;
-        cursor.y = y.round() as i32;
     }
 
     renderer.schedule_dom_update();
@@ -4154,8 +4213,7 @@ fn op_canvas_path_stroke(
 fn op_canvas_path_fill(
     state: &mut OpState,
     #[number] node_idx: usize,
-    #[serde] path: Vec<Vec<f64>>,
-    line_width: f64,
+    #[serde] path: Vec<CanvasPathCommand>,
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -4170,47 +4228,66 @@ fn op_canvas_path_fill(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
     let mut cursor = Position {
-        x: path[0][0] as i32,
-        y: path[0][1] as i32,
+        x: 0,
+        y: 0,
     };
     let mut x_pixels = vec![vec![]; node_width as usize];
     let mut y_pixels = vec![vec![]; node_height as usize];
     let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
     let stride = node_width as usize;
-    for line in path.iter().skip(1) {
-        let x = line[0];
-        let y = line[1];
-        let start_x = cursor.x as f64;
-        let start_y = cursor.y as f64;
-        let x_delta = x - cursor.x as f64;
-        let y_delta = y - cursor.y as f64;
+    for (idx, line) in path.iter().enumerate() {
+        match line {
+            CanvasPathCommand::Point { point } => {
+                let x = point[0];
+                let y = point[1];
 
-        let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+                if idx == 0 {
+                    cursor.x = x as i32;
+                    cursor.y = y as i32;
+                    continue;
+                }
 
-        let x_ratio = x_delta / hyp as f64;
-        let y_ratio = y_delta / hyp as f64;
+                let start_x = cursor.x as f64;
+                let start_y = cursor.y as f64;
+                let x_delta = x - cursor.x as f64;
+                let y_delta = y - cursor.y as f64;
 
-        let line_width_offset = -line_width as i32 / 2;
-        let line_width_end = line_width as i32 / 2;
+                let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
 
-        for idx in 0..hyp {
-            for wxidx in line_width_offset..line_width_end {
-                for wyidx in line_width_offset..line_width_end {
-                    let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
+                let x_ratio = x_delta / hyp as f64;
+                let y_ratio = y_delta / hyp as f64;
+
+                for idx in 0..hyp {
+                    let px = (start_x + idx as f64 * x_ratio)
                         .round()
                         .min(node_width as f64) as i32;
-                    let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
+                    let py = (start_y + idx as f64 * y_ratio)
                         .round()
                         .min(node_height as f64) as i32;
 
                     x_pixels[px as usize].push(py as usize);
                     y_pixels[py as usize].push(px as usize);
                 }
-            }
-        }
 
-        cursor.x = x.round() as i32;
-        cursor.y = y.round() as i32;
+                cursor.x = x.round() as i32;
+                cursor.y = y.round() as i32;
+            }
+            CanvasPathCommand::BezierCurve { cp1, cp2, endpoint } => {
+                let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
+                    distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
+                    distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
+                for x_idx in 0..=steps {
+                    let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
+                    let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
+
+                    x_pixels[x as usize].push(y as usize);
+                    y_pixels[y as usize].push(x as usize);
+                }
+
+                cursor.x = endpoint[0].round() as i32;
+                cursor.y = endpoint[1].round() as i32;
+            }
+        };
     }
 
     // Fill it in. The process here is relatively simple:
@@ -11522,7 +11599,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://vite.dev".to_string(),
+        "file:///home/pontus/browser/pages/test.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;

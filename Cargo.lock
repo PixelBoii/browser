@@ -560,6 +560,7 @@ dependencies = [
  "reqwest",
  "resvg",
  "rustls",
+ "serde",
  "softbuffer",
  "sys_traits",
  "tokio",

@@ -29,6 +29,7 @@ image = "0.25.10"
 fixedbitset = "0.5.7"
 deno_error = "=0.7.1"
 palette = "0.7.6"
+serde = { version = "1", features = ["derive"] }
 
 [patch.crates-io]
 resvg = { path = "vendor/resvg" }

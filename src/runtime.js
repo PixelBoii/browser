@@ -954,6 +954,9 @@ function camelize(str) {
     });
 }
 
+const CANVAS_COMMAND_POINT = "point"
+const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
+
 class CanvasRenderingContext2D {
     constructor(canvas) {
         this.canvas = canvas
@@ -976,18 +979,37 @@ class CanvasRenderingContext2D {
 
     moveTo(x, y) {
         this.cursor = [x, y]
+        this.path.push({
+            type: CANVAS_COMMAND_POINT,
+            point: this.cursor
+        })
     }
 
     lineTo(x, y) {
         if (this.path.length === 0) {
-            this.path.push(this.cursor)
+            this.path.push({
+                type: CANVAS_COMMAND_POINT,
+                point: this.cursor
+            })
         }
-        this.path.push([x, y])
+        this.path.push({
+            type: CANVAS_COMMAND_POINT,
+            point: [x, y]
+        })
         this.cursor = [x, y]
     }
 
     closePath() {
         this.path.push(this.path[0])
+    }
+
+    bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
+        this.path.push({
+            type: CANVAS_COMMAND_BEZIER_CURVE,
+            cp1: [cp1x, cp1y],
+            cp2: [cp2x, cp2y],
+            endpoint: [x, y]
+        })
     }
 
     stroke(suppliedPath = null) {
@@ -1002,12 +1024,11 @@ class CanvasRenderingContext2D {
 
     fill(suppliedPath = null) {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : this.path
-        const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
         if (!path) {
             return
         }
 
-        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path, lineWidth)
+        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path)
     }
 }
 
@@ -1020,18 +1041,37 @@ class Path2D {
 
     moveTo(x, y) {
         this.cursor = [x, y]
+        this.path.push({
+            type: CANVAS_COMMAND_POINT,
+            point: this.cursor
+        })
     }
 
     lineTo(x, y) {
         if (this.path.length === 0) {
-            this.path.push(this.cursor)
+            this.path.push({
+                type: CANVAS_COMMAND_POINT,
+                point: this.cursor
+            })
         }
-        this.path.push([x, y])
+        this.path.push({
+            type: CANVAS_COMMAND_POINT,
+            point: [x, y]
+        })
         this.cursor = [x, y]
     }
 
     closePath() {
         this.path.push(this.path[0])
+    }
+
+    bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
+        this.path.push({
+            type: CANVAS_COMMAND_BEZIER_CURVE,
+            cp1: [cp1x, cp1y],
+            cp2: [cp2x, cp2y],
+            endpoint: [x, y]
+        })
     }
 }
 
