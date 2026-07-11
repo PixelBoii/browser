@@ -218,7 +218,28 @@ enum RequestCacheEntry {
     CssData(String),
     JpegData(Bytes),
     GifData(Bytes),
+    WebpData(Bytes),
     Unsupported,
+}
+
+fn sniff_image_data(bytes: Vec<u8>) -> Option<RequestCacheEntry> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some(RequestCacheEntry::PngData(bytes.into()))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(RequestCacheEntry::WebpData(bytes.into()))
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(RequestCacheEntry::JpegData(bytes.into()))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(RequestCacheEntry::GifData(bytes.into()))
+    } else {
+        let text = String::from_utf8(bytes).ok()?;
+        let text_start = text.trim_start();
+        if text_start.starts_with("<svg") || text_start.starts_with("<?xml") {
+            Some(RequestCacheEntry::SvgData(text))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1380,6 +1401,77 @@ fn rasterize_gif(
         .with_context(|| "Failed to convert to pixmap")?;
         cached_rasterizations.gifs.insert(key.clone(), value);
         cached_rasterizations.gifs.get(&key).unwrap()
+    };
+
+    Ok(pixmap.clone())
+}
+
+fn prepare_webp(
+    cached_rasterizations: &mut CachedRasterizations,
+    src: &str,
+    bytes: &[u8],
+    input_w: Option<u32>,
+    input_h: Option<u32>,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
+) -> Result<(u32, u32)> {
+    let result = if let Some(cached) = cached_rasterizations.decoded_webps.get(src) {
+        cached
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(bytes));
+        reader.set_format(image::ImageFormat::WebP);
+        cached_rasterizations
+            .decoded_webps
+            .insert(src.to_string(), reader.decode()?);
+        cached_rasterizations.decoded_webps.get(src).unwrap()
+    };
+
+    let (mut target_h, mut target_w) = infer_image_size(
+        Size {
+            height: result.height(),
+            width: result.width(),
+        },
+        input_w,
+        input_h,
+    );
+    if let Some(max_h) = max_h {
+        (target_h, target_w) = clamp_with_ratio(target_h, max_h, target_w);
+    }
+    if let Some(max_w) = max_w {
+        (target_w, target_h) = clamp_with_ratio(target_w, max_w, target_h);
+    }
+
+    Ok((target_h, target_w))
+}
+
+fn rasterize_webp(
+    cached_rasterizations: &mut CachedRasterizations,
+    src: &str,
+    target_w: u32,
+    target_h: u32,
+) -> Result<tiny_skia::Pixmap> {
+    let decoded = cached_rasterizations.decoded_webps.get(src).unwrap();
+    let key = (src.to_string(), target_h, target_w);
+    let pixmap = if let Some(cached) = cached_rasterizations.webps.get(&key) {
+        cached
+    } else {
+        let result =
+            decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+        let mut rgba = result.to_rgba8().into_raw();
+        for pixel in rgba.chunks_exact_mut(4) {
+            let alpha = pixel[3] as u16;
+            pixel[0] = ((pixel[0] as u16 * alpha + 127) / 255) as u8;
+            pixel[1] = ((pixel[1] as u16 * alpha + 127) / 255) as u8;
+            pixel[2] = ((pixel[2] as u16 * alpha + 127) / 255) as u8;
+        }
+
+        let value = Pixmap::from_vec(
+            rgba,
+            IntSize::from_wh(target_w, target_h).context("Failed to create WebP image size")?,
+        )
+        .context("Failed to convert WebP to pixmap")?;
+        cached_rasterizations.webps.insert(key.clone(), value);
+        cached_rasterizations.webps.get(&key).unwrap()
     };
 
     Ok(pixmap.clone())
@@ -4538,9 +4630,11 @@ struct CachedRasterizations {
     decoded_pngs: HashMap<String, Pixmap>,
     decoded_jpegs: HashMap<String, DynamicImage>,
     decoded_gifs: HashMap<String, DynamicImage>,
+    decoded_webps: HashMap<String, DynamicImage>,
     decoded_svgs: HashMap<(String, u32), Tree>,
     jpegs: HashMap<(String, u32, u32), Pixmap>,
     gifs: HashMap<(String, u32, u32), Pixmap>,
+    webps: HashMap<(String, u32, u32), Pixmap>,
     svgs: HashMap<(String, u32, u32, u32), Pixmap>,
 }
 
@@ -4550,9 +4644,11 @@ impl CachedRasterizations {
             decoded_pngs: HashMap::new(),
             decoded_jpegs: HashMap::new(),
             decoded_gifs: HashMap::new(),
+            decoded_webps: HashMap::new(),
             decoded_svgs: HashMap::new(),
             jpegs: HashMap::new(),
             gifs: HashMap::new(),
+            webps: HashMap::new(),
             svgs: HashMap::new(),
         }
     }
@@ -5519,6 +5615,8 @@ impl Renderer {
             Some("image/jpeg")
         } else if src.ends_with(".gif") {
             Some("image/gif")
+        } else if src.ends_with(".webp") {
+            Some("image/webp")
         } else {
             None
         }
@@ -5549,6 +5647,7 @@ impl Renderer {
                 "image/svg+xml" => Ok(RequestCacheEntry::SvgData(resp.text().await?)),
                 "image/jpeg" => Ok(RequestCacheEntry::JpegData(resp.bytes().await?)),
                 "image/gif" => Ok(RequestCacheEntry::GifData(resp.bytes().await?)),
+                "image/webp" => Ok(RequestCacheEntry::WebpData(resp.bytes().await?)),
                 content_type => Err(anyhow!(
                     "Failed to handle image content-type: {}",
                     content_type
@@ -5804,15 +5903,7 @@ impl Renderer {
             let url = url::Url::parse(&src).ok()?;
             let blob = self.blob_store.get_object_url(url)?;
             let bytes = self.tokio.borrow_mut().block_on(blob.read_all());
-            match blob.media_type.as_str() {
-                "image/png" => {
-                    Some(RequestCacheEntry::PngData(bytes.into()))
-                },
-                "image/svg+xml" => {
-                    Some(RequestCacheEntry::SvgData(String::from_utf8(bytes).ok()?))
-                },
-                _ => None
-            }
+            sniff_image_data(bytes)
         } else {
             self.get_img_src_data(&src)
         };
@@ -5912,6 +6003,39 @@ impl Renderer {
                         target_h,
                         target_w,
                         true,
+                    )
+                }
+            }
+            Some(RequestCacheEntry::WebpData(bytes)) => {
+                let (target_h, target_w) = prepare_webp(
+                    &mut self.cached_rasterizations,
+                    &src,
+                    &bytes,
+                    input_w,
+                    input_h,
+                    max_w,
+                    max_h,
+                )
+                .inspect_err(|err| println!("Failed to decode WebP: {}", err))
+                .ok()?;
+                let (target_h, target_w) = (target_h.max(1), target_w.max(1));
+                if *mode == LayoutMode::Complete {
+                    let pixmap = rasterize_webp(
+                        &mut self.cached_rasterizations,
+                        &src,
+                        target_w,
+                        target_h,
+                    )
+                    .inspect_err(|err| println!("Failed to rasterize WebP: {}", err))
+                    .ok()?;
+                    let opaque = pixmap_is_opaque(&pixmap);
+                    (pixmap, target_h, target_w, opaque)
+                } else {
+                    (
+                        Pixmap::new(target_w, target_h).unwrap(),
+                        target_h,
+                        target_w,
+                        false,
                     )
                 }
             }
