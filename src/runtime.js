@@ -964,11 +964,23 @@ const CANVAS_COMMAND_TRANSFORM = "transform"
 const CANVAS_COMMAND_SAVE = "save"
 const CANVAS_COMMAND_RESTORE = "restore"
 const CANVAS_COMMAND_CLEAR_RECT = "clearRect"
+const CANVAS_COMMAND_BEGIN_PATH = "beginPath"
+
+class CanvasGradient {
+    constructor() {
+        this.colorStops = []
+    }
+
+    addColorStop(offset, color) {
+        this.colorStops.push([offset, color])
+    }
+}
 
 class CanvasRenderingContext2D {
     constructor(canvas) {
         this.canvas = canvas
         this.lineWidth = 1
+        this.fillStyle = "#000000"
     }
 
     fillRect(x, y, width, height) {
@@ -1017,8 +1029,23 @@ class CanvasRenderingContext2D {
         })
     }
 
+    // TODO: Track a clipping region in canvas state and apply it to subsequent drawing operations.
+    clip() {}
+
+    // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
+    createLinearGradient() {
+        return new CanvasGradient()
+    }
+
+    // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
+    createRadialGradient() {
+        return new CanvasGradient()
+    }
+
     beginPath() {
-        //
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_BEGIN_PATH
+        })
     }
 
     moveTo(x, y) {
@@ -1060,8 +1087,9 @@ class CanvasRenderingContext2D {
 
     fill(suppliedPath = null) {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
+        const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
 
-        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path)
+        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path, fillStyle)
         core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
@@ -1633,6 +1661,22 @@ class SVGElement extends HtmlElement {
 class Image extends HTMLElement {
     constructor() {
         super("img")
+    }
+
+    get width() {
+        return super.width || this.naturalWidth || 0
+    }
+
+    set width(value) {
+        super.width = value
+    }
+
+    get height() {
+        return super.height || this.naturalHeight || 0
+    }
+
+    set height(value) {
+        super.height = value
     }
 }
 

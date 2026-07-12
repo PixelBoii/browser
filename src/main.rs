@@ -411,6 +411,9 @@ impl CanvasBuffer {
                         transform = saved;
                     }
                 }
+                CanvasPathCommand::BeginPath => {
+                    queued_commands.clear();
+                }
                 CanvasPathCommand::MoveTo { point: _ }
                 | CanvasPathCommand::Point { point: _ }
                 | CanvasPathCommand::BezierCurve {
@@ -520,8 +523,14 @@ impl CanvasBuffer {
                     self.apply_stroke(&queued_commands, line_width, &transform)
                         .unwrap();
                 }
-                CanvasPathCommand::Fill => {
-                    self.apply_fill(&queued_commands, &transform).unwrap();
+                CanvasPathCommand::StrokePath { path, line_width } => {
+                    self.apply_stroke(&path, line_width, &transform).unwrap();
+                }
+                CanvasPathCommand::Fill { color } => {
+                    self.apply_fill(&queued_commands, &transform, color).unwrap();
+                }
+                CanvasPathCommand::FillPath { path, color } => {
+                    self.apply_fill(&path, &transform, color).unwrap();
                 }
             }
         }
@@ -539,12 +548,13 @@ impl CanvasBuffer {
         &mut self,
         queued_commands: &Vec<CanvasPathCommand>,
         transform: &Option<Matrixf32>,
+        color: u32,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
         let mut x_pixels = vec![vec![]; self.width as usize];
         let mut y_pixels = vec![vec![]; self.height as usize];
-        let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
+        let color_tuple = rgba_to_premul_tuple(color);
         let stride = self.width as usize;
         for cmd in queued_commands {
             match cmd {
@@ -581,12 +591,16 @@ impl CanvasBuffer {
                     let y_ratio = y_delta / hyp as f64;
 
                     for idx in 0..hyp {
-                        let px = (start_x + idx as f64 * x_ratio)
-                            .round()
-                            .min(self.width as f64) as i32;
-                        let py = (start_y + idx as f64 * y_ratio)
-                            .round()
-                            .min(self.height as f64) as i32;
+                        let px = (start_x + idx as f64 * x_ratio).round() as i32;
+                        let py = (start_y + idx as f64 * y_ratio).round() as i32;
+
+                        if px < 0
+                            || py < 0
+                            || px >= self.width as i32
+                            || py >= self.height as i32
+                        {
+                            continue;
+                        }
 
                         x_pixels[px as usize].push(py as usize);
                         y_pixels[py as usize].push(px as usize);
@@ -626,8 +640,10 @@ impl CanvasBuffer {
                             endpoint[1] as i32,
                         );
 
-                        x_pixels[x as usize].push(y as usize);
-                        y_pixels[y as usize].push(x as usize);
+                        if x >= 0 && x < self.width as i32 && y >= 0 && y < self.height as i32 {
+                            x_pixels[x as usize].push(y as usize);
+                            y_pixels[y as usize].push(x as usize);
+                        }
                     }
 
                     cursor.x = endpoint[0].round() as i32;
@@ -4554,9 +4570,19 @@ enum CanvasPathCommand {
         endpoint: [f64; 2],
     },
     Close,
-    Fill,
+    Fill {
+        color: u32,
+    },
     Stroke {
         line_width: f64,
+    },
+    StrokePath {
+        path: Vec<CanvasPathCommand>,
+        line_width: f64,
+    },
+    FillPath {
+        path: Vec<CanvasPathCommand>,
+        color: u32,
     },
     FillRect {
         x: i32,
@@ -4576,6 +4602,7 @@ enum CanvasPathCommand {
     },
     Save,
     Restore,
+    BeginPath,
     ClearRect {
         x: i32,
         y: i32,
@@ -4617,13 +4644,14 @@ fn op_canvas_path_stroke(
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
-    if let Some(mut path) = path {
-        canvas.commands.append(&mut path);
+    match path {
+        Some(path) => canvas
+            .commands
+            .push(CanvasPathCommand::StrokePath { path, line_width }),
+        None => canvas
+            .commands
+            .push(CanvasPathCommand::Stroke { line_width }),
     }
-
-    canvas
-        .commands
-        .push(CanvasPathCommand::Stroke { line_width });
 
     Ok(())
 }
@@ -4633,7 +4661,16 @@ fn op_canvas_path_fill(
     state: &mut OpState,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
-) -> Result<(), JsError> {
+    #[string] fill_style: String,
+) -> Result<(), JsErrorBox> {
+    let color = match style::parse_color(fill_style)
+        .map_err(|err| JsErrorBox::generic(err.to_string()))?
+    {
+        StyleBackground::Hex(color) => color,
+        StyleBackground::Transparent => 0,
+        _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
+    };
+
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
@@ -4646,11 +4683,12 @@ fn op_canvas_path_fill(
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
-    if let Some(mut path) = path {
-        canvas.commands.append(&mut path);
+    match path {
+        Some(path) => canvas
+            .commands
+            .push(CanvasPathCommand::FillPath { path, color }),
+        None => canvas.commands.push(CanvasPathCommand::Fill { color }),
     }
-
-    canvas.commands.push(CanvasPathCommand::Fill);
 
     Ok(())
 }
@@ -11982,7 +12020,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://vite.dev".to_string(),
+        "file:///home/pontus/browser/pages/test.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;

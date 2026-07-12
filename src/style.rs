@@ -1169,7 +1169,7 @@ fn parse_color_mix(raw: &str) -> Result<StyleBackground> {
     }
 }
 
-fn parse_color(value: String) -> Result<StyleBackground> {
+pub(crate) fn parse_color(value: String) -> Result<StyleBackground> {
     let value = value.trim();
     if value.starts_with("#") {
         let code_str = value
