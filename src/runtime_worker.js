@@ -265,10 +265,10 @@ function fetchLogBodyText(body) {
         return body.toString()
     }
     if (body instanceof ArrayBuffer) {
-        return new TextDecoder().decode(body)
+        return `[${body.byteLength} bytes omitted]`
     }
     if (ArrayBuffer.isView(body)) {
-        return new TextDecoder().decode(body)
+        return `[${body.byteLength} bytes omitted]`
     }
     if (typeof body.entries === "function") {
         return JSON.stringify(Array.from(body.entries()).map(([key, value]) => {
