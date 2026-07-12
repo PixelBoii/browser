@@ -198,6 +198,7 @@ struct Rect {
 enum LayoutKind {
     Element,
     PixMap((tiny_skia::Pixmap, bool)),
+    Canvas,
     Text(tiny_skia::Pixmap),
     Iframe,
 }
@@ -362,6 +363,7 @@ struct CanvasBuffer {
     width: u32,
     height: u32,
     commands: Vec<CanvasPathCommand>,
+    dirty: bool,
 }
 
 impl CanvasBuffer {
@@ -371,6 +373,7 @@ impl CanvasBuffer {
             width,
             height,
             commands: vec![],
+            dirty: false,
         }
     }
 
@@ -385,6 +388,14 @@ impl CanvasBuffer {
         self.width = width;
         self.height = height;
         self.buffer.resize(width as usize * height as usize, 0);
+        self.dirty = true;
+    }
+
+    fn update_if_needed(&mut self) {
+        if self.dirty {
+            self.update_buffer();
+            self.dirty = false;
+        }
     }
 
     fn update_buffer(&mut self) {
@@ -527,7 +538,8 @@ impl CanvasBuffer {
                     self.apply_stroke(&path, line_width, &transform).unwrap();
                 }
                 CanvasPathCommand::Fill { color } => {
-                    self.apply_fill(&queued_commands, &transform, color).unwrap();
+                    self.apply_fill(&queued_commands, &transform, color)
+                        .unwrap();
                 }
                 CanvasPathCommand::FillPath { path, color } => {
                     self.apply_fill(&path, &transform, color).unwrap();
@@ -594,11 +606,7 @@ impl CanvasBuffer {
                         let px = (start_x + idx as f64 * x_ratio).round() as i32;
                         let py = (start_y + idx as f64 * y_ratio).round() as i32;
 
-                        if px < 0
-                            || py < 0
-                            || px >= self.width as i32
-                            || py >= self.height as i32
-                        {
+                        if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
                             continue;
                         }
 
@@ -1098,6 +1106,7 @@ struct Renderer {
     resolved_widths: HashMap<usize, u32>,
     dom_indexes: DomIndexes,
     canvas_buffers: HashMap<usize, CanvasBuffer>,
+    pending_canvas_update: bool,
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
@@ -3693,6 +3702,7 @@ enum UserEvent {
     ImagesPrefetched(Vec<(ReqwestUrl, RequestCacheEntry)>),
     Navigate((UserNavigateUrl, bool)),
     FrameUpdated,
+    CanvasUpdated,
     TabUpdated(Vec<u32>),
     TabUrlUpdated { tab_idx: usize, url: String },
     ChildMessage(String),
@@ -4663,13 +4673,12 @@ fn op_canvas_path_fill(
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[string] fill_style: String,
 ) -> Result<(), JsErrorBox> {
-    let color = match style::parse_color(fill_style)
-        .map_err(|err| JsErrorBox::generic(err.to_string()))?
-    {
-        StyleBackground::Hex(color) => color,
-        StyleBackground::Transparent => 0,
-        _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
-    };
+    let color =
+        match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
+            StyleBackground::Hex(color) => color,
+            StyleBackground::Transparent => 0,
+            _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
+        };
 
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -4703,9 +4712,9 @@ fn op_canvas_paint(state: &mut OpState, #[number] node_idx: usize) -> Result<(),
         .get_mut(&node_idx)
         .ok_or_else(|| JsErrorBox::generic("Failed to get canvas in op_canvas_paint"))?;
 
-    canvas.update_buffer();
+    canvas.dirty = true;
 
-    renderer.schedule_dom_update();
+    renderer.schedule_canvas_update();
 
     Ok(())
 }
@@ -5351,6 +5360,7 @@ impl Renderer {
             resolved_widths: HashMap::new(),
             dom_indexes,
             canvas_buffers: HashMap::new(),
+            pending_canvas_update: false,
             network_fetch,
             cached_rasterizations: CachedRasterizations::new(),
             animations: vec![],
@@ -5704,6 +5714,7 @@ impl Renderer {
         self.pending_dom_update = false;
         self.scroll_y.clear();
         self.canvas_buffers.clear();
+        self.pending_canvas_update = false;
         self.animations.clear();
         self.clear_layout_state();
         self.recompute_nodes();
@@ -6806,7 +6817,7 @@ impl Renderer {
                             .container_width_non_filling
                             .unwrap_or(available_size.width),
                     );
-                    let (pixmap, height, width, opaque) = match element.tag.as_str() {
+                    let (kind, height, width) = match element.tag.as_str() {
                         "canvas" => {
                             let (Some(canvas_width), Some(canvas_height)) =
                                 (match self.nodes.get(node_idx).unwrap() {
@@ -6832,16 +6843,10 @@ impl Renderer {
                                 .entry(node_idx)
                                 .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
                             canvas.resize_if_needed(canvas_width, canvas_height);
-                            let data = premul_rgba_buffer_to_bytes(&canvas.buffer);
-                            let pixmap = tiny_skia::Pixmap::from_vec(
-                                data,
-                                IntSize::from_wh(canvas_width, canvas_height)?,
-                            )?;
                             (
-                                pixmap,
+                                LayoutKind::Canvas,
                                 container_size.container_height,
                                 container_size.container_width,
-                                false,
                             )
                         }
                         "svg" => {
@@ -6862,7 +6867,9 @@ impl Renderer {
                                     println!("Failed to rasterize SVG data: {}", err);
                                     return None;
                                 }
-                                Ok(res) => res,
+                                Ok((pixmap, height, width, opaque)) => {
+                                    (LayoutKind::PixMap((pixmap, opaque)), height, width)
+                                }
                             }
                         }
                         "img" | "video" => {
@@ -6877,9 +6884,14 @@ impl Renderer {
                             if result.is_none() && element.tag == "img" {
                                 let (height, width) =
                                     container_size.image_placeholder_size(max_w, max_h);
-                                (Pixmap::new(1, 1).unwrap(), height, width, false)
+                                (
+                                    LayoutKind::PixMap((Pixmap::new(1, 1).unwrap(), false)),
+                                    height,
+                                    width,
+                                )
                             } else {
-                                result?
+                                let (pixmap, height, width, opaque) = result?;
+                                (LayoutKind::PixMap((pixmap, opaque)), height, width)
                             }
                         }
                         _ => panic!(),
@@ -6900,7 +6912,7 @@ impl Renderer {
                                 border: RectBorder::new_empty(),
                                 border_radius: BorderRadius::new_empty(),
                             },
-                            kind: LayoutKind::PixMap((pixmap, opaque)),
+                            kind,
                             children: vec![],
                             node_idx,
                             allow_overflow: style.overflow_y.visible(),
@@ -9340,6 +9352,31 @@ impl Renderer {
                     *opaque,
                 );
             }
+            LayoutKind::Canvas => {
+                let pixmap = self
+                    .canvas_buffers
+                    .get_mut(&layout_box.node_idx)
+                    .and_then(|canvas| {
+                        canvas.update_if_needed();
+                        let size = IntSize::from_wh(canvas.width, canvas.height)?;
+                        tiny_skia::Pixmap::from_vec(
+                            premul_rgba_buffer_to_bytes(&canvas.buffer),
+                            size,
+                        )
+                    });
+                if let Some(pixmap) = pixmap {
+                    self.apply_pixmap_on_buffer(
+                        layout_box,
+                        buffer,
+                        width,
+                        height,
+                        container_start_x,
+                        container_start_y,
+                        &pixmap,
+                        false,
+                    );
+                }
+            }
             LayoutKind::Iframe => {
                 if let Some(handle) = self
                     .frames
@@ -9779,6 +9816,16 @@ impl Renderer {
             self.event_loop_notify.notify_one();
         }
     }
+
+    pub fn schedule_canvas_update(&mut self) {
+        if !self.pending_canvas_update
+            && let Some(proxy) = &self.event_loop_proxy
+        {
+            proxy.fire_user_event(UserEvent::CanvasUpdated).unwrap();
+            self.pending_canvas_update = true;
+            self.event_loop_notify.notify_one();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -10102,7 +10149,17 @@ impl Frame {
         match cmd {
             cmd @ (FrameCommand::Render
             | FrameCommand::UserEvent(UserEvent::DomUpdated)
+            | FrameCommand::UserEvent(UserEvent::CanvasUpdated)
             | FrameCommand::UserEvent(UserEvent::ImagesPrefetched(_))) => {
+                let canvas_updated =
+                    matches!(&cmd, FrameCommand::UserEvent(UserEvent::CanvasUpdated));
+                if canvas_updated {
+                    self.renderer
+                        .as_ref()
+                        .unwrap()
+                        .borrow_mut()
+                        .pending_canvas_update = false;
+                }
                 if let FrameCommand::UserEvent(UserEvent::ImagesPrefetched(urls)) = cmd
                     && let Some(renderer) = self.renderer.as_ref()
                 {
@@ -10121,7 +10178,7 @@ impl Frame {
                     &mut pixels,
                     size.width,
                     size.height,
-                    true,
+                    !canvas_updated,
                 );
 
                 *bitmap_for_thread.lock().unwrap() = pixels;
@@ -11289,13 +11346,24 @@ impl Frame {
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
             }
             FrameCommand::UserEvent(
-                event @ (UserEvent::FrameUpdated | UserEvent::ImagesPrefetched(_)),
+                event @ (UserEvent::FrameUpdated
+                | UserEvent::CanvasUpdated
+                | UserEvent::ImagesPrefetched(_)),
             ) => {
-                if let UserEvent::ImagesPrefetched(urls) = event {
-                    if let Some(renderer) = self.renderer.as_ref() {
-                        renderer.borrow_mut().finish_image_prefetch(urls);
+                match event {
+                    UserEvent::CanvasUpdated => {
+                        if let Some(renderer) = self.renderer.as_ref() {
+                            renderer.borrow_mut().pending_canvas_update = false;
+                        }
                     }
-                    self.layout_dirty = true;
+                    UserEvent::ImagesPrefetched(urls) => {
+                        if let Some(renderer) = self.renderer.as_ref() {
+                            renderer.borrow_mut().finish_image_prefetch(urls);
+                        }
+                        self.layout_dirty = true;
+                    }
+                    UserEvent::FrameUpdated => {}
+                    _ => unreachable!(),
                 }
                 let buffer = self.render_loop();
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
