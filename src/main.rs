@@ -399,10 +399,20 @@ impl CanvasBuffer {
                 CanvasPathCommand::Transform { matrix } => {
                     transform = Some(matrix);
                 }
-                CanvasPathCommand::Point { point: _ } | CanvasPathCommand::BezierCurve { cp1: _, cp2: _, endpoint: _ } => {
+                CanvasPathCommand::Point { point: _ }
+                | CanvasPathCommand::BezierCurve {
+                    cp1: _,
+                    cp2: _,
+                    endpoint: _,
+                } => {
                     queued_commands.push(cmd);
                 }
-                CanvasPathCommand::FillRect { x, y, width, height } => {
+                CanvasPathCommand::FillRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
                     draw_rect_filled(
                         &mut self.buffer,
                         false,
@@ -416,7 +426,13 @@ impl CanvasBuffer {
                         &BorderRadius::new_empty(),
                     );
                 }
-                CanvasPathCommand::StrokeRect { x, y, width, height, line_width } => {
+                CanvasPathCommand::StrokeRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    line_width,
+                } => {
                     draw_rect_filled(
                         &mut self.buffer,
                         false,
@@ -467,7 +483,8 @@ impl CanvasBuffer {
                     ); // Bottom
                 }
                 CanvasPathCommand::Stroke { line_width } => {
-                    self.apply_stroke(&queued_commands, line_width, &transform).unwrap();
+                    self.apply_stroke(&queued_commands, line_width, &transform)
+                        .unwrap();
                 }
                 CanvasPathCommand::Fill => {
                     self.apply_fill(&queued_commands, &transform).unwrap();
@@ -478,15 +495,18 @@ impl CanvasBuffer {
 
     fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
         let point_matrix = Matrixf32::new(vec![point[0] as f32, point[1] as f32, 1.], 3, 1);
-        let out = transform.multiply(&point_matrix).with_context(|| "Invalid shapes")?;
+        let out = transform
+            .multiply(&point_matrix)
+            .with_context(|| "Invalid shapes")?;
         Ok([out.get(0, 0) as f64, out.get(1, 0) as f64])
     }
 
-    fn apply_fill(&mut self, queued_commands: &Vec<CanvasPathCommand>, transform: &Option<Matrixf32>) -> Result<()> {
-        let mut cursor = Position {
-            x: 0,
-            y: 0,
-        };
+    fn apply_fill(
+        &mut self,
+        queued_commands: &Vec<CanvasPathCommand>,
+        transform: &Option<Matrixf32>,
+    ) -> Result<()> {
+        let mut cursor = Position { x: 0, y: 0 };
         let mut x_pixels = vec![vec![]; self.width as usize];
         let mut y_pixels = vec![vec![]; self.height as usize];
         let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
@@ -531,18 +551,36 @@ impl CanvasBuffer {
                     cursor.x = x.round() as i32;
                     cursor.y = y.round() as i32;
                 }
-                &CanvasPathCommand::BezierCurve { mut cp1, mut cp2, mut endpoint } => {
+                &CanvasPathCommand::BezierCurve {
+                    mut cp1,
+                    mut cp2,
+                    mut endpoint,
+                } => {
                     if let Some(transform) = transform {
                         cp1 = self.compute_point_transform(&cp1, transform)?;
                         cp2 = self.compute_point_transform(&cp2, transform)?;
                         endpoint = self.compute_point_transform(&endpoint, transform)?;
                     }
-                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
-                        distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
-                        distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
+                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1]))
+                        + distance((cp1[0], cp1[1]), (cp2[0], cp2[1]))
+                        + distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1])))
+                    .ceil()
+                    .max(1.) as usize;
                     for x_idx in 0..=steps {
-                        let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
-                        let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
+                        let x = cubic_bezier(
+                            x_idx as f32 / steps as f32,
+                            cursor.x,
+                            cp1[0] as i32,
+                            cp2[0] as i32,
+                            endpoint[0] as i32,
+                        );
+                        let y = cubic_bezier(
+                            x_idx as f32 / steps as f32,
+                            cursor.y,
+                            cp1[1] as i32,
+                            cp2[1] as i32,
+                            endpoint[1] as i32,
+                        );
 
                         x_pixels[x as usize].push(y as usize);
                         y_pixels[y as usize].push(x as usize);
@@ -561,23 +599,26 @@ impl CanvasBuffer {
         for py in 0..self.height as usize {
             let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
             for px in 0..self.width as usize {
-                if x_pixels[px].iter().any(|ipy| *ipy < py) &&
-                    x_pixels[px].iter().any(|ipy| *ipy > py) &&
-                    y_pixels[py].iter().any(|ipx| *ipx < px) &&
-                    y_pixels[py].iter().any(|ipx| *ipx > px) {
-                        row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
-                    }
+                if x_pixels[px].iter().any(|ipy| *ipy < py)
+                    && x_pixels[px].iter().any(|ipy| *ipy > py)
+                    && y_pixels[py].iter().any(|ipx| *ipx < px)
+                    && y_pixels[py].iter().any(|ipx| *ipx > px)
+                {
+                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                }
             }
         }
 
         Ok(())
     }
 
-    fn apply_stroke(&mut self, queued_commands: &Vec<CanvasPathCommand>, line_width: f64, transform: &Option<Matrixf32>) -> Result<()> {
-        let mut cursor = Position {
-            x: 0,
-            y: 0,
-        };
+    fn apply_stroke(
+        &mut self,
+        queued_commands: &Vec<CanvasPathCommand>,
+        line_width: f64,
+        transform: &Option<Matrixf32>,
+    ) -> Result<()> {
+        let mut cursor = Position { x: 0, y: 0 };
         let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
         let line_width_offset = -line_width as i32 / 2;
         let line_width_end = line_width as i32 / 2;
@@ -612,13 +653,17 @@ impl CanvasBuffer {
                             for wyidx in line_width_offset..line_width_end {
                                 let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
                                     .round()
-                                    .min(self.width as f64) as i32;
+                                    .min(self.width as f64)
+                                    as i32;
                                 let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
                                     .round()
-                                    .min(self.height as f64) as i32;
+                                    .min(self.height as f64)
+                                    as i32;
 
-                                let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
-                                row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                                let row = &mut self.buffer
+                                    [py as usize * stride..(py as usize + 1) * stride];
+                                row[px as usize] =
+                                    blend_rgba_with_rgba(row[px as usize], color_tuple);
                             }
                         }
                     }
@@ -626,19 +671,37 @@ impl CanvasBuffer {
                     cursor.x = x.round() as i32;
                     cursor.y = y.round() as i32;
                 }
-                &CanvasPathCommand::BezierCurve { mut cp1, mut cp2, mut endpoint } => {
+                &CanvasPathCommand::BezierCurve {
+                    mut cp1,
+                    mut cp2,
+                    mut endpoint,
+                } => {
                     if let Some(transform) = transform {
                         cp1 = self.compute_point_transform(&cp1, transform)?;
                         cp2 = self.compute_point_transform(&cp2, transform)?;
                         endpoint = self.compute_point_transform(&endpoint, transform)?;
                     }
                     let stride = self.width as i32;
-                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
-                        distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
-                        distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
+                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1]))
+                        + distance((cp1[0], cp1[1]), (cp2[0], cp2[1]))
+                        + distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1])))
+                    .ceil()
+                    .max(1.) as usize;
                     for x_idx in 0..=steps {
-                        let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
-                        let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
+                        let x = cubic_bezier(
+                            x_idx as f32 / steps as f32,
+                            cursor.x,
+                            cp1[0] as i32,
+                            cp2[0] as i32,
+                            endpoint[0] as i32,
+                        );
+                        let y = cubic_bezier(
+                            x_idx as f32 / steps as f32,
+                            cursor.y,
+                            cp1[1] as i32,
+                            cp2[1] as i32,
+                            endpoint[1] as i32,
+                        );
 
                         for wxidx in line_width_offset..line_width_end {
                             for wyidx in line_width_offset..line_width_end {
@@ -667,7 +730,7 @@ impl CanvasBuffer {
 struct Matrixf32 {
     data: Vec<f32>,
     rows: usize,
-    columns: usize
+    columns: usize,
 }
 
 impl Matrixf32 {
@@ -675,7 +738,7 @@ impl Matrixf32 {
         Self {
             data,
             rows,
-            columns
+            columns,
         }
     }
 
@@ -791,7 +854,10 @@ struct FrameHandle {
 
 #[derive(Debug, Clone)]
 enum RendererProxy {
-    WindowLoop { proxy: EventLoopProxy<UserEvent>, tab_idx: usize },
+    WindowLoop {
+        proxy: EventLoopProxy<UserEvent>,
+        tab_idx: usize,
+    },
     FrameLoop(std::sync::mpsc::Sender<FrameCommand>),
 }
 
@@ -1022,9 +1088,7 @@ impl ContainerSizes {
             (None, None) => (150, 300),
         };
         (
-            height
-                .max(self.min_height.unwrap_or(0))
-                .min(max_height),
+            height.max(self.min_height.unwrap_or(0)).min(max_height),
             width.max(self.min_width.unwrap_or(0)).min(max_width),
         )
     }
@@ -1237,7 +1301,7 @@ impl ContainingNode {
 
 enum SizeUnit {
     Px,
-    Em
+    Em,
 }
 
 fn get_specified_size(
@@ -1263,15 +1327,40 @@ fn get_specified_size(
         StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
         StyleSize::Clamp { min, value, max } => {
-            let min = get_specified_size(font_size, min, available_size, auto_size, window_size, default_unit)?;
-            let value =
-                get_specified_size(font_size, value, available_size, auto_size, window_size, default_unit)?;
-            let max = get_specified_size(font_size, max, available_size, auto_size, window_size, default_unit)?;
+            let min = get_specified_size(
+                font_size,
+                min,
+                available_size,
+                auto_size,
+                window_size,
+                default_unit,
+            )?;
+            let value = get_specified_size(
+                font_size,
+                value,
+                available_size,
+                auto_size,
+                window_size,
+                default_unit,
+            )?;
+            let max = get_specified_size(
+                font_size,
+                max,
+                available_size,
+                auto_size,
+                window_size,
+                default_unit,
+            )?;
             Some(value.min(max).max(min))
         }
-        StyleSize::Calc(calc) => {
-            solve_calc(calc, font_size, available_size, auto_size, window_size, default_unit)
-        }
+        StyleSize::Calc(calc) => solve_calc(
+            calc,
+            font_size,
+            available_size,
+            auto_size,
+            window_size,
+            default_unit,
+        ),
         StyleSize::Em(em) => Some(unit_to_px(*em, &SizeUnit::Em, font_size) as i32),
         // TODO: This should actually be the font-size of the root element, so figure that out
         StyleSize::Rem(rem) => Some((*rem * 16 as f32) as i32),
@@ -1288,12 +1377,22 @@ fn get_calc_exp_value(
     default_unit: &SizeUnit,
 ) -> Option<i32> {
     match exp {
-        CalcExpression::Size(size) => {
-            get_specified_size(font_size, &size, available_size, auto_size, window_size, default_unit)
-        }
-        CalcExpression::Nesting(nesting) => {
-            solve_calc(nesting, font_size, available_size, auto_size, window_size, default_unit)
-        }
+        CalcExpression::Size(size) => get_specified_size(
+            font_size,
+            &size,
+            available_size,
+            auto_size,
+            window_size,
+            default_unit,
+        ),
+        CalcExpression::Nesting(nesting) => solve_calc(
+            nesting,
+            font_size,
+            available_size,
+            auto_size,
+            window_size,
+            default_unit,
+        ),
         CalcExpression::Solved(value) => Some(*value as i32),
         _ => panic!("Expected calc expression to be value"),
     }
@@ -1312,20 +1411,49 @@ fn solve_calc(
     while calc.len() > 1 {
         let exp = calc
             .iter()
-            .position(|exp| matches!(exp, CalcExpression::Operator(StyleCalcOperator::Multiply | StyleCalcOperator::Divide)))
+            .position(|exp| {
+                matches!(
+                    exp,
+                    CalcExpression::Operator(
+                        StyleCalcOperator::Multiply | StyleCalcOperator::Divide
+                    )
+                )
+            })
             .or_else(|| {
-                calc
-                    .iter()
-                    .position(|exp| matches!(exp, CalcExpression::Operator(StyleCalcOperator::Plus | StyleCalcOperator::Minus)))
+                calc.iter().position(|exp| {
+                    matches!(
+                        exp,
+                        CalcExpression::Operator(
+                            StyleCalcOperator::Plus | StyleCalcOperator::Minus
+                        )
+                    )
+                })
             });
 
-        if let Some(exp) = exp && exp > 0 && exp < calc.len() - 1 {
+        if let Some(exp) = exp
+            && exp > 0
+            && exp < calc.len() - 1
+        {
             let prev = &calc[exp - 1];
             let curr = &calc[exp];
             let next = &calc[exp + 1];
 
-            let prev_value = get_calc_exp_value(prev, font_size, available_size, auto_size, window_size, default_unit)?;
-            let next_value = get_calc_exp_value(next, font_size, available_size, auto_size, window_size, default_unit)?;
+            let prev_value = get_calc_exp_value(
+                prev,
+                font_size,
+                available_size,
+                auto_size,
+                window_size,
+                default_unit,
+            )?;
+            let next_value = get_calc_exp_value(
+                next,
+                font_size,
+                available_size,
+                auto_size,
+                window_size,
+                default_unit,
+            )?;
 
             let CalcExpression::Operator(operator) = curr else {
                 unreachable!();
@@ -1344,9 +1472,13 @@ fn solve_calc(
         }
     }
 
-    let mut value = if calc.len() == 1 && let CalcExpression::Solved(value) = calc[0] {
+    let mut value = if calc.len() == 1
+        && let CalcExpression::Solved(value) = calc[0]
+    {
         Some(value as i32)
-    } else if calc.len() == 1 && let CalcExpression::Size(StyleSize::Px(size)) = calc[0] {
+    } else if calc.len() == 1
+        && let CalcExpression::Size(StyleSize::Px(size)) = calc[0]
+    {
         Some(size as i32)
     } else {
         None
@@ -1362,7 +1494,7 @@ fn solve_calc(
 fn unit_to_px(value: f32, unit: &SizeUnit, font_size: u32) -> f32 {
     match unit {
         SizeUnit::Px => value,
-        SizeUnit::Em => value * font_size as f32
+        SizeUnit::Em => value * font_size as f32,
     }
 }
 
@@ -4278,7 +4410,7 @@ fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
 fn op_canvas_record_command(
     state: &mut OpState,
     #[number] node_idx: usize,
-    #[serde] command: CanvasPathCommand
+    #[serde] command: CanvasPathCommand,
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -4304,14 +4436,12 @@ fn op_canvas_record_command(
 #[serde]
 fn op_get_canvas_path(
     state: &mut OpState,
-    #[number] node_idx: usize
+    #[number] node_idx: usize,
 ) -> Result<Vec<CanvasPathCommand>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow_mut();
 
-    let canvas = renderer
-        .canvas_buffers
-        .get(&node_idx);
+    let canvas = renderer.canvas_buffers.get(&node_idx);
 
     let path = if let Some(canvas) = canvas {
         canvas.commands.clone()
@@ -4334,28 +4464,31 @@ enum CanvasPathCommand {
     },
     Fill,
     Stroke {
-        line_width: f64
+        line_width: f64,
     },
     FillRect {
         x: i32,
         y: i32,
         width: u32,
-        height: u32
+        height: u32,
     },
     StrokeRect {
         x: i32,
         y: i32,
         width: u32,
         height: u32,
-        line_width: f64
+        line_width: f64,
     },
     Transform {
         matrix: Matrixf32,
-    }
+    },
 }
 
 fn cubic_bezier(t: f32, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {
-    let result = (1. - t).powi(3) * p0 as f32 + 3. * (1. - t).powi(2) * t * p1 as f32 + 3. * (1. - t) * t.powi(2) * p2 as f32 + t.powi(3) * p3 as f32;
+    let result = (1. - t).powi(3) * p0 as f32
+        + 3. * (1. - t).powi(2) * t * p1 as f32
+        + 3. * (1. - t) * t.powi(2) * p2 as f32
+        + t.powi(3) * p3 as f32;
     result.round() as i32
 }
 
@@ -4388,7 +4521,9 @@ fn op_canvas_path_stroke(
         canvas.commands.append(&mut path);
     }
 
-    canvas.commands.push(CanvasPathCommand::Stroke { line_width });
+    canvas
+        .commands
+        .push(CanvasPathCommand::Stroke { line_width });
 
     renderer.schedule_dom_update();
 
@@ -4465,8 +4600,7 @@ fn op_collect_data_for_form(
 fn op_track_intersection(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    renderer
-        .track_intersection(node_idx);
+    renderer.track_intersection(node_idx);
     Ok(())
 }
 
@@ -5104,7 +5238,11 @@ impl Renderer {
 
     fn track_intersection(&mut self, node_idx: usize) {
         self.tracking_intersection.push(node_idx);
-        let _ = self.event_loop_proxy.as_ref().unwrap().fire_user_event(UserEvent::IntersectionTracked);
+        let _ = self
+            .event_loop_proxy
+            .as_ref()
+            .unwrap()
+            .fire_user_event(UserEvent::IntersectionTracked);
     }
 
     fn untrack_intersection(&mut self, node_idx: usize) {
@@ -5113,13 +5251,16 @@ impl Renderer {
     }
 
     fn layout_inside_viewport(&self, layout: &LayoutBox, layout_box_id: usize) -> bool {
-        let rendered_node = self.rendered_nodes_ordered.iter().find(|n| n.layout_box_idx == layout_box_id);
+        let rendered_node = self
+            .rendered_nodes_ordered
+            .iter()
+            .find(|n| n.layout_box_idx == layout_box_id);
         let offset_x = layout.rect.x + rendered_node.map(|n| n.offset_x).unwrap_or(0);
         let offset_y = layout.rect.y + rendered_node.map(|n| n.offset_y).unwrap_or(0);
-        offset_x + layout.rect.width as i32 > 0 &&
-        offset_x < self.window_size.width as i32 &&
-        offset_y + layout.rect.height as i32 >= 0 &&
-        offset_y < self.window_size.height as i32
+        offset_x + layout.rect.width as i32 > 0
+            && offset_x < self.window_size.width as i32
+            && offset_y + layout.rect.height as i32 >= 0
+            && offset_y < self.window_size.height as i32
     }
 
     fn compute_intersections(&mut self) -> (Vec<usize>, Vec<usize>) {
@@ -6076,14 +6217,23 @@ impl Renderer {
         layout_roots
     }
 
-    fn decode_and_rasterize_img(&mut self, node_idx: usize, mode: &LayoutMode, input_h: Option<u32>, input_w: Option<u32>, max_h: Option<u32>, max_w: Option<u32>) -> Option<(Pixmap, u32, u32, bool)> {
+    fn decode_and_rasterize_img(
+        &mut self,
+        node_idx: usize,
+        mode: &LayoutMode,
+        input_h: Option<u32>,
+        input_w: Option<u32>,
+        max_h: Option<u32>,
+        max_w: Option<u32>,
+    ) -> Option<(Pixmap, u32, u32, bool)> {
         let Some(node) = self.nodes.get(node_idx) else {
             return None;
         };
         let Node::Element(element) = node else {
             return None;
         };
-        let style = self.node_styles
+        let style = self
+            .node_styles
             .get(&node_idx)
             .map(|style| Cow::Borrowed(style))
             .unwrap_or_else(|| Cow::Owned(get_base_style(node, None)));
@@ -6098,10 +6248,7 @@ impl Renderer {
                     .decode_utf8()
                     .ok()?
                     .to_string();
-                self.inject_css_variables_into_str(
-                    &mut decoded,
-                    &style.variables,
-                );
+                self.inject_css_variables_into_str(&mut decoded, &style.variables);
                 Some(RequestCacheEntry::SvgData(decoded))
             } else {
                 None
@@ -6138,16 +6285,11 @@ impl Renderer {
                     max_h,
                 )
                 .unwrap();
-                let (target_h, target_w) =
-                    (target_h.max(1), target_w.max(1));
+                let (target_h, target_w) = (target_h.max(1), target_w.max(1));
                 if *mode == LayoutMode::Complete {
-                    let pixmap = rasterize_jpeg(
-                        &mut self.cached_rasterizations,
-                        &src,
-                        target_w,
-                        target_h,
-                    )
-                    .unwrap();
+                    let pixmap =
+                        rasterize_jpeg(&mut self.cached_rasterizations, &src, target_w, target_h)
+                            .unwrap();
                     (pixmap, target_h, target_w, true)
                 } else {
                     (
@@ -6160,10 +6302,7 @@ impl Renderer {
             }
             Some(RequestCacheEntry::SvgData(svg_data)) => {
                 let mut injected = svg_data.clone();
-                self.inject_css_variables_into_str(
-                    &mut injected,
-                    &style.variables,
-                );
+                self.inject_css_variables_into_str(&mut injected, &style.variables);
                 let result = rasterize_svg(
                     &mut self.cached_rasterizations,
                     &injected,
@@ -6193,16 +6332,11 @@ impl Renderer {
                     max_h,
                 )
                 .unwrap();
-                let (target_h, target_w) =
-                    (target_h.max(1), target_w.max(1));
+                let (target_h, target_w) = (target_h.max(1), target_w.max(1));
                 if *mode == LayoutMode::Complete {
-                    let pixmap = rasterize_gif(
-                        &mut self.cached_rasterizations,
-                        &src,
-                        target_w,
-                        target_h,
-                    )
-                    .unwrap();
+                    let pixmap =
+                        rasterize_gif(&mut self.cached_rasterizations, &src, target_w, target_h)
+                            .unwrap();
                     (pixmap, target_h, target_w, true)
                 } else {
                     (
@@ -6227,14 +6361,10 @@ impl Renderer {
                 .ok()?;
                 let (target_h, target_w) = (target_h.max(1), target_w.max(1));
                 if *mode == LayoutMode::Complete {
-                    let pixmap = rasterize_webp(
-                        &mut self.cached_rasterizations,
-                        &src,
-                        target_w,
-                        target_h,
-                    )
-                    .inspect_err(|err| println!("Failed to rasterize WebP: {}", err))
-                    .ok()?;
+                    let pixmap =
+                        rasterize_webp(&mut self.cached_rasterizations, &src, target_w, target_h)
+                            .inspect_err(|err| println!("Failed to rasterize WebP: {}", err))
+                            .ok()?;
                     let opaque = pixmap_is_opaque(&pixmap);
                     (pixmap, target_h, target_w, opaque)
                 } else {
@@ -6248,7 +6378,8 @@ impl Renderer {
             }
             _ => return None,
         };
-        self.images_nodes_loaded.insert(node_idx, (result.1, result.2));
+        self.images_nodes_loaded
+            .insert(node_idx, (result.1, result.2));
         Some(result)
     }
 
@@ -6600,7 +6731,14 @@ impl Renderer {
                             }
                         }
                         "img" | "video" => {
-                            let result = self.decode_and_rasterize_img(node_idx, mode, container_size.container_height_non_filling, container_size.container_width_non_filling, Some(max_h), Some(max_w));
+                            let result = self.decode_and_rasterize_img(
+                                node_idx,
+                                mode,
+                                container_size.container_height_non_filling,
+                                container_size.container_width_non_filling,
+                                Some(max_h),
+                                Some(max_w),
+                            );
                             if result.is_none() && element.tag == "img" {
                                 let (height, width) =
                                     container_size.image_placeholder_size(max_w, max_h);
@@ -6608,7 +6746,7 @@ impl Renderer {
                             } else {
                                 result?
                             }
-                        },
+                        }
                         _ => panic!(),
                     };
                     let z_index = match style.z_index {
@@ -6929,12 +7067,7 @@ impl Renderer {
                     frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
 
                     while let Ok(cmd) = rx.try_recv() {
-                        frame.handle_frame_command(
-                            cmd,
-                            &parent_proxy,
-                            &size,
-                            &bitmap_for_thread,
-                        );
+                        frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
                     }
                 }
                 if had_command || js_pending {
@@ -8150,8 +8283,15 @@ impl Renderer {
             return None;
         }
 
-        get_specified_size(font_size, size, available_size, None, &self.window_size, &SizeUnit::Px)
-            .and_then(|v| if v >= 0 { Some(v as u32) } else { None })
+        get_specified_size(
+            font_size,
+            size,
+            available_size,
+            None,
+            &self.window_size,
+            &SizeUnit::Px,
+        )
+        .and_then(|v| if v >= 0 { Some(v as u32) } else { None })
     }
 
     fn layout_flex(
@@ -8707,8 +8847,7 @@ impl Renderer {
                     .containing_nodes
                     .get(&containing_node_idx)
                     .filter(|_| {
-                        self.node_styles.get(child_idx).unwrap().position
-                            == StylePosition::Absolute
+                        self.node_styles.get(child_idx).unwrap().position == StylePosition::Absolute
                     })
                     .map(|containing_node| {
                         let size_dependent_offset = match style.flex_direction {
@@ -9997,9 +10136,7 @@ impl Frame {
 
     fn command_wait_timeout(&self, js_pending: bool) -> Option<Duration> {
         match (js_pending, self.animation_frame_delay()) {
-            (true, Some(animation_delay)) => {
-                Some(Duration::from_millis(16).min(animation_delay))
-            }
+            (true, Some(animation_delay)) => Some(Duration::from_millis(16).min(animation_delay)),
             (true, None) => Some(Duration::from_millis(16)),
             (false, Some(animation_delay)) => Some(animation_delay),
             (false, None) => None,
@@ -10167,7 +10304,8 @@ impl Frame {
     }
 
     pub fn run_js(&mut self) -> Result<()> {
-        let scripts: Vec<Script> = self.renderer
+        let scripts: Vec<Script> = self
+            .renderer
             .as_ref()
             .unwrap()
             .borrow_mut()
@@ -10770,7 +10908,10 @@ impl Frame {
             .collect::<Vec<_>>()
             .join(",");
 
-        self.execute_host_script("update newly loaded images", format!(r#"
+        self.execute_host_script(
+            "update newly loaded images",
+            format!(
+                r#"
         for (const [idx, height, width] of [{}]) {{
             const node = __elementFromNodeIdx(idx)
             if (!node) continue
@@ -10778,7 +10919,10 @@ impl Frame {
             node.naturalHeight = height
             node.naturalWidth = width
         }}
-        "#, images))
+        "#,
+                images
+            ),
+        )
         .unwrap();
     }
 
@@ -11009,7 +11153,9 @@ impl Frame {
                 let buffer = self.render_loop();
                 let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
             }
-            FrameCommand::UserEvent(event @ (UserEvent::FrameUpdated | UserEvent::ImagesPrefetched(_))) => {
+            FrameCommand::UserEvent(
+                event @ (UserEvent::FrameUpdated | UserEvent::ImagesPrefetched(_)),
+            ) => {
                 if let UserEvent::ImagesPrefetched(urls) = event {
                     if let Some(renderer) = self.renderer.as_ref() {
                         renderer.borrow_mut().finish_image_prefetch(urls);
@@ -11410,9 +11556,17 @@ impl Browser {
         Ok(runtime)
     }
 
-    pub fn open_tab(&self, url: String, hover_debugging: bool, tab_idx: usize) -> Result<TabHandle> {
+    pub fn open_tab(
+        &self,
+        url: String,
+        hover_debugging: bool,
+        tab_idx: usize,
+    ) -> Result<TabHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = TabHandle { tx: tx.clone(), url: url.clone() };
+        let handle = TabHandle {
+            tx: tx.clone(),
+            url: url.clone(),
+        };
         let proxy = self.event_loop_proxy.clone();
         let tab_window = Some(self.window.clone());
         std::thread::spawn(move || {
@@ -11447,27 +11601,29 @@ impl Browser {
     ) {
         while let Ok(action) = header_comms_rx.try_recv() {
             match action {
-                BrowserAction::OpenTab(url) => match self.open_tab(url.clone(), hover_debugging, self.tabs.len()) {
-                    Ok(handle) => {
-                        self.tabs.push(handle);
-                        self.current_tab_idx = self.tabs.len() - 1;
-                        header.state.borrow_mut().url = self.current_tab().url.clone();
-                        let comms_tx = header.builder.comms_tx.clone();
-                        self.build_header(&mut header.builder, &header.state, comms_tx)
-                            .unwrap();
-                        match header.rerender() {
-                            Ok(_) => {
-                                window.request_redraw();
-                            }
-                            Err(err) => {
-                                eprintln!("Failed to render header: {err:?}");
+                BrowserAction::OpenTab(url) => {
+                    match self.open_tab(url.clone(), hover_debugging, self.tabs.len()) {
+                        Ok(handle) => {
+                            self.tabs.push(handle);
+                            self.current_tab_idx = self.tabs.len() - 1;
+                            header.state.borrow_mut().url = self.current_tab().url.clone();
+                            let comms_tx = header.builder.comms_tx.clone();
+                            self.build_header(&mut header.builder, &header.state, comms_tx)
+                                .unwrap();
+                            match header.rerender() {
+                                Ok(_) => {
+                                    window.request_redraw();
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to render header: {err:?}");
+                                }
                             }
                         }
+                        Err(err) => {
+                            eprintln!("Failed to open tab: {err:?}")
+                        }
                     }
-                    Err(err) => {
-                        eprintln!("Failed to open tab: {err:?}")
-                    }
-                },
+                }
                 BrowserAction::SelectTab(tab_idx) => {
                     self.current_tab_idx = tab_idx;
                     header.state.borrow_mut().url = self.current_tab().url.clone();
@@ -12158,8 +12314,7 @@ mod tests {
     use crate::{
         Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
         style::{
-            CalcExpression, StyleCalcOperator, StyleSize, parse_calc,
-            split_ignoring_parentheses,
+            CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
     };
 
@@ -12410,7 +12565,14 @@ mod tests {
         };
 
         assert_eq!(
-            super::solve_calc(&calc, 16, None, None, &PhysicalSize::new(100, 100), &SizeUnit::Px),
+            super::solve_calc(
+                &calc,
+                16,
+                None,
+                None,
+                &PhysicalSize::new(100, 100),
+                &SizeUnit::Px
+            ),
             Some(2)
         );
         Ok(())
@@ -12423,10 +12585,16 @@ mod tests {
         };
 
         assert_eq!(
-            super::solve_calc(&calc, 16, None, None, &PhysicalSize::new(100, 100), &SizeUnit::Px),
+            super::solve_calc(
+                &calc,
+                16,
+                None,
+                None,
+                &PhysicalSize::new(100, 100),
+                &SizeUnit::Px
+            ),
             Some(14)
         );
         Ok(())
     }
-
 }

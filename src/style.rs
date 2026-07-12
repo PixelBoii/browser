@@ -1262,10 +1262,7 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
                 let collected: String = buffer.drain(..).collect();
                 let (name, default) = if let Some(collected) = collected.split_once(",") {
                     let default_parts = parse_variable_template(collected.1.trim());
-                    (
-                        collected.0.trim().to_owned(),
-                        Some(default_parts),
-                    )
+                    (collected.0.trim().to_owned(), Some(default_parts))
                 } else {
                     (collected.trim().to_string(), None)
                 };
@@ -1431,7 +1428,9 @@ fn resolve_variable_template(
                 } else {
                     default
                         .as_ref()
-                        .map(|v| resolve_variable_template(&v, resolved_variables, variable_definitions))
+                        .map(|v| {
+                            resolve_variable_template(&v, resolved_variables, variable_definitions)
+                        })
                         .unwrap_or(name.to_string())
                 };
                 if previous_was_var
