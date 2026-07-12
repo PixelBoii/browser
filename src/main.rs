@@ -363,6 +363,9 @@ struct CanvasBuffer {
     width: u32,
     height: u32,
     commands: Vec<CanvasPathCommand>,
+    current_path: Vec<CanvasPathCommand>,
+    transform: Option<Matrixf32>,
+    transform_stack: Vec<Option<Matrixf32>>,
     dirty: bool,
 }
 
@@ -373,6 +376,9 @@ impl CanvasBuffer {
             width,
             height,
             commands: vec![],
+            current_path: vec![],
+            transform: None,
+            transform_stack: vec![],
             dirty: false,
         }
     }
@@ -387,7 +393,11 @@ impl CanvasBuffer {
 
         self.width = width;
         self.height = height;
-        self.buffer.resize(width as usize * height as usize, 0);
+        self.buffer = vec![0; width as usize * height as usize];
+        self.commands.clear();
+        self.current_path.clear();
+        self.transform = None;
+        self.transform_stack.clear();
         self.dirty = true;
     }
 
@@ -399,31 +409,25 @@ impl CanvasBuffer {
     }
 
     fn update_buffer(&mut self) {
-        // Clear buffer
-        self.buffer.fill(0x00_00_00_00);
-
-        let mut queued_commands = vec![];
-        let commands = self.commands.clone();
-        let mut transform: Option<Matrixf32> = None;
-        let mut transform_stack: Vec<Option<Matrixf32>> = vec![];
+        let commands = std::mem::take(&mut self.commands);
         for cmd in commands {
             match cmd {
                 CanvasPathCommand::Transform { matrix } => {
-                    transform = Some(match transform {
+                    self.transform = Some(match self.transform.take() {
                         Some(current) => current.multiply(&matrix).unwrap(),
                         None => matrix,
                     });
                 }
                 CanvasPathCommand::Save => {
-                    transform_stack.push(transform.clone());
+                    self.transform_stack.push(self.transform.clone());
                 }
                 CanvasPathCommand::Restore => {
-                    if let Some(saved) = transform_stack.pop() {
-                        transform = saved;
+                    if let Some(saved) = self.transform_stack.pop() {
+                        self.transform = saved;
                     }
                 }
                 CanvasPathCommand::BeginPath => {
-                    queued_commands.clear();
+                    self.current_path.clear();
                 }
                 CanvasPathCommand::MoveTo { point: _ }
                 | CanvasPathCommand::Point { point: _ }
@@ -433,7 +437,7 @@ impl CanvasBuffer {
                     endpoint: _,
                 }
                 | CanvasPathCommand::Close => {
-                    queued_commands.push(cmd);
+                    self.current_path.push(cmd);
                 }
                 CanvasPathCommand::FillRect {
                     x,
@@ -531,17 +535,23 @@ impl CanvasBuffer {
                     }
                 }
                 CanvasPathCommand::Stroke { line_width } => {
-                    self.apply_stroke(&queued_commands, line_width, &transform)
+                    let current_path = self.current_path.clone();
+                    let transform = self.transform.clone();
+                    self.apply_stroke(&current_path, line_width, &transform)
                         .unwrap();
                 }
                 CanvasPathCommand::StrokePath { path, line_width } => {
+                    let transform = self.transform.clone();
                     self.apply_stroke(&path, line_width, &transform).unwrap();
                 }
                 CanvasPathCommand::Fill { color, fill_rule } => {
-                    self.apply_fill(&queued_commands, &transform, color, &fill_rule)
+                    let current_path = self.current_path.clone();
+                    let transform = self.transform.clone();
+                    self.apply_fill(&current_path, &transform, color, &fill_rule)
                         .unwrap();
                 }
                 CanvasPathCommand::FillPath { path, color, fill_rule } => {
+                    let transform = self.transform.clone();
                     self.apply_fill(&path, &transform, color, &fill_rule).unwrap();
                 }
             }
