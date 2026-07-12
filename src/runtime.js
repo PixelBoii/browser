@@ -956,55 +956,71 @@ function camelize(str) {
 
 const CANVAS_COMMAND_POINT = "point"
 const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
+const CANVAS_COMMAND_FILL_RECT = "fillRect"
+const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
+const CANVAS_COMMAND_TRANSFORM = "transform"
 
 class CanvasRenderingContext2D {
     constructor(canvas) {
         this.canvas = canvas
         this.lineWidth = 1
-        this.path = null
-        this.cursor = null
+    }
+
+    get path() {
+        return core.ops.op_get_canvas_path(this.canvas.__node_idx)
     }
 
     fillRect(x, y, width, height) {
-        core.ops.op_fill_canvas_rect(this.canvas.__node_idx, x, y, width, height)
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_FILL_RECT,
+            x,
+            y,
+            width,
+            height
+        })
+        core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
     strokeRect(x, y, width, height) {
-        core.ops.op_stroke_canvas_rect(this.canvas.__node_idx, x, y, width, height, this.lineWidth)
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_STROKE_RECT,
+            x,
+            y,
+            width,
+            height,
+            line_width: lineWidth
+        })
+        core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
     beginPath() {
-        this.path = []
+        //
     }
 
     moveTo(x, y) {
-        this.cursor = [x, y]
-        this.path.push({
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_POINT,
-            point: this.cursor
+            x,
+            y,
+            width,
+            height,
+            line_width: lineWidth
         })
     }
 
     lineTo(x, y) {
-        if (this.path.length === 0) {
-            this.path.push({
-                type: CANVAS_COMMAND_POINT,
-                point: this.cursor
-            })
-        }
-        this.path.push({
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_POINT,
             point: [x, y]
         })
-        this.cursor = [x, y]
     }
 
     closePath() {
-        this.path.push(this.path[0])
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, this.path[0])
     }
 
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
-        this.path.push({
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_BEZIER_CURVE,
             cp1: [cp1x, cp1y],
             cp2: [cp2x, cp2y],
@@ -1013,22 +1029,33 @@ class CanvasRenderingContext2D {
     }
 
     stroke(suppliedPath = null) {
-        const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : this.path
+        const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
-        if (!path) {
-            return
-        }
 
         core.ops.op_canvas_path_stroke(this.canvas.__node_idx, path, lineWidth)
+        core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
     fill(suppliedPath = null) {
-        const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : this.path
-        if (!path) {
-            return
-        }
+        const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
 
         core.ops.op_canvas_path_fill(this.canvas.__node_idx, path)
+        core.ops.op_canvas_paint(this.canvas.__node_idx)
+    }
+
+    transform(a, b, c, d, e, f) {
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_TRANSFORM,
+            matrix: {
+                data: [
+                    a, c, e,
+                    b, d, f,
+                    0, 0, 1,
+                ],
+                rows: 3,
+                columns: 3,
+            },
+        })
     }
 }
 
@@ -1036,29 +1063,20 @@ class Path2D {
     constructor() {
         this.path = []
         this.lineWidth = 1
-        this.cursor = null
     }
 
     moveTo(x, y) {
-        this.cursor = [x, y]
-        this.path.push({
-            type: CANVAS_COMMAND_POINT,
-            point: this.cursor
-        })
-    }
-
-    lineTo(x, y) {
-        if (this.path.length === 0) {
-            this.path.push({
-                type: CANVAS_COMMAND_POINT,
-                point: this.cursor
-            })
-        }
         this.path.push({
             type: CANVAS_COMMAND_POINT,
             point: [x, y]
         })
-        this.cursor = [x, y]
+    }
+
+    lineTo(x, y) {
+        this.path.push({
+            type: CANVAS_COMMAND_POINT,
+            point: [x, y]
+        })
     }
 
     closePath() {

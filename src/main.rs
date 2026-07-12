@@ -13,6 +13,7 @@ use parser::{Element, HtmlParser, Node};
 use reqwest::cookie::{CookieStore, Jar};
 use resvg::tiny_skia::{IntSize, Pixmap};
 use resvg::usvg::Tree;
+use serde::Serialize;
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
     StyleSize, StyleTransform, StyleTransformOperation, StyleVisibility, get_base_style,
@@ -360,6 +361,7 @@ struct CanvasBuffer {
     buffer: Vec<u32>,
     width: u32,
     height: u32,
+    commands: Vec<CanvasPathCommand>,
 }
 
 impl CanvasBuffer {
@@ -368,6 +370,7 @@ impl CanvasBuffer {
             buffer: vec![0x00_00_00_00; width as usize * height as usize],
             width,
             height,
+            commands: vec![],
         }
     }
 
@@ -382,6 +385,320 @@ impl CanvasBuffer {
         self.width = width;
         self.height = height;
         self.buffer.resize(width as usize * height as usize, 0);
+    }
+
+    fn update_buffer(&mut self) {
+        // Clear buffer
+        self.buffer.fill(0x00_00_00_00);
+
+        let mut queued_commands = vec![];
+        let commands = self.commands.clone();
+        let mut transform = None;
+        for cmd in commands {
+            match cmd {
+                CanvasPathCommand::Transform { matrix } => {
+                    transform = Some(matrix);
+                }
+                CanvasPathCommand::Point { point: _ } | CanvasPathCommand::BezierCurve { cp1: _, cp2: _, endpoint: _ } => {
+                    queued_commands.push(cmd);
+                }
+                CanvasPathCommand::FillRect { x, y, width, height } => {
+                    draw_rect_filled(
+                        &mut self.buffer,
+                        false,
+                        self.width,
+                        self.height,
+                        x,
+                        y,
+                        width,
+                        height,
+                        0x00_00_00_FF,
+                        &BorderRadius::new_empty(),
+                    );
+                }
+                CanvasPathCommand::StrokeRect { x, y, width, height, line_width } => {
+                    draw_rect_filled(
+                        &mut self.buffer,
+                        false,
+                        self.width,
+                        self.height,
+                        x,
+                        y,
+                        line_width as u32,
+                        height,
+                        0x00_00_00_FF,
+                        &BorderRadius::new_empty(),
+                    ); // Left
+                    draw_rect_filled(
+                        &mut self.buffer,
+                        false,
+                        self.width,
+                        self.height,
+                        x,
+                        y,
+                        width,
+                        line_width as u32,
+                        0x00_00_00_FF,
+                        &BorderRadius::new_empty(),
+                    ); // Top
+                    draw_rect_filled(
+                        &mut self.buffer,
+                        false,
+                        self.width,
+                        self.height,
+                        x + width as i32 - line_width as i32,
+                        y,
+                        line_width as u32,
+                        height,
+                        0x00_00_00_FF,
+                        &BorderRadius::new_empty(),
+                    ); // Right
+                    draw_rect_filled(
+                        &mut self.buffer,
+                        false,
+                        self.width,
+                        self.height,
+                        x,
+                        y + height as i32 - line_width as i32,
+                        width,
+                        line_width as u32,
+                        0x00_00_00_FF,
+                        &BorderRadius::new_empty(),
+                    ); // Bottom
+                }
+                CanvasPathCommand::Stroke { line_width } => {
+                    self.apply_stroke(&queued_commands, line_width, &transform).unwrap();
+                }
+                CanvasPathCommand::Fill => {
+                    self.apply_fill(&queued_commands, &transform).unwrap();
+                }
+            }
+        }
+    }
+
+    fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
+        let point_matrix = Matrixf32::new(vec![point[0] as f32, point[1] as f32, 1.], 3, 1);
+        let out = transform.multiply(&point_matrix).with_context(|| "Invalid shapes")?;
+        Ok([out.get(0, 0) as f64, out.get(1, 0) as f64])
+    }
+
+    fn apply_fill(&mut self, queued_commands: &Vec<CanvasPathCommand>, transform: &Option<Matrixf32>) -> Result<()> {
+        let mut cursor = Position {
+            x: 0,
+            y: 0,
+        };
+        let mut x_pixels = vec![vec![]; self.width as usize];
+        let mut y_pixels = vec![vec![]; self.height as usize];
+        let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
+        let stride = self.width as usize;
+        for (idx, cmd) in queued_commands.iter().enumerate() {
+            match cmd {
+                &CanvasPathCommand::Point { mut point } => {
+                    if let Some(transform) = transform {
+                        point = self.compute_point_transform(&point, transform)?;
+                    }
+                    let x = point[0];
+                    let y = point[1];
+
+                    if idx == 0 {
+                        cursor.x = x as i32;
+                        cursor.y = y as i32;
+                        continue;
+                    }
+
+                    let start_x = cursor.x as f64;
+                    let start_y = cursor.y as f64;
+                    let x_delta = x - cursor.x as f64;
+                    let y_delta = y - cursor.y as f64;
+
+                    let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+
+                    let x_ratio = x_delta / hyp as f64;
+                    let y_ratio = y_delta / hyp as f64;
+
+                    for idx in 0..hyp {
+                        let px = (start_x + idx as f64 * x_ratio)
+                            .round()
+                            .min(self.width as f64) as i32;
+                        let py = (start_y + idx as f64 * y_ratio)
+                            .round()
+                            .min(self.height as f64) as i32;
+
+                        x_pixels[px as usize].push(py as usize);
+                        y_pixels[py as usize].push(px as usize);
+                    }
+
+                    cursor.x = x.round() as i32;
+                    cursor.y = y.round() as i32;
+                }
+                &CanvasPathCommand::BezierCurve { mut cp1, mut cp2, mut endpoint } => {
+                    if let Some(transform) = transform {
+                        cp1 = self.compute_point_transform(&cp1, transform)?;
+                        cp2 = self.compute_point_transform(&cp2, transform)?;
+                        endpoint = self.compute_point_transform(&endpoint, transform)?;
+                    }
+                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
+                        distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
+                        distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
+                    for x_idx in 0..=steps {
+                        let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
+                        let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
+
+                        x_pixels[x as usize].push(y as usize);
+                        y_pixels[y as usize].push(x as usize);
+                    }
+
+                    cursor.x = endpoint[0].round() as i32;
+                    cursor.y = endpoint[1].round() as i32;
+                }
+                _ => {}
+            };
+        }
+
+        // Fill it in. The process here is relatively simple:
+        // For each pixel, ask the question "Do I have a pixel above me, below me, on my left and on my right?"
+        // If we do, then that pixel is inside and we should fill it in.
+        for py in 0..self.height as usize {
+            let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
+            for px in 0..self.width as usize {
+                if x_pixels[px].iter().any(|ipy| *ipy < py) &&
+                    x_pixels[px].iter().any(|ipy| *ipy > py) &&
+                    y_pixels[py].iter().any(|ipx| *ipx < px) &&
+                    y_pixels[py].iter().any(|ipx| *ipx > px) {
+                        row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                    }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_stroke(&mut self, queued_commands: &Vec<CanvasPathCommand>, line_width: f64, transform: &Option<Matrixf32>) -> Result<()> {
+        let mut cursor = Position {
+            x: 0,
+            y: 0,
+        };
+        let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
+        let line_width_offset = -line_width as i32 / 2;
+        let line_width_end = line_width as i32 / 2;
+        for (idx, cmd) in queued_commands.iter().enumerate() {
+            match cmd {
+                &CanvasPathCommand::Point { mut point } => {
+                    if let Some(transform) = transform {
+                        point = self.compute_point_transform(&point, transform)?;
+                    }
+                    let x = point[0];
+                    let y = point[1];
+
+                    if idx == 0 {
+                        cursor.x = x as i32;
+                        cursor.y = y as i32;
+                        continue;
+                    }
+
+                    let start_x = cursor.x as f64;
+                    let start_y = cursor.y as f64;
+                    let x_delta = x - cursor.x as f64;
+                    let y_delta = y - cursor.y as f64;
+
+                    let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+                    let stride = self.width as usize;
+
+                    let x_ratio = x_delta / hyp as f64;
+                    let y_ratio = y_delta / hyp as f64;
+
+                    for idx in 0..hyp {
+                        for wxidx in line_width_offset..line_width_end {
+                            for wyidx in line_width_offset..line_width_end {
+                                let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
+                                    .round()
+                                    .min(self.width as f64) as i32;
+                                let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
+                                    .round()
+                                    .min(self.height as f64) as i32;
+
+                                let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
+                                row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                            }
+                        }
+                    }
+
+                    cursor.x = x.round() as i32;
+                    cursor.y = y.round() as i32;
+                }
+                &CanvasPathCommand::BezierCurve { mut cp1, mut cp2, mut endpoint } => {
+                    if let Some(transform) = transform {
+                        cp1 = self.compute_point_transform(&cp1, transform)?;
+                        cp2 = self.compute_point_transform(&cp2, transform)?;
+                        endpoint = self.compute_point_transform(&endpoint, transform)?;
+                    }
+                    let stride = self.width as i32;
+                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
+                        distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
+                        distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
+                    for x_idx in 0..=steps {
+                        let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
+                        let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
+
+                        for wxidx in line_width_offset..line_width_end {
+                            for wyidx in line_width_offset..line_width_end {
+                                let cord = y * stride + wyidx * stride + x + wxidx;
+                                if cord < 0 || cord >= (self.width * self.height) as i32 {
+                                    continue;
+                                }
+                                let px = &mut self.buffer[cord as usize];
+                                *px = blend_rgba_with_rgba(*px, color_tuple);
+                            }
+                        }
+                    }
+
+                    cursor.x = endpoint[0].round() as i32;
+                    cursor.y = endpoint[1].round() as i32;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Matrixf32 {
+    data: Vec<f32>,
+    rows: usize,
+    columns: usize
+}
+
+impl Matrixf32 {
+    pub fn new(data: Vec<f32>, rows: usize, columns: usize) -> Self {
+        Self {
+            data,
+            rows,
+            columns
+        }
+    }
+
+    fn get(&self, row: usize, column: usize) -> f32 {
+        self.data[row * self.columns + column]
+    }
+
+    fn multiply(&self, other: &Self) -> Option<Self> {
+        if self.columns != other.rows {
+            return None;
+        }
+        let compatibility = self.columns;
+        let mut data = vec![0.; self.rows * other.columns];
+        for row in 0..self.rows {
+            for column in 0..other.columns {
+                let mut value = 0.;
+                for inner in 0..compatibility {
+                    value += self.get(row, inner) * other.get(inner, column);
+                }
+                data[row * other.columns + column] = value;
+            }
+        }
+        Some(Self::new(data, self.rows, other.columns))
     }
 }
 
@@ -3957,14 +4274,11 @@ fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
     }
 }
 
-#[op2(fast)]
-fn op_fill_canvas_rect(
+#[op2]
+fn op_canvas_record_command(
     state: &mut OpState,
     #[number] node_idx: usize,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+    #[serde] command: CanvasPathCommand
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -3973,119 +4287,41 @@ fn op_fill_canvas_rect(
         return Ok(());
     };
 
-    let x = x.round() as i32;
-    let y = y.round() as i32;
-    let width = width.round() as u32;
-    let height = height.round() as u32;
-
     let canvas = renderer
         .canvas_buffers
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
     canvas.resize_if_needed(node_width, node_height);
 
-    draw_rect_filled(
-        &mut canvas.buffer,
-        false,
-        node_width,
-        node_height,
-        x,
-        y,
-        width,
-        height,
-        0x00_00_00_FF,
-        &BorderRadius::new_empty(),
-    );
+    canvas.commands.push(command);
 
     renderer.schedule_dom_update();
 
     Ok(())
 }
 
-#[op2(fast)]
-fn op_stroke_canvas_rect(
+#[op2]
+#[serde]
+fn op_get_canvas_path(
     state: &mut OpState,
-    #[number] node_idx: usize,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    line_width: f64,
-) -> Result<(), JsError> {
+    #[number] node_idx: usize
+) -> Result<Vec<CanvasPathCommand>, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    let node = renderer.nodes.get(node_idx).unwrap();
-    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
-        return Ok(());
-    };
-
-    let x = x.round() as i32;
-    let y = y.round() as i32;
-    let width = width.round() as u32;
-    let height = height.round() as u32;
-    let line_width = line_width.round() as u32;
+    let renderer = host.renderer.borrow_mut();
 
     let canvas = renderer
         .canvas_buffers
-        .entry(node_idx)
-        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
-    canvas.resize_if_needed(node_width, node_height);
+        .get(&node_idx);
 
-    draw_rect_filled(
-        &mut canvas.buffer,
-        false,
-        node_width,
-        node_height,
-        x,
-        y,
-        line_width,
-        height,
-        0x00_00_00_FF,
-        &BorderRadius::new_empty(),
-    ); // Left
-    draw_rect_filled(
-        &mut canvas.buffer,
-        false,
-        node_width,
-        node_height,
-        x,
-        y,
-        width,
-        line_width,
-        0x00_00_00_FF,
-        &BorderRadius::new_empty(),
-    ); // Top
-    draw_rect_filled(
-        &mut canvas.buffer,
-        false,
-        node_width,
-        node_height,
-        x + width as i32 - line_width as i32,
-        y,
-        line_width,
-        height,
-        0x00_00_00_FF,
-        &BorderRadius::new_empty(),
-    ); // Right
-    draw_rect_filled(
-        &mut canvas.buffer,
-        false,
-        node_width,
-        node_height,
-        x,
-        y + height as i32 - line_width as i32,
-        width,
-        line_width,
-        0x00_00_00_FF,
-        &BorderRadius::new_empty(),
-    ); // Bottom
-
-    renderer.schedule_dom_update();
-
-    Ok(())
+    let path = if let Some(canvas) = canvas {
+        canvas.commands.clone()
+    } else {
+        vec![]
+    };
+    Ok(path)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CanvasPathCommand {
     Point {
@@ -4096,6 +4332,26 @@ enum CanvasPathCommand {
         cp2: [f64; 2],
         endpoint: [f64; 2],
     },
+    Fill,
+    Stroke {
+        line_width: f64
+    },
+    FillRect {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32
+    },
+    StrokeRect {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        line_width: f64
+    },
+    Transform {
+        matrix: Matrixf32,
+    }
 }
 
 fn cubic_bezier(t: f32, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {
@@ -4113,7 +4369,7 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 fn op_canvas_path_stroke(
     state: &mut OpState,
     #[number] node_idx: usize,
-    #[serde] path: Vec<CanvasPathCommand>,
+    #[serde] path: Option<Vec<CanvasPathCommand>>,
     line_width: f64,
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
@@ -4128,81 +4384,11 @@ fn op_canvas_path_stroke(
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
-    let mut cursor = Position {
-        x: 0,
-        y: 0,
-    };
-    let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
-    let line_width_offset = -line_width as i32 / 2;
-    let line_width_end = line_width as i32 / 2;
-    for (idx, line) in path.iter().enumerate() {
-        match line {
-            CanvasPathCommand::Point { point } => {
-                let x = point[0];
-                let y = point[1];
-
-                if idx == 0 {
-                    cursor.x = x as i32;
-                    cursor.y = y as i32;
-                    continue;
-                }
-
-                let start_x = cursor.x as f64;
-                let start_y = cursor.y as f64;
-                let x_delta = x - cursor.x as f64;
-                let y_delta = y - cursor.y as f64;
-
-                let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
-                let stride = node_width as usize;
-
-                let x_ratio = x_delta / hyp as f64;
-                let y_ratio = y_delta / hyp as f64;
-
-                for idx in 0..hyp {
-                    for wxidx in line_width_offset..line_width_end {
-                        for wyidx in line_width_offset..line_width_end {
-                            let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
-                                .round()
-                                .min(node_width as f64) as i32;
-                            let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
-                                .round()
-                                .min(node_height as f64) as i32;
-
-                            let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
-                            row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
-                        }
-                    }
-                }
-
-                cursor.x = x.round() as i32;
-                cursor.y = y.round() as i32;
-            },
-            CanvasPathCommand::BezierCurve { cp1, cp2, endpoint } => {
-                let stride = node_width as i32;
-                let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
-                    distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
-                    distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
-                for x_idx in 0..=steps {
-                    let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
-                    let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
-
-                    for wxidx in line_width_offset..line_width_end {
-                        for wyidx in line_width_offset..line_width_end {
-                            let cord = y * stride + wyidx * stride + x + wxidx;
-                            if cord < 0 || cord >= (node_width * node_height) as i32 {
-                                continue;
-                            }
-                            let px = &mut canvas.buffer[cord as usize];
-                            *px = blend_rgba_with_rgba(*px, color_tuple);
-                        }
-                    }
-                }
-
-                cursor.x = endpoint[0].round() as i32;
-                cursor.y = endpoint[1].round() as i32;
-            }
-        }
+    if let Some(mut path) = path {
+        canvas.commands.append(&mut path);
     }
+
+    canvas.commands.push(CanvasPathCommand::Stroke { line_width });
 
     renderer.schedule_dom_update();
 
@@ -4213,7 +4399,7 @@ fn op_canvas_path_stroke(
 fn op_canvas_path_fill(
     state: &mut OpState,
     #[number] node_idx: usize,
-    #[serde] path: Vec<CanvasPathCommand>,
+    #[serde] path: Option<Vec<CanvasPathCommand>>,
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -4227,85 +4413,28 @@ fn op_canvas_path_fill(
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
-    let mut cursor = Position {
-        x: 0,
-        y: 0,
-    };
-    let mut x_pixels = vec![vec![]; node_width as usize];
-    let mut y_pixels = vec![vec![]; node_height as usize];
-    let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
-    let stride = node_width as usize;
-    for (idx, line) in path.iter().enumerate() {
-        match line {
-            CanvasPathCommand::Point { point } => {
-                let x = point[0];
-                let y = point[1];
-
-                if idx == 0 {
-                    cursor.x = x as i32;
-                    cursor.y = y as i32;
-                    continue;
-                }
-
-                let start_x = cursor.x as f64;
-                let start_y = cursor.y as f64;
-                let x_delta = x - cursor.x as f64;
-                let y_delta = y - cursor.y as f64;
-
-                let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
-
-                let x_ratio = x_delta / hyp as f64;
-                let y_ratio = y_delta / hyp as f64;
-
-                for idx in 0..hyp {
-                    let px = (start_x + idx as f64 * x_ratio)
-                        .round()
-                        .min(node_width as f64) as i32;
-                    let py = (start_y + idx as f64 * y_ratio)
-                        .round()
-                        .min(node_height as f64) as i32;
-
-                    x_pixels[px as usize].push(py as usize);
-                    y_pixels[py as usize].push(px as usize);
-                }
-
-                cursor.x = x.round() as i32;
-                cursor.y = y.round() as i32;
-            }
-            CanvasPathCommand::BezierCurve { cp1, cp2, endpoint } => {
-                let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1])) +
-                    distance((cp1[0], cp1[1]), (cp2[0], cp2[1])) +
-                    distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1]))).ceil().max(1.) as usize;
-                for x_idx in 0..=steps {
-                    let x = cubic_bezier(x_idx as f32 / steps as f32, cursor.x, cp1[0] as i32, cp2[0] as i32, endpoint[0] as i32);
-                    let y = cubic_bezier(x_idx as f32 / steps as f32, cursor.y, cp1[1] as i32, cp2[1] as i32, endpoint[1] as i32);
-
-                    x_pixels[x as usize].push(y as usize);
-                    y_pixels[y as usize].push(x as usize);
-                }
-
-                cursor.x = endpoint[0].round() as i32;
-                cursor.y = endpoint[1].round() as i32;
-            }
-        };
+    if let Some(mut path) = path {
+        canvas.commands.append(&mut path);
     }
 
-    // Fill it in. The process here is relatively simple:
-    // For each pixel, ask the question "Do I have a pixel above me, below me, on my left and on my right?"
-    // If we do, then that pixel is inside and we should fill it in.
-    for py in 0..node_height as usize {
-        let row = &mut canvas.buffer[py as usize * stride..(py as usize + 1) * stride];
-        for px in 0..node_width as usize {
-            if x_pixels[px].iter().any(|ipy| *ipy < py) &&
-                x_pixels[px].iter().any(|ipy| *ipy > py) &&
-                y_pixels[py].iter().any(|ipx| *ipx < px) &&
-                y_pixels[py].iter().any(|ipx| *ipx > px) {
-                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
-                }
-        }
-    }
+    canvas.commands.push(CanvasPathCommand::Fill);
 
     renderer.schedule_dom_update();
+
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_canvas_paint(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+
+    let canvas = renderer
+        .canvas_buffers
+        .get_mut(&node_idx)
+        .ok_or_else(|| JsErrorBox::generic("Failed to get canvas in op_canvas_paint"))?;
+
+    canvas.update_buffer();
 
     Ok(())
 }
@@ -4441,10 +4570,11 @@ extension!(
     op_get_inner_html,
     op_get_text_content,
     op_tls_peer_certificate,
-    op_fill_canvas_rect,
-    op_stroke_canvas_rect,
+    op_canvas_record_command,
+    op_get_canvas_path,
     op_canvas_path_stroke,
     op_canvas_path_fill,
+    op_canvas_paint,
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
