@@ -955,6 +955,8 @@ function camelize(str) {
 }
 
 const CANVAS_COMMAND_POINT = "point"
+const CANVAS_COMMAND_MOVE_TO = "moveTo"
+const CANVAS_COMMAND_CLOSE = "close"
 const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
 const CANVAS_COMMAND_FILL_RECT = "fillRect"
 const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
@@ -964,10 +966,6 @@ class CanvasRenderingContext2D {
     constructor(canvas) {
         this.canvas = canvas
         this.lineWidth = 1
-    }
-
-    get path() {
-        return core.ops.op_get_canvas_path(this.canvas.__node_idx)
     }
 
     fillRect(x, y, width, height) {
@@ -999,12 +997,8 @@ class CanvasRenderingContext2D {
 
     moveTo(x, y) {
         core.ops.op_canvas_record_command(this.canvas.__node_idx, {
-            type: CANVAS_COMMAND_POINT,
-            x,
-            y,
-            width,
-            height,
-            line_width: lineWidth
+            type: CANVAS_COMMAND_MOVE_TO,
+            point: [x, y]
         })
     }
 
@@ -1016,7 +1010,9 @@ class CanvasRenderingContext2D {
     }
 
     closePath() {
-        core.ops.op_canvas_record_command(this.canvas.__node_idx, this.path[0])
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_CLOSE
+        })
     }
 
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
@@ -1067,7 +1063,7 @@ class Path2D {
 
     moveTo(x, y) {
         this.path.push({
-            type: CANVAS_COMMAND_POINT,
+            type: CANVAS_COMMAND_MOVE_TO,
             point: [x, y]
         })
     }
@@ -1080,7 +1076,7 @@ class Path2D {
     }
 
     closePath() {
-        this.path.push(this.path[0])
+        this.path.push({ type: CANVAS_COMMAND_CLOSE })
     }
 
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {

@@ -399,12 +399,14 @@ impl CanvasBuffer {
                 CanvasPathCommand::Transform { matrix } => {
                     transform = Some(matrix);
                 }
-                CanvasPathCommand::Point { point: _ }
+                CanvasPathCommand::MoveTo { point: _ }
+                | CanvasPathCommand::Point { point: _ }
                 | CanvasPathCommand::BezierCurve {
                     cp1: _,
                     cp2: _,
                     endpoint: _,
-                } => {
+                }
+                | CanvasPathCommand::Close => {
                     queued_commands.push(cmd);
                 }
                 CanvasPathCommand::FillRect {
@@ -507,12 +509,21 @@ impl CanvasBuffer {
         transform: &Option<Matrixf32>,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
+        let mut subpath_start: Option<[f64; 2]> = None;
         let mut x_pixels = vec![vec![]; self.width as usize];
         let mut y_pixels = vec![vec![]; self.height as usize];
         let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
         let stride = self.width as usize;
-        for (idx, cmd) in queued_commands.iter().enumerate() {
+        for cmd in queued_commands {
             match cmd {
+                &CanvasPathCommand::MoveTo { mut point } => {
+                    if let Some(transform) = transform {
+                        point = self.compute_point_transform(&point, transform)?;
+                    }
+                    cursor.x = point[0].round() as i32;
+                    cursor.y = point[1].round() as i32;
+                    subpath_start = Some(point);
+                }
                 &CanvasPathCommand::Point { mut point } => {
                     if let Some(transform) = transform {
                         point = self.compute_point_transform(&point, transform)?;
@@ -520,9 +531,10 @@ impl CanvasBuffer {
                     let x = point[0];
                     let y = point[1];
 
-                    if idx == 0 {
+                    if subpath_start.is_none() {
                         cursor.x = x as i32;
                         cursor.y = y as i32;
+                        subpath_start = Some(point);
                         continue;
                     }
 
@@ -589,6 +601,28 @@ impl CanvasBuffer {
                     cursor.x = endpoint[0].round() as i32;
                     cursor.y = endpoint[1].round() as i32;
                 }
+                CanvasPathCommand::Close => {
+                    let Some([x, y]) = subpath_start else {
+                        continue;
+                    };
+                    let x_delta = x - cursor.x as f64;
+                    let y_delta = y - cursor.y as f64;
+                    let steps = (x_delta.powi(2) + y_delta.powi(2)).sqrt().ceil() as i32;
+                    if steps > 0 {
+                        for step in 0..=steps {
+                            let px = (cursor.x as f64 + x_delta * step as f64 / steps as f64)
+                                .round() as usize;
+                            let py = (cursor.y as f64 + y_delta * step as f64 / steps as f64)
+                                .round() as usize;
+                            if px < self.width as usize && py < self.height as usize {
+                                x_pixels[px].push(py);
+                                y_pixels[py].push(px);
+                            }
+                        }
+                    }
+                    cursor.x = x.round() as i32;
+                    cursor.y = y.round() as i32;
+                }
                 _ => {}
             };
         }
@@ -619,11 +653,20 @@ impl CanvasBuffer {
         transform: &Option<Matrixf32>,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
+        let mut subpath_start: Option<[f64; 2]> = None;
         let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
         let line_width_offset = -line_width as i32 / 2;
         let line_width_end = line_width as i32 / 2;
-        for (idx, cmd) in queued_commands.iter().enumerate() {
+        for cmd in queued_commands {
             match cmd {
+                &CanvasPathCommand::MoveTo { mut point } => {
+                    if let Some(transform) = transform {
+                        point = self.compute_point_transform(&point, transform)?;
+                    }
+                    cursor.x = point[0].round() as i32;
+                    cursor.y = point[1].round() as i32;
+                    subpath_start = Some(point);
+                }
                 &CanvasPathCommand::Point { mut point } => {
                     if let Some(transform) = transform {
                         point = self.compute_point_transform(&point, transform)?;
@@ -631,9 +674,10 @@ impl CanvasBuffer {
                     let x = point[0];
                     let y = point[1];
 
-                    if idx == 0 {
+                    if subpath_start.is_none() {
                         cursor.x = x as i32;
                         cursor.y = y as i32;
+                        subpath_start = Some(point);
                         continue;
                     }
 
@@ -717,6 +761,39 @@ impl CanvasBuffer {
 
                     cursor.x = endpoint[0].round() as i32;
                     cursor.y = endpoint[1].round() as i32;
+                }
+                CanvasPathCommand::Close => {
+                    let Some([x, y]) = subpath_start else {
+                        continue;
+                    };
+                    let x_delta = x - cursor.x as f64;
+                    let y_delta = y - cursor.y as f64;
+                    let steps = (x_delta.powi(2) + y_delta.powi(2)).sqrt().ceil() as i32;
+                    if steps > 0 {
+                        for step in 0..=steps {
+                            let x = (cursor.x as f64 + x_delta * step as f64 / steps as f64).round()
+                                as i32;
+                            let y = (cursor.y as f64 + y_delta * step as f64 / steps as f64).round()
+                                as i32;
+                            for wxidx in line_width_offset..line_width_end {
+                                for wyidx in line_width_offset..line_width_end {
+                                    let px = x + wxidx;
+                                    let py = y + wyidx;
+                                    if px >= 0
+                                        && py >= 0
+                                        && px < self.width as i32
+                                        && py < self.height as i32
+                                    {
+                                        let idx = py as usize * self.width as usize + px as usize;
+                                        self.buffer[idx] =
+                                            blend_rgba_with_rgba(self.buffer[idx], color_tuple);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cursor.x = x.round() as i32;
+                    cursor.y = y.round() as i32;
                 }
                 _ => {}
             }
@@ -4432,28 +4509,12 @@ fn op_canvas_record_command(
     Ok(())
 }
 
-#[op2]
-#[serde]
-fn op_get_canvas_path(
-    state: &mut OpState,
-    #[number] node_idx: usize,
-) -> Result<Vec<CanvasPathCommand>, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow_mut();
-
-    let canvas = renderer.canvas_buffers.get(&node_idx);
-
-    let path = if let Some(canvas) = canvas {
-        canvas.commands.clone()
-    } else {
-        vec![]
-    };
-    Ok(path)
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CanvasPathCommand {
+    MoveTo {
+        point: [f64; 2],
+    },
     Point {
         point: [f64; 2],
     },
@@ -4462,6 +4523,7 @@ enum CanvasPathCommand {
         cp2: [f64; 2],
         endpoint: [f64; 2],
     },
+    Close,
     Fill,
     Stroke {
         line_width: f64,
@@ -4705,7 +4767,6 @@ extension!(
     op_get_text_content,
     op_tls_peer_certificate,
     op_canvas_record_command,
-    op_get_canvas_path,
     op_canvas_path_stroke,
     op_canvas_path_fill,
     op_canvas_paint,
