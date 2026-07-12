@@ -393,11 +393,23 @@ impl CanvasBuffer {
 
         let mut queued_commands = vec![];
         let commands = self.commands.clone();
-        let mut transform = None;
+        let mut transform: Option<Matrixf32> = None;
+        let mut transform_stack: Vec<Option<Matrixf32>> = vec![];
         for cmd in commands {
             match cmd {
                 CanvasPathCommand::Transform { matrix } => {
-                    transform = Some(matrix);
+                    transform = Some(match transform {
+                        Some(current) => current.multiply(&matrix).unwrap(),
+                        None => matrix,
+                    });
+                }
+                CanvasPathCommand::Save => {
+                    transform_stack.push(transform.clone());
+                }
+                CanvasPathCommand::Restore => {
+                    if let Some(saved) = transform_stack.pop() {
+                        transform = saved;
+                    }
                 }
                 CanvasPathCommand::MoveTo { point: _ }
                 | CanvasPathCommand::Point { point: _ }
@@ -483,6 +495,26 @@ impl CanvasBuffer {
                         0x00_00_00_FF,
                         &BorderRadius::new_empty(),
                     ); // Bottom
+                }
+                CanvasPathCommand::ClearRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    let start_x = x.max(0).min(self.width as i32) as usize;
+                    let start_y = y.max(0).min(self.height as i32) as usize;
+                    let end_x =
+                        x.saturating_add(width as i32).max(0).min(self.width as i32) as usize;
+                    let end_y = y
+                        .saturating_add(height as i32)
+                        .max(0)
+                        .min(self.height as i32) as usize;
+                    for py in start_y..end_y {
+                        let row = &mut self.buffer
+                            [py * self.width as usize..(py + 1) * self.width as usize];
+                        row[start_x..end_x].fill(0);
+                    }
                 }
                 CanvasPathCommand::Stroke { line_width } => {
                     self.apply_stroke(&queued_commands, line_width, &transform)
@@ -4504,8 +4536,6 @@ fn op_canvas_record_command(
 
     canvas.commands.push(command);
 
-    renderer.schedule_dom_update();
-
     Ok(())
 }
 
@@ -4543,6 +4573,14 @@ enum CanvasPathCommand {
     },
     Transform {
         matrix: Matrixf32,
+    },
+    Save,
+    Restore,
+    ClearRect {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
     },
 }
 
@@ -4587,8 +4625,6 @@ fn op_canvas_path_stroke(
         .commands
         .push(CanvasPathCommand::Stroke { line_width });
 
-    renderer.schedule_dom_update();
-
     Ok(())
 }
 
@@ -4616,8 +4652,6 @@ fn op_canvas_path_fill(
 
     canvas.commands.push(CanvasPathCommand::Fill);
 
-    renderer.schedule_dom_update();
-
     Ok(())
 }
 
@@ -4632,6 +4666,8 @@ fn op_canvas_paint(state: &mut OpState, #[number] node_idx: usize) -> Result<(),
         .ok_or_else(|| JsErrorBox::generic("Failed to get canvas in op_canvas_paint"))?;
 
     canvas.update_buffer();
+
+    renderer.schedule_dom_update();
 
     Ok(())
 }
@@ -11946,7 +11982,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pontus/browser/pages/test.html".to_string(),
+        "https://vite.dev".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;

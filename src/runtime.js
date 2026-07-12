@@ -110,7 +110,7 @@ function runAnimationFrame(timestamp) {
         try {
             callback(timestamp)
         } catch (err) {
-            console.error("requestAnimationFrame callback failed", err)
+            console.error("requestAnimationFrame callback failed", err?.stack ?? err?.message ?? String(err))
         }
     }
 }
@@ -880,7 +880,7 @@ class HtmlElement extends BaseNode {
     }
 
     get height() {
-        return this.getAttribute('height')
+        return Number.parseFloat(this.getAttribute('height')) || 0
     }
 
     set height(value) {
@@ -888,7 +888,7 @@ class HtmlElement extends BaseNode {
     }
 
     get width() {
-        return this.getAttribute('width')
+        return Number.parseFloat(this.getAttribute('width')) || 0
     }
 
     set width(value) {
@@ -961,6 +961,9 @@ const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
 const CANVAS_COMMAND_FILL_RECT = "fillRect"
 const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
 const CANVAS_COMMAND_TRANSFORM = "transform"
+const CANVAS_COMMAND_SAVE = "save"
+const CANVAS_COMMAND_RESTORE = "restore"
+const CANVAS_COMMAND_CLEAR_RECT = "clearRect"
 
 class CanvasRenderingContext2D {
     constructor(canvas) {
@@ -989,6 +992,29 @@ class CanvasRenderingContext2D {
             line_width: lineWidth
         })
         core.ops.op_canvas_paint(this.canvas.__node_idx)
+    }
+
+    clearRect(x, y, width, height) {
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_CLEAR_RECT,
+            x,
+            y,
+            width,
+            height
+        })
+        core.ops.op_canvas_paint(this.canvas.__node_idx)
+    }
+
+    save() {
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_SAVE
+        })
+    }
+
+    restore() {
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_RESTORE
+        })
     }
 
     beginPath() {
