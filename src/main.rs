@@ -537,12 +537,12 @@ impl CanvasBuffer {
                 CanvasPathCommand::StrokePath { path, line_width } => {
                     self.apply_stroke(&path, line_width, &transform).unwrap();
                 }
-                CanvasPathCommand::Fill { color } => {
-                    self.apply_fill(&queued_commands, &transform, color)
+                CanvasPathCommand::Fill { color, fill_rule } => {
+                    self.apply_fill(&queued_commands, &transform, color, &fill_rule)
                         .unwrap();
                 }
-                CanvasPathCommand::FillPath { path, color } => {
-                    self.apply_fill(&path, &transform, color).unwrap();
+                CanvasPathCommand::FillPath { path, color, fill_rule } => {
+                    self.apply_fill(&path, &transform, color, &fill_rule).unwrap();
                 }
             }
         }
@@ -561,6 +561,7 @@ impl CanvasBuffer {
         queued_commands: &Vec<CanvasPathCommand>,
         transform: &Option<Matrixf32>,
         color: u32,
+        fill_rule: &CanvasFillRule,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
@@ -689,12 +690,25 @@ impl CanvasBuffer {
         for py in 0..self.height as usize {
             let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
             for px in 0..self.width as usize {
-                if x_pixels[px].iter().any(|ipy| *ipy < py)
-                    && x_pixels[px].iter().any(|ipy| *ipy > py)
-                    && y_pixels[py].iter().any(|ipx| *ipx < px)
-                    && y_pixels[py].iter().any(|ipx| *ipx > px)
-                {
-                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                match fill_rule {
+                    CanvasFillRule::NonZero => {
+                        if x_pixels[px].iter().any(|ipy| *ipy < py)
+                            && x_pixels[px].iter().any(|ipy| *ipy > py)
+                            && y_pixels[py].iter().any(|ipx| *ipx < px)
+                            && y_pixels[py].iter().any(|ipx| *ipx > px)
+                        {
+                            row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                        }
+                    }
+                    CanvasFillRule::EvenOdd => {
+                        if !x_pixels[px].iter().filter(|ipy| **ipy < py).count().is_multiple_of(2)
+                            && !x_pixels[px].iter().filter(|ipy| **ipy > py).count().is_multiple_of(2)
+                            && !y_pixels[py].iter().filter(|ipx| **ipx < px).count().is_multiple_of(2)
+                            && !y_pixels[py].iter().filter(|ipx| **ipx > px).count().is_multiple_of(2)
+                        {
+                            row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                        }
+                    }
                 }
             }
         }
@@ -4566,6 +4580,13 @@ fn op_canvas_record_command(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CanvasFillRule {
+    NonZero,
+    EvenOdd,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CanvasPathCommand {
     MoveTo {
@@ -4582,6 +4603,7 @@ enum CanvasPathCommand {
     Close,
     Fill {
         color: u32,
+        fill_rule: CanvasFillRule,
     },
     Stroke {
         line_width: f64,
@@ -4593,6 +4615,7 @@ enum CanvasPathCommand {
     FillPath {
         path: Vec<CanvasPathCommand>,
         color: u32,
+        fill_rule: CanvasFillRule,
     },
     FillRect {
         x: i32,
@@ -4672,6 +4695,7 @@ fn op_canvas_path_fill(
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[string] fill_style: String,
+    #[serde] fill_rule: CanvasFillRule,
 ) -> Result<(), JsErrorBox> {
     let color =
         match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
@@ -4695,8 +4719,8 @@ fn op_canvas_path_fill(
     match path {
         Some(path) => canvas
             .commands
-            .push(CanvasPathCommand::FillPath { path, color }),
-        None => canvas.commands.push(CanvasPathCommand::Fill { color }),
+            .push(CanvasPathCommand::FillPath { path, color, fill_rule }),
+        None => canvas.commands.push(CanvasPathCommand::Fill { color, fill_rule }),
     }
 
     Ok(())

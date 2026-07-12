@@ -1088,11 +1088,22 @@ class CanvasRenderingContext2D {
         core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
-    fill(suppliedPath = null) {
+    fill(firstArg = null, secondArg = null) {
+        let suppliedPath = null;
+        let fillRule = "nonzero";
+        if (firstArg && secondArg) {
+            suppliedPath = firstArg
+            fillRule = secondArg
+        } else if (firstArg && firstArg instanceof Path2D) {
+            suppliedPath = firstArg
+        } else if (firstArg && typeof firstArg === "string") {
+            fillRule = firstArg
+        }
+
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
 
-        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path, fillStyle)
+        core.ops.op_canvas_path_fill(this.canvas.__node_idx, path, fillStyle, fillRule)
         core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
