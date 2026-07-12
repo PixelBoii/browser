@@ -1042,6 +1042,9 @@ class CanvasRenderingContext2D {
         return new CanvasGradient()
     }
 
+    // TODO: Draw image sources into the canvas buffer with the current transform.
+    drawImage() {}
+
     beginPath() {
         core.ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_BEGIN_PATH
@@ -2852,6 +2855,10 @@ function fetchLogBodyPreview(text) {
     return `${text.slice(0, FETCH_LOG_BODY_LIMIT)}...[truncated ${text.length - FETCH_LOG_BODY_LIMIT} chars]`
 }
 
+function fetchLogContentTypeIsText(contentType) {
+    return contentType.startsWith("text/") || contentType.startsWith("application/json")
+}
+
 function fetchLogBodyText(body) {
     if (body == null) {
         return null
@@ -2867,6 +2874,13 @@ function fetchLogBodyText(body) {
     }
     if (ArrayBuffer.isView(body)) {
         return `[${body.byteLength} bytes omitted]`
+    }
+    if (body instanceof Blob) {
+        return `[${body.size} bytes omitted]`
+    }
+    const contentType = body?.headers?.get?.("content-type") ?? ""
+    if (contentType && !fetchLogContentTypeIsText(contentType)) {
+        return "[bytes omitted]"
     }
     if (typeof body.entries === "function") {
         return JSON.stringify(Array.from(body.entries()).map(([key, value]) => {
