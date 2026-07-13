@@ -357,9 +357,7 @@ impl DomIndexes {
         self.children_index = build_children_index(html_nodes, nodes_idxs);
     }
 
-    pub fn update_bitset_capacity(&mut self, nodes_idxs: &Vec<usize>) {
-        let needed = nodes_idxs.iter().max().map_or(0, |idx| idx + 1);
-
+    pub fn update_bitset_capacity(&mut self, needed: usize) {
         self.node_bitset_capacity = needed;
         for elements in &mut self.class_elements {
             elements.grow(needed);
@@ -4487,7 +4485,6 @@ fn op_append_child<'s>(
                 renderer.nodes_idxs.insert(before_pos, idx);
             }
         }
-        renderer.update_bitset_capacity();
         renderer.recompute_children_index();
         renderer.schedule_dom_update();
 
@@ -6033,10 +6030,6 @@ impl Renderer {
             .cloned()
             .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()));
         owned
-    }
-
-    fn update_bitset_capacity(&mut self) {
-        self.dom_indexes.update_bitset_capacity(&self.nodes_idxs);
     }
 
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
@@ -10077,7 +10070,8 @@ impl Renderer {
     pub fn reserve_node_idx(&mut self) {
         self.nodes.cursor += 1;
         self.nodes_idxs.push(self.nodes.cursor);
-        self.dom_indexes.update_bitset_capacity(&self.nodes_idxs);
+        self.dom_indexes
+            .update_bitset_capacity(self.nodes.cursor + 1);
     }
 
     pub fn insert_node_at_idx(&mut self, idx: usize, node: Node) {
