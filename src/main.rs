@@ -549,19 +549,102 @@ impl CanvasBuffer {
                     x,
                     y,
                 } => {
-                    // TODO: Apply the current canvas transform to images.
                     if let Some(image) =
                         self.images
                             .get(&(image_node_idx, image_width, image_height))
                     {
-                        draw_image_untransformed(
-                            &mut self.buffer,
-                            self.width,
-                            self.height,
-                            image,
-                            x,
-                            y,
-                        );
+                        let image_width = image.width() as usize;
+                        let image_height = image.height() as usize;
+                        let canvas_width = self.width as usize;
+                        let pixels = image.pixels();
+
+                        let mut top_left = [x as f64, y as f64];
+                        let mut top_right = [x as f64 + image_width as f64, y as f64];
+                        let mut bottom_left = [x as f64, y as f64 + image_height as f64];
+                        let mut bottom_right = [x as f64 + image_width as f64, y as f64 + image_height as f64];
+                        if let Some(transform) = &self.transform {
+                            top_left = self.compute_point_transform(&top_left, &transform).unwrap();
+                            top_right = self.compute_point_transform(&top_right, &transform).unwrap();
+                            bottom_left = self.compute_point_transform(&bottom_left, &transform).unwrap();
+                            bottom_right = self.compute_point_transform(&bottom_right, &transform).unwrap();
+                        }
+
+                        let inverse_transform = match &self.transform {
+                            None => None,
+                            Some(transform) => match transform.inverse_affine() {
+                                Some(inverse) => Some(inverse),
+                                None => continue,
+                            },
+                        };
+
+                        let min_x = top_left[0]
+                            .min(top_right[0])
+                            .min(bottom_left[0])
+                            .min(bottom_right[0])
+                            .floor() as i32;
+
+                        let max_x = top_left[0]
+                            .max(top_right[0])
+                            .max(bottom_left[0])
+                            .max(bottom_right[0])
+                            .ceil() as i32;
+
+                        let min_y = top_left[1]
+                            .min(top_right[1])
+                            .min(bottom_left[1])
+                            .min(bottom_right[1])
+                            .floor() as i32;
+
+                        let max_y = top_left[1]
+                            .max(top_right[1])
+                            .max(bottom_left[1])
+                            .max(bottom_right[1])
+                            .ceil() as i32;
+
+                        let start_x = min_x;
+                        let start_y = min_y;
+                        let dest_width = max_x - min_x;
+                        let dest_height = max_y - min_y;
+
+                        for dest_local_y in 0..dest_height {
+                            let destination_y = start_y + dest_local_y as i32;
+                            if destination_y < 0 || destination_y >= self.height as i32 {
+                                continue;
+                            }
+
+                            for dest_local_x in 0..dest_width {
+                                let destination_x = start_x + dest_local_x as i32;
+                                let destination_point = [
+                                    destination_x as f64 + 0.5,
+                                    destination_y as f64 + 0.5,
+                                ];
+                                let user_point = match &inverse_transform {
+                                    Some(inverse) => self.compute_point_transform(&destination_point, inverse).unwrap(),
+                                    None => destination_point,
+                                };
+
+                                let source_x = user_point[0] - x as f64;
+                                let source_y = user_point[1] - y as f64;
+
+                                if source_x < 0.0
+                                    || source_x >= image_width as f64
+                                    || source_y < 0.0
+                                    || source_y >= image_height as f64
+                                {
+                                    continue;
+                                }
+
+                                let source_x = source_x.floor() as usize;
+                                let source_y = source_y.floor() as usize;
+
+                                let source = pixels[source_y * image_width + source_x];
+                                let destination_idx = destination_y as usize * canvas_width + destination_x as usize;
+                                self.buffer[destination_idx] = blend_rgba_with_rgba(
+                                    self.buffer[destination_idx],
+                                    (source.red(), source.green(), source.blue(), source.alpha()),
+                                );
+                            }
+                        }
                     }
                 }
                 CanvasPathCommand::Stroke { line_width } => {
@@ -594,11 +677,10 @@ impl CanvasBuffer {
     }
 
     fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
-        let point_matrix = Matrixf32::new(vec![point[0] as f32, point[1] as f32, 1.], 3, 1);
-        let out = transform
-            .multiply(&point_matrix)
-            .with_context(|| "Invalid shapes")?;
-        Ok([out.get(0, 0) as f64, out.get(1, 0) as f64])
+        Ok([
+            (transform.get(0, 0) * point[0] as f32 + transform.get(0, 1) * point[1] as f32 + transform.get(0, 2)) as f64,
+            (transform.get(1, 0) * point[0] as f32 + transform.get(1, 1) * point[1] as f32 + transform.get(1, 2)) as f64,
+        ])
     }
 
     fn apply_fill(
@@ -932,40 +1014,6 @@ impl CanvasBuffer {
     }
 }
 
-fn draw_image_untransformed(
-    buffer: &mut [u32],
-    canvas_width: u32,
-    canvas_height: u32,
-    image: &Pixmap,
-    x: i32,
-    y: i32,
-) {
-    let image_width = image.width() as usize;
-    let canvas_width = canvas_width as usize;
-    let pixels = image.pixels();
-
-    for source_y in 0..image.height() as usize {
-        let destination_y = y + source_y as i32;
-        if destination_y < 0 || destination_y >= canvas_height as i32 {
-            continue;
-        }
-
-        for source_x in 0..image_width {
-            let destination_x = x + source_x as i32;
-            if destination_x < 0 || destination_x >= canvas_width as i32 {
-                continue;
-            }
-
-            let source = pixels[source_y * image_width + source_x];
-            let destination_idx = destination_y as usize * canvas_width + destination_x as usize;
-            buffer[destination_idx] = blend_rgba_with_rgba(
-                buffer[destination_idx],
-                (source.red(), source.green(), source.blue(), source.alpha()),
-            );
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Matrixf32 {
     data: Vec<f32>,
@@ -986,22 +1034,57 @@ impl Matrixf32 {
         self.data[row * self.columns + column]
     }
 
-    fn multiply(&self, other: &Self) -> Option<Self> {
-        if self.columns != other.rows {
-            return None;
+    fn multiply_into(&self, other: &Self, out: &mut Self) -> Result<()> {
+        if self.columns != other.rows || out.rows != self.rows || out.columns != other.columns {
+            return Err(anyhow!("Invalid shape"));
         }
         let compatibility = self.columns;
-        let mut data = vec![0.; self.rows * other.columns];
         for row in 0..self.rows {
             for column in 0..other.columns {
                 let mut value = 0.;
                 for inner in 0..compatibility {
                     value += self.get(row, inner) * other.get(inner, column);
                 }
-                data[row * other.columns + column] = value;
+                out.data[row * other.columns + column] = value;
             }
         }
-        Some(Self::new(data, self.rows, other.columns))
+        Ok(())
+    }
+
+    fn multiply(&self, other: &Self) -> Option<Self> {
+        let mut out = Self::new(vec![0.; self.rows * other.columns], self.rows, other.columns);
+        self.multiply_into(other, &mut out).ok()?;
+        Some(out)
+    }
+
+    fn inverse_affine(&self) -> Option<Self> {
+        let a = self.get(0, 0);
+        let c = self.get(0, 1);
+        let e = self.get(0, 2);
+        let b = self.get(1, 0);
+        let d = self.get(1, 1);
+        let f = self.get(1, 2);
+
+        let determinant = a * d - b * c;
+        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+            return None;
+        }
+
+        Some(Self::new(
+            vec![
+                d / determinant,
+                -c / determinant,
+                (c * f - d * e) / determinant,
+                -b / determinant,
+                a / determinant,
+                (b * e - a * f) / determinant,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            3,
+            3,
+        ))
     }
 }
 
