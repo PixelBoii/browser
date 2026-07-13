@@ -6277,22 +6277,22 @@ impl Renderer {
         events
     }
 
-    fn get_scrollable_dimensions(&self) -> (usize, u32, u32) {
+    fn get_scrollable_dimensions(&self) -> Option<(usize, u32, u32)> {
         if let Some(hovering) = self.get_scrollable_node_idx() {
             let hovering_layout_idx = self.node_layout_mapping.get(&hovering).unwrap();
             if let Some(layout) = self.layout_table.get(hovering_layout_idx) {
-                return (hovering, layout.content_height, layout.rect.height);
+                return Some((hovering, layout.content_height, layout.rect.height));
             }
         }
         // TODO: This might not cover all cases, like maybe the HTML tag can be larger than the window? Idk. Might wanna add some scroll logic that is independent from nodes.
-        let layout_root_idx = self.layout_roots[0];
+        let layout_root_idx = self.layout_roots.first()?;
         let root_node_idx = self.layout_to_node_idx(&layout_root_idx);
         let root_height = self
             .layout_table
             .get(&layout_root_idx)
             .and_then(|l| Some(l.content_height))
             .unwrap();
-        (root_node_idx, root_height, self.window_size.height)
+        Some((root_node_idx, root_height, self.window_size.height))
     }
 
     fn get_scrollable_node_idx_inner(&self, node_idx: usize) -> Option<usize> {
@@ -12002,8 +12002,10 @@ impl Frame {
     pub fn scroll_y_by(&mut self, y: f32) {
         let scrollable_idx = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-            let (scrollable_idx, content_height, scrollport_height) =
-                renderer.get_scrollable_dimensions();
+            let Some((scrollable_idx, content_height, scrollport_height)) =
+                renderer.get_scrollable_dimensions() else {
+                    return;
+                };
             let max_scroll = (content_height as f32 - scrollport_height as f32).max(0.);
             let scroll_y = renderer.scroll_y.get(&scrollable_idx).cloned().unwrap_or(0);
             if let Some(Animation::ScrollAnimation(existing_animation)) = renderer
