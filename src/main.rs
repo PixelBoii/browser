@@ -10083,10 +10083,20 @@ impl Renderer {
     }
 
     pub fn reserve_node_idx(&mut self) {
-        self.nodes.cursor += 1;
-        self.nodes_idxs.push(self.nodes.cursor);
+        self.reserve_node_idxs(1);
+    }
+
+    fn reserve_node_idxs(&mut self, count: usize) -> usize {
+        let first_idx = self.nodes.cursor + 1;
+        if count == 0 {
+            return first_idx;
+        }
+
+        self.nodes.cursor += count;
+        self.nodes_idxs.extend(first_idx..=self.nodes.cursor);
         self.dom_indexes
             .update_bitset_capacity(self.nodes.cursor + 1);
+        first_idx
     }
 
     pub fn insert_node_at_idx(&mut self, idx: usize, node: Node) {
@@ -10420,10 +10430,10 @@ impl Renderer {
     pub fn create_children_from_html(&mut self, parent_idx: usize, html: String) {
         let mut parser = HtmlParser::new(html);
         parser.parse().expect("Failed to parse inner html");
+        let first_node_idx = self.reserve_node_idxs(parser.nodes.len());
         let mut idx_mapping = HashMap::new();
         for (node_internal_idx, _) in parser.nodes.iter().enumerate() {
-            self.reserve_node_idx();
-            idx_mapping.insert(node_internal_idx, self.nodes.cursor);
+            idx_mapping.insert(node_internal_idx, first_node_idx + node_internal_idx);
         }
         for (node_internal_idx, node) in parser.nodes.iter_mut().enumerate() {
             // Set root elements parent to us
