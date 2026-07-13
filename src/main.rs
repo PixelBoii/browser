@@ -26,6 +26,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::NonZeroU32;
+use std::ops::Mul;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -624,7 +625,7 @@ impl CanvasBuffer {
                         let px = (start_x + idx as f64 * x_ratio).round() as i32;
                         let py = (start_y + idx as f64 * y_ratio).round() as i32;
 
-                        if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
+                        if px < 0 || py < 0 || py >= self.height as i32 {
                             continue;
                         }
 
@@ -648,6 +649,8 @@ impl CanvasBuffer {
                         + distance((cp1[0], cp1[1]), (cp2[0], cp2[1]))
                         + distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1])))
                     .ceil()
+                    // TODO: Multiplying by 3 here is a dirty fix, come back to this
+                    .mul(3.)
                     .max(1.) as usize;
                     let mut last_y = None;
                     for t_idx in 0..=steps {
@@ -720,7 +723,9 @@ impl CanvasBuffer {
                     let Some(max) = edges.iter().max() else {
                         continue;
                     };
-                    for px in *min..*max {
+                    let min = (*min).clamp(0, self.width as usize - 1);
+                    let max = (*max).clamp(0, self.width as usize - 1);
+                    for px in min..max {
                         row[px] = blend_rgba_with_rgba(row[px], color_tuple);
                     }
                 }
@@ -731,8 +736,8 @@ impl CanvasBuffer {
                         panic!("Edge count must be even!");
                     }
                     for edge_pair in edges.chunks_exact(2) {
-                        let edge_start = edge_pair[0];
-                        let edge_end = edge_pair[1];
+                        let edge_start = edge_pair[0].clamp(0, self.width as usize - 1);
+                        let edge_end = edge_pair[1].clamp(0, self.width as usize - 1);
                         for px in edge_start..edge_end {
                             row[px] = blend_rgba_with_rgba(row[px], color_tuple);
                         }
