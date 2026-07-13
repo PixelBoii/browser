@@ -133,8 +133,12 @@ pub enum Overflow {
 }
 
 impl Overflow {
-    pub fn visible(&self) -> bool {
-        *self == Overflow::Visible || *self == Overflow::Auto
+    pub fn clips(&self) -> bool {
+        *self != Overflow::Visible
+    }
+
+    pub fn allows_user_scroll(&self) -> bool {
+        matches!(self, Overflow::Auto | Overflow::Scroll)
     }
 }
 

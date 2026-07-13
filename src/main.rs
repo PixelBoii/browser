@@ -50,8 +50,7 @@ use winit::window::{Window, WindowBuilder};
 
 use crate::css::{
     ClassIndexes, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery,
-    Node as CssNode, Overflow, PropertyValue, PseudoClass, parse_media_query_parts,
-    selector_to_parts,
+    Node as CssNode, PropertyValue, PseudoClass, parse_media_query_parts, selector_to_parts,
 };
 use crate::loader::HttpModuleLoader;
 use crate::parser::{Attributes, CommentElement, TextElement};
@@ -195,6 +194,88 @@ struct Rect {
     border_radius: BorderRadius,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PaintClip {
+    start_x: i32,
+    start_y: i32,
+    end_x: i32,
+    end_y: i32,
+}
+
+impl PaintClip {
+    fn viewport(width: u32, height: u32) -> Self {
+        Self {
+            start_x: 0,
+            start_y: 0,
+            end_x: i32::try_from(width).unwrap_or(i32::MAX),
+            end_y: i32::try_from(height).unwrap_or(i32::MAX),
+        }
+    }
+
+    fn intersect_x(mut self, start_x: i32, end_x: i32) -> Self {
+        self.start_x = self.start_x.max(start_x);
+        self.end_x = self.end_x.min(end_x);
+        self
+    }
+
+    fn intersect_y(mut self, start_y: i32, end_y: i32) -> Self {
+        self.start_y = self.start_y.max(start_y);
+        self.end_y = self.end_y.min(end_y);
+        self
+    }
+
+    fn is_empty(self) -> bool {
+        self.start_x >= self.end_x || self.start_y >= self.end_y
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClippedBlit {
+    src_x: u32,
+    src_y: u32,
+    dst_x: u32,
+    dst_y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn clipped_blit(
+    dst_width: u32,
+    dst_height: u32,
+    src_width: u32,
+    src_height: u32,
+    dst_x: i32,
+    dst_y: i32,
+    clip: PaintClip,
+) -> Option<ClippedBlit> {
+    if dst_width == 0 || dst_height == 0 || src_width == 0 || src_height == 0 || clip.is_empty() {
+        return None;
+    }
+
+    let start_x = dst_x.max(0).max(clip.start_x);
+    let start_y = dst_y.max(0).max(clip.start_y);
+    let end_x = dst_x
+        .saturating_add_unsigned(src_width)
+        .min(i32::try_from(dst_width).unwrap_or(i32::MAX))
+        .min(clip.end_x);
+    let end_y = dst_y
+        .saturating_add_unsigned(src_height)
+        .min(i32::try_from(dst_height).unwrap_or(i32::MAX))
+        .min(clip.end_y);
+    if start_x >= end_x || start_y >= end_y {
+        return None;
+    }
+
+    Some(ClippedBlit {
+        src_x: (start_x - dst_x) as u32,
+        src_y: (start_y - dst_y) as u32,
+        dst_x: start_x as u32,
+        dst_y: start_y as u32,
+        width: (end_x - start_x) as u32,
+        height: (end_y - start_y) as u32,
+    })
+}
+
 #[derive(Debug, Clone)]
 enum LayoutKind {
     Element,
@@ -210,7 +291,6 @@ struct LayoutBox {
     kind: LayoutKind,
     children: Vec<usize>,
     node_idx: usize,
-    allow_overflow: bool,
     content_height: u32,
     z_index: i32,
 }
@@ -1339,7 +1419,10 @@ struct RenderedNode {
     layout_box_idx: usize,
     offset_x: i32,
     offset_y: i32,
+    clip: PaintClip,
 }
+
+type DeferredPaint = (usize, i32, i32, PaintClip);
 
 #[derive(Debug)]
 struct NodesTable {
@@ -5707,32 +5790,20 @@ fn blit_rgb_buffer(
     src_height: u32,
     dst_x: i32,
     dst_y: i32,
+    clip: PaintClip,
 ) {
-    if dst_width == 0 || dst_height == 0 || src_width == 0 || src_height == 0 {
+    let Some(blit) = clipped_blit(
+        dst_width, dst_height, src_width, src_height, dst_x, dst_y, clip,
+    ) else {
         return;
-    }
+    };
 
-    let src_x0 = (-dst_x).max(0) as u32;
-    let src_y0 = (-dst_y).max(0) as u32;
-    let dst_x0 = dst_x.max(0) as u32;
-    let dst_y0 = dst_y.max(0) as u32;
+    for row in 0..blit.height {
+        let src_start = ((blit.src_y + row) * src_width + blit.src_x) as usize;
+        let dst_start = ((blit.dst_y + row) * dst_width + blit.dst_x) as usize;
 
-    if src_x0 >= src_width || src_y0 >= src_height {
-        return;
-    }
-    if dst_x0 >= dst_width || dst_y0 >= dst_height {
-        return;
-    }
-
-    let copy_width = (src_width - src_x0).min(dst_width - dst_x0);
-    let copy_height = (src_height - src_y0).min(dst_height - dst_y0);
-
-    for row in 0..copy_height {
-        let src_start = ((src_y0 + row) * src_width + src_x0) as usize;
-        let dst_start = ((dst_y0 + row) * dst_width + dst_x0) as usize;
-
-        let src_row = &src[src_start..src_start + copy_width as usize];
-        let dst_row = &mut dst[dst_start..dst_start + copy_width as usize];
+        let src_row = &src[src_start..src_start + blit.width as usize];
+        let dst_row = &mut dst[dst_start..dst_start + blit.width as usize];
 
         dst_row.copy_from_slice(src_row);
     }
@@ -5855,10 +5926,13 @@ impl Renderer {
             .find(|n| n.layout_box_idx == layout_box_id);
         let offset_x = layout.rect.x + rendered_node.map(|n| n.offset_x).unwrap_or(0);
         let offset_y = layout.rect.y + rendered_node.map(|n| n.offset_y).unwrap_or(0);
-        offset_x + layout.rect.width as i32 > 0
-            && offset_x < self.window_size.width as i32
-            && offset_y + layout.rect.height as i32 >= 0
-            && offset_y < self.window_size.height as i32
+        let clip = rendered_node.map(|node| node.clip).unwrap_or_else(|| {
+            PaintClip::viewport(self.window_size.width, self.window_size.height)
+        });
+        offset_x + layout.rect.width as i32 > clip.start_x
+            && offset_x < clip.end_x
+            && offset_y + layout.rect.height as i32 >= clip.start_y
+            && offset_y < clip.end_y
     }
 
     fn compute_intersections(&mut self) -> (Vec<usize>, Vec<usize>) {
@@ -6203,11 +6277,11 @@ impl Renderer {
         events
     }
 
-    fn get_scrollable_height(&self) -> (usize, u32) {
+    fn get_scrollable_dimensions(&self) -> (usize, u32, u32) {
         if let Some(hovering) = self.get_scrollable_node_idx() {
             let hovering_layout_idx = self.node_layout_mapping.get(&hovering).unwrap();
             if let Some(layout) = self.layout_table.get(hovering_layout_idx) {
-                return (hovering, layout.content_height);
+                return (hovering, layout.content_height, layout.rect.height);
             }
         }
         // TODO: This might not cover all cases, like maybe the HTML tag can be larger than the window? Idk. Might wanna add some scroll logic that is independent from nodes.
@@ -6218,7 +6292,7 @@ impl Renderer {
             .get(&layout_root_idx)
             .and_then(|l| Some(l.content_height))
             .unwrap();
-        (root_node_idx, root_height)
+        (root_node_idx, root_height, self.window_size.height)
     }
 
     fn get_scrollable_node_idx_inner(&self, node_idx: usize) -> Option<usize> {
@@ -6232,10 +6306,7 @@ impl Renderer {
         } else {
             false
         };
-        if style.is_some_and(|style| {
-            style.overflow_y == Overflow::Auto || style.overflow_y == Overflow::Scroll
-        }) && allow_scroll
-        {
+        if style.is_some_and(|style| style.overflow_y.allows_user_scroll()) && allow_scroll {
             Some(node_idx)
         } else if let Some(parent) = self.nodes.get(node_idx).and_then(|n| n.get_parent()) {
             self.get_scrollable_node_idx_inner(parent)
@@ -6419,63 +6490,6 @@ impl Renderer {
         Ok(())
     }
 
-    fn apply_overflow_constraints_inner(
-        &mut self,
-        layout_box_id: usize,
-        mut overflow_box: Option<(u32, u32, u32, u32)>,
-    ) {
-        let layout_box = self.layout_table.get(&layout_box_id).unwrap();
-        let style = self.node_styles.get(&layout_box.node_idx);
-
-        let (transform_x, transform_y) = style
-            .as_ref()
-            .map(|style| self.resolve_transform_offset(style, &layout_box))
-            .unwrap_or((0, 0));
-
-        let layout_box = self.layout_table.get_mut(&layout_box_id).unwrap();
-
-        if let Some((start_x, start_y, end_x, end_y)) = overflow_box {
-            if layout_box.rect.x + transform_x < start_x as i32 {
-                layout_box.rect.x = start_x as i32;
-            }
-            if layout_box.rect.y + transform_y < start_y as i32 {
-                layout_box.rect.y = start_y as i32;
-            }
-            let target_end_x = layout_box.rect.x + layout_box.rect.width as i32;
-            let overflow_right = target_end_x - end_x as i32;
-            layout_box.rect.width = layout_box
-                .rect
-                .width
-                .saturating_sub_signed(overflow_right.max(0));
-            let target_end_y = layout_box.rect.y + layout_box.rect.height as i32;
-            let overflow_bottom = target_end_y - end_y as i32;
-            layout_box.rect.height = layout_box
-                .rect
-                .height
-                .saturating_sub_signed(overflow_bottom.max(0));
-        }
-
-        if !layout_box.allow_overflow {
-            let rect = &layout_box.rect;
-            overflow_box = Some((
-                rect.x as u32,
-                rect.y as u32,
-                (rect.x + rect.width as i32) as u32,
-                (rect.y + rect.height as i32) as u32,
-            ));
-        }
-
-        for child in layout_box.children.clone() {
-            self.apply_overflow_constraints_inner(child, overflow_box);
-        }
-    }
-
-    fn apply_overflow_constraints(&mut self) {
-        for l in self.layout_roots.clone() {
-            self.apply_overflow_constraints_inner(l, None);
-        }
-    }
-
     fn resolve_pending_canvas_images(&mut self) {
         let dirty_canvas_idxs = self
             .canvas_buffers
@@ -6543,24 +6557,20 @@ impl Renderer {
         if rebuild_layout {
             self.clear_layout_state();
             self.layout_roots = self.build_layout(width, height);
-            self.apply_overflow_constraints();
         }
         self.resolve_pending_canvas_images();
         let mut new_rendered_nodes_ordered = vec![];
         let mut deferred_z_index = vec![];
+        let viewport_clip = PaintClip::viewport(width, height);
         for layout_box_idx in self.layout_roots.clone().iter() {
-            let scroll_y = self
-                .scroll_y
-                .get(&self.layout_to_node_idx(&layout_box_idx))
-                .cloned()
-                .unwrap_or(0);
             self.paint_layout_box(
                 *layout_box_idx,
                 buffer,
                 width,
                 height,
                 0,
-                scroll_y,
+                0,
+                viewport_clip,
                 &mut new_rendered_nodes_ordered,
                 &mut deferred_z_index,
                 true,
@@ -6941,7 +6951,8 @@ impl Renderer {
                     max_w,
                     max_h,
                 )
-                .unwrap();
+                .inspect_err(|err| println!("Failed to rasterize JPEG: {}", err))
+                .ok()?;
                 let (target_h, target_w) = (target_h.max(1), target_w.max(1));
                 if *mode == LayoutMode::Complete {
                     let pixmap =
@@ -7271,7 +7282,6 @@ impl Renderer {
                         kind: LayoutKind::Text(buffer.clone()),
                         children: vec![],
                         node_idx,
-                        allow_overflow: style.overflow_y.visible(),
                         content_height: *height,
                         z_index: 0,
                     },
@@ -7426,7 +7436,6 @@ impl Renderer {
                             kind,
                             children: vec![],
                             node_idx,
-                            allow_overflow: style.overflow_y.visible(),
                             content_height: height,
                             z_index,
                         },
@@ -7478,7 +7487,6 @@ impl Renderer {
                             kind: LayoutKind::Iframe,
                             children: vec![],
                             node_idx,
-                            allow_overflow: false,
                             content_height: height,
                             z_index,
                         },
@@ -7524,7 +7532,6 @@ impl Renderer {
                     if let Some((width, height, mut children, content_height)) = layout {
                         let style = self.node_styles.get(&node_idx).unwrap();
                         let style_bg = style.background.clone();
-                        let allow_overflow = style.overflow_y.visible();
                         let border = RectBorder {
                             left: RectBorderSide::parse_from_style(
                                 &style.border_left,
@@ -7650,7 +7657,6 @@ impl Renderer {
                                 kind: LayoutKind::Element,
                                 children,
                                 node_idx,
-                                allow_overflow,
                                 content_height,
                                 z_index,
                             },
@@ -8043,7 +8049,6 @@ impl Renderer {
                 kind: LayoutKind::Text(buffer.clone()),
                 children: vec![],
                 node_idx,
-                allow_overflow: style.overflow_y.visible(),
                 content_height: *height,
                 z_index: 0,
             },
@@ -9580,10 +9585,16 @@ impl Renderer {
                     .layout_table
                     .get(&renderer_node.layout_box_idx)
                     .unwrap();
-                let start_x = layout_box.rect.x + renderer_node.offset_x;
-                let start_y = layout_box.rect.y + renderer_node.offset_y;
-                let end_x = start_x + layout_box.rect.width as i32;
-                let end_y = start_y + layout_box.rect.height as i32;
+                let start_x =
+                    (layout_box.rect.x + renderer_node.offset_x).max(renderer_node.clip.start_x);
+                let start_y =
+                    (layout_box.rect.y + renderer_node.offset_y).max(renderer_node.clip.start_y);
+                let end_x =
+                    (layout_box.rect.x + renderer_node.offset_x + layout_box.rect.width as i32)
+                        .min(renderer_node.clip.end_x);
+                let end_y =
+                    (layout_box.rect.y + renderer_node.offset_y + layout_box.rect.height as i32)
+                        .min(renderer_node.clip.end_y);
 
                 position.x > start_x
                     && position.x < end_x
@@ -9601,11 +9612,12 @@ impl Renderer {
         height: u32,
         offset_x: i32,
         offset_y: i32,
+        clip: PaintClip,
     ) {
         let container_start_x = layout_box.rect.x + offset_x;
         let container_start_y = layout_box.rect.y + offset_y;
         if let Some(border) = &layout_box.rect.border.left {
-            draw_rect_filled(
+            draw_rect_filled_clipped(
                 buffer,
                 false,
                 width,
@@ -9616,10 +9628,11 @@ impl Renderer {
                 layout_box.rect.height,
                 border.color,
                 &BorderRadius::new_empty(),
+                clip,
             );
         }
         if let Some(border) = &layout_box.rect.border.top {
-            draw_rect_filled(
+            draw_rect_filled_clipped(
                 buffer,
                 false,
                 width,
@@ -9630,10 +9643,11 @@ impl Renderer {
                 border.size,
                 border.color,
                 &BorderRadius::new_empty(),
+                clip,
             );
         }
         if let Some(border) = &layout_box.rect.border.right {
-            draw_rect_filled(
+            draw_rect_filled_clipped(
                 buffer,
                 false,
                 width,
@@ -9644,10 +9658,11 @@ impl Renderer {
                 layout_box.rect.height,
                 border.color,
                 &BorderRadius::new_empty(),
+                clip,
             );
         }
         if let Some(border) = &layout_box.rect.border.bottom {
-            draw_rect_filled(
+            draw_rect_filled_clipped(
                 buffer,
                 false,
                 width,
@@ -9658,6 +9673,7 @@ impl Renderer {
                 border.size,
                 border.color,
                 &BorderRadius::new_empty(),
+                clip,
             );
         }
     }
@@ -9672,30 +9688,37 @@ impl Renderer {
         container_start_y: i32,
         pixmap_buffer: &tiny_skia::Pixmap,
         opaque: bool,
+        clip: PaintClip,
     ) {
         let pixels = pixmap_buffer.pixels();
         let pixmap_width = layout_box.rect.width.min(pixmap_buffer.width());
         let pixmap_height = layout_box.rect.height.min(pixmap_buffer.height());
         let pixmap_stride = pixmap_buffer.width();
-        let end_x = pixmap_width.min((width as i32 - container_start_x).max(0) as u32);
-        let start_y = (-container_start_y).max(0) as u32;
-        let end_y = pixmap_height.min((height as i32 - container_start_y).max(0) as u32);
-        for pixel_y in start_y..end_y {
-            let src_start = (pixel_y * pixmap_stride) as usize;
-            let src_row = &pixels[src_start..src_start + pixmap_width as usize];
-            let dst_start = (container_start_y * width as i32
-                + container_start_x.min(width as i32)
-                + pixel_y as i32 * width as i32) as usize;
-            let dst_row = &mut buffer[dst_start..(dst_start + end_x as usize)];
-            for pixel_x in 0..end_x {
-                let pixel = src_row[pixel_x as usize];
+        let Some(blit) = clipped_blit(
+            width,
+            height,
+            pixmap_width,
+            pixmap_height,
+            container_start_x,
+            container_start_y,
+            clip,
+        ) else {
+            return;
+        };
+
+        for row in 0..blit.height {
+            let src_start = ((blit.src_y + row) * pixmap_stride + blit.src_x) as usize;
+            let src_row = &pixels[src_start..src_start + blit.width as usize];
+            let dst_start = ((blit.dst_y + row) * width + blit.dst_x) as usize;
+            let dst_row = &mut buffer[dst_start..dst_start + blit.width as usize];
+            for pixel_x in 0..blit.width as usize {
+                let pixel = src_row[pixel_x];
                 if opaque {
-                    dst_row[pixel_x as usize] = ((pixel.red() as u32) << 16)
+                    dst_row[pixel_x] = ((pixel.red() as u32) << 16)
                         | ((pixel.green() as u32) << 8)
                         | (pixel.blue() as u32);
                 } else {
-                    dst_row[pixel_x as usize] =
-                        self.blend_premul_over_rgb(dst_row[pixel_x as usize], pixel);
+                    dst_row[pixel_x] = self.blend_premul_over_rgb(dst_row[pixel_x], pixel);
                 }
             }
         }
@@ -9709,15 +9732,20 @@ impl Renderer {
         height: u32,
         parent_offset_x: i32,
         parent_offset_y: i32,
+        clip: PaintClip,
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
-        deferred_z_index: &mut Vec<(usize, i32, i32)>,
+        deferred_z_index: &mut Vec<DeferredPaint>,
         defer_positive_z_index: bool,
     ) {
+        if clip.is_empty() {
+            return;
+        }
+
         let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
         let style = self.node_styles.get(&layout_box.node_idx).cloned();
         let creates_stacking_context = style.as_ref().is_some_and(Self::creates_stacking_context);
         if defer_positive_z_index && layout_box.z_index > 0 && creates_stacking_context {
-            deferred_z_index.push((layout_box_idx, parent_offset_x, parent_offset_y));
+            deferred_z_index.push((layout_box_idx, parent_offset_x, parent_offset_y, clip));
             return;
         }
         let (transform_x, transform_y) = style
@@ -9725,17 +9753,18 @@ impl Renderer {
             .map(|style| self.resolve_transform_offset(style, layout_box))
             .unwrap_or((0, 0));
         let offset_x = parent_offset_x + transform_x;
-        let offset_y = parent_offset_y
+        let offset_y = parent_offset_y + transform_y;
+        let child_offset_y = offset_y
             + self
                 .scroll_y
                 .get(&self.layout_to_node_idx(&layout_box_idx))
-                .cloned()
-                .unwrap_or(0)
-            + transform_y;
+                .copied()
+                .unwrap_or(0);
         rendered_nodes_ordered.push(RenderedNode {
             layout_box_idx,
             offset_x,
             offset_y,
+            clip,
         });
         if style.as_ref().is_some_and(|style| style.opacity == 0.0) {
             return;
@@ -9754,44 +9783,40 @@ impl Renderer {
         if !visible {
             return;
         }
+        let left_border_size = layout_box
+            .rect
+            .border
+            .left
+            .as_ref()
+            .map_or(0, |border| border.size) as i32;
+        let top_border_size = layout_box
+            .rect
+            .border
+            .top
+            .as_ref()
+            .map_or(0, |border| border.size) as i32;
+        let right_border_size = layout_box
+            .rect
+            .border
+            .right
+            .as_ref()
+            .map_or(0, |border| border.size) as i32;
+        let bottom_border_size = layout_box
+            .rect
+            .border
+            .bottom
+            .as_ref()
+            .map_or(0, |border| border.size) as i32;
         match &layout_box.kind {
             LayoutKind::Element => {
-                let left_border_size = layout_box
-                    .rect
-                    .border
-                    .left
-                    .as_ref()
-                    .and_then(|v| Some(v.size))
-                    .unwrap_or(0) as i32;
-                let top_border_size = layout_box
-                    .rect
-                    .border
-                    .top
-                    .as_ref()
-                    .and_then(|v| Some(v.size))
-                    .unwrap_or(0) as i32;
-                let right_border_size = layout_box
-                    .rect
-                    .border
-                    .right
-                    .as_ref()
-                    .and_then(|v| Some(v.size))
-                    .unwrap_or(0) as i32;
-                let bottom_border_size = layout_box
-                    .rect
-                    .border
-                    .bottom
-                    .as_ref()
-                    .and_then(|v| Some(v.size))
-                    .unwrap_or(0) as i32;
                 match &layout_box.rect.background {
                     StyleBackground::Hex(code) => {
-                        draw_rect_filled(
+                        draw_rect_filled_clipped(
                             buffer,
                             false,
                             width,
                             height,
-                            layout_box.rect.x + left_border_size,
+                            container_start_x + left_border_size,
                             container_start_y + top_border_size,
                             (layout_box.rect.width as i32 - left_border_size - right_border_size)
                                 .max(0) as u32,
@@ -9799,6 +9824,7 @@ impl Renderer {
                                 .max(0) as u32,
                             code.clone(),
                             &layout_box.rect.border_radius,
+                            clip,
                         );
                     }
                     StyleBackground::DataUrl(_) => {
@@ -9814,12 +9840,13 @@ impl Renderer {
                                 container_start_y,
                                 pixmap,
                                 false,
+                                clip,
                             );
                         }
                     }
                     _ => {}
                 };
-                self.paint_borders(&layout_box, buffer, width, height, offset_x, offset_y);
+                self.paint_borders(&layout_box, buffer, width, height, offset_x, offset_y, clip);
             }
             LayoutKind::Text(text) => {
                 let bg_hex: Option<u32> = match layout_box.rect.background {
@@ -9827,7 +9854,7 @@ impl Renderer {
                     _ => None,
                 };
                 if let Some(bg) = bg_hex {
-                    draw_rect_filled(
+                    draw_rect_filled_clipped(
                         buffer,
                         false,
                         width,
@@ -9838,6 +9865,7 @@ impl Renderer {
                         layout_box.rect.height,
                         bg,
                         &layout_box.rect.border_radius,
+                        clip,
                     );
                 }
                 self.apply_pixmap_on_buffer(
@@ -9849,6 +9877,7 @@ impl Renderer {
                     container_start_y,
                     text,
                     false,
+                    clip,
                 );
             }
             LayoutKind::PixMap((pixmap_buffer, opaque)) => {
@@ -9861,6 +9890,7 @@ impl Renderer {
                     container_start_y,
                     pixmap_buffer,
                     *opaque,
+                    clip,
                 );
             }
             LayoutKind::Canvas => {
@@ -9885,6 +9915,7 @@ impl Renderer {
                         container_start_y,
                         &pixmap,
                         false,
+                        clip,
                     );
                 }
             }
@@ -9902,10 +9933,31 @@ impl Renderer {
                         layout_box.rect.height,
                         container_start_x,
                         container_start_y,
+                        clip,
                     );
                 } else {
                     println!("Failed to find iframe frame");
                 }
+            }
+        }
+
+        let mut child_clip = clip;
+        if let Some(style) = &style {
+            if style.overflow_x.clips() {
+                child_clip = child_clip.intersect_x(
+                    container_start_x + left_border_size,
+                    container_start_x
+                        .saturating_add_unsigned(layout_box.rect.width)
+                        .saturating_sub(right_border_size),
+                );
+            }
+            if style.overflow_y.clips() {
+                child_clip = child_clip.intersect_y(
+                    container_start_y + top_border_size,
+                    container_start_y
+                        .saturating_add_unsigned(layout_box.rect.height)
+                        .saturating_sub(bottom_border_size),
+                );
             }
         }
 
@@ -9922,7 +9974,8 @@ impl Renderer {
                 width,
                 height,
                 offset_x,
-                offset_y,
+                child_offset_y,
+                child_clip,
                 rendered_nodes_ordered,
                 child_deferred_z_index,
                 true,
@@ -9949,7 +10002,7 @@ impl Renderer {
 
     fn paint_deferred_z_index(
         &mut self,
-        deferred_z_index: &mut Vec<(usize, i32, i32)>,
+        deferred_z_index: &mut Vec<DeferredPaint>,
         buffer: &mut [u32],
         width: u32,
         height: u32,
@@ -9961,7 +10014,8 @@ impl Renderer {
             a_z.cmp(&b_z)
         });
         let deferred_z_index_to_paint = std::mem::take(deferred_z_index);
-        for (child, child_parent_offset_x, child_parent_offset_y) in deferred_z_index_to_paint {
+        for (child, child_parent_offset_x, child_parent_offset_y, clip) in deferred_z_index_to_paint
+        {
             self.paint_layout_box(
                 child,
                 buffer,
@@ -9969,6 +10023,7 @@ impl Renderer {
                 height,
                 child_parent_offset_x,
                 child_parent_offset_y,
+                clip,
                 rendered_nodes_ordered,
                 deferred_z_index,
                 false,
@@ -11947,9 +12002,9 @@ impl Frame {
     pub fn scroll_y_by(&mut self, y: f32) {
         let scrollable_idx = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-            let size = self.render_size;
-            let (scrollable_idx, scrollable_height) = renderer.get_scrollable_height();
-            let max_scroll = (scrollable_height as f32 - size.height as f32).max(0.);
+            let (scrollable_idx, content_height, scrollport_height) =
+                renderer.get_scrollable_dimensions();
+            let max_scroll = (content_height as f32 - scrollport_height as f32).max(0.);
             let scroll_y = renderer.scroll_y.get(&scrollable_idx).cloned().unwrap_or(0);
             if let Some(Animation::ScrollAnimation(existing_animation)) = renderer
                 .animations
@@ -12599,7 +12654,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pontus/browser/pages/test.html".to_string(),
+        "https://vite.dev".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
@@ -12889,12 +12944,47 @@ pub fn draw_rect_filled(
     color: u32,
     border_radius: &BorderRadius,
 ) {
-    let max_x = width as i32;
-    let max_y = height as i32;
-    let start_x = x.max(0);
-    let start_y = y.max(0);
-    let end_x = (x + w as i32).min(max_x);
-    let end_y = (y + h as i32).min(max_y);
+    draw_rect_filled_clipped(
+        buffer,
+        buffer_rgba,
+        width,
+        height,
+        x,
+        y,
+        w,
+        h,
+        color,
+        border_radius,
+        PaintClip::viewport(width, height),
+    );
+}
+
+fn draw_rect_filled_clipped(
+    buffer: &mut [u32],
+    buffer_rgba: bool,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: u32,
+    border_radius: &BorderRadius,
+    clip: PaintClip,
+) {
+    if clip.is_empty() {
+        return;
+    }
+
+    let max_x = i32::try_from(width).unwrap_or(i32::MAX);
+    let max_y = i32::try_from(height).unwrap_or(i32::MAX);
+    let start_x = x.max(0).max(clip.start_x);
+    let start_y = y.max(0).max(clip.start_y);
+    let end_x = x.saturating_add_unsigned(w).min(max_x).min(clip.end_x);
+    let end_y = y.saturating_add_unsigned(h).min(max_y).min(clip.end_y);
+    if start_x >= end_x || start_y >= end_y {
+        return;
+    }
     let stride = width as usize;
 
     let has_border_radius = border_radius.top_left > 0
