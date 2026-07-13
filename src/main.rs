@@ -1412,6 +1412,16 @@ impl RendererProxy {
         }
         Ok(())
     }
+
+    fn fire_tab_updated(&self, buffer: Vec<u32>) -> Result<()> {
+        if let RendererProxy::WindowLoop { proxy, tab_idx } = self {
+            proxy.send_event(UserEvent::TabUpdated {
+                tab_idx: *tab_idx,
+                buffer,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -4109,7 +4119,7 @@ enum UserEvent {
     Navigate((UserNavigateUrl, bool)),
     FrameUpdated,
     CanvasUpdated,
-    TabUpdated(Vec<u32>),
+    TabUpdated { tab_idx: usize, buffer: Vec<u32> },
     TabUrlUpdated { tab_idx: usize, url: String },
     ChildMessage(String),
     ParentMessage(String),
@@ -11903,13 +11913,13 @@ impl Frame {
         match event {
             FrameCommand::Render => {
                 let buffer = self.render_loop();
-                let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
+                let _ = proxy.fire_tab_updated(buffer);
             }
             FrameCommand::Resized(new_size) => {
                 self.render_size = new_size;
                 self.layout_dirty = true;
                 let buffer = self.render_loop();
-                let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
+                let _ = proxy.fire_tab_updated(buffer);
             }
             FrameCommand::UserEvent(
                 event @ (UserEvent::FrameUpdated
@@ -11932,7 +11942,7 @@ impl Frame {
                     _ => unreachable!(),
                 }
                 let buffer = self.render_loop();
-                let _ = proxy.fire_user_event(UserEvent::TabUpdated(buffer));
+                let _ = proxy.fire_tab_updated(buffer);
             }
             FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
                 self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
@@ -12003,9 +12013,10 @@ impl Frame {
         let scrollable_idx = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             let Some((scrollable_idx, content_height, scrollport_height)) =
-                renderer.get_scrollable_dimensions() else {
-                    return;
-                };
+                renderer.get_scrollable_dimensions()
+            else {
+                return;
+            };
             let max_scroll = (content_height as f32 - scrollport_height as f32).max(0.);
             let scroll_y = renderer.scroll_y.get(&scrollable_idx).cloned().unwrap_or(0);
             if let Some(Animation::ScrollAnimation(existing_animation)) = renderer
@@ -12586,7 +12597,10 @@ impl Browser {
                         }
                         _ => {}
                     },
-                    Event::UserEvent(UserEvent::TabUpdated(tab_buffer)) => {
+                    Event::UserEvent(UserEvent::TabUpdated {
+                        tab_idx,
+                        buffer: tab_buffer,
+                    }) if tab_idx == browser.current_tab_idx => {
                         let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
 
                         // Apply data to buffer
@@ -12613,6 +12627,7 @@ impl Browser {
                             }
                         }
                     }
+                    Event::UserEvent(UserEvent::TabUpdated { .. }) => {}
                     Event::UserEvent(UserEvent::TabUrlUpdated { tab_idx, url }) => {
                         let is_current = tab_idx == browser.current_tab_idx;
                         if let Some(tab) = browser.tabs.get_mut(tab_idx) {
