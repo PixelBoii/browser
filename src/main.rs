@@ -434,6 +434,12 @@ impl DomIndexes {
                 .insert(attribute.to_string(), elements);
         }
     }
+
+    pub fn remove_attribute_node(&mut self, attribute: &str, node_idx: usize) {
+        if let Some(existing) = self.attribute_elements.get_mut(attribute) {
+            existing.remove(node_idx);
+        }
+    }
 }
 
 type CanvasImageKey = (usize, Option<u32>, Option<u32>);
@@ -4925,13 +4931,27 @@ fn op_remove_attribute(
 ) -> Result<(), JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    match renderer.nodes.get_mut(node_idx).unwrap() {
-        Node::Element(element) => {
-            element.attributes.remove(&attribute);
-        }
-        _ => {}
+    let removed = match renderer.nodes.get_mut(node_idx).unwrap() {
+        Node::Element(element) => element.attributes.remove(&attribute),
+        _ => None,
     };
-    renderer.recompute_dom_indexes();
+    let Some(removed) = removed else {
+        return Ok(());
+    };
+
+    if attribute == "id" {
+        renderer.dom_indexes.remove_id_node(&removed, node_idx);
+    } else if attribute == "class" {
+        let Renderer {
+            dom_indexes,
+            css_parser,
+            ..
+        } = &mut *renderer;
+        dom_indexes.remove_class_node(&removed, node_idx, &mut css_parser.class_definitions);
+    }
+    renderer
+        .dom_indexes
+        .remove_attribute_node(&attribute, node_idx);
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -6033,12 +6053,7 @@ impl Renderer {
     }
 
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
-        let children = self.dom_indexes.children_index.get(&node_idx);
-        if let Some(children) = children {
-            for child in children.clone() {
-                self.remove_node(child, true);
-            }
-        }
+        self.remove_children(node_idx);
         self.create_children_from_html(node_idx, html);
         self.recompute_dom_indexes();
         self.schedule_dom_update();
@@ -10118,6 +10133,32 @@ impl Renderer {
         self.nodes.remove(node_idx);
         self.node_layout_mapping.remove(&node_idx);
         self.dom_indexes.children_index.remove(&node_idx);
+    }
+
+    fn remove_children(&mut self, parent_idx: usize) {
+        let mut pending = self
+            .dom_indexes
+            .children_index
+            .get(&parent_idx)
+            .cloned()
+            .unwrap_or_default();
+        let mut removed = HashSet::with_capacity(pending.len());
+        while let Some(node_idx) = pending.pop() {
+            if !removed.insert(node_idx) {
+                continue;
+            }
+            if let Some(children) = self.dom_indexes.children_index.get(&node_idx) {
+                pending.extend(children);
+            }
+        }
+
+        self.nodes_idxs.retain(|idx| !removed.contains(idx));
+        for node_idx in removed {
+            self.nodes.remove(node_idx);
+            self.node_layout_mapping.remove(&node_idx);
+            self.dom_indexes.children_index.remove(&node_idx);
+        }
+        self.dom_indexes.children_index.insert(parent_idx, vec![]);
     }
 
     pub fn detach_node(&mut self, node_idx: usize) {

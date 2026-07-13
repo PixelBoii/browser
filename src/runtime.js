@@ -444,6 +444,14 @@ class Event {
     composedPath() {
         return this.__path.slice()
     }
+
+    initEvent(type, bubbles = false, cancelable = false) {
+        this.type = String(type)
+        this.name = this.type
+        this.bubbles = Boolean(bubbles)
+        this.cancelable = Boolean(cancelable)
+        this.defaultPrevented = false
+    }
 }
 
 Object.defineProperty(globalThis, "Event", {
@@ -2011,6 +2019,15 @@ class Document extends EventTarget {
     }
     get referrer() {
         return ""
+    }
+    createEvent(interfaceName) {
+        if (!["Event", "Events", "HTMLEvents"].includes(String(interfaceName))) {
+            throw new DOMException.DOMException(
+                `Unsupported event interface: ${interfaceName}`,
+                "NotSupportedError",
+            )
+        }
+        return new Event("")
     }
     write() {
         // TODO: Implement parser insertion for document.write.
