@@ -358,11 +358,14 @@ impl DomIndexes {
     }
 }
 
+type CanvasImageKey = (usize, Option<u32>, Option<u32>);
+
 #[derive(Debug)]
 struct CanvasBuffer {
     buffer: Vec<u32>,
     width: u32,
     height: u32,
+    images: HashMap<CanvasImageKey, Pixmap>,
     commands: Vec<CanvasPathCommand>,
     current_path: Vec<CanvasPathCommand>,
     transform: Option<Matrixf32>,
@@ -376,6 +379,7 @@ impl CanvasBuffer {
             buffer: vec![0x00_00_00_00; width as usize * height as usize],
             width,
             height,
+            images: HashMap::new(),
             commands: vec![],
             current_path: vec![],
             transform: None,
@@ -536,6 +540,28 @@ impl CanvasBuffer {
                         let row = &mut self.buffer
                             [py * self.width as usize..(py + 1) * self.width as usize];
                         row[start_x..end_x].fill(0);
+                    }
+                }
+                CanvasPathCommand::DrawImage {
+                    image_node_idx,
+                    image_width,
+                    image_height,
+                    x,
+                    y,
+                } => {
+                    // TODO: Apply the current canvas transform to images.
+                    if let Some(image) =
+                        self.images
+                            .get(&(image_node_idx, image_width, image_height))
+                    {
+                        draw_image_untransformed(
+                            &mut self.buffer,
+                            self.width,
+                            self.height,
+                            image,
+                            x,
+                            y,
+                        );
                     }
                 }
                 CanvasPathCommand::Stroke { line_width } => {
@@ -903,6 +929,40 @@ impl CanvasBuffer {
         }
 
         Ok(())
+    }
+}
+
+fn draw_image_untransformed(
+    buffer: &mut [u32],
+    canvas_width: u32,
+    canvas_height: u32,
+    image: &Pixmap,
+    x: i32,
+    y: i32,
+) {
+    let image_width = image.width() as usize;
+    let canvas_width = canvas_width as usize;
+    let pixels = image.pixels();
+
+    for source_y in 0..image.height() as usize {
+        let destination_y = y + source_y as i32;
+        if destination_y < 0 || destination_y >= canvas_height as i32 {
+            continue;
+        }
+
+        for source_x in 0..image_width {
+            let destination_x = x + source_x as i32;
+            if destination_x < 0 || destination_x >= canvas_width as i32 {
+                continue;
+            }
+
+            let source = pixels[source_y * image_width + source_x];
+            let destination_idx = destination_y as usize * canvas_width + destination_x as usize;
+            buffer[destination_idx] = blend_rgba_with_rgba(
+                buffer[destination_idx],
+                (source.red(), source.green(), source.blue(), source.alpha()),
+            );
+        }
     }
 }
 
@@ -4676,6 +4736,21 @@ enum CanvasPathCommand {
         width: u32,
         height: u32,
     },
+    DrawImage {
+        image_node_idx: usize,
+        image_width: Option<u32>,
+        image_height: Option<u32>,
+        x: i32,
+        y: i32,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct CanvasDrawImageRequest {
+    x: f64,
+    y: f64,
+    width: Option<f64>,
+    height: Option<f64>,
 }
 
 fn cubic_bezier(t: f32, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {
@@ -4690,6 +4765,65 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
     let dx = b.0 - a.0;
     let dy = b.1 - a.1;
     (dx * dx + dy * dy).sqrt()
+}
+
+#[op2]
+fn op_canvas_draw_image(
+    state: &mut OpState,
+    #[number] canvas_node_idx: usize,
+    #[number] image_node_idx: usize,
+    #[serde] request: CanvasDrawImageRequest,
+) -> Result<bool, JsErrorBox> {
+    if !request.x.is_finite() || !request.y.is_finite() {
+        return Ok(false);
+    }
+
+    let (input_width, input_height) = match (request.width, request.height) {
+        (None, None) => (None, None),
+        (Some(width), Some(height))
+            if width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0
+                && width <= u32::MAX as f64
+                && height <= u32::MAX as f64 =>
+        {
+            (
+                Some(width.round().max(1.0) as u32),
+                Some(height.round().max(1.0) as u32),
+            )
+        }
+        _ => return Ok(false),
+    };
+
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    if !renderer.nodes.contains_key(image_node_idx) {
+        return Ok(false);
+    }
+    let (Some(canvas_width), Some(canvas_height)) = renderer
+        .nodes
+        .get(canvas_node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return Ok(false);
+    };
+
+    let canvas = renderer
+        .canvas_buffers
+        .entry(canvas_node_idx)
+        .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
+    canvas.resize_if_needed(canvas_width, canvas_height);
+    canvas.commands.push(CanvasPathCommand::DrawImage {
+        image_node_idx,
+        image_width: input_width,
+        image_height: input_height,
+        x: request.x.round() as i32,
+        y: request.y.round() as i32,
+    });
+
+    Ok(true)
 }
 
 #[op2]
@@ -4912,6 +5046,7 @@ extension!(
     op_get_text_content,
     op_tls_peer_certificate,
     op_canvas_record_command,
+    op_canvas_draw_image,
     op_canvas_path_stroke,
     op_canvas_path_fill,
     op_canvas_paint,
@@ -6085,6 +6220,63 @@ impl Renderer {
         }
     }
 
+    fn resolve_pending_canvas_images(&mut self) {
+        let dirty_canvas_idxs = self
+            .canvas_buffers
+            .iter()
+            .filter_map(|(idx, canvas)| canvas.dirty.then_some(*idx))
+            .collect::<Vec<_>>();
+
+        for canvas_idx in dirty_canvas_idxs {
+            let image_keys = self
+                .canvas_buffers
+                .get(&canvas_idx)
+                .map(|canvas| {
+                    canvas
+                        .commands
+                        .iter()
+                        .filter_map(|command| match command {
+                            CanvasPathCommand::DrawImage {
+                                image_node_idx,
+                                image_width,
+                                image_height,
+                                ..
+                            } => Some((*image_node_idx, *image_width, *image_height)),
+                            _ => None,
+                        })
+                        .collect::<HashSet<CanvasImageKey>>()
+                })
+                .unwrap_or_default();
+
+            let resolved_images = image_keys
+                .into_iter()
+                .map(|image_key @ (image_node_idx, image_width, image_height)| {
+                    let image = self
+                        .decode_and_rasterize_img(
+                            image_node_idx,
+                            &LayoutMode::Complete,
+                            image_height,
+                            image_width,
+                            None,
+                            None,
+                        )
+                        .map(|(image, _, _, _)| image);
+                    (image_key, image)
+                })
+                .collect::<Vec<_>>();
+
+            if let Some(canvas) = self.canvas_buffers.get_mut(&canvas_idx) {
+                for (image_key, image) in resolved_images {
+                    if let Some(image) = image {
+                        canvas.images.insert(image_key, image);
+                    } else {
+                        canvas.images.remove(&image_key);
+                    }
+                }
+            }
+        }
+    }
+
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
         if width == 0 || height == 0 {
             return;
@@ -6097,6 +6289,7 @@ impl Renderer {
             self.layout_roots = self.build_layout(width, height);
             self.apply_overflow_constraints();
         }
+        self.resolve_pending_canvas_images();
         let mut new_rendered_nodes_ordered = vec![];
         let mut deferred_z_index = vec![];
         for layout_box_idx in self.layout_roots.clone().iter() {

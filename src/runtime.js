@@ -1043,8 +1043,33 @@ class CanvasRenderingContext2D {
         return new CanvasGradient()
     }
 
-    // TODO: Draw image sources into the canvas buffer with the current transform.
-    drawImage() {}
+    drawImage(image, ...args) {
+        if (!(image instanceof HTMLImageElement) || image.__node_idx == null) {
+            return
+        }
+
+        let x
+        let y
+        let width = null
+        let height = null
+        if (args.length === 2) {
+            [x, y] = args
+        } else if (args.length === 4) {
+            [x, y, width, height] = args
+        } else {
+            // TODO: Support the source-cropping drawImage overload.
+            return
+        }
+
+        const queued = core.ops.op_canvas_draw_image(
+            this.canvas.__node_idx,
+            image.__node_idx,
+            { x, y, width, height },
+        )
+        if (queued) {
+            core.ops.op_canvas_paint(this.canvas.__node_idx)
+        }
+    }
 
     beginPath() {
         core.ops.op_canvas_record_command(this.canvas.__node_idx, {
