@@ -751,6 +751,13 @@ class HtmlElement extends BaseNode {
         return core.ops.op_get_inner_html(this.__node_idx, this.ownerDocument.__frameId)
     }
 
+    get outerHTML() {
+        const attributes = this.attributes
+            .map(attribute => ` ${attribute.name}="${attribute.value}"`)
+            .join("")
+        return `<${this.tag}${attributes}>${this.innerHTML}</${this.tag}>`
+    }
+
     get nodeType() {
         return 1
     }
@@ -2004,6 +2011,9 @@ class Document extends EventTarget {
     }
     get referrer() {
         return ""
+    }
+    write() {
+        // TODO: Implement parser insertion for document.write.
     }
     hasStorageAccess() {
         return Promise.resolve(true)

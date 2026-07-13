@@ -232,6 +232,7 @@ pub struct Style {
     pub border_bottom: StyleSizeAndColor,
     pub grid_template_columns: GridTemplateColumns,
     pub grid_template_rows: GridTemplateColumns,
+    pub grid_column_span: u32,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub z_index: StyleZIndex,
@@ -289,6 +290,7 @@ impl Style {
             border_bottom: self.border_bottom.clone(),
             grid_template_columns: self.grid_template_columns.clone(),
             grid_template_rows: self.grid_template_rows.clone(),
+            grid_column_span: self.grid_column_span,
             overflow_x: self.overflow_x.clone(),
             overflow_y: self.overflow_y.clone(),
             z_index: self.z_index.clone(),
@@ -468,6 +470,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         },
         grid_template_columns: GridTemplateColumns::None,
         grid_template_rows: GridTemplateColumns::None,
+        grid_column_span: 1,
         overflow_x: Overflow::Visible,
         overflow_y: Overflow::Visible,
         z_index: StyleZIndex::Auto,
@@ -1687,6 +1690,16 @@ fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
     ))
 }
 
+fn parse_grid_column_span(value: &str) -> Option<u32> {
+    let mut parts = value.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == "span" {
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
+}
+
 fn parse_background(value: String) -> Result<PropertyValue> {
     let parts = split_ignoring_parentheses(value, ' ', &[]);
     let mut background = StyleBackground::Transparent;
@@ -1910,6 +1923,9 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             }
             "grid-template-columns" => parse_grid_template_columns_value(value)?,
             "grid-template-rows" => parse_grid_template_columns_value(value)?,
+            "grid-column" => parse_grid_column_span(&value)
+                .map(PropertyValue::Int)
+                .unwrap_or(PropertyValue::Raw(value)),
             "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
             "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
             "pointer-events" => PropertyValue::PointerEvents(parse_poiner_events(value)?),
@@ -2222,6 +2238,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("grid-template-rows", PropertyValue::GridTemplateColumns(rows)) => {
             style.grid_template_rows = rows;
+        }
+        ("grid-column", PropertyValue::Int(span)) => {
+            style.grid_column_span = span.max(1);
         }
         ("overflow", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow.clone();

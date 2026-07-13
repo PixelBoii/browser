@@ -5693,6 +5693,7 @@ struct GridBaseItem {
     base_height: u32,
     target_height: u32,
     column: i32,
+    column_span: i32,
     row: i32,
 }
 
@@ -7452,6 +7453,10 @@ impl Renderer {
                         save_as_final,
                     ))
                 } else if element.tag == "iframe" {
+                    let style = self.node_styles.get(&node_idx).unwrap();
+                    if style.display == StyleDisplay::None {
+                        return None;
+                    }
                     let height = element
                         .attributes
                         .get_str("height")
@@ -7463,7 +7468,6 @@ impl Renderer {
                         .and_then(|v| v.parse::<f32>().ok())
                         .unwrap_or(300.) as u32;
                     let url = element.attributes.get_str("src");
-                    let style = self.node_styles.get(&node_idx).unwrap();
                     let z_index = match style.z_index {
                         StyleZIndex::Auto => 0,
                         StyleZIndex::Number(value) => value,
@@ -8070,10 +8074,11 @@ impl Renderer {
     fn get_grid_column(
         &self,
         current_column: i32,
+        column_span: i32,
         template_columns: &Vec<GridTemplateColumnsValue>,
     ) -> bool {
         // Are we out of columns?
-        current_column >= template_columns.len() as i32
+        current_column + column_span > template_columns.len() as i32
     }
 
     fn calculate_grid_item_size(
@@ -8316,9 +8321,13 @@ impl Renderer {
         let mut current_row: usize = 0;
         // Compute base items and their ideal sizes
         for child_idx in immediate_children.iter() {
+            let column_span =
+                self.node_styles
+                    .get(child_idx)
+                    .map_or(1, |style| style.grid_column_span.max(1)) as i32;
             let wrap = match grid_template_columns {
                 GridTemplateColumns::Values(ref template_columns) => {
-                    self.get_grid_column(current_column, &template_columns)
+                    self.get_grid_column(current_column, column_span, &template_columns)
                 }
                 GridTemplateColumns::None => current_column >= 1,
             };
@@ -8352,9 +8361,10 @@ impl Renderer {
                     base_height: child_box.rect.height,
                     target_height: child_box.rect.height,
                     column: current_column,
+                    column_span,
                     row: current_row as i32,
                 });
-                current_column += 1;
+                current_column += column_span;
                 column_count = column_count.max(current_column as usize);
             }
         }
@@ -8394,15 +8404,19 @@ impl Renderer {
         for base_item in base_items.iter_mut() {
             let specified_column_size =
                 if let GridTemplateColumns::Values(columns) = &grid_template_columns {
-                    self.calculate_grid_item_size(
-                        columns,
-                        base_item.column as usize,
-                        width_to_distribute,
-                        dynamic_width_to_give,
-                        max_column_fractions,
-                        total_auto_columns,
-                        &column_max_widths,
-                    )
+                    (base_item.column..base_item.column + base_item.column_span)
+                        .map(|column| {
+                            self.calculate_grid_item_size(
+                                columns,
+                                column as usize,
+                                width_to_distribute,
+                                dynamic_width_to_give,
+                                max_column_fractions,
+                                total_auto_columns,
+                                &column_max_widths,
+                            )
+                        })
+                        .sum()
                 } else {
                     container_sizes.inner_width as i32
                 };
@@ -8454,11 +8468,14 @@ impl Renderer {
                 }
                 _ => base_item.base_width,
             };
-            let forced_height = match child_style.height {
-                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => {
-                    base_item.target_height
+            let forced_height = match (&grid_template_rows, &child_style.height) {
+                (GridTemplateColumns::Values(_), StyleSize::Auto)
+                    if align_items == StyleJustifyContent::Stretch =>
+                {
+                    Some(base_item.target_height)
                 }
-                _ => base_item.base_height,
+                (_, StyleSize::Auto) => None,
+                _ => Some(base_item.base_height),
             };
             if let Some(child) = self.layout_node(
                 base_item.node_idx,
@@ -8469,7 +8486,7 @@ impl Renderer {
                 },
                 OptionalSize {
                     width: Some(forced_width),
-                    height: Some(forced_height),
+                    height: forced_height,
                 },
                 containing_node_idx,
                 child_allow_fill,
@@ -8479,7 +8496,8 @@ impl Renderer {
                 content_position.x += base_item.target_width as i32;
                 longest_row_width =
                     longest_row_width.max(content_position.x - original_content_position.x);
-                max_child_height = max_child_height.max(base_item.target_height as i32);
+                max_child_height =
+                    max_child_height.max(self.layout_table.get(&child).unwrap().rect.height as i32);
                 children.push(child);
             }
         }
