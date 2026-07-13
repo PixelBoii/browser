@@ -1030,8 +1030,20 @@ class CanvasRenderingContext2D {
         })
     }
 
-    // TODO: Track a clipping region in canvas state and apply it to subsequent drawing operations.
-    clip() {}
+    clip(firstArg = null, secondArg = null) {
+        let path = null
+        let fillRule = "nonzero"
+        if (firstArg instanceof Path2D) {
+            path = firstArg.path
+            if (typeof secondArg === "string") {
+                fillRule = secondArg
+            }
+        } else if (typeof firstArg === "string") {
+            fillRule = firstArg
+        }
+
+        core.ops.op_canvas_path_clip(this.canvas.__node_idx, path, fillRule)
+    }
 
     // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
     createLinearGradient() {

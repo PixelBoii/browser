@@ -360,6 +360,82 @@ impl DomIndexes {
 
 type CanvasImageKey = (usize, Option<u32>, Option<u32>);
 
+type CanvasClipMask = Rc<[u8]>;
+
+#[derive(Clone, Debug, Default)]
+struct CanvasState {
+    transform: Option<Matrixf32>,
+    clip_mask: Option<CanvasClipMask>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CanvasSpan {
+    y: usize,
+    start_x: usize,
+    end_x: usize,
+}
+
+fn multiply_coverage(first: u8, second: u8) -> u8 {
+    ((u16::from(first) * u16::from(second) + 127) / 255) as u8
+}
+
+fn clipped_coverage(clip_mask: Option<&[u8]>, pixel_idx: usize, coverage: u8) -> u8 {
+    match clip_mask {
+        Some(mask) => multiply_coverage(coverage, mask[pixel_idx]),
+        None => coverage,
+    }
+}
+
+fn blend_canvas_pixel(
+    buffer: &mut [u32],
+    clip_mask: Option<&[u8]>,
+    pixel_idx: usize,
+    source: (u8, u8, u8, u8),
+    coverage: u8,
+) {
+    let coverage = clipped_coverage(clip_mask, pixel_idx, coverage);
+    if coverage == 0 {
+        return;
+    }
+
+    let source = if coverage == u8::MAX {
+        source
+    } else {
+        (
+            multiply_coverage(source.0, coverage),
+            multiply_coverage(source.1, coverage),
+            multiply_coverage(source.2, coverage),
+            multiply_coverage(source.3, coverage),
+        )
+    };
+    buffer[pixel_idx] = blend_rgba_with_rgba(buffer[pixel_idx], source);
+}
+
+fn clear_canvas_pixel(
+    buffer: &mut [u32],
+    clip_mask: Option<&[u8]>,
+    pixel_idx: usize,
+    coverage: u8,
+) {
+    let coverage = clipped_coverage(clip_mask, pixel_idx, coverage);
+    if coverage == 0 {
+        return;
+    }
+    if coverage == u8::MAX {
+        buffer[pixel_idx] = 0;
+        return;
+    }
+
+    let remaining = u8::MAX - coverage;
+    let [red, green, blue, alpha] = buffer[pixel_idx].to_be_bytes();
+    buffer[pixel_idx] = u32::from_be_bytes([
+        multiply_coverage(red, remaining),
+        multiply_coverage(green, remaining),
+        multiply_coverage(blue, remaining),
+        multiply_coverage(alpha, remaining),
+    ]);
+}
+
 #[derive(Debug)]
 struct CanvasBuffer {
     buffer: Vec<u32>,
@@ -368,8 +444,8 @@ struct CanvasBuffer {
     images: HashMap<CanvasImageKey, Pixmap>,
     commands: Vec<CanvasPathCommand>,
     current_path: Vec<CanvasPathCommand>,
-    transform: Option<Matrixf32>,
-    transform_stack: Vec<Option<Matrixf32>>,
+    state: CanvasState,
+    state_stack: Vec<CanvasState>,
     dirty: bool,
 }
 
@@ -382,8 +458,8 @@ impl CanvasBuffer {
             images: HashMap::new(),
             commands: vec![],
             current_path: vec![],
-            transform: None,
-            transform_stack: vec![],
+            state: CanvasState::default(),
+            state_stack: vec![],
             dirty: false,
         }
     }
@@ -401,8 +477,8 @@ impl CanvasBuffer {
         self.buffer = vec![0; width as usize * height as usize];
         self.commands.clear();
         self.current_path.clear();
-        self.transform = None;
-        self.transform_stack.clear();
+        self.state = CanvasState::default();
+        self.state_stack.clear();
         self.dirty = true;
     }
 
@@ -413,25 +489,84 @@ impl CanvasBuffer {
         }
     }
 
+    fn rect_bounds(&self, x: i32, y: i32, width: u32, height: u32) -> (usize, usize, usize, usize) {
+        let canvas_width = i64::from(self.width);
+        let canvas_height = i64::from(self.height);
+        let start_x = i64::from(x).clamp(0, canvas_width) as usize;
+        let start_y = i64::from(y).clamp(0, canvas_height) as usize;
+        let end_x = (i64::from(x) + i64::from(width)).clamp(0, canvas_width) as usize;
+        let end_y = (i64::from(y) + i64::from(height)).clamp(0, canvas_height) as usize;
+        (start_x, start_y, end_x, end_y)
+    }
+
+    fn blend_pixel(&mut self, x: i32, y: i32, source: (u8, u8, u8, u8), coverage: u8) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+
+        let pixel_idx = y as usize * self.width as usize + x as usize;
+        blend_canvas_pixel(
+            &mut self.buffer,
+            self.state.clip_mask.as_deref(),
+            pixel_idx,
+            source,
+            coverage,
+        );
+    }
+
+    fn fill_rect(&mut self, x: i32, y: i32, width: u32, height: u32, color: u32) {
+        let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
+        let stride = self.width as usize;
+        let source = rgba_to_premul_tuple(color);
+        for py in start_y..end_y {
+            for px in start_x..end_x {
+                let pixel_idx = py * stride + px;
+                blend_canvas_pixel(
+                    &mut self.buffer,
+                    self.state.clip_mask.as_deref(),
+                    pixel_idx,
+                    source,
+                    u8::MAX,
+                );
+            }
+        }
+    }
+
+    fn clear_rect(&mut self, x: i32, y: i32, width: u32, height: u32) {
+        let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
+        let stride = self.width as usize;
+        for py in start_y..end_y {
+            for px in start_x..end_x {
+                let pixel_idx = py * stride + px;
+                clear_canvas_pixel(
+                    &mut self.buffer,
+                    self.state.clip_mask.as_deref(),
+                    pixel_idx,
+                    u8::MAX,
+                );
+            }
+        }
+    }
+
     fn update_buffer(&mut self) {
         let commands = std::mem::take(&mut self.commands);
         for cmd in commands {
             match cmd {
                 CanvasPathCommand::Transform { matrix } => {
-                    self.transform = Some(match self.transform.take() {
+                    self.state.transform = Some(match self.state.transform.take() {
                         Some(current) => current.multiply(&matrix).unwrap(),
                         None => matrix,
                     });
                 }
                 CanvasPathCommand::ResetTransform => {
-                    self.transform = None;
+                    self.state.transform = None;
                 }
                 CanvasPathCommand::Save => {
-                    self.transform_stack.push(self.transform.clone());
+                    self.state_stack.push(self.state.clone());
                 }
                 CanvasPathCommand::Restore => {
-                    if let Some(saved) = self.transform_stack.pop() {
-                        self.transform = saved;
+                    if let Some(saved) = self.state_stack.pop() {
+                        self.state = saved;
                     }
                 }
                 CanvasPathCommand::BeginPath => {
@@ -453,18 +588,7 @@ impl CanvasBuffer {
                     width,
                     height,
                 } => {
-                    draw_rect_filled(
-                        &mut self.buffer,
-                        false,
-                        self.width,
-                        self.height,
-                        x,
-                        y,
-                        width,
-                        height,
-                        0x00_00_00_FF,
-                        &BorderRadius::new_empty(),
-                    );
+                    self.fill_rect(x, y, width, height, 0x00_00_00_FF);
                 }
                 CanvasPathCommand::StrokeRect {
                     x,
@@ -473,53 +597,22 @@ impl CanvasBuffer {
                     height,
                     line_width,
                 } => {
-                    draw_rect_filled(
-                        &mut self.buffer,
-                        false,
-                        self.width,
-                        self.height,
-                        x,
-                        y,
-                        line_width as u32,
-                        height,
-                        0x00_00_00_FF,
-                        &BorderRadius::new_empty(),
-                    ); // Left
-                    draw_rect_filled(
-                        &mut self.buffer,
-                        false,
-                        self.width,
-                        self.height,
-                        x,
-                        y,
-                        width,
-                        line_width as u32,
-                        0x00_00_00_FF,
-                        &BorderRadius::new_empty(),
-                    ); // Top
-                    draw_rect_filled(
-                        &mut self.buffer,
-                        false,
-                        self.width,
-                        self.height,
+                    let line_width = line_width as u32;
+                    self.fill_rect(x, y, line_width, height, 0x00_00_00_FF); // Left
+                    self.fill_rect(x, y, width, line_width, 0x00_00_00_FF); // Top
+                    self.fill_rect(
                         x + width as i32 - line_width as i32,
                         y,
-                        line_width as u32,
+                        line_width,
                         height,
                         0x00_00_00_FF,
-                        &BorderRadius::new_empty(),
                     ); // Right
-                    draw_rect_filled(
-                        &mut self.buffer,
-                        false,
-                        self.width,
-                        self.height,
+                    self.fill_rect(
                         x,
                         y + height as i32 - line_width as i32,
                         width,
-                        line_width as u32,
+                        line_width,
                         0x00_00_00_FF,
-                        &BorderRadius::new_empty(),
                     ); // Bottom
                 }
                 CanvasPathCommand::ClearRect {
@@ -528,19 +621,7 @@ impl CanvasBuffer {
                     width,
                     height,
                 } => {
-                    let start_x = x.max(0).min(self.width as i32) as usize;
-                    let start_y = y.max(0).min(self.height as i32) as usize;
-                    let end_x =
-                        x.saturating_add(width as i32).max(0).min(self.width as i32) as usize;
-                    let end_y = y
-                        .saturating_add(height as i32)
-                        .max(0)
-                        .min(self.height as i32) as usize;
-                    for py in start_y..end_y {
-                        let row = &mut self.buffer
-                            [py * self.width as usize..(py + 1) * self.width as usize];
-                        row[start_x..end_x].fill(0);
-                    }
+                    self.clear_rect(x, y, width, height);
                 }
                 CanvasPathCommand::DrawImage {
                     image_node_idx,
@@ -561,15 +642,24 @@ impl CanvasBuffer {
                         let mut top_left = [x as f64, y as f64];
                         let mut top_right = [x as f64 + image_width as f64, y as f64];
                         let mut bottom_left = [x as f64, y as f64 + image_height as f64];
-                        let mut bottom_right = [x as f64 + image_width as f64, y as f64 + image_height as f64];
-                        if let Some(transform) = &self.transform {
+                        let mut bottom_right = [
+                            x as f64 + image_width as f64,
+                            y as f64 + image_height as f64,
+                        ];
+                        if let Some(transform) = &self.state.transform {
                             top_left = self.compute_point_transform(&top_left, &transform).unwrap();
-                            top_right = self.compute_point_transform(&top_right, &transform).unwrap();
-                            bottom_left = self.compute_point_transform(&bottom_left, &transform).unwrap();
-                            bottom_right = self.compute_point_transform(&bottom_right, &transform).unwrap();
+                            top_right = self
+                                .compute_point_transform(&top_right, &transform)
+                                .unwrap();
+                            bottom_left = self
+                                .compute_point_transform(&bottom_left, &transform)
+                                .unwrap();
+                            bottom_right = self
+                                .compute_point_transform(&bottom_right, &transform)
+                                .unwrap();
                         }
 
-                        let inverse_transform = match &self.transform {
+                        let inverse_transform = match &self.state.transform {
                             None => None,
                             Some(transform) => match transform.inverse_affine() {
                                 Some(inverse) => Some(inverse),
@@ -601,25 +691,19 @@ impl CanvasBuffer {
                             .max(bottom_right[1])
                             .ceil() as i32;
 
-                        let start_x = min_x;
-                        let start_y = min_y;
-                        let dest_width = max_x - min_x;
-                        let dest_height = max_y - min_y;
+                        let start_x = min_x.max(0);
+                        let start_y = min_y.max(0);
+                        let end_x = max_x.min(self.width as i32);
+                        let end_y = max_y.min(self.height as i32);
 
-                        for dest_local_y in 0..dest_height {
-                            let destination_y = start_y + dest_local_y as i32;
-                            if destination_y < 0 || destination_y >= self.height as i32 {
-                                continue;
-                            }
-
-                            for dest_local_x in 0..dest_width {
-                                let destination_x = start_x + dest_local_x as i32;
-                                let destination_point = [
-                                    destination_x as f64 + 0.5,
-                                    destination_y as f64 + 0.5,
-                                ];
+                        for destination_y in start_y..end_y {
+                            for destination_x in start_x..end_x {
+                                let destination_point =
+                                    [destination_x as f64 + 0.5, destination_y as f64 + 0.5];
                                 let user_point = match &inverse_transform {
-                                    Some(inverse) => self.compute_point_transform(&destination_point, inverse).unwrap(),
+                                    Some(inverse) => self
+                                        .compute_point_transform(&destination_point, inverse)
+                                        .unwrap(),
                                     None => destination_point,
                                 };
 
@@ -638,10 +722,14 @@ impl CanvasBuffer {
                                 let source_y = source_y.floor() as usize;
 
                                 let source = pixels[source_y * image_width + source_x];
-                                let destination_idx = destination_y as usize * canvas_width + destination_x as usize;
-                                self.buffer[destination_idx] = blend_rgba_with_rgba(
-                                    self.buffer[destination_idx],
+                                let destination_idx =
+                                    destination_y as usize * canvas_width + destination_x as usize;
+                                blend_canvas_pixel(
+                                    &mut self.buffer,
+                                    self.state.clip_mask.as_deref(),
+                                    destination_idx,
                                     (source.red(), source.green(), source.blue(), source.alpha()),
+                                    u8::MAX,
                                 );
                             }
                         }
@@ -649,17 +737,17 @@ impl CanvasBuffer {
                 }
                 CanvasPathCommand::Stroke { line_width } => {
                     let current_path = self.current_path.clone();
-                    let transform = self.transform.clone();
+                    let transform = self.state.transform.clone();
                     self.apply_stroke(&current_path, line_width, &transform)
                         .unwrap();
                 }
                 CanvasPathCommand::StrokePath { path, line_width } => {
-                    let transform = self.transform.clone();
+                    let transform = self.state.transform.clone();
                     self.apply_stroke(&path, line_width, &transform).unwrap();
                 }
                 CanvasPathCommand::Fill { color, fill_rule } => {
                     let current_path = self.current_path.clone();
-                    let transform = self.transform.clone();
+                    let transform = self.state.transform.clone();
                     self.apply_fill(&current_path, &transform, color, &fill_rule)
                         .unwrap();
                 }
@@ -668,9 +756,19 @@ impl CanvasBuffer {
                     color,
                     fill_rule,
                 } => {
-                    let transform = self.transform.clone();
+                    let transform = self.state.transform.clone();
                     self.apply_fill(&path, &transform, color, &fill_rule)
                         .unwrap();
+                }
+                CanvasPathCommand::Clip { fill_rule } => {
+                    let current_path = self.current_path.clone();
+                    let transform = self.state.transform.clone();
+                    self.apply_clip(&current_path, &transform, &fill_rule)
+                        .unwrap();
+                }
+                CanvasPathCommand::ClipPath { path, fill_rule } => {
+                    let transform = self.state.transform.clone();
+                    self.apply_clip(&path, &transform, &fill_rule).unwrap();
                 }
             }
         }
@@ -678,23 +776,24 @@ impl CanvasBuffer {
 
     fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
         Ok([
-            (transform.get(0, 0) * point[0] as f32 + transform.get(0, 1) * point[1] as f32 + transform.get(0, 2)) as f64,
-            (transform.get(1, 0) * point[0] as f32 + transform.get(1, 1) * point[1] as f32 + transform.get(1, 2)) as f64,
+            (transform.get(0, 0) * point[0] as f32
+                + transform.get(0, 1) * point[1] as f32
+                + transform.get(0, 2)) as f64,
+            (transform.get(1, 0) * point[0] as f32
+                + transform.get(1, 1) * point[1] as f32
+                + transform.get(1, 2)) as f64,
         ])
     }
 
-    fn apply_fill(
-        &mut self,
-        queued_commands: &Vec<CanvasPathCommand>,
+    fn rasterize_path_spans(
+        &self,
+        queued_commands: &[CanvasPathCommand],
         transform: &Option<Matrixf32>,
-        color: u32,
         fill_rule: &CanvasFillRule,
-    ) -> Result<()> {
+    ) -> Result<Vec<CanvasSpan>> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
         let mut y_pixels = vec![vec![]; self.height as usize];
-        let color_tuple = rgba_to_premul_tuple(color);
-        let stride = self.width as usize;
         for cmd in queued_commands {
             match cmd {
                 &CanvasPathCommand::MoveTo { mut point } => {
@@ -816,50 +915,101 @@ impl CanvasBuffer {
             };
         }
 
-        // Fill it in. The process here is relatively simple:
-        // For each pixel, ask the question "Do I have a pixel above me, below me, on my left and on my right?"
-        // If we do, then that pixel is inside and we should fill it in.
-        for py in 0..self.height as usize {
-            let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
+        let width = self.width as usize;
+        let mut spans = vec![];
+        if width == 0 {
+            return Ok(spans);
+        }
+
+        for (py, edges) in y_pixels.iter_mut().enumerate() {
+            edges.sort_unstable();
             match fill_rule {
                 CanvasFillRule::NonZero => {
-                    let edges = &mut y_pixels[py];
-                    edges.sort_unstable();
-                    let Some(min) = edges.iter().min() else {
+                    let Some(min) = edges.first() else {
                         continue;
                     };
-                    let Some(max) = edges.iter().max() else {
+                    let Some(max) = edges.last() else {
                         continue;
                     };
-                    let min = (*min).clamp(0, self.width as usize - 1);
-                    let max = (*max).clamp(0, self.width as usize - 1);
-                    for px in min..max {
-                        row[px] = blend_rgba_with_rgba(row[px], color_tuple);
+                    let min = (*min).min(width - 1);
+                    let max = (*max).min(width - 1);
+                    if min < max {
+                        spans.push(CanvasSpan {
+                            y: py,
+                            start_x: min,
+                            end_x: max,
+                        });
                     }
                 }
                 CanvasFillRule::EvenOdd => {
-                    let edges = &mut y_pixels[py];
-                    edges.sort_unstable();
-                    if !edges.len().is_multiple_of(2) {
-                        panic!("Edge count must be even!");
-                    }
                     for edge_pair in edges.chunks_exact(2) {
-                        let edge_start = edge_pair[0].clamp(0, self.width as usize - 1);
-                        let edge_end = edge_pair[1].clamp(0, self.width as usize - 1);
-                        for px in edge_start..edge_end {
-                            row[px] = blend_rgba_with_rgba(row[px], color_tuple);
+                        let edge_start = edge_pair[0].min(width - 1);
+                        let edge_end = edge_pair[1].min(width - 1);
+                        if edge_start < edge_end {
+                            spans.push(CanvasSpan {
+                                y: py,
+                                start_x: edge_start,
+                                end_x: edge_end,
+                            });
                         }
                     }
                 }
             }
         }
 
+        Ok(spans)
+    }
+
+    fn apply_fill(
+        &mut self,
+        queued_commands: &[CanvasPathCommand],
+        transform: &Option<Matrixf32>,
+        color: u32,
+        fill_rule: &CanvasFillRule,
+    ) -> Result<()> {
+        let spans = self.rasterize_path_spans(queued_commands, transform, fill_rule)?;
+        let source = rgba_to_premul_tuple(color);
+        let stride = self.width as usize;
+        for span in spans {
+            for x in span.start_x..span.end_x {
+                blend_canvas_pixel(
+                    &mut self.buffer,
+                    self.state.clip_mask.as_deref(),
+                    span.y * stride + x,
+                    source,
+                    u8::MAX,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_clip(
+        &mut self,
+        queued_commands: &[CanvasPathCommand],
+        transform: &Option<Matrixf32>,
+        fill_rule: &CanvasFillRule,
+    ) -> Result<()> {
+        let spans = self.rasterize_path_spans(queued_commands, transform, fill_rule)?;
+        let stride = self.width as usize;
+        let mut mask = vec![0; stride * self.height as usize];
+        for span in spans {
+            mask[span.y * stride + span.start_x..span.y * stride + span.end_x].fill(u8::MAX);
+        }
+        if let Some(current_clip) = &self.state.clip_mask {
+            for (coverage, current_coverage) in mask.iter_mut().zip(current_clip.iter()) {
+                *coverage = multiply_coverage(*coverage, *current_coverage);
+            }
+        }
+        self.state.clip_mask = Some(Rc::from(mask));
+
         Ok(())
     }
 
     fn apply_stroke(
         &mut self,
-        queued_commands: &Vec<CanvasPathCommand>,
+        queued_commands: &[CanvasPathCommand],
         line_width: f64,
         transform: &Option<Matrixf32>,
     ) -> Result<()> {
@@ -898,27 +1048,19 @@ impl CanvasBuffer {
                     let y_delta = y - cursor.y as f64;
 
                     let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
-                    let stride = self.width as usize;
+                    if hyp > 0 {
+                        let x_ratio = x_delta / hyp as f64;
+                        let y_ratio = y_delta / hyp as f64;
 
-                    let x_ratio = x_delta / hyp as f64;
-                    let y_ratio = y_delta / hyp as f64;
-
-                    for idx in 0..hyp {
-                        for wxidx in line_width_offset..line_width_end {
-                            for wyidx in line_width_offset..line_width_end {
-                                let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
-                                    .round()
-                                    .min(self.width as f64)
-                                    as i32;
-                                let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
-                                    .round()
-                                    .min(self.height as f64)
-                                    as i32;
-
-                                let row = &mut self.buffer
-                                    [py as usize * stride..(py as usize + 1) * stride];
-                                row[px as usize] =
-                                    blend_rgba_with_rgba(row[px as usize], color_tuple);
+                        for idx in 0..hyp {
+                            for wxidx in line_width_offset..line_width_end {
+                                for wyidx in line_width_offset..line_width_end {
+                                    let px = (start_x + idx as f64 * x_ratio + wxidx as f64).round()
+                                        as i32;
+                                    let py = (start_y + idx as f64 * y_ratio + wyidx as f64).round()
+                                        as i32;
+                                    self.blend_pixel(px, py, color_tuple, u8::MAX);
+                                }
                             }
                         }
                     }
@@ -936,7 +1078,6 @@ impl CanvasBuffer {
                         cp2 = self.compute_point_transform(&cp2, transform)?;
                         endpoint = self.compute_point_transform(&endpoint, transform)?;
                     }
-                    let stride = self.width as i32;
                     let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1]))
                         + distance((cp1[0], cp1[1]), (cp2[0], cp2[1]))
                         + distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1])))
@@ -960,12 +1101,7 @@ impl CanvasBuffer {
 
                         for wxidx in line_width_offset..line_width_end {
                             for wyidx in line_width_offset..line_width_end {
-                                let cord = y * stride + wyidx * stride + x + wxidx;
-                                if cord < 0 || cord >= (self.width * self.height) as i32 {
-                                    continue;
-                                }
-                                let px = &mut self.buffer[cord as usize];
-                                *px = blend_rgba_with_rgba(*px, color_tuple);
+                                self.blend_pixel(x + wxidx, y + wyidx, color_tuple, u8::MAX);
                             }
                         }
                     }
@@ -988,17 +1124,7 @@ impl CanvasBuffer {
                                 as i32;
                             for wxidx in line_width_offset..line_width_end {
                                 for wyidx in line_width_offset..line_width_end {
-                                    let px = x + wxidx;
-                                    let py = y + wyidx;
-                                    if px >= 0
-                                        && py >= 0
-                                        && px < self.width as i32
-                                        && py < self.height as i32
-                                    {
-                                        let idx = py as usize * self.width as usize + px as usize;
-                                        self.buffer[idx] =
-                                            blend_rgba_with_rgba(self.buffer[idx], color_tuple);
-                                    }
+                                    self.blend_pixel(x + wxidx, y + wyidx, color_tuple, u8::MAX);
                                 }
                             }
                         }
@@ -1052,7 +1178,11 @@ impl Matrixf32 {
     }
 
     fn multiply(&self, other: &Self) -> Option<Self> {
-        let mut out = Self::new(vec![0.; self.rows * other.columns], self.rows, other.columns);
+        let mut out = Self::new(
+            vec![0.; self.rows * other.columns],
+            self.rows,
+            other.columns,
+        );
         self.multiply_into(other, &mut out).ok()?;
         Some(out)
     }
@@ -1862,8 +1992,7 @@ fn blend_rgba_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
     let g = src.1 as u32 + (dg * inv_a + 127) / 255;
     let b = src.2 as u32 + (db * inv_a + 127) / 255;
 
-    let output_alpha =
-        a + (da * inv_a + 127) / 255;
+    let output_alpha = a + (da * inv_a + 127) / 255;
 
     (r << 24) | (g << 16) | (b << 8) | output_alpha
 }
@@ -4797,6 +4926,13 @@ enum CanvasPathCommand {
         color: u32,
         fill_rule: CanvasFillRule,
     },
+    Clip {
+        fill_rule: CanvasFillRule,
+    },
+    ClipPath {
+        path: Vec<CanvasPathCommand>,
+        fill_rule: CanvasFillRule,
+    },
     FillRect {
         x: i32,
         y: i32,
@@ -4931,6 +5067,7 @@ fn op_canvas_path_stroke(
         .canvas_buffers
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+    canvas.resize_if_needed(node_width, node_height);
 
     match path {
         Some(path) => canvas
@@ -4970,6 +5107,7 @@ fn op_canvas_path_fill(
         .canvas_buffers
         .entry(node_idx)
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+    canvas.resize_if_needed(node_width, node_height);
 
     match path {
         Some(path) => canvas.commands.push(CanvasPathCommand::FillPath {
@@ -4980,6 +5118,36 @@ fn op_canvas_path_fill(
         None => canvas
             .commands
             .push(CanvasPathCommand::Fill { color, fill_rule }),
+    }
+
+    Ok(())
+}
+
+#[op2]
+fn op_canvas_path_clip(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[serde] path: Option<Vec<CanvasPathCommand>>,
+    #[serde] fill_rule: CanvasFillRule,
+) -> Result<(), JsError> {
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let node = renderer.nodes.get(node_idx).unwrap();
+    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
+        return Ok(());
+    };
+
+    let canvas = renderer
+        .canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+    canvas.resize_if_needed(node_width, node_height);
+
+    match path {
+        Some(path) => canvas
+            .commands
+            .push(CanvasPathCommand::ClipPath { path, fill_rule }),
+        None => canvas.commands.push(CanvasPathCommand::Clip { fill_rule }),
     }
 
     Ok(())
@@ -5136,6 +5304,7 @@ extension!(
     op_canvas_draw_image,
     op_canvas_path_stroke,
     op_canvas_path_fill,
+    op_canvas_path_clip,
     op_canvas_paint,
     op_set_cookie,
     op_get_cookie,
