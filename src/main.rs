@@ -1856,12 +1856,16 @@ fn blend_rgba_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
     let dr = (dst >> 24) & 0xFF;
     let dg = (dst >> 16) & 0xFF;
     let db = (dst >> 8) & 0xFF;
+    let da = dst & 0xFF;
 
     let r = src.0 as u32 + (dr * inv_a + 127) / 255;
     let g = src.1 as u32 + (dg * inv_a + 127) / 255;
     let b = src.2 as u32 + (db * inv_a + 127) / 255;
 
-    (r << 24) | (g << 16) | (b << 8) | a
+    let output_alpha =
+        a + (da * inv_a + 127) / 255;
+
+    (r << 24) | (g << 16) | (b << 8) | output_alpha
 }
 
 fn blend_rgb_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
