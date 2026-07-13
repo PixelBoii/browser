@@ -575,7 +575,6 @@ impl CanvasBuffer {
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
-        let mut x_pixels = vec![vec![]; self.width as usize];
         let mut y_pixels = vec![vec![]; self.height as usize];
         let color_tuple = rgba_to_premul_tuple(color);
         let stride = self.width as usize;
@@ -608,12 +607,12 @@ impl CanvasBuffer {
                     let x_delta = x - cursor.x as f64;
                     let y_delta = y - cursor.y as f64;
 
-                    let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+                    let steps = y_delta.abs().ceil().max(1.) as usize;
 
-                    let x_ratio = x_delta / hyp as f64;
-                    let y_ratio = y_delta / hyp as f64;
+                    let x_ratio = x_delta / steps as f64;
+                    let y_ratio = y_delta / steps as f64;
 
-                    for idx in 0..hyp {
+                    for idx in 0..steps {
                         let px = (start_x + idx as f64 * x_ratio).round() as i32;
                         let py = (start_y + idx as f64 * y_ratio).round() as i32;
 
@@ -621,7 +620,6 @@ impl CanvasBuffer {
                             continue;
                         }
 
-                        x_pixels[px as usize].push(py as usize);
                         y_pixels[py as usize].push(px as usize);
                     }
 
@@ -643,25 +641,26 @@ impl CanvasBuffer {
                         + distance((cp2[0], cp2[1]), (endpoint[0], endpoint[1])))
                     .ceil()
                     .max(1.) as usize;
-                    for x_idx in 0..=steps {
+                    let mut last_y = None;
+                    for t_idx in 0..=steps {
                         let x = cubic_bezier(
-                            x_idx as f32 / steps as f32,
+                            t_idx as f32 / steps as f32,
                             cursor.x,
                             cp1[0] as i32,
                             cp2[0] as i32,
                             endpoint[0] as i32,
                         );
                         let y = cubic_bezier(
-                            x_idx as f32 / steps as f32,
+                            t_idx as f32 / steps as f32,
                             cursor.y,
                             cp1[1] as i32,
                             cp2[1] as i32,
                             endpoint[1] as i32,
                         );
 
-                        if x >= 0 && x < self.width as i32 && y >= 0 && y < self.height as i32 {
-                            x_pixels[x as usize].push(y as usize);
+                        if x >= 0 && x < self.width as i32 && y >= 0 && y < self.height as i32 && last_y.is_none_or(|last| last != y) {
                             y_pixels[y as usize].push(x as usize);
+                            last_y = Some(y);
                         }
                     }
 
@@ -674,7 +673,7 @@ impl CanvasBuffer {
                     };
                     let x_delta = x - cursor.x as f64;
                     let y_delta = y - cursor.y as f64;
-                    let steps = (x_delta.powi(2) + y_delta.powi(2)).sqrt().ceil() as i32;
+                    let steps = y_delta.abs().max(1.) as usize;
                     if steps > 0 {
                         for step in 0..=steps {
                             let px = (cursor.x as f64 + x_delta * step as f64 / steps as f64)
@@ -682,7 +681,6 @@ impl CanvasBuffer {
                             let py = (cursor.y as f64 + y_delta * step as f64 / steps as f64)
                                 .round() as usize;
                             if px < self.width as usize && py < self.height as usize {
-                                x_pixels[px].push(py);
                                 y_pixels[py].push(px);
                             }
                         }
@@ -699,24 +697,31 @@ impl CanvasBuffer {
         // If we do, then that pixel is inside and we should fill it in.
         for py in 0..self.height as usize {
             let row = &mut self.buffer[py as usize * stride..(py as usize + 1) * stride];
-            for px in 0..self.width as usize {
-                match fill_rule {
-                    CanvasFillRule::NonZero => {
-                        if x_pixels[px].iter().any(|ipy| *ipy < py)
-                            && x_pixels[px].iter().any(|ipy| *ipy > py)
-                            && y_pixels[py].iter().any(|ipx| *ipx < px)
-                            && y_pixels[py].iter().any(|ipx| *ipx > px)
-                        {
-                            row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
-                        }
+            match fill_rule {
+                CanvasFillRule::NonZero => {
+                    let edges = &mut y_pixels[py];
+                    edges.sort_unstable();
+                    let Some(min) = edges.iter().min() else {
+                        continue;
+                    };
+                    let Some(max) = edges.iter().max() else {
+                        continue;
+                    };
+                    for px in *min..*max {
+                        row[px] = blend_rgba_with_rgba(row[px], color_tuple);
                     }
-                    CanvasFillRule::EvenOdd => {
-                        if !x_pixels[px].iter().filter(|ipy| **ipy < py).count().is_multiple_of(2)
-                            && !x_pixels[px].iter().filter(|ipy| **ipy > py).count().is_multiple_of(2)
-                            && !y_pixels[py].iter().filter(|ipx| **ipx < px).count().is_multiple_of(2)
-                            && !y_pixels[py].iter().filter(|ipx| **ipx > px).count().is_multiple_of(2)
-                        {
-                            row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
+                }
+                CanvasFillRule::EvenOdd => {
+                    let edges = &mut y_pixels[py];
+                    edges.sort_unstable();
+                    if !edges.len().is_multiple_of(2) {
+                        panic!("Edge count must be even!");
+                    }
+                    for edge_pair in edges.chunks_exact(2) {
+                        let edge_start = edge_pair[0];
+                        let edge_end = edge_pair[1];
+                        for px in edge_start..edge_end {
+                            row[px] = blend_rgba_with_rgba(row[px], color_tuple);
                         }
                     }
                 }
