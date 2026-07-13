@@ -13345,6 +13345,23 @@ mod tests {
     }
 
     #[test]
+    fn render_mingolf() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://mingolf.golf.se/".to_string(),
+            false,
+            PhysicalSize::new(1920, 2160),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 2160];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
+        ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
     fn splits_space_ignoring_parentheses() {
         assert_eq!(
             split_ignoring_parentheses("repeat(2, 1fr) 20px".into(), ' ', &[]),
