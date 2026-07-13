@@ -418,6 +418,9 @@ impl CanvasBuffer {
                         None => matrix,
                     });
                 }
+                CanvasPathCommand::ResetTransform => {
+                    self.transform = None;
+                }
                 CanvasPathCommand::Save => {
                     self.transform_stack.push(self.transform.clone());
                 }
@@ -550,9 +553,14 @@ impl CanvasBuffer {
                     self.apply_fill(&current_path, &transform, color, &fill_rule)
                         .unwrap();
                 }
-                CanvasPathCommand::FillPath { path, color, fill_rule } => {
+                CanvasPathCommand::FillPath {
+                    path,
+                    color,
+                    fill_rule,
+                } => {
                     let transform = self.transform.clone();
-                    self.apply_fill(&path, &transform, color, &fill_rule).unwrap();
+                    self.apply_fill(&path, &transform, color, &fill_rule)
+                        .unwrap();
                 }
             }
         }
@@ -658,7 +666,12 @@ impl CanvasBuffer {
                             endpoint[1] as i32,
                         );
 
-                        if x >= 0 && x < self.width as i32 && y >= 0 && y < self.height as i32 && last_y.is_none_or(|last| last != y) {
+                        if x >= 0
+                            && x < self.width as i32
+                            && y >= 0
+                            && y < self.height as i32
+                            && last_y.is_none_or(|last| last != y)
+                        {
                             y_pixels[y as usize].push(x as usize);
                             last_y = Some(y);
                         }
@@ -4648,6 +4661,7 @@ enum CanvasPathCommand {
     Transform {
         matrix: Matrixf32,
     },
+    ResetTransform,
     Save,
     Restore,
     BeginPath,
@@ -4732,10 +4746,14 @@ fn op_canvas_path_fill(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
 
     match path {
-        Some(path) => canvas
+        Some(path) => canvas.commands.push(CanvasPathCommand::FillPath {
+            path,
+            color,
+            fill_rule,
+        }),
+        None => canvas
             .commands
-            .push(CanvasPathCommand::FillPath { path, color, fill_rule }),
-        None => canvas.commands.push(CanvasPathCommand::Fill { color, fill_rule }),
+            .push(CanvasPathCommand::Fill { color, fill_rule }),
     }
 
     Ok(())

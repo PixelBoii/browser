@@ -961,6 +961,7 @@ const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
 const CANVAS_COMMAND_FILL_RECT = "fillRect"
 const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
 const CANVAS_COMMAND_TRANSFORM = "transform"
+const CANVAS_COMMAND_RESET_TRANSFORM = "resetTransform"
 const CANVAS_COMMAND_SAVE = "save"
 const CANVAS_COMMAND_RESTORE = "restore"
 const CANVAS_COMMAND_CLEAR_RECT = "clearRect"
@@ -1119,6 +1120,12 @@ class CanvasRenderingContext2D {
                 rows: 3,
                 columns: 3,
             },
+        })
+    }
+
+    resetTransform() {
+        core.ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_RESET_TRANSFORM,
         })
     }
 }
