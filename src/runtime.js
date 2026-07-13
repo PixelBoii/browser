@@ -710,9 +710,8 @@ class HtmlElement extends BaseNode {
         this.parentNode?.removeChild(this)
     }
 
-    // TODO: Implement this
     getComputedStyle() {
-        return {}
+        return getComputedStyle(this)
     }
 
     querySelector(selector) {
@@ -2380,16 +2379,34 @@ Object.defineProperty(globalThis, "screen", {
     writable: true,
 })
 
-// TODO: Fill this out from the resolved style table.
-function getComputedStyle() {
-    return {
-        transitionDuration: "0s",
-        transitionDelay: "0s",
-        scrollBehavior: "auto",
-        getPropertyValue() {
-            return ""
-        },
+function getComputedStyle(element) {
+    if (element?.__node_idx == null) {
+        throw new TypeError("getComputedStyle requires an Element")
     }
+
+    const properties = {
+        "font-size": "16px",
+        ...core.ops.op_get_computed_style(element.__node_idx, element.ownerDocument?.__frameId),
+        "transition-duration": "0s",
+        "transition-delay": "0s",
+        "scroll-behavior": "auto",
+    }
+
+    for (const [property, value] of Object.entries(properties)) {
+        const camelCaseProperty = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())
+        properties[camelCaseProperty] = value
+    }
+
+    Object.defineProperty(properties, "getPropertyValue", {
+        value(property) {
+            const propertyName = String(property).trim()
+            const normalizedProperty = propertyName.startsWith("--") ? propertyName : propertyName.toLowerCase()
+            const camelCaseProperty = normalizedProperty.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())
+            return properties[normalizedProperty] ?? properties[camelCaseProperty] ?? ""
+        },
+    })
+
+    return properties
 }
 
 Object.defineProperty(globalThis, "getComputedStyle", {

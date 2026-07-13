@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Display};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
@@ -187,6 +188,204 @@ pub enum StyleTransformOperation {
 pub enum StyleTransform {
     None,
     Operations(Vec<StyleTransformOperation>),
+}
+
+pub fn format_css_number(value: f32) -> String {
+    if value == -0.0 {
+        "0".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn calc_expression_to_css(expression: &[CalcExpression]) -> String {
+    expression
+        .iter()
+        .map(|part| match part {
+            CalcExpression::Size(size) => size.to_string(),
+            CalcExpression::Operator(StyleCalcOperator::Plus) => "+".to_string(),
+            CalcExpression::Operator(StyleCalcOperator::Minus) => "-".to_string(),
+            CalcExpression::Operator(StyleCalcOperator::Divide) => "/".to_string(),
+            CalcExpression::Operator(StyleCalcOperator::Multiply) => "*".to_string(),
+            CalcExpression::Nesting(expression) => {
+                format!("({})", calc_expression_to_css(expression))
+            }
+            CalcExpression::Solved(value) => format_css_number(*value),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl Display for StyleSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StyleSize::Auto => write!(formatter, "auto"),
+            StyleSize::Px(value) => write!(formatter, "{}px", format_css_number(*value)),
+            StyleSize::Em(value) => write!(formatter, "{}em", format_css_number(*value)),
+            StyleSize::Rem(value) => write!(formatter, "{}rem", format_css_number(*value)),
+            StyleSize::Percent(value) => write!(formatter, "{}%", format_css_number(*value)),
+            StyleSize::Vh(value) => write!(formatter, "{value}vh"),
+            StyleSize::Svh(value) => write!(formatter, "{value}svh"),
+            StyleSize::Vw(value) => write!(formatter, "{value}vw"),
+            StyleSize::Clamp { min, value, max } => {
+                write!(formatter, "clamp({min}, {value}, {max})")
+            }
+            StyleSize::Calc(expression) => {
+                write!(formatter, "calc({})", calc_expression_to_css(expression))
+            }
+            StyleSize::FitContent => write!(formatter, "fit-content"),
+            StyleSize::MinContent => write!(formatter, "min-content"),
+            StyleSize::MaxContent => write!(formatter, "max-content"),
+        }
+    }
+}
+
+impl StyleBackground {
+    pub fn to_css_color(&self) -> String {
+        match self {
+            StyleBackground::DataUrl(_) => "rgba(0, 0, 0, 0)".to_string(),
+            _ => self.to_string(),
+        }
+    }
+
+    pub fn to_css_image(&self) -> String {
+        match self {
+            StyleBackground::DataUrl(_) => self.to_string(),
+            _ => "none".to_string(),
+        }
+    }
+}
+
+impl Display for StyleBackground {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StyleBackground::Transparent => write!(formatter, "rgba(0, 0, 0, 0)"),
+            StyleBackground::CurrentColor => write!(formatter, "currentcolor"),
+            StyleBackground::Hex(value) => {
+                let red = value >> 24;
+                let green = value >> 16 & 0xff;
+                let blue = value >> 8 & 0xff;
+                let alpha = value & 0xff;
+                if alpha == 0xff {
+                    write!(formatter, "rgb({red}, {green}, {blue})")
+                } else {
+                    write!(
+                        formatter,
+                        "rgba({red}, {green}, {blue}, {})",
+                        format_css_number(alpha as f32 / 255.0)
+                    )
+                }
+            }
+            StyleBackground::DataUrl((format, data)) => {
+                write!(formatter, "url(\"data:{format},{data}\")")
+            }
+        }
+    }
+}
+
+macro_rules! impl_css_keyword {
+    ($type:ty, $($variant:path => $value:literal),+ $(,)?) => {
+        impl Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(match self {
+                    $($variant => $value),+
+                })
+            }
+        }
+    };
+}
+
+impl_css_keyword!(
+    StyleDisplay,
+    StyleDisplay::None => "none",
+    StyleDisplay::Block => "block",
+    StyleDisplay::InlineBlock => "inline-block",
+    StyleDisplay::Inline => "inline",
+    StyleDisplay::InlineFlex => "inline-flex",
+    StyleDisplay::Flex => "flex",
+    StyleDisplay::Grid => "grid",
+);
+impl_css_keyword!(
+    StyleJustifyContent,
+    StyleJustifyContent::Auto => "auto",
+    StyleJustifyContent::FlexStart => "flex-start",
+    StyleJustifyContent::FlexEnd => "flex-end",
+    StyleJustifyContent::Center => "center",
+    StyleJustifyContent::SpaceBetween => "space-between",
+    StyleJustifyContent::SpaceAround => "space-around",
+    StyleJustifyContent::Stretch => "stretch",
+    StyleJustifyContent::SpaceEvenly => "space-evenly",
+);
+impl_css_keyword!(
+    StyleFlexDirection,
+    StyleFlexDirection::Row => "row",
+    StyleFlexDirection::Column => "column",
+);
+impl_css_keyword!(
+    StylePosition,
+    StylePosition::Static => "static",
+    StylePosition::Relative => "relative",
+    StylePosition::Absolute => "absolute",
+    StylePosition::Fixed => "fixed",
+    StylePosition::Sticky => "sticky",
+);
+impl_css_keyword!(
+    StyleAlign,
+    StyleAlign::Left => "left",
+    StyleAlign::Center => "center",
+    StyleAlign::Right => "right",
+);
+impl_css_keyword!(
+    StyleBorderStyle,
+    StyleBorderStyle::None => "none",
+    StyleBorderStyle::Solid => "solid",
+);
+impl_css_keyword!(
+    Overflow,
+    Overflow::Hidden => "hidden",
+    Overflow::Visible => "visible",
+    Overflow::Auto => "auto",
+    Overflow::Scroll => "scroll",
+    Overflow::Clip => "clip",
+);
+impl_css_keyword!(
+    StylePointerEvents,
+    StylePointerEvents::None => "none",
+    StylePointerEvents::Auto => "auto",
+);
+impl_css_keyword!(
+    StyleVisibility,
+    StyleVisibility::Visible => "visible",
+    StyleVisibility::Hidden => "hidden",
+    StyleVisibility::Collapse => "collapse",
+);
+
+impl Display for StyleZIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StyleZIndex::Number(value) => value.fmt(formatter),
+            StyleZIndex::Auto => formatter.write_str("auto"),
+        }
+    }
+}
+
+impl Display for StyleTransform {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StyleTransform::None => formatter.write_str("none"),
+            StyleTransform::Operations(operations) => formatter.write_str(
+                &operations
+                    .iter()
+                    .map(|operation| match operation {
+                        StyleTransformOperation::Translate { x, y } => {
+                            format!("translate({x}, {y})")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

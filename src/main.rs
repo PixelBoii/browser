@@ -57,8 +57,8 @@ use crate::parser::{Attributes, CommentElement, TextElement};
 use crate::style::{
     CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign,
     StyleBorderStyle, StyleCalcOperator, StylePointerEvents, StyleSizeAndColor, StyleZIndex,
-    build_css_children_index, element_matched_attributes, get_chain_order, get_class_list,
-    get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
+    build_css_children_index, element_matched_attributes, format_css_number, get_chain_order,
+    get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
 };
 use crate::ui::{Typeable, UiBuilder, UiRuntime};
 
@@ -1348,6 +1348,10 @@ enum FrameDomCommand {
     GetInnerHtml {
         node_idx: usize,
         reply: std::sync::mpsc::Sender<String>,
+    },
+    GetComputedStyle {
+        node_idx: usize,
+        reply: std::sync::mpsc::Sender<HashMap<String, String>>,
     },
     CreateElement {
         tag: String,
@@ -3320,7 +3324,8 @@ fn get_specificity_tuple(parts: &Vec<ClassNamePart>) -> [i32; 3] {
             ClassNamePart::Attributes(_)
             | ClassNamePart::PseudoClass(_)
             | ClassNamePart::Class(_) => tuple[1] += 1,
-            ClassNamePart::Tag(_) => tuple[2] += 1,
+            ClassNamePart::Tag(tag) if tag != "*" => tuple[2] += 1,
+            ClassNamePart::Tag(_) => {}
             ClassNamePart::Combined(combined) => {
                 let specificity = get_specificity_tuple(combined);
                 for (idx, value) in specificity.iter().enumerate() {
@@ -4404,6 +4409,138 @@ fn op_get_attributes(
     Ok(value)
 }
 
+fn style_border_to_properties(
+    properties: &mut HashMap<String, String>,
+    side: &str,
+    border: &StyleSizeAndColor,
+) {
+    properties.insert(format!("border-{side}-width"), border.size.to_string());
+    properties.insert(format!("border-{side}-color"), border.color.to_css_color());
+    properties.insert(format!("border-{side}-style"), border.style.to_string());
+}
+
+fn computed_style_properties(renderer: &Renderer, node_idx: usize) -> HashMap<String, String> {
+    let Some(style) = renderer.node_styles.get(&node_idx) else {
+        return HashMap::new();
+    };
+
+    let mut properties = HashMap::from([
+        ("width".to_string(), style.width.to_string()),
+        ("height".to_string(), style.height.to_string()),
+        ("min-width".to_string(), style.min_width.to_string()),
+        ("max-width".to_string(), style.max_width.to_string()),
+        ("min-height".to_string(), style.min_height.to_string()),
+        ("max-height".to_string(), style.max_height.to_string()),
+        (
+            "background-color".to_string(),
+            style.background.to_css_color(),
+        ),
+        (
+            "background-image".to_string(),
+            style.background.to_css_image(),
+        ),
+        ("display".to_string(), style.display.to_string()),
+        ("flex-grow".to_string(), style.flex_grow.to_string()),
+        ("flex-shrink".to_string(), style.flex_shrink.to_string()),
+        ("flex-basis".to_string(), style.flex_basis.to_string()),
+        (
+            "justify-content".to_string(),
+            style.justify_content.to_string(),
+        ),
+        ("justify-items".to_string(), style.justify_items.to_string()),
+        ("align-items".to_string(), style.align_items.to_string()),
+        ("align-self".to_string(), style.align_self.to_string()),
+        (
+            "flex-direction".to_string(),
+            style.flex_direction.to_string(),
+        ),
+        ("gap".to_string(), style.gap.to_string()),
+        ("margin-left".to_string(), style.margin_left.to_string()),
+        ("margin-right".to_string(), style.margin_right.to_string()),
+        ("margin-top".to_string(), style.margin_top.to_string()),
+        ("margin-bottom".to_string(), style.margin_bottom.to_string()),
+        ("padding-left".to_string(), style.padding_left.to_string()),
+        ("padding-right".to_string(), style.padding_right.to_string()),
+        ("padding-top".to_string(), style.padding_top.to_string()),
+        (
+            "padding-bottom".to_string(),
+            style.padding_bottom.to_string(),
+        ),
+        ("color".to_string(), style.color.to_css_color()),
+        ("position".to_string(), style.position.to_string()),
+        ("left".to_string(), style.left.to_string()),
+        ("right".to_string(), style.right.to_string()),
+        ("top".to_string(), style.top.to_string()),
+        ("bottom".to_string(), style.bottom.to_string()),
+        ("text-align".to_string(), style.text_align.to_string()),
+        ("font-size".to_string(), style.font_size.to_string()),
+        (
+            "line-height".to_string(),
+            match style.line_height {
+                StyleSize::Auto => "normal".to_string(),
+                _ => style.line_height.to_string(),
+            },
+        ),
+        ("overflow-x".to_string(), style.overflow_x.to_string()),
+        ("overflow-y".to_string(), style.overflow_y.to_string()),
+        ("z-index".to_string(), style.z_index.to_string()),
+        (
+            "pointer-events".to_string(),
+            style.pointer_events.to_string(),
+        ),
+        ("opacity".to_string(), format_css_number(style.opacity)),
+        ("visibility".to_string(), style.visibility.to_string()),
+        ("transform".to_string(), style.transform.to_string()),
+        (
+            "border-top-left-radius".to_string(),
+            style.border_radius_top_left.to_string(),
+        ),
+        (
+            "border-top-right-radius".to_string(),
+            style.border_radius_top_right.to_string(),
+        ),
+        (
+            "border-bottom-right-radius".to_string(),
+            style.border_radius_bottom_right.to_string(),
+        ),
+        (
+            "border-bottom-left-radius".to_string(),
+            style.border_radius_bottom_left.to_string(),
+        ),
+    ]);
+
+    style_border_to_properties(&mut properties, "left", &style.border_left);
+    style_border_to_properties(&mut properties, "top", &style.border_top);
+    style_border_to_properties(&mut properties, "right", &style.border_right);
+    style_border_to_properties(&mut properties, "bottom", &style.border_bottom);
+
+    for (variable_idx, value) in style.variables.iter() {
+        if let Some(definition) = renderer.variable_definitions.data.get(variable_idx) {
+            properties.insert(definition.property.clone(), value.clone());
+        }
+    }
+
+    properties
+}
+
+#[op2]
+#[serde]
+fn op_get_computed_style(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[number] frame_id: Option<usize>,
+) -> Result<HashMap<String, String>, JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply })
+        })
+    } else {
+        Ok(computed_style_properties(&renderer, node_idx))
+    }
+}
+
 #[op2(fast)]
 fn op_create_comment_element(
     state: &mut OpState,
@@ -5424,6 +5561,7 @@ extension!(
     op_get_closest,
     op_get_attribute,
     op_get_attributes,
+    op_get_computed_style,
     op_post_message_to_parent,
     op_post_message_to_frame,
     op_get_offset_y,
@@ -10911,6 +11049,10 @@ impl Frame {
                 let html = renderer.get_element_inner_html(node_idx);
                 let _ = reply.send(html);
             }
+            FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let _ = reply.send(computed_style_properties(&renderer, node_idx));
+            }
             FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply }) => {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let idx = renderer.create_element(tag);
@@ -13420,6 +13562,10 @@ mod tests {
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
+        frame.apply_hovering(&Position { x: 1140, y: 1850 });
+        frame.on_click()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
     }
