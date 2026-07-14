@@ -340,7 +340,6 @@ struct DomIndexes {
     children_index: HashMap<usize, Vec<usize>>,
     attribute_elements: HashMap<String, FixedBitSet>,
     root_indice: usize,
-    node_bitset_capacity: usize,
 }
 
 impl DomIndexes {
@@ -353,22 +352,6 @@ impl DomIndexes {
         self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     }
 
-    pub fn update_bitset_capacity(&mut self, needed: usize) {
-        self.node_bitset_capacity = needed;
-        for elements in &mut self.class_elements {
-            elements.grow(needed);
-        }
-        for elements in self.tag_elements.values_mut() {
-            elements.grow(needed);
-        }
-        for elements in self.id_elements.values_mut() {
-            elements.grow(needed);
-        }
-        for elements in self.attribute_elements.values_mut() {
-            elements.grow(needed);
-        }
-    }
-
     pub fn remove_id_node(&mut self, id: &String, node_idx: usize) {
         if let Some(existing) = self.id_elements.get_mut(id) {
             existing.remove(node_idx);
@@ -377,10 +360,10 @@ impl DomIndexes {
 
     pub fn add_id_node(&mut self, id: &String, node_idx: usize) {
         if let Some(existing) = self.id_elements.get_mut(id) {
-            existing.insert(node_idx);
+            existing.grow_and_insert(node_idx);
         } else {
-            let mut elements = FixedBitSet::with_capacity(self.node_bitset_capacity);
-            elements.insert(node_idx);
+            let mut elements = FixedBitSet::with_capacity(0);
+            elements.grow_and_insert(node_idx);
             self.id_elements.insert(id.clone(), elements);
         }
     }
@@ -409,23 +392,21 @@ impl DomIndexes {
         for class in class.split_whitespace() {
             let (new, class_idx) = class_indexes.upsert_definition(class.to_string());
             if new {
-                self.class_elements.resize(
-                    class_indexes.len(),
-                    FixedBitSet::with_capacity(self.node_bitset_capacity),
-                );
+                self.class_elements
+                    .resize(class_indexes.len(), FixedBitSet::with_capacity(0));
             }
             if let Some(existing) = self.class_elements.get_mut(class_idx) {
-                existing.insert(node_idx);
+                existing.grow_and_insert(node_idx);
             }
         }
     }
 
     pub fn add_attribute_node(&mut self, attribute: &str, node_idx: usize) {
         if let Some(existing) = self.attribute_elements.get_mut(attribute) {
-            existing.insert(node_idx);
+            existing.grow_and_insert(node_idx);
         } else {
-            let mut elements = FixedBitSet::with_capacity(self.node_bitset_capacity);
-            elements.insert(node_idx);
+            let mut elements = FixedBitSet::with_capacity(0);
+            elements.grow_and_insert(node_idx);
             self.attribute_elements
                 .insert(attribute.to_string(), elements);
         }
@@ -5802,7 +5783,6 @@ fn get_dom_indexes(
         children_index,
         attribute_elements,
         root_indice,
-        node_bitset_capacity: bitset_capacity,
     }
 }
 
@@ -10227,8 +10207,6 @@ impl Renderer {
 
         self.nodes.cursor += count;
         self.nodes_idxs.extend(first_idx..=self.nodes.cursor);
-        self.dom_indexes
-            .update_bitset_capacity(self.nodes.cursor + 1);
         first_idx
     }
 
