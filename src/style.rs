@@ -572,7 +572,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                             }
                         }
                         "span" | "img" | "a" => StyleDisplay::InlineBlock,
-                        "br" => StyleDisplay::Inline,
+                        "br" | "code" => StyleDisplay::Inline,
                         _ => StyleDisplay::Block,
                     }
                 }

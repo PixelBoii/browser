@@ -2593,7 +2593,12 @@ fn compute_node_style(
     window_size: &PhysicalSize<u32>,
     css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
+    ancestor_hidden: bool,
 ) {
+    // Keep cached descendants until their hidden ancestor can render again.
+    if ancestor_hidden && node_styles.contains_key(&node_idx) {
+        return;
+    }
     let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
     let node = &nodes.get(node_idx).unwrap();
     let mut style = if matches!(node, Node::Element(_)) {
@@ -2630,6 +2635,7 @@ fn compute_node_style(
     // Set to resolved size in px so that ems dont stack on top of each other
     style.font_size = StyleSize::Px(resolved_font_size as f32);
 
+    let subtree_hidden = ancestor_hidden || style.display == StyleDisplay::None;
     let resolved_variables = Rc::clone(&style.variables);
 
     node_styles.insert(node_idx, style);
@@ -2650,6 +2656,7 @@ fn compute_node_style(
             window_size,
             css_node_ranking,
             variable_definitions,
+            subtree_hidden,
         );
     }
 }
@@ -3995,12 +4002,16 @@ fn compute_node_styles(
     flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     hovering_chain: &Vec<usize>,
     css_parser: &mut CssParser,
+    mut node_styles: HashMap<usize, Style>,
+    mut resolved_font_sizes: HashMap<usize, u32>,
 ) -> (
     HashMap<usize, Style>,
     HashMap<usize, u32>,
     VariableDefinitions,
     HashSet<usize>,
 ) {
+    node_styles.retain(|idx, _| nodes.contains_key(*idx));
+    resolved_font_sizes.retain(|idx, _| nodes.contains_key(*idx));
     let start = Instant::now();
     let mut parsed_css_nodes = get_css_nodes(
         base_url,
@@ -4049,8 +4060,6 @@ fn compute_node_styles(
         }
     }
 
-    let mut node_styles = HashMap::new();
-    let mut resolved_font_sizes = HashMap::new();
     compute_node_style(
         &mut node_styles,
         &mut resolved_font_sizes,
@@ -4066,6 +4075,7 @@ fn compute_node_styles(
         window_size,
         &css_node_ranking,
         &definitions_map,
+        false,
     );
     println!(
         "computing styles took {} microseconds",
@@ -5995,6 +6005,8 @@ impl Renderer {
                 &mut flattened_css_cache,
                 &vec![],
                 &mut css_parser,
+                HashMap::new(),
+                HashMap::new(),
             );
 
         Self {
@@ -10315,6 +10327,8 @@ impl Renderer {
 
     pub fn recompute_styles(&mut self) {
         let hover_chain = self.get_hover_chain();
+        let node_styles = std::mem::take(&mut self.node_styles);
+        let resolved_font_sizes = std::mem::take(&mut self.resolved_font_sizes);
         (
             self.node_styles,
             self.resolved_font_sizes,
@@ -10333,6 +10347,8 @@ impl Renderer {
             &mut self.flattened_css_cache,
             &hover_chain,
             &mut self.css_parser,
+            node_styles,
+            resolved_font_sizes,
         );
     }
 
@@ -12338,6 +12354,8 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
             &mut flattened_css_cache,
             &hovering_chain,
             &mut css_parser,
+            HashMap::new(),
+            HashMap::new(),
         )
     };
 
@@ -12844,7 +12862,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://vite.dev".to_string(),
+        "https://vite.dev/guide/features".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
