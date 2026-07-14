@@ -637,6 +637,10 @@ class HtmlElement extends BaseNode {
         return attributes
     }
 
+    getAttributeNames() {
+        return Object.keys(core.ops.op_get_attributes(this.__node_idx))
+    }
+
     get children() {
         return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
     }

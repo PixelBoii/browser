@@ -483,6 +483,8 @@ pub fn selector_to_parts(
             let mut buffer = String::new();
             let new_statement = ['.', '#', '[', '>', '~', '+', ':'];
             let mut parentheses_depth = 0;
+            let mut attribute_depth = 0;
+            let mut quote = None;
             let mut escaped = false;
             for char in p.chars() {
                 if escaped {
@@ -504,13 +506,31 @@ pub fn selector_to_parts(
                     escaped = true;
                     continue;
                 }
+                if let Some(active_quote) = quote {
+                    if char == active_quote {
+                        quote = None;
+                    }
+                    buffer.push(char);
+                    continue;
+                }
+                if attribute_depth > 0 && matches!(char, '\'' | '"') {
+                    quote = Some(char);
+                    buffer.push(char);
+                    continue;
+                }
                 if buffer.len() > 0
                     && new_statement.contains(&char)
                     && parentheses_depth == 0
+                    && attribute_depth == 0
                     && !(buffer == ":" && char == ':')
                 {
                     conditions.push(buffer.clone());
                     buffer.clear();
+                }
+                if char == '[' {
+                    attribute_depth += 1;
+                } else if char == ']' && attribute_depth > 0 {
+                    attribute_depth -= 1;
                 }
                 buffer.push(char);
             }

@@ -13516,6 +13516,35 @@ mod tests {
     }
 
     #[test]
+    fn marble_match_hydration_head_payload() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://marblematch.io".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script(
+            "MarbleMatch hydration head reconciliation",
+            r#"
+                const payload = document.head.querySelector('script[id="unhead:payload"]')
+                if (!payload) throw new Error("Missing Unhead payload")
+
+                const attributes = payload.getAttributeNames().reduce((result, name) => {
+                    result[name] = payload.getAttribute(name)
+                    return result
+                }, {})
+                if (attributes.id !== "unhead:payload") {
+                    throw new Error("Failed to read Unhead payload attributes")
+                }
+            "#
+            .to_string(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn render_time_tracker() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
