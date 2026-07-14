@@ -1121,6 +1121,10 @@ class CanvasRenderingContext2D {
         })
     }
 
+    arc() {
+        // TODO: Implement this
+    }
+
     closePath() {
         core.ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_CLOSE
@@ -1386,6 +1390,10 @@ class HTMLTextAreaElement extends HTMLFormControlElement {
 class HTMLSelectElement extends HTMLFormControlElement {
     constructor() {
         super("select")
+    }
+
+    get options() {
+        return this.getElementsByTagName("option")
     }
 }
 

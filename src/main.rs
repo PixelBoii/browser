@@ -4927,20 +4927,23 @@ fn op_set_text_content(
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
 
-    match renderer.nodes.get_mut(node_idx).unwrap() {
+    let needs_index_rebuild = match renderer.nodes.get_mut(node_idx).unwrap() {
         Node::Text(element) => {
             element.text = text;
+            false
         }
         Node::Comment(element) => {
             element.comment = text;
+            false
         }
         Node::Element(_) => {
             let children = renderer
                 .dom_indexes
                 .children_index
                 .get(&node_idx)
-                .unwrap_or(&vec![])
-                .clone();
+                .cloned()
+                .unwrap_or_default();
+            let had_children = !children.is_empty();
             for child in children {
                 renderer.remove_node(child, true);
             }
@@ -4954,10 +4957,15 @@ fn op_set_text_content(
                 .children_index
                 .insert(node_idx, vec![text_idx]);
             renderer.dom_indexes.children_index.insert(text_idx, vec![]);
+            had_children
         }
-    }
+    };
 
-    renderer.recompute_dom_indexes();
+    // Text nodes are absent from the tag/class/id/attribute indexes, and the new parent-child
+    // relationship was recorded above. Only removed descendants can invalidate those indexes.
+    if needs_index_rebuild {
+        renderer.recompute_dom_indexes();
+    }
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -13516,8 +13524,8 @@ mod tests {
     }
 
     #[test]
-    fn marble_match_hydration_head_payload() -> Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
+    fn render_marble_match() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
             "https://marblematch.io".to_string(),
             false,
@@ -13525,23 +13533,11 @@ mod tests {
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
-        frame.execute_host_script(
-            "MarbleMatch hydration head reconciliation",
-            r#"
-                const payload = document.head.querySelector('script[id="unhead:payload"]')
-                if (!payload) throw new Error("Missing Unhead payload")
-
-                const attributes = payload.getAttributeNames().reduce((result, name) => {
-                    result[name] = payload.getAttribute(name)
-                    return result
-                }, {})
-                if (attributes.id !== "unhead:payload") {
-                    throw new Error("Failed to read Unhead payload attributes")
-                }
-            "#
-            .to_string(),
-        )?;
-        Ok(())
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(2)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
+        ensure_snapshot_matches(&buffer, "marblematchio", 1920, 1080)
     }
 
     #[test]
