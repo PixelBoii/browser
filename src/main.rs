@@ -353,10 +353,6 @@ impl DomIndexes {
         self.class_elements = get_dom_indexes_classes(html_nodes, nodes_idxs, class_indexes);
     }
 
-    pub fn recompute_children(&mut self, html_nodes: &NodesTable, nodes_idxs: &Vec<usize>) {
-        self.children_index = build_children_index(html_nodes, nodes_idxs);
-    }
-
     pub fn update_bitset_capacity(&mut self, needed: usize) {
         self.node_bitset_capacity = needed;
         for elements in &mut self.class_elements {
@@ -4628,7 +4624,6 @@ fn op_append_child<'s>(
                 renderer.nodes_idxs.insert(before_pos, idx);
             }
         }
-        renderer.recompute_children_index();
         renderer.schedule_dom_update();
 
         match renderer.extract_script_from_idx(node_idx) {
@@ -10322,11 +10317,6 @@ impl Renderer {
             node.set_parent(None);
         }
         self.node_layout_mapping.remove(&node_idx);
-    }
-
-    pub fn recompute_children_index(&mut self) {
-        self.dom_indexes
-            .recompute_children(&self.nodes, &self.nodes_idxs);
     }
 
     pub fn recompute_dom_indexes(&mut self) {
