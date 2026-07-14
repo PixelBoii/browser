@@ -1538,6 +1538,7 @@ struct FlexItem {
     node_idx: usize,
     target_size: f32,
     base_size: f32,
+    main_margin: i32,
     max_size: f32,
     cross_size: f32,
     max_cross_size: f32,
@@ -9298,6 +9299,18 @@ impl Renderer {
                 .get(child_idx)
                 .cloned()
                 .unwrap_or(font_size);
+            let (margin_left, margin_right, margin_top, margin_bottom) = self.get_margins(
+                *child_idx,
+                &child_style,
+                Size {
+                    width: container_sizes.inner_width,
+                    height: container_sizes.inner_height,
+                },
+            );
+            let main_margin = match style.flex_direction {
+                StyleFlexDirection::Row => margin_left + margin_right,
+                StyleFlexDirection::Column => margin_top + margin_bottom,
+            };
             let flex_basis = self.resolve_flex_basis(
                 &child_style,
                 child_font_size,
@@ -9368,6 +9381,7 @@ impl Renderer {
                     node_idx: *child_idx,
                     target_size: base_size,
                     base_size,
+                    main_margin,
                     max_size: max_size as f32,
                     cross_size: (cross_size as f32).min(max_cross_size as f32),
                     max_cross_size: max_cross_size as f32,
@@ -9377,12 +9391,16 @@ impl Renderer {
             }
         }
 
-        // Shrinking
-        let total_base: f32 = base_items.iter().map(|i| i.base_size).sum();
+        // Flex free space is based on each item's outer size, including fixed main-axis margins.
+        // Auto margins resolve to zero here and receive their share during final alignment.
+        let total_outer_base: f32 = base_items
+            .iter()
+            .map(|item| item.base_size + item.main_margin as f32)
+            .sum();
         let flex_available_size = match style.flex_direction {
             StyleFlexDirection::Row => container_sizes.inner_width,
             StyleFlexDirection::Column if has_definite_height => container_sizes.inner_height,
-            StyleFlexDirection::Column => total_base.max(0.).ceil() as u32,
+            StyleFlexDirection::Column => total_outer_base.max(0.).ceil() as u32,
         };
         let cross_available_size = match style.flex_direction {
             StyleFlexDirection::Column => container_sizes.inner_width,
@@ -9399,7 +9417,7 @@ impl Renderer {
             }
         };
         let distributes_main_space = has_explicit_main_size || fills_main_axis;
-        let overflow = total_base - flex_available_size as f32;
+        let overflow = total_outer_base - flex_available_size as f32;
 
         if overflow > 0. {
             let total_scaled: f32 = base_items
@@ -9479,7 +9497,7 @@ impl Renderer {
 
         let used_main: u32 = base_items
             .iter()
-            .map(|i| i.target_size.round() as u32)
+            .map(|item| (item.target_size + item.main_margin as f32).max(0.).round() as u32)
             .sum::<u32>()
             + gap_total as u32;
         let main_free_space = match style.flex_direction {
