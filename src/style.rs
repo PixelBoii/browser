@@ -397,6 +397,7 @@ pub struct Style {
     pub flex_shrink: u32,
     pub flex_grow: u32,
     pub flex_basis: StyleSize,
+    pub order: i32,
     pub justify_content: StyleJustifyContent,
     pub justify_items: StyleJustifyContent,
     pub align_items: StyleJustifyContent,
@@ -455,6 +456,7 @@ impl Style {
             flex_shrink: self.flex_shrink,
             flex_grow: self.flex_grow,
             flex_basis: self.flex_basis.clone(),
+            order: self.order,
             justify_content: self.justify_content,
             justify_items: self.justify_items,
             align_items: self.align_items,
@@ -583,6 +585,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         flex_shrink: 1,
         flex_grow: 0,
         flex_basis: StyleSize::Auto,
+        order: 0,
         justify_content: StyleJustifyContent::FlexStart,
         justify_items: StyleJustifyContent::Stretch,
         align_items: StyleJustifyContent::Stretch,
@@ -1719,6 +1722,15 @@ mod tests {
 
         assert_eq!(resolved, None);
     }
+
+    #[test]
+    fn parses_signed_flex_order() {
+        let (value, important) =
+            parse_property_value("order".to_string(), "-2".to_string()).unwrap();
+
+        assert_eq!(value, PropertyValue::SignedInt(-2));
+        assert!(!important);
+    }
 }
 
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
@@ -2030,6 +2042,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                 .with_context(|| "Failed to parse text-align")?,
             ),
             "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
+            "order" => PropertyValue::SignedInt(value.parse::<i32>()?),
             "flex-basis" => PropertyValue::Size(parse_style_size(value)?),
             "flex" => {
                 let parts: Vec<&str> = value.split(" ").collect();
@@ -2320,6 +2333,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("flex-basis", PropertyValue::Size(value)) => {
             style.flex_basis = value;
+        }
+        ("order", PropertyValue::SignedInt(value)) => {
+            style.order = value;
         }
         (
             "flex",

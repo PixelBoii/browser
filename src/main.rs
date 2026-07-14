@@ -4430,6 +4430,7 @@ fn computed_style_properties(renderer: &Renderer, node_idx: usize) -> HashMap<St
         ("flex-grow".to_string(), style.flex_grow.to_string()),
         ("flex-shrink".to_string(), style.flex_shrink.to_string()),
         ("flex-basis".to_string(), style.flex_basis.to_string()),
+        ("order".to_string(), style.order.to_string()),
         (
             "justify-content".to_string(),
             style.justify_content.to_string(),
@@ -9217,13 +9218,15 @@ impl Renderer {
             .unwrap()
             .clone();
 
-        let immediate_children: Vec<&usize> = children_idxs
+        let mut immediate_children: Vec<&usize> = children_idxs
             .iter()
             .filter(|c| {
                 let style = &self.node_styles.get(*c).unwrap();
                 !style.position.is_free()
             })
             .collect();
+        // Flex items are laid out by ascending `order`; equal values retain DOM order.
+        immediate_children.sort_by_key(|child_idx| self.node_styles.get(*child_idx).unwrap().order);
         let free_children: Vec<&usize> = children_idxs
             .iter()
             .filter(|c| {
@@ -13483,6 +13486,22 @@ mod tests {
         let mut buffer = vec![0; 1920 * 4320];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 4320, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "vitedev", 1920, 4320)
+    }
+
+    #[test]
+    fn render_vite_features() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://vite.dev/guide/features".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
+        ensure_snapshot_matches(&buffer, "vitefeatures", 1920, 1080)
     }
 
     #[test]

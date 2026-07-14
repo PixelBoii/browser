@@ -157,6 +157,7 @@ pub enum PropertyValue {
     Position(StylePosition),
     Align(StyleAlign),
     Int(u32),
+    SignedInt(i32),
     JustifyContent(StyleJustifyContent),
     FlexDirection(StyleFlexDirection),
     Flex {
