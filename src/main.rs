@@ -797,15 +797,20 @@ impl CanvasBuffer {
                         }
                     }
                 }
-                CanvasPathCommand::Stroke { line_width } => {
+                CanvasPathCommand::Stroke { line_width, color } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&current_path, line_width, &transform)
+                    self.apply_stroke(&current_path, line_width, &transform, color)
                         .unwrap();
                 }
-                CanvasPathCommand::StrokePath { path, line_width } => {
+                CanvasPathCommand::StrokePath {
+                    path,
+                    line_width,
+                    color,
+                } => {
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&path, line_width, &transform).unwrap();
+                    self.apply_stroke(&path, line_width, &transform, color)
+                        .unwrap();
                 }
                 CanvasPathCommand::Fill { color, fill_rule } => {
                     let current_path = self.current_path.clone();
@@ -1074,10 +1079,11 @@ impl CanvasBuffer {
         queued_commands: &[CanvasPathCommand],
         line_width: f64,
         transform: &Option<Matrixf32>,
+        color: u32,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
-        let color_tuple = rgba_to_premul_tuple(0x00_00_00_FF);
+        let color_tuple = rgba_to_premul_tuple(color);
         let line_width_offset = -line_width as i32 / 2;
         let line_width_end = line_width as i32 / 2;
         for cmd in queued_commands {
@@ -5159,10 +5165,12 @@ enum CanvasPathCommand {
     },
     Stroke {
         line_width: f64,
+        color: u32,
     },
     StrokePath {
         path: Vec<CanvasPathCommand>,
         line_width: f64,
+        color: u32,
     },
     FillPath {
         path: Vec<CanvasPathCommand>,
@@ -5298,7 +5306,16 @@ fn op_canvas_path_stroke(
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     line_width: f64,
-) -> Result<(), JsError> {
+    #[string] stroke_style: String,
+) -> Result<(), JsErrorBox> {
+    let color = match style::parse_color(stroke_style)
+        .map_err(|err| JsErrorBox::generic(err.to_string()))?
+    {
+        StyleBackground::Hex(color) => color,
+        StyleBackground::Transparent => 0,
+        _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
+    };
+
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
@@ -5313,12 +5330,14 @@ fn op_canvas_path_stroke(
     canvas.resize_if_needed(node_width, node_height);
 
     match path {
-        Some(path) => canvas
-            .commands
-            .push(CanvasPathCommand::StrokePath { path, line_width }),
+        Some(path) => canvas.commands.push(CanvasPathCommand::StrokePath {
+            path,
+            line_width,
+            color,
+        }),
         None => canvas
             .commands
-            .push(CanvasPathCommand::Stroke { line_width }),
+            .push(CanvasPathCommand::Stroke { line_width, color }),
     }
 
     Ok(())

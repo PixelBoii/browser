@@ -1000,6 +1000,7 @@ class CanvasRenderingContext2D {
         this.canvas = canvas
         this.lineWidth = 1
         this.fillStyle = "#000000"
+        this.strokeStyle = "#000000"
     }
 
     fillRect(x, y, width, height) {
@@ -1143,8 +1144,9 @@ class CanvasRenderingContext2D {
     stroke(suppliedPath = null) {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
+        const strokeStyle = typeof this.strokeStyle === "string" ? this.strokeStyle : "#000000"
 
-        core.ops.op_canvas_path_stroke(this.canvas.__node_idx, path, lineWidth)
+        core.ops.op_canvas_path_stroke(this.canvas.__node_idx, path, lineWidth, strokeStyle)
         core.ops.op_canvas_paint(this.canvas.__node_idx)
     }
 
