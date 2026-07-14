@@ -59,6 +59,7 @@ use crate::style::{
     StyleBorderStyle, StyleCalcOperator, StylePointerEvents, StyleSizeAndColor, StyleZIndex,
     build_css_children_index, element_matched_attributes, format_css_number, get_chain_order,
     get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
+    split_ignoring_parentheses,
 };
 use crate::ui::{Typeable, UiBuilder, UiRuntime};
 
@@ -6141,15 +6142,24 @@ impl Renderer {
         selector: String,
         required_parent: Option<usize>,
     ) -> Vec<usize> {
-        let selector = selector_to_parts(&selector, &mut self.css_parser.class_definitions);
-        query_selector_all(
-            &self.nodes,
-            selector,
-            &self.window_size,
-            &self.dom_indexes,
-            &self.get_hover_chain(),
-            required_parent,
-        )
+        let mut matches = Vec::new();
+        for selector in split_ignoring_parentheses(selector, ',', &[]) {
+            let selector = selector_to_parts(
+                &selector.trim().to_string(),
+                &mut self.css_parser.class_definitions,
+            );
+            matches.extend(query_selector_all(
+                &self.nodes,
+                selector,
+                &self.window_size,
+                &self.dom_indexes,
+                &self.get_hover_chain(),
+                required_parent,
+            ));
+        }
+        matches.sort_unstable();
+        matches.dedup();
+        matches
     }
 
     fn query_selector_all_nodes(
@@ -13498,6 +13508,7 @@ mod tests {
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;

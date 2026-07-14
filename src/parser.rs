@@ -516,6 +516,7 @@ impl HtmlParser {
                 },
                 ' ' | '\n' => match self.stage {
                     BuildPhase::Start => {
+                        self.stage = BuildPhase::Text;
                         self.tag.push(char);
                     }
                     BuildPhase::Tag => {
