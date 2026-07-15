@@ -3,16 +3,17 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc::Sender};
 
 use anyhow::{Context, Result, anyhow};
+use render::{BorderRadius, FontHandler, blend_rgb_with_rgba, draw_rect_filled, text_to_buffer};
 use resvg::tiny_skia::Pixmap;
 use winit::{
     event::KeyEvent,
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use crate::{
-    BrowserAction, FontHandler, Position, blend_rgb_with_rgba, blend_rgba_with_rgba,
-    draw_rect_filled, text_to_buffer,
-};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiEvent {
+    Rerender,
+}
 
 pub struct UiBuilder {
     curr: Option<usize>,
@@ -20,7 +21,7 @@ pub struct UiBuilder {
     width: u32,
     height: u32,
     font_handler: Rc<FontHandler>,
-    pub comms_tx: Sender<BrowserAction>,
+    pub comms_tx: Sender<UiEvent>,
 }
 
 pub struct Typeable {
@@ -91,12 +92,7 @@ pub struct UiRuntime<T> {
 }
 
 impl<T> UiRuntime<T> {
-    pub fn new_empty(
-        width: u32,
-        height: u32,
-        comms_tx: Sender<BrowserAction>,
-        state: T,
-    ) -> Result<Self> {
+    pub fn new_empty(width: u32, height: u32, comms_tx: Sender<UiEvent>, state: T) -> Result<Self> {
         Ok(Self {
             builder: UiBuilder {
                 curr: None,
@@ -114,7 +110,7 @@ impl<T> UiRuntime<T> {
         })
     }
 
-    pub fn apply_hovering(&mut self, position: Position) {
+    pub fn apply_hovering(&mut self, x: i32, y: i32) {
         for layout_box in self.layout.iter().rev() {
             let start_x = layout_box.x;
             let start_y = layout_box.y;
@@ -122,10 +118,10 @@ impl<T> UiRuntime<T> {
             let end_y = start_y + layout_box.height as i32;
 
             if matches!(&&self.builder.nodes[layout_box.node_idx], Node::Element(_))
-                && position.x >= start_x
-                && position.x < end_x
-                && position.y >= start_y
-                && position.y < end_y
+                && x >= start_x
+                && x < end_x
+                && y >= start_y
+                && y < end_y
             {
                 self.hovering = Some(layout_box.node_idx);
                 return;
@@ -185,7 +181,7 @@ impl<T> UiRuntime<T> {
             if let Some(on_input) = &typeable.on_input {
                 on_input(&*typeable);
             }
-            let _ = self.builder.comms_tx.send(BrowserAction::Rerender);
+            let _ = self.builder.comms_tx.send(UiEvent::Rerender);
         }
     }
 
@@ -198,7 +194,7 @@ impl<T> UiRuntime<T> {
 }
 
 impl UiBuilder {
-    pub fn new(width: u32, height: u32, comms_tx: Sender<BrowserAction>) -> Result<Self> {
+    pub fn new(width: u32, height: u32, comms_tx: Sender<UiEvent>) -> Result<Self> {
         Ok(Self {
             curr: None,
             nodes: vec![],
@@ -392,7 +388,7 @@ impl UiBuilder {
                         layout.width,
                         layout.height,
                         layout.bg_color,
-                        &crate::BorderRadius {
+                        &BorderRadius {
                             top_left: layout.border_radius,
                             top_right: layout.border_radius,
                             bottom_right: layout.border_radius,
@@ -462,18 +458,20 @@ pub struct LayoutBox {
     pub border_radius: u32,
 }
 
+#[cfg(test)]
 mod tests {
-    use std::{cell::Cell, num::NonZero, rc::Rc, sync::Arc};
+    use std::path::PathBuf;
 
-    use anyhow::{Context, Result, anyhow};
-    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-    use softbuffer::{Context as SoftContext, Surface};
-    use winit::{dpi::PhysicalSize, event_loop::EventLoopBuilder, window::WindowBuilder};
+    use anyhow::Result;
+    use render::ensure_snapshot_matches;
 
-    use crate::{
-        Position, ensure_snapshot_matches,
-        ui::{UiBuilder, UiRuntime},
-    };
+    use crate::UiRuntime;
+
+    fn snapshot_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("snapshots")
+    }
 
     #[test]
     fn renders() -> Result<()> {
@@ -498,7 +496,7 @@ mod tests {
 
         runtime.rerender()?;
 
-        ensure_snapshot_matches(&runtime.buffer, "UiBuilder", 1920, 1080)?;
+        ensure_snapshot_matches(&runtime.buffer, snapshot_dir(), "UiBuilder", 1920, 1080)?;
 
         Ok(())
     }

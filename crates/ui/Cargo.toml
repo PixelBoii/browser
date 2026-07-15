@@ -1,0 +1,10 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+render = { path = "../render" }
+resvg = "0.47.0"
+winit = "0.29"

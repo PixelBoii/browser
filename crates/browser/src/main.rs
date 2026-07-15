@@ -2,7 +2,6 @@ mod css;
 mod loader;
 mod parser;
 mod style;
-mod ui;
 
 use deno_core::serde::Deserialize;
 use deno_error::JsErrorBox;
@@ -27,19 +26,22 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::ops::Mul;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
-use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use deno_core::error::JsError;
 use deno_core::{JsRuntime, OpState, ToV8, extension, op2, v8};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use render::{
+    BorderRadius, FontHandler, PaintClip, blend_rgb_with_rgba, blend_rgba_with_rgba,
+    draw_rect_filled_clipped, premul_rgba_buffer_to_bytes, rgba_to_premul_tuple, text_to_buffer,
+    text_to_buffer_with_line_height,
+};
 use reqwest::Url as ReqwestUrl;
 use resvg::{tiny_skia, usvg};
 use softbuffer::{Context as SoftContext, Surface};
@@ -61,7 +63,7 @@ use crate::style::{
     get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
     split_ignoring_parentheses,
 };
-use crate::ui::{Typeable, UiBuilder, UiRuntime};
+use ui::{Typeable, UiBuilder, UiEvent, UiRuntime};
 
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
@@ -166,25 +168,6 @@ impl RectBorder {
 }
 
 #[derive(Debug, Clone)]
-pub struct BorderRadius {
-    top_left: u32,
-    top_right: u32,
-    bottom_right: u32,
-    bottom_left: u32,
-}
-
-impl BorderRadius {
-    pub fn new_empty() -> Self {
-        Self {
-            top_left: 0,
-            top_right: 0,
-            bottom_right: 0,
-            bottom_left: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Rect {
     x: i32,
     y: i32,
@@ -193,41 +176,6 @@ struct Rect {
     background: StyleBackground,
     border: RectBorder,
     border_radius: BorderRadius,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PaintClip {
-    start_x: i32,
-    start_y: i32,
-    end_x: i32,
-    end_y: i32,
-}
-
-impl PaintClip {
-    fn viewport(width: u32, height: u32) -> Self {
-        Self {
-            start_x: 0,
-            start_y: 0,
-            end_x: i32::try_from(width).unwrap_or(i32::MAX),
-            end_y: i32::try_from(height).unwrap_or(i32::MAX),
-        }
-    }
-
-    fn intersect_x(mut self, start_x: i32, end_x: i32) -> Self {
-        self.start_x = self.start_x.max(start_x);
-        self.end_x = self.end_x.min(end_x);
-        self
-    }
-
-    fn intersect_y(mut self, start_y: i32, end_y: i32) -> Self {
-        self.start_y = self.start_y.max(start_y);
-        self.end_y = self.end_y.min(end_y);
-        self
-    }
-
-    fn is_empty(self) -> bool {
-        self.start_x >= self.end_x || self.start_y >= self.end_y
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2053,56 +2001,6 @@ fn infer_image_size(base_size: Size, input_w: Option<u32>, input_h: Option<u32>)
     };
 
     (target_h, target_w)
-}
-
-fn blend_rgba_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
-    let a = src.3 as u32;
-    if a == 0 {
-        return dst;
-    }
-    if a == 255 {
-        return ((src.0 as u32) << 24)
-            | ((src.1 as u32) << 16)
-            | ((src.2 as u32) << 8)
-            | (src.3 as u32);
-    }
-
-    let inv_a = 255 - a;
-
-    let dr = (dst >> 24) & 0xFF;
-    let dg = (dst >> 16) & 0xFF;
-    let db = (dst >> 8) & 0xFF;
-    let da = dst & 0xFF;
-
-    let r = src.0 as u32 + (dr * inv_a + 127) / 255;
-    let g = src.1 as u32 + (dg * inv_a + 127) / 255;
-    let b = src.2 as u32 + (db * inv_a + 127) / 255;
-
-    let output_alpha = a + (da * inv_a + 127) / 255;
-
-    (r << 24) | (g << 16) | (b << 8) | output_alpha
-}
-
-fn blend_rgb_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
-    let a = src.3 as u32;
-    if a == 0 {
-        return dst;
-    }
-    if a == 255 {
-        return ((src.0 as u32) << 16) | ((src.1 as u32) << 8) | (src.2 as u32);
-    }
-
-    let inv_a = 255 - a;
-
-    let dr = (dst >> 16) & 0xFF;
-    let dg = (dst >> 8) & 0xFF;
-    let db = dst & 0xFF;
-
-    let r = src.0 as u32 + (dr * inv_a + 127) / 255;
-    let g = src.1 as u32 + (dg * inv_a + 127) / 255;
-    let b = src.2 as u32 + (db * inv_a + 127) / 255;
-
-    (r << 16) | (g << 8) | b
 }
 
 fn clamp_with_ratio(mut main_value: u32, max_value: u32, mut other_value: u32) -> (u32, u32) {
@@ -10648,26 +10546,6 @@ impl Renderer {
 }
 
 #[derive(Debug)]
-struct FontHandler {
-    font: FontRef<'static>,
-}
-
-impl FontHandler {
-    pub fn new() -> Result<Self> {
-        let font = FontRef::try_from_slice(include_bytes!("./InterVariable.ttf"))?;
-        Ok(Self { font })
-    }
-
-    pub fn outline_glyph_for(&self, char: char, scale: f32) -> Option<OutlinedGlyph> {
-        self.font.outline_glyph(self.glyph_for(char, scale))
-    }
-
-    pub fn glyph_for(&self, char: char, scale: f32) -> Glyph {
-        self.font.glyph_id(char).with_scale(scale)
-    }
-}
-
-#[derive(Debug)]
 struct NetworkFetch {
     request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
     client: reqwest::Client,
@@ -12441,7 +12319,6 @@ pub struct TabHandle {
 enum BrowserAction {
     OpenTab(String),
     SelectTab(usize),
-    Rerender,
     Navigate(String),
 }
 
@@ -12575,13 +12452,13 @@ impl Browser {
         &self,
         url: &String,
         action_tx: Sender<BrowserAction>,
-    ) -> Result<ui::UiRuntime<HeaderState>> {
+        ui_event_tx: Sender<UiEvent>,
+    ) -> Result<UiRuntime<HeaderState>> {
         let state = HeaderState {
             url: url.clone(),
             fps: None,
         };
-        let mut runtime =
-            UiRuntime::new_empty(WINDOW_WIDTH, HEADER_HEIGHT, action_tx.clone(), state)?;
+        let mut runtime = UiRuntime::new_empty(WINDOW_WIDTH, HEADER_HEIGHT, ui_event_tx, state)?;
         self.build_header(&mut runtime.builder, &runtime.state, action_tx)?;
         runtime.rerender()?;
         Ok(runtime)
@@ -12627,10 +12504,12 @@ impl Browser {
         &mut self,
         header: &mut UiRuntime<HeaderState>,
         window: &Arc<Window>,
-        header_comms_rx: &Receiver<BrowserAction>,
+        browser_action_tx: &Sender<BrowserAction>,
+        browser_action_rx: &Receiver<BrowserAction>,
+        ui_event_rx: &Receiver<UiEvent>,
         hover_debugging: bool,
     ) {
-        while let Ok(action) = header_comms_rx.try_recv() {
+        while let Ok(action) = browser_action_rx.try_recv() {
             match action {
                 BrowserAction::OpenTab(url) => {
                     match self.open_tab(url.clone(), hover_debugging, self.tabs.len()) {
@@ -12638,9 +12517,12 @@ impl Browser {
                             self.tabs.push(handle);
                             self.current_tab_idx = self.tabs.len() - 1;
                             header.state.borrow_mut().url = self.current_tab().url.clone();
-                            let comms_tx = header.builder.comms_tx.clone();
-                            self.build_header(&mut header.builder, &header.state, comms_tx)
-                                .unwrap();
+                            self.build_header(
+                                &mut header.builder,
+                                &header.state,
+                                browser_action_tx.clone(),
+                            )
+                            .unwrap();
                             match header.rerender() {
                                 Ok(_) => {
                                     window.request_redraw();
@@ -12658,22 +12540,12 @@ impl Browser {
                 BrowserAction::SelectTab(tab_idx) => {
                     self.current_tab_idx = tab_idx;
                     header.state.borrow_mut().url = self.current_tab().url.clone();
-                    let comms_tx = header.builder.comms_tx.clone();
-                    self.build_header(&mut header.builder, &header.state, comms_tx)
-                        .unwrap();
-                    match header.rerender() {
-                        Ok(_) => {
-                            window.request_redraw();
-                        }
-                        Err(err) => {
-                            eprintln!("Failed to render header: {err:?}");
-                        }
-                    }
-                }
-                BrowserAction::Rerender => {
-                    let comms_tx = header.builder.comms_tx.clone();
-                    self.build_header(&mut header.builder, &header.state, comms_tx)
-                        .unwrap();
+                    self.build_header(
+                        &mut header.builder,
+                        &header.state,
+                        browser_action_tx.clone(),
+                    )
+                    .unwrap();
                     match header.rerender() {
                         Ok(_) => {
                             window.request_redraw();
@@ -12703,6 +12575,23 @@ impl Browser {
                                 }),
                                 true,
                             ))));
+                }
+            }
+        }
+
+        while let Ok(event) = ui_event_rx.try_recv() {
+            match event {
+                UiEvent::Rerender => {
+                    self.build_header(
+                        &mut header.builder,
+                        &header.state,
+                        browser_action_tx.clone(),
+                    )
+                    .unwrap();
+                    match header.rerender() {
+                        Ok(_) => window.request_redraw(),
+                        Err(err) => eprintln!("Failed to render header: {err:?}"),
+                    }
                 }
             }
         }
@@ -12739,7 +12628,8 @@ impl Browser {
         browser.tabs.push(handle);
 
         let (browser_action_tx, browser_action_rx) = std::sync::mpsc::channel();
-        let mut header = browser.get_header_buffer(&url, browser_action_tx.clone())?;
+        let (ui_event_tx, ui_event_rx) = std::sync::mpsc::channel();
+        let mut header = browser.get_header_buffer(&url, browser_action_tx.clone(), ui_event_tx)?;
 
         event_loop
             .run(move |event, elwt| {
@@ -12772,10 +12662,7 @@ impl Browser {
                             device_id: _,
                             position,
                         } => {
-                            header.apply_hovering(Position {
-                                x: position.x as i32,
-                                y: position.y as i32,
-                            });
+                            header.apply_hovering(position.x as i32, position.y as i32);
                             let tab_cursor = Position {
                                 x: position.x as i32,
                                 y: position.y as i32 - HEADER_HEIGHT as i32,
@@ -12787,7 +12674,9 @@ impl Browser {
                             browser.poll_header_events(
                                 &mut header,
                                 &window,
+                                &browser_action_tx,
                                 &browser_action_rx,
+                                &ui_event_rx,
                                 hover_debugging,
                             );
                         }
@@ -12805,7 +12694,9 @@ impl Browser {
                                 browser.poll_header_events(
                                     &mut header,
                                     &window,
+                                    &browser_action_tx,
                                     &browser_action_rx,
+                                    &ui_event_rx,
                                     hover_debugging,
                                 );
                             }
@@ -12839,7 +12730,9 @@ impl Browser {
                                 browser.poll_header_events(
                                     &mut header,
                                     &window,
+                                    &browser_action_tx,
                                     &browser_action_rx,
+                                    &ui_event_rx,
                                     hover_debugging,
                                 );
                             }
@@ -12866,9 +12759,12 @@ impl Browser {
                             .and_then(FpsCounter::record_present)
                         {
                             header.state.borrow_mut().fps = Some(fps);
-                            let comms_tx = header.builder.comms_tx.clone();
                             browser
-                                .build_header(&mut header.builder, &header.state, comms_tx)
+                                .build_header(
+                                    &mut header.builder,
+                                    &header.state,
+                                    browser_action_tx.clone(),
+                                )
                                 .unwrap();
                             match header.rerender() {
                                 Ok(_) => window.request_redraw(),
@@ -12885,9 +12781,12 @@ impl Browser {
 
                         if is_current {
                             header.state.borrow_mut().url = url;
-                            let comms_tx = header.builder.comms_tx.clone();
                             browser
-                                .build_header(&mut header.builder, &header.state, comms_tx)
+                                .build_header(
+                                    &mut header.builder,
+                                    &header.state,
+                                    browser_action_tx.clone(),
+                                )
                                 .unwrap();
                             match header.rerender() {
                                 Ok(_) => {
@@ -13013,367 +12912,10 @@ fn collapse_whitespace(text: &str) -> Option<String> {
     }
 }
 
-struct GlyphPosition {
-    x: f32,
-    y: f32,
-    glyph: OutlinedGlyph,
-}
-
-fn premul_rgba_buffer_to_bytes(buffer: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(buffer.len() * 4);
-
-    for pixel in buffer {
-        let [r, g, b, a] = pixel.to_be_bytes();
-        bytes.extend_from_slice(&[r, g, b, a]);
-    }
-
-    bytes
-}
-
-fn text_to_buffer(
-    font_handler: &Rc<FontHandler>,
-    color: u32,
-    text: &String,
-    font_px: u32,
-    max_width: Option<u32>,
-) -> Option<(Pixmap, u32, u32)> {
-    text_to_buffer_with_line_height(font_handler, color, text, font_px, max_width, None)
-}
-
-fn text_to_buffer_with_line_height(
-    font_handler: &Rc<FontHandler>,
-    color: u32,
-    text: &String,
-    font_px: u32,
-    max_width: Option<u32>,
-    line_height_px: Option<u32>,
-) -> Option<(Pixmap, u32, u32)> {
-    let scaled_font = font_handler.font.as_scaled(font_px as f32);
-    let mut width = 0f32;
-    let x = 0;
-    let y = 0;
-    let mut pen_x: f32 = x as f32;
-    let mut pen_y: f32 = y as f32;
-    let mut previous = None;
-
-    let mut glyph_positions = vec![];
-
-    let default_line_height = scaled_font.height() + scaled_font.line_gap();
-    let line_height = line_height_px
-        .map(|line_height| line_height as f32)
-        .unwrap_or(default_line_height);
-    let leading = ((line_height - default_line_height) / 2.).max(0.);
-    for ch in text.chars() {
-        let glyph_id = font_handler.font.glyph_id(ch);
-        if let Some(previous_id) = previous {
-            pen_x += scaled_font.kern(previous_id, glyph_id);
-        }
-        if let Some(glyph) = font_handler.outline_glyph_for(ch, font_px as f32) {
-            glyph_positions.push(GlyphPosition {
-                x: pen_x,
-                y: pen_y,
-                glyph,
-            });
-        }
-        let advance = scaled_font.h_advance(glyph_id);
-        // Line break
-        if max_width.is_some_and(|max_width| pen_x + advance >= max_width as f32) && ch == ' ' {
-            pen_x = x as f32;
-            pen_y += line_height;
-        } else {
-            pen_x += advance;
-            width = width.max(pen_x)
-        }
-        previous = Some(glyph_id);
-    }
-    let width = width as u32;
-    let height = (pen_y + line_height) as u32;
-    let mut buffer = vec![0x00_00_00_00; (width * height) as usize];
-    for glyph_pos in glyph_positions {
-        draw_glyph(
-            &mut buffer,
-            width,
-            height,
-            glyph_pos.x as i32,
-            (glyph_pos.y + leading + scaled_font.ascent() + glyph_pos.glyph.px_bounds().min.y)
-                as i32,
-            &glyph_pos.glyph,
-            color,
-        );
-    }
-    let pixmap = Pixmap::from_vec(
-        premul_rgba_buffer_to_bytes(&buffer),
-        IntSize::from_wh(width, height)?,
-    )?;
-    Some((pixmap, width, height))
-}
-
-fn with_coverage(color: u32, c: f32) -> u32 {
-    let alpha = color & 0xFF;
-    let covered_alpha = ((alpha as f32) * c.clamp(0.0, 1.0)).round() as u32;
-
-    (color & 0xFFFF_FF00) | covered_alpha
-}
-
-fn draw_glyph(
-    buffer: &mut [u32],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    glyph: &OutlinedGlyph,
-    color: u32,
-) {
-    glyph.draw(|glyph_x, glyph_y, c| {
-        draw_rect_filled(
-            buffer,
-            true,
-            width,
-            height,
-            x + glyph_x as i32,
-            y + glyph_y as i32,
-            1,
-            1,
-            with_coverage(color, c),
-            &BorderRadius::new_empty(),
-        );
-    });
-}
-
-fn rgba_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
-    let [r, g, b, a] = src.to_be_bytes();
-    let r = (r as u32 * a as u32 / 255) as u8;
-    let g = (g as u32 * a as u32 / 255) as u8;
-    let b = (b as u32 * a as u32 / 255) as u8;
-    (r, g, b, a)
-}
-
-fn rgba_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(buffer.len() * 4);
-
-    for pixel in buffer {
-        let (r, g, b, a) = rgba_to_premul_tuple(*pixel);
-
-        bytes.extend_from_slice(&[r, g, b, a]);
-    }
-
-    bytes
-}
-
-fn rgb_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
-    let [_, r, g, b] = src.to_be_bytes();
-    let a = 255;
-    let r = (r as u32 * a as u32 / 255) as u8;
-    let g = (g as u32 * a as u32 / 255) as u8;
-    let b = (b as u32 * a as u32 / 255) as u8;
-    (r, g, b, a)
-}
-
-#[allow(dead_code)]
-fn rgb_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(buffer.len() * 4);
-
-    for pixel in buffer {
-        let (r, g, b, a) = rgb_to_premul_tuple(*pixel);
-
-        bytes.extend_from_slice(&[r, g, b, a]);
-    }
-
-    bytes
-}
-
-#[allow(dead_code)]
-fn pixmaps_are_equal(first: &Pixmap, second: &Pixmap) -> bool {
-    if first.width() != second.width() {
-        return false;
-    }
-    if first.height() != second.height() {
-        return false;
-    }
-    for (px_one, px_two) in first.data().iter().zip(second.data()) {
-        if px_one != px_two {
-            return false;
-        }
-    }
-    true
-}
-
-pub fn draw_rect_filled(
-    buffer: &mut [u32],
-    buffer_rgba: bool,
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    color: u32,
-    border_radius: &BorderRadius,
-) {
-    draw_rect_filled_clipped(
-        buffer,
-        buffer_rgba,
-        width,
-        height,
-        x,
-        y,
-        w,
-        h,
-        color,
-        border_radius,
-        PaintClip::viewport(width, height),
-    );
-}
-
-fn draw_rect_filled_clipped(
-    buffer: &mut [u32],
-    buffer_rgba: bool,
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    color: u32,
-    border_radius: &BorderRadius,
-    clip: PaintClip,
-) {
-    if clip.is_empty() {
-        return;
-    }
-
-    let max_x = i32::try_from(width).unwrap_or(i32::MAX);
-    let max_y = i32::try_from(height).unwrap_or(i32::MAX);
-    let start_x = x.max(0).max(clip.start_x);
-    let start_y = y.max(0).max(clip.start_y);
-    let end_x = x.saturating_add_unsigned(w).min(max_x).min(clip.end_x);
-    let end_y = y.saturating_add_unsigned(h).min(max_y).min(clip.end_y);
-    if start_x >= end_x || start_y >= end_y {
-        return;
-    }
-    let stride = width as usize;
-
-    let has_border_radius = border_radius.top_left > 0
-        || border_radius.top_right > 0
-        || border_radius.bottom_right > 0
-        || border_radius.bottom_left > 0;
-    let color_tuple = rgba_to_premul_tuple(color);
-    if !has_border_radius {
-        for py in start_y..end_y {
-            let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
-            for px in start_x..end_x {
-                if buffer_rgba {
-                    row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
-                } else {
-                    row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
-                }
-            }
-        }
-        return;
-    }
-
-    let mut mask = vec![true; (w * h) as usize];
-    let radius = border_radius.top_left.min(w / 2).min(h / 2) as usize;
-    for row in 0..radius {
-        for col in 0..radius {
-            let dx = radius as i32 - col as i32;
-            let dy = radius as i32 - row as i32;
-
-            if dx * dx + dy * dy > (radius * radius) as i32 {
-                mask[row * w as usize + col] = false;
-            }
-        }
-    }
-    let radius = border_radius.top_right.min(w / 2).min(h / 2) as usize;
-    for row in 0..radius {
-        for col in 0..radius {
-            let dx = col as i32;
-            let dy = radius as i32 - row as i32;
-
-            if dx * dx + dy * dy > (radius * radius) as i32 {
-                mask[row * w as usize + col + w as usize - radius] = false;
-            }
-        }
-    }
-    let radius = border_radius.bottom_left.min(w / 2).min(h / 2) as usize;
-    for row in 0..radius {
-        for col in 0..radius {
-            let dx = radius as i32 - col as i32;
-            let dy = row as i32;
-
-            if dx * dx + dy * dy > (radius * radius) as i32 {
-                mask[(row + h as usize - radius) * w as usize + col] = false;
-            }
-        }
-    }
-    let radius = border_radius.bottom_right.min(w / 2).min(h / 2) as usize;
-    for row in 0..radius {
-        for col in 0..radius {
-            let dx = col as i32;
-            let dy = row as i32;
-
-            if dx * dx + dy * dy > (radius * radius) as i32 {
-                mask[(row + h as usize - radius) * w as usize + col + w as usize - radius] = false;
-            }
-        }
-    }
-
-    for py in start_y..end_y {
-        let row = &mut buffer[py as usize * stride..(py as usize + 1) * stride];
-        for px in start_x..end_x {
-            let local_x = (px - x) as usize;
-            let local_y = (py - y) as usize;
-            if !mask[local_y * w as usize + local_x] {
-                continue;
-            }
-
-            if buffer_rgba {
-                row[px as usize] = blend_rgba_with_rgba(row[px as usize], color_tuple);
-            } else {
-                row[px as usize] = blend_rgb_with_rgba(row[px as usize], color_tuple);
-            }
-        }
-    }
-}
-
-pub fn ensure_snapshot_matches(
-    buffer: &[u32],
-    name: &'static str,
-    width: u32,
-    height: u32,
-) -> Result<()> {
-    let snapshot_path = format!("snapshots/{}.png", name);
-    let snapshot_path = Path::new(&snapshot_path);
-    let pixmap = Pixmap::from_vec(
-        rgb_buffer_to_premul_bytes(&buffer),
-        IntSize::from_wh(width, height).with_context(|| "Failed to create IntSize")?,
-    )
-    .with_context(|| "Failed to create pixmap")?;
-    match Path::exists(snapshot_path) {
-        true => {
-            let snapshot = Pixmap::load_png(snapshot_path)?;
-            if pixmaps_are_equal(&pixmap, &snapshot) {
-                Ok(())
-            } else {
-                let invalid_path = format!("snapshots/{}.invalid.png", name);
-                let invalid_path = Path::new(&invalid_path);
-                pixmap.save_png(invalid_path)?;
-                Err(anyhow!(
-                    "Pixmap did not match saved snapshot. Saved invalid file in {:?}",
-                    invalid_path
-                ))
-            }
-        }
-        false => {
-            pixmap.save_png(snapshot_path)?;
-            Err(anyhow!("No snapshot existed. Created one now."))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::{Result, anyhow, bail};
+    use render::ensure_snapshot_matches;
     use std::{
         ops::Add,
         sync::mpsc::{Receiver, RecvTimeoutError},
@@ -13382,7 +12924,7 @@ mod tests {
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
+        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
@@ -13474,7 +13016,7 @@ mod tests {
         frame.on_click()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
+        ensure_snapshot_matches(&buffer, "snapshots", "googlecom", 1920, 1080)
     }
 
     #[test]
@@ -13524,7 +13066,7 @@ mod tests {
             hot_render_min,
             hot_render_max
         );
-        ensure_snapshot_matches(&buffer, "widgetswappedcom", 1920, 1080)
+        ensure_snapshot_matches(&buffer, "snapshots", "widgetswappedcom", 1920, 1080)
     }
 
     #[test]
@@ -13540,7 +13082,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 4320];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 4320, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "vitedev", 1920, 4320)
+        ensure_snapshot_matches(&buffer, "snapshots", "vitedev", 1920, 4320)
     }
 
     #[test]
@@ -13557,7 +13099,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "vitefeatures", 1920, 1080)
+        ensure_snapshot_matches(&buffer, "snapshots", "vitefeatures", 1920, 1080)
     }
 
     #[test]
@@ -13574,7 +13116,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(2)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "marblematchio", 1920, 1080)
+        ensure_snapshot_matches(&buffer, "snapshots", "marblematchio", 1920, 1080)
     }
 
     #[test]
@@ -13590,7 +13132,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "pixeltimetracker", 1920, 1080)
+        ensure_snapshot_matches(&buffer, "snapshots", "pixeltimetracker", 1920, 1080)
     }
 
     #[test]
@@ -13607,7 +13149,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 8640];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 8640, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "slackcom", 1920, 8640)
+        ensure_snapshot_matches(&buffer, "snapshots", "slackcom", 1920, 8640)
     }
 
     #[test]
@@ -13624,7 +13166,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "nodejsorg", 1920, 2160)
+        ensure_snapshot_matches(&buffer, "snapshots", "nodejsorg", 1920, 2160)
     }
 
     #[test]
@@ -13645,7 +13187,7 @@ mod tests {
         frame.on_click()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+        ensure_snapshot_matches(&buffer, "snapshots", "mingolfgolfse", 1920, 2160)
     }
 
     #[test]
