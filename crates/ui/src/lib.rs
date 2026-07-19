@@ -38,7 +38,7 @@ pub struct Element {
     pub padding: u32,
     pub parent: Option<usize>,
     pub on_click: Option<Box<dyn Fn()>>,
-    pub hor: bool,
+    pub hor: Option<Hor>,
     pub typeable: Option<Typeable>,
     pub gap: u32,
     pub border_radius: u32,
@@ -53,7 +53,7 @@ impl Element {
             height: 0,
             parent: None,
             on_click: None,
-            hor: false,
+            hor: None,
             typeable: None,
             gap: 0,
             border_radius: 0,
@@ -193,6 +193,26 @@ impl<T> UiRuntime<T> {
     }
 }
 
+pub enum JustifyContent {
+    Start,
+    Center,
+    End,
+}
+
+pub struct Hor {
+    justify_content: JustifyContent,
+    align_items: JustifyContent,
+}
+
+impl Hor {
+    pub fn new() -> Self {
+        Self {
+            justify_content: JustifyContent::Start,
+            align_items: JustifyContent::Start,
+        }
+    }
+}
+
 impl UiBuilder {
     pub fn new(width: u32, height: u32, comms_tx: Sender<UiEvent>) -> Result<Self> {
         Ok(Self {
@@ -248,12 +268,30 @@ impl UiBuilder {
     }
 
     pub fn hor(&mut self) -> Result<()> {
-        self.curr_element_mut()?.hor = true;
+        self.curr_element_mut()?.hor = Some(Hor::new());
         Ok(())
     }
 
     pub fn gap(&mut self, gap: u32) -> Result<()> {
         self.curr_element_mut()?.gap = gap;
+        Ok(())
+    }
+
+    pub fn justify(&mut self, value: JustifyContent) -> Result<()> {
+        self.curr_element_mut()?
+            .hor
+            .as_mut()
+            .with_context(|| "Hor must be set for justify to work")?
+            .justify_content = value;
+        Ok(())
+    }
+
+    pub fn align(&mut self, value: JustifyContent) -> Result<()> {
+        self.curr_element_mut()?
+            .hor
+            .as_mut()
+            .with_context(|| "Hor must be set for justify to work")?
+            .align_items = value;
         Ok(())
     }
 
@@ -297,7 +335,8 @@ impl UiBuilder {
         mut cursor: (i32, i32),
         node_idx: usize,
         children_index: &HashMap<usize, Vec<usize>>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let idx = layouts.len();
         match &self.nodes[node_idx] {
             Node::Element(el) => {
                 layouts.push(LayoutBox {
@@ -315,12 +354,72 @@ impl UiBuilder {
                 cursor.1 += el.padding as i32;
 
                 if let Some(children) = children_index.get(&node_idx) {
+                    let (shift_x, shift_y) = if let Some(hor) = &el.hor {
+                        let mut base_items = vec![];
+                        let mut layout_buffer = vec![];
+                        for child in children.iter() {
+                            let idx = self.render_node(
+                                &mut layout_buffer,
+                                cursor,
+                                *child,
+                                children_index,
+                            )?;
+                            base_items.push(idx);
+                        }
+                        let shift_x = match hor.justify_content {
+                            JustifyContent::Start => 0,
+                            JustifyContent::Center => {
+                                let free = el.width as i32
+                                    - el.padding as i32 * 2
+                                    - base_items
+                                        .iter()
+                                        .map(|l| layout_buffer[*l].width as i32)
+                                        .sum::<i32>();
+                                free / 2
+                            }
+                            JustifyContent::End => {
+                                el.width as i32
+                                    - el.padding as i32 * 2
+                                    - base_items
+                                        .iter()
+                                        .map(|l| layout_buffer[*l].width as i32)
+                                        .sum::<i32>()
+                            }
+                        };
+                        let shift_y = match hor.align_items {
+                            JustifyContent::Start => 0,
+                            JustifyContent::Center => {
+                                let free = el.height as i32
+                                    - el.padding as i32 * 2
+                                    - base_items
+                                        .iter()
+                                        .map(|l| layout_buffer[*l].height as i32)
+                                        .sum::<i32>();
+                                free / 2
+                            }
+                            JustifyContent::End => {
+                                el.height as i32
+                                    - el.padding as i32 * 2
+                                    - base_items
+                                        .iter()
+                                        .map(|l| layout_buffer[*l].height as i32)
+                                        .sum::<i32>()
+                            }
+                        };
+                        (shift_x, shift_y)
+                    } else {
+                        (0, 0)
+                    };
+
+                    cursor.0 += shift_x;
+                    cursor.1 += shift_y;
+
                     for child in children {
                         self.render_node(layouts, cursor, *child, children_index)?;
 
                         let child_node = &self.nodes[*child];
                         if let Node::Element(child_el) = child_node {
-                            if el.hor {
+                            if el.hor.is_some() {
                                 cursor.0 += child_el.width as i32 + el.gap as i32;
                             } else {
                                 cursor.1 += child_el.height as i32 + el.gap as i32;
@@ -370,7 +469,7 @@ impl UiBuilder {
                 });
             }
         };
-        Ok(())
+        Ok(idx)
     }
 
     fn layout_to_buffer(&self, layouts: &Vec<LayoutBox>) -> Vec<u32> {
