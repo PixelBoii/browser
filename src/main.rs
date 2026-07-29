@@ -12769,7 +12769,6 @@ impl Browser {
                                 .current_tab()
                                 .tx
                                 .send(FrameCommand::Resized(tab_size));
-                            window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged { .. } => {
                             size = window.inner_size();
