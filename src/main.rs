@@ -10970,6 +10970,12 @@ impl Frame {
             | FrameCommand::UserEvent(UserEvent::DomUpdated)
             | FrameCommand::UserEvent(UserEvent::CanvasUpdated)
             | FrameCommand::UserEvent(UserEvent::ImagesPrefetched(_))) => {
+                // A render may have already consumed the pending update before its queued event arrives.
+                if matches!(&cmd, FrameCommand::UserEvent(UserEvent::DomUpdated))
+                    && !self.renderer.as_ref().unwrap().borrow().pending_dom_update
+                {
+                    return;
+                }
                 let canvas_updated =
                     matches!(&cmd, FrameCommand::UserEvent(UserEvent::CanvasUpdated));
                 if canvas_updated {
@@ -12197,7 +12203,14 @@ impl Frame {
             FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
                 self.animation_frame_requested = true;
             }
-            FrameCommand::UserEvent(UserEvent::DomUpdated) => self.execute_dom_update(),
+            FrameCommand::UserEvent(UserEvent::DomUpdated) => {
+                // Ignore a queued notification when another render already processed its DOM changes.
+                let pending_dom_update =
+                    self.renderer.as_ref().unwrap().borrow().pending_dom_update;
+                if pending_dom_update {
+                    self.execute_dom_update();
+                }
+            }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let data = js_string_literal(&message);
                 let code = format!(
