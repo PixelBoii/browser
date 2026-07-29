@@ -11178,9 +11178,6 @@ impl Frame {
             "requestAnimationFrame callbacks",
             "__run_animation_frame(performance.now())".to_string(),
         )?;
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
         Ok(true)
     }
 
