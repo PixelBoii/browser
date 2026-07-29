@@ -10744,7 +10744,7 @@ struct Frame {
     is_top: bool,
     hover_debugging: bool,
     render_size: PhysicalSize<u32>,
-    loaded_nodes: Vec<usize>,
+    loaded_nodes: HashSet<usize>,
     last_hover_position: Option<Position>,
     animation_frame_requested: bool,
     last_animation_frame: Instant,
@@ -10805,7 +10805,7 @@ impl Frame {
             is_top: true,
             hover_debugging,
             render_size,
-            loaded_nodes: vec![],
+            loaded_nodes: HashSet::new(),
             last_hover_position: None,
             animation_frame_requested: false,
             last_animation_frame: Instant::now(),
@@ -11824,26 +11824,28 @@ impl Frame {
     fn fire_load_phase(&mut self, phase: &LoadPhase, idxs: Option<&Vec<usize>>) {
         let nodes_idxs = {
             let renderer = self.renderer.as_ref().unwrap().borrow();
-            let idxs_to_fire: Vec<&usize> = renderer
-                .nodes_idxs
+            let candidates = idxs.unwrap_or(&renderer.nodes_idxs);
+            let idxs_to_fire: Vec<usize> = candidates
                 .iter()
+                .copied()
                 .filter(|idx| {
-                    idxs.is_none_or(|f| f.contains(idx))
-                        && !self.loaded_nodes.contains(idx)
-                        && renderer.element_has_loaded(**idx, phase)
+                    !self.loaded_nodes.contains(idx) && renderer.element_has_loaded(*idx, phase)
                 })
                 .collect();
 
             for idx in idxs_to_fire.iter() {
-                self.loaded_nodes.push(**idx);
+                self.loaded_nodes.insert(*idx);
             }
 
             idxs_to_fire
                 .iter()
-                .map(|idx| idx.to_string())
+                .map(usize::to_string)
                 .collect::<Vec<String>>()
                 .join(",")
         };
+        if nodes_idxs.is_empty() {
+            return;
+        }
         let load_code = format!(
             r#"
         (() => {{
