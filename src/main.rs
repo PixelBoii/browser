@@ -11955,13 +11955,7 @@ impl Frame {
             .keys()
             .copied()
             .collect();
-        let mut buffer =
-            vec![0; self.render_size.width as usize * self.render_size.height as usize];
-        let first_boot = self.render(&mut buffer);
-        self.refresh_hover_after_render();
-        let _ = self.refresh_intersections();
-        self.decode_detached_images();
-        self.update_newly_loaded_images(&prev_loaded_images);
+        let first_boot = !self.layout_booted;
         if first_boot {
             let start = Instant::now();
             let js_result = self.run_js();
@@ -11972,6 +11966,13 @@ impl Frame {
             );
             self.fire_load_phase(&LoadPhase::JsDone, None);
         }
+        let mut buffer =
+            vec![0; self.render_size.width as usize * self.render_size.height as usize];
+        self.render(&mut buffer);
+        self.refresh_hover_after_render();
+        let _ = self.refresh_intersections();
+        self.decode_detached_images();
+        self.update_newly_loaded_images(&prev_loaded_images);
 
         // If there are animations, continue re-rendering until there aren't
         if animation_redraw && let Some(window) = &self.window {
