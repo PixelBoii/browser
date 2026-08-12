@@ -6,15 +6,14 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
 use palette::{FromColor, Hsl, Srgb};
-use winit::dpi::PhysicalSize;
 
-use crate::VariableDefinitions;
 use crate::css::{
     BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteria,
     MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue,
     StyleComplexBackground, Variable, VariableTemplatePart, unquote,
 };
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
+use crate::{VariableDefinitions, ViewportSize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleCalcOperator {
@@ -1198,7 +1197,7 @@ pub fn build_css_children_index(nodes: &Vec<(usize, &Node)>) -> HashMap<usize, V
     children_index
 }
 
-pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) -> bool {
+pub fn media_query_matches(query: &MediaQuery, window_size: &ViewportSize) -> bool {
     query.criterias.iter().all(|q| {
         match q {
             // Media queries REM are not resolved against the font-size configured by CSS, but the default in the browser, which we hard-code to 16

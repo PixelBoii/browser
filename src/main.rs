@@ -2,13 +2,12 @@ mod css;
 mod loader;
 mod parser;
 mod style;
-mod ui;
 
 use deno_core::serde::Deserialize;
 use deno_error::JsErrorBox;
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use fixedbitset::FixedBitSet;
-use image::{DynamicImage, ImageReader};
+use image::{DynamicImage, Frame as ImageFrame, ImageReader, RgbaImage};
 use parser::{Element, HtmlParser, Node};
 use reqwest::cookie::{CookieStore, Jar};
 use resvg::tiny_skia::{IntSize, Pixmap};
@@ -24,11 +23,12 @@ use std::borrow::Cow;
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Cursor;
-use std::num::NonZeroU32;
 use std::ops::Mul;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
@@ -39,14 +39,13 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use deno_core::error::JsError;
 use deno_core::{JsRuntime, OpState, ToV8, extension, op2, v8};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use gpui::{
+    App, Application, Context as GpuiContext, FocusHandle, Focusable, KeyDownEvent, MouseMoveEvent,
+    Render, RenderImage, ScrollWheelEvent, Window, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, rgb, size,
+};
 use reqwest::Url as ReqwestUrl;
 use resvg::{tiny_skia, usvg};
-use softbuffer::{Context as SoftContext, Surface};
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{EventLoopBuilder, EventLoopProxy};
-use winit::window::{Window, WindowBuilder};
 
 use crate::css::{
     ClassIndexes, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery,
@@ -61,12 +60,22 @@ use crate::style::{
     get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
     split_ignoring_parentheses,
 };
-use crate::ui::{Typeable, UiBuilder, UiRuntime};
-
 const WINDOW_WIDTH: u32 = 1920;
 const WINDOW_HEIGHT: u32 = 1080;
 const HEADER_HEIGHT: u32 = 100;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ViewportSize {
+    width: u32,
+    height: u32,
+}
+
+impl ViewportSize {
+    fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
 
 // Many websites rely on the user-agent to be one of the major frames, so we don't use our own for now
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -115,7 +124,7 @@ impl RectBorderSide {
         node_style: &Style,
         font_size: u32,
         available_size: &Size,
-        window_size: &PhysicalSize<u32>,
+        window_size: &ViewportSize,
     ) -> Option<RectBorderSide> {
         match style.style {
             StyleBorderStyle::Solid => Some(Self {
@@ -203,6 +212,111 @@ struct PaintClip {
     end_y: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PageImageId {
+    renderer: u64,
+    resource: u64,
+}
+
+#[derive(Debug)]
+struct PageImage {
+    id: PageImageId,
+    revision: u64,
+    width: u32,
+    height: u32,
+    bgra: Arc<[u8]>,
+    #[cfg(test)]
+    premul_bgra: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+enum PagePaintCommand {
+    Fill {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        color: u32,
+        border_radius: BorderRadius,
+        clip: PaintClip,
+    },
+    Image {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        image: Arc<PageImage>,
+        opaque: bool,
+        clip: PaintClip,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PageDisplayList {
+    commands: Vec<PagePaintCommand>,
+    needs_animation: bool,
+}
+
+impl PageDisplayList {
+    fn empty() -> Self {
+        Self {
+            commands: vec![],
+            needs_animation: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn rasterize_into(&self, buffer: &mut [u32], width: u32, height: u32) {
+        clear_buffer(buffer, 0xFF_FF_FF_FF);
+        for command in &self.commands {
+            match command {
+                PagePaintCommand::Fill {
+                    x,
+                    y,
+                    width: fill_width,
+                    height: fill_height,
+                    color,
+                    border_radius,
+                    clip,
+                } => draw_rect_filled_clipped(
+                    buffer,
+                    false,
+                    width,
+                    height,
+                    *x,
+                    *y,
+                    *fill_width,
+                    *fill_height,
+                    *color,
+                    border_radius,
+                    *clip,
+                ),
+                PagePaintCommand::Image {
+                    x,
+                    y,
+                    width: image_width,
+                    height: image_height,
+                    image,
+                    opaque,
+                    clip,
+                    ..
+                } => paint_page_image_into_buffer(
+                    buffer,
+                    width,
+                    height,
+                    image,
+                    *image_width,
+                    *image_height,
+                    *x,
+                    *y,
+                    *opaque,
+                    *clip,
+                ),
+            }
+        }
+    }
+}
+
 impl PaintClip {
     fn viewport(width: u32, height: u32) -> Self {
         Self {
@@ -225,11 +339,26 @@ impl PaintClip {
         self
     }
 
+    fn intersect(self, other: Self) -> Self {
+        self.intersect_x(other.start_x, other.end_x)
+            .intersect_y(other.start_y, other.end_y)
+    }
+
+    fn translated(self, x: i32, y: i32) -> Self {
+        Self {
+            start_x: self.start_x.saturating_add(x),
+            start_y: self.start_y.saturating_add(y),
+            end_x: self.end_x.saturating_add(x),
+            end_y: self.end_y.saturating_add(y),
+        }
+    }
+
     fn is_empty(self) -> bool {
         self.start_x >= self.end_x || self.start_y >= self.end_y
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct ClippedBlit {
     src_x: u32,
@@ -240,6 +369,7 @@ struct ClippedBlit {
     height: u32,
 }
 
+#[cfg(test)]
 fn clipped_blit(
     dst_width: u32,
     dst_height: u32,
@@ -1368,19 +1498,19 @@ enum FrameCommand {
     Render,
     UserEvent(UserEvent),
     Dom(FrameDomCommand),
-    Resized(PhysicalSize<u32>),
+    Resized(ViewportSize),
 }
 
 #[derive(Debug)]
 struct FrameHandle {
-    surface: Arc<Mutex<Vec<u32>>>,
+    display_list: Arc<Mutex<PageDisplayList>>,
     tx: std::sync::mpsc::Sender<FrameCommand>,
 }
 
 #[derive(Debug, Clone)]
 enum RendererProxy {
     WindowLoop {
-        proxy: EventLoopProxy<UserEvent>,
+        tx: async_channel::Sender<BrowserEvent>,
         tab_idx: usize,
     },
     FrameLoop(std::sync::mpsc::Sender<FrameCommand>),
@@ -1390,14 +1520,16 @@ impl RendererProxy {
     fn fire_user_event(&self, event: UserEvent) -> Result<()> {
         match self {
             RendererProxy::FrameLoop(tx) => tx.send(FrameCommand::UserEvent(event))?,
-            RendererProxy::WindowLoop { proxy, .. } => proxy.send_event(event)?,
+            RendererProxy::WindowLoop { .. } => {
+                return Err(anyhow!("browser UI proxy cannot receive frame events"));
+            }
         };
         Ok(())
     }
 
     fn fire_tab_url_updated(&self, url: String) -> Result<()> {
-        if let RendererProxy::WindowLoop { proxy, tab_idx } = self {
-            proxy.send_event(UserEvent::TabUrlUpdated {
+        if let RendererProxy::WindowLoop { tx, tab_idx } = self {
+            tx.send_blocking(BrowserEvent::TabUrlUpdated {
                 tab_idx: *tab_idx,
                 url,
             })?;
@@ -1405,11 +1537,11 @@ impl RendererProxy {
         Ok(())
     }
 
-    fn fire_tab_updated(&self, buffer: Vec<u32>) -> Result<()> {
-        if let RendererProxy::WindowLoop { proxy, tab_idx } = self {
-            proxy.send_event(UserEvent::TabUpdated {
+    fn fire_tab_updated(&self, display_list: PageDisplayList) -> Result<()> {
+        if let RendererProxy::WindowLoop { tx, tab_idx } = self {
+            tx.send_blocking(BrowserEvent::TabUpdated {
                 tab_idx: *tab_idx,
-                buffer,
+                display_list,
             })?;
         }
         Ok(())
@@ -1498,7 +1630,7 @@ struct Renderer {
     tokio: Rc<RefCell<tokio::runtime::Runtime>>,
     resolved_font_sizes: HashMap<usize, u32>,
     resolved_pixmaps: HashMap<String, tiny_skia::Pixmap>,
-    window_size: PhysicalSize<u32>,
+    window_size: ViewportSize,
     font_handler: Rc<FontHandler>,
     pending_dom_update: bool,
     event_loop_notify: Rc<tokio::sync::Notify>,
@@ -1528,6 +1660,8 @@ struct Renderer {
     nodes_intersecting: HashSet<usize>,
     blob_store: Arc<BlobStore>,
     images_nodes_loaded: HashMap<usize, (u32, u32)>,
+    page_image_cache: HashMap<u64, Arc<PageImage>>,
+    paint_namespace: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1849,7 +1983,7 @@ fn get_specified_size(
     value: &StyleSize,
     available_size: Option<u32>,
     auto_size: Option<i32>,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     default_unit: &SizeUnit,
 ) -> Option<i32> {
     match value {
@@ -1913,7 +2047,7 @@ fn get_calc_exp_value(
     font_size: u32,
     available_size: Option<u32>,
     auto_size: Option<i32>,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     default_unit: &SizeUnit,
 ) -> Option<i32> {
     match exp {
@@ -1943,7 +2077,7 @@ fn solve_calc(
     font_size: u32,
     available_size: Option<u32>,
     auto_size: Option<i32>,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     default_unit: &SizeUnit,
 ) -> Option<i32> {
     let mut calc = calc.clone();
@@ -2598,7 +2732,7 @@ fn compute_node_style(
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
     ancestor_hidden: bool,
@@ -2696,7 +2830,7 @@ fn move_up_ancestor_chain(
     css_nodes: &Vec<(usize, &CssNode)>,
     class_elements: &Vec<FixedBitSet>,
     css_node: &CssNode,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     require_immediate_match: bool,
     walk_up_parent: bool,
     dom_indexes: &DomIndexes,
@@ -2770,7 +2904,7 @@ fn move_up_class_part(
     css_node: usize,
     nested_part_idx: usize,
     name_part_idx: usize,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     walk_up_parent: bool,
     require_immediate_match: bool,
     dom_indexes: &DomIndexes,
@@ -3076,7 +3210,7 @@ fn narrow_elements_by_ancestors(
     css_node: usize,
     name_part_idx: usize,
     nested_part_idx: usize,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     require_immediate_match: bool,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
@@ -3264,7 +3398,7 @@ fn get_parent_html_idx(node_idx: usize, html_nodes: &NodesTable) -> Option<usize
 fn collect_class_nodes_for_elements(
     css_nodes: &mut Vec<CssNode>,
     raw_html_nodes: &NodesTable,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
 ) -> (
@@ -3453,7 +3587,7 @@ fn search_elements_for_css_nodes(
     to_resolve: HashSet<usize>,
     css_nodes: &mut Vec<CssNode>,
     html_nodes: &NodesTable,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
 ) -> (
@@ -3498,7 +3632,7 @@ fn search_elements_for_css_nodes(
         for idx in query_selector_all(
             html_nodes,
             selector.clone(),
-            &PhysicalSize {
+            &ViewportSize {
                 width: 0,
                 height: 0,
             },
@@ -4004,7 +4138,7 @@ fn compute_node_styles(
     nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
     root_indice: usize,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     dom_indexes: &mut DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
     flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
@@ -4123,17 +4257,27 @@ enum UserEvent {
     Navigate((UserNavigateUrl, bool)),
     FrameUpdated,
     CanvasUpdated,
-    TabUpdated { tab_idx: usize, buffer: Vec<u32> },
-    TabUrlUpdated { tab_idx: usize, url: String },
     ChildMessage(String),
     ParentMessage(String),
     Hover(Position),
     Click,
-    Keyup(KeyEvent),
+    Keyup(String),
     ScrollBy((f32, f32)),
     FrameLoaded(usize),
     AnimationFrameRequested,
     IntersectionTracked,
+}
+
+#[derive(Debug)]
+enum BrowserEvent {
+    TabUpdated {
+        tab_idx: usize,
+        display_list: PageDisplayList,
+    },
+    TabUrlUpdated {
+        tab_idx: usize,
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -4277,7 +4421,7 @@ fn op_spawn_frame(
         return Ok(());
     }
     let handle = renderer
-        .spawn_frame(url, PhysicalSize::new(300, 150), node_idx)
+        .spawn_frame(url, ViewportSize::new(300, 150), node_idx)
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
     renderer.frames.insert(node_idx, handle);
     Ok(())
@@ -5488,7 +5632,7 @@ fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<(), JsErr
 fn query_selector_all(
     nodes_table: &NodesTable,
     selector: Vec<ClassNamePart>,
-    window_size: &PhysicalSize<u32>,
+    window_size: &ViewportSize,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
     required_parent: Option<usize>,
@@ -5962,31 +6106,44 @@ fn build_form_navigation(
     })
 }
 
-fn blit_rgb_buffer(
+#[cfg(test)]
+fn paint_page_image_into_buffer(
     dst: &mut [u32],
     dst_width: u32,
     dst_height: u32,
-    src: &[u32],
-    src_width: u32,
-    src_height: u32,
+    image: &PageImage,
+    painted_width: u32,
+    painted_height: u32,
     dst_x: i32,
     dst_y: i32,
+    opaque: bool,
     clip: PaintClip,
 ) {
     let Some(blit) = clipped_blit(
-        dst_width, dst_height, src_width, src_height, dst_x, dst_y, clip,
+        dst_width,
+        dst_height,
+        painted_width.min(image.width),
+        painted_height.min(image.height),
+        dst_x,
+        dst_y,
+        clip,
     ) else {
         return;
     };
 
     for row in 0..blit.height {
-        let src_start = ((blit.src_y + row) * src_width + blit.src_x) as usize;
+        let src_start = ((blit.src_y + row) * image.width + blit.src_x) as usize * 4;
         let dst_start = ((blit.dst_y + row) * dst_width + blit.dst_x) as usize;
-
-        let src_row = &src[src_start..src_start + blit.width as usize];
+        let src_row = &image.premul_bgra[src_start..src_start + blit.width as usize * 4];
         let dst_row = &mut dst[dst_start..dst_start + blit.width as usize];
-
-        dst_row.copy_from_slice(src_row);
+        for (dst_pixel, bgra) in dst_row.iter_mut().zip(src_row.chunks_exact(4)) {
+            let [blue, green, red, alpha] = [bgra[0], bgra[1], bgra[2], bgra[3]];
+            *dst_pixel = if opaque {
+                ((red as u32) << 16) | ((green as u32) << 8) | blue as u32
+            } else {
+                blend_rgb_with_rgba(*dst_pixel, (red, green, blue, alpha))
+            };
+        }
     }
 }
 
@@ -6001,13 +6158,14 @@ impl Renderer {
         url: String,
         tokio: Rc<RefCell<tokio::runtime::Runtime>>,
         nodes_table: NodesTable,
-        window_size: PhysicalSize<u32>,
+        window_size: ViewportSize,
         font_handler: Rc<FontHandler>,
         network_fetch: Rc<RefCell<NetworkFetch>>,
         mut dom_indexes: DomIndexes,
         nodes_idxs: Vec<usize>,
         blob_store: Arc<BlobStore>,
     ) -> Self {
+        static NEXT_PAINT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
         let request_cache = HashMap::new();
 
         let layout_table = HashMap::new();
@@ -6085,6 +6243,8 @@ impl Renderer {
             nodes_intersecting: HashSet::new(),
             blob_store,
             images_nodes_loaded: HashMap::new(),
+            page_image_cache: HashMap::new(),
+            paint_namespace: NEXT_PAINT_NAMESPACE.fetch_add(1, AtomicOrdering::Relaxed),
         }
     }
 
@@ -6730,25 +6890,39 @@ impl Renderer {
         }
     }
 
+    #[cfg(test)]
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
         if width == 0 || height == 0 {
             return;
         }
 
-        clear_buffer(buffer, 0xFF_FF_FF_FF);
+        self.build_display_list(width, height, rebuild_layout)
+            .rasterize_into(buffer, width, height);
+    }
+
+    fn build_display_list(
+        &mut self,
+        width: u32,
+        height: u32,
+        rebuild_layout: bool,
+    ) -> PageDisplayList {
+        if width == 0 || height == 0 {
+            return PageDisplayList::empty();
+        }
 
         if rebuild_layout {
             self.clear_layout_state();
             self.layout_roots = self.build_layout(width, height);
         }
         self.resolve_pending_canvas_images();
+        let mut commands = vec![];
         let mut new_rendered_nodes_ordered = vec![];
         let mut deferred_z_index = vec![];
         let viewport_clip = PaintClip::viewport(width, height);
         for layout_box_idx in self.layout_roots.clone().iter() {
             self.paint_layout_box(
                 *layout_box_idx,
-                buffer,
+                &mut commands,
                 width,
                 height,
                 0,
@@ -6761,12 +6935,30 @@ impl Renderer {
         }
         self.paint_deferred_z_index(
             &mut deferred_z_index,
-            buffer,
+            &mut commands,
             width,
             height,
             &mut new_rendered_nodes_ordered,
         );
         self.rendered_nodes_ordered = new_rendered_nodes_ordered;
+        let used_images = commands
+            .iter()
+            .filter_map(|command| match command {
+                PagePaintCommand::Image { image, .. }
+                    if image.id.renderer == self.paint_namespace =>
+                {
+                    Some(image.id.resource)
+                }
+                PagePaintCommand::Image { .. } => None,
+                PagePaintCommand::Fill { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        self.page_image_cache
+            .retain(|resource_id, _| used_images.contains(resource_id));
+        PageDisplayList {
+            commands,
+            needs_animation: false,
+        }
     }
 
     fn move_entire_box(&mut self, layout_box_idx: usize, x: i32, y: i32) {
@@ -7648,7 +7840,7 @@ impl Renderer {
                         let handle = self
                             .spawn_frame(
                                 url.and_then(|v| Some(v.into_owned())),
-                                PhysicalSize { width, height },
+                                ViewportSize { width, height },
                                 node_idx,
                             )
                             .ok()?;
@@ -7859,12 +8051,12 @@ impl Renderer {
     fn spawn_frame(
         &mut self,
         url: Option<String>,
-        size: PhysicalSize<u32>,
+        size: ViewportSize,
         node_idx: usize,
     ) -> Result<FrameHandle> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
-        let bitmap_for_thread = Arc::clone(&latest_bitmap);
+        let latest_display_list = Arc::new(Mutex::new(PageDisplayList::empty()));
+        let display_list_for_thread = Arc::clone(&latest_display_list);
         let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
         tx.send(FrameCommand::Render).unwrap();
         let tx_proxy = RendererProxy::FrameLoop(tx.clone());
@@ -7914,10 +8106,15 @@ impl Renderer {
                 };
                 let had_command = cmd.is_some();
                 if let Some(cmd) = cmd {
-                    frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
+                    frame.handle_frame_command(cmd, &parent_proxy, &size, &display_list_for_thread);
 
                     while let Ok(cmd) = rx.try_recv() {
-                        frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
+                        frame.handle_frame_command(
+                            cmd,
+                            &parent_proxy,
+                            &size,
+                            &display_list_for_thread,
+                        );
                     }
                 }
                 if had_command || js_pending {
@@ -7934,7 +8131,7 @@ impl Renderer {
             }
         });
         Ok(FrameHandle {
-            surface: latest_bitmap,
+            display_list: latest_display_list,
             tx,
         })
     }
@@ -9780,10 +9977,6 @@ impl Renderer {
         Some((width, height, children, content_height))
     }
 
-    fn blend_premul_over_rgb(&self, dst: u32, src: tiny_skia::PremultipliedColorU8) -> u32 {
-        blend_rgb_with_rgba(dst, (src.red(), src.green(), src.blue(), src.alpha()))
-    }
-
     fn compute_hovering(&mut self, position: Position) {
         let hovering = self
             .rendered_nodes_ordered
@@ -9823,12 +10016,32 @@ impl Renderer {
         self.hovering = hovering.and_then(|v| Some(v.layout_box_idx));
     }
 
-    fn paint_borders(
-        &self,
-        layout_box: &LayoutBox,
-        buffer: &mut [u32],
+    fn push_fill(
+        commands: &mut Vec<PagePaintCommand>,
+        x: i32,
+        y: i32,
         width: u32,
         height: u32,
+        color: u32,
+        border_radius: &BorderRadius,
+        clip: PaintClip,
+    ) {
+        if width > 0 && height > 0 && !clip.is_empty() {
+            commands.push(PagePaintCommand::Fill {
+                x,
+                y,
+                width,
+                height,
+                color,
+                border_radius: border_radius.clone(),
+                clip,
+            });
+        }
+    }
+
+    fn paint_borders(
+        layout_box: &LayoutBox,
+        commands: &mut Vec<PagePaintCommand>,
         offset_x: i32,
         offset_y: i32,
         clip: PaintClip,
@@ -9836,11 +10049,8 @@ impl Renderer {
         let container_start_x = layout_box.rect.x + offset_x;
         let container_start_y = layout_box.rect.y + offset_y;
         if let Some(border) = &layout_box.rect.border.left {
-            draw_rect_filled_clipped(
-                buffer,
-                false,
-                width,
-                height,
+            Self::push_fill(
+                commands,
                 container_start_x,
                 container_start_y,
                 border.size,
@@ -9851,11 +10061,8 @@ impl Renderer {
             );
         }
         if let Some(border) = &layout_box.rect.border.top {
-            draw_rect_filled_clipped(
-                buffer,
-                false,
-                width,
-                height,
+            Self::push_fill(
+                commands,
                 container_start_x,
                 container_start_y,
                 layout_box.rect.width,
@@ -9866,11 +10073,8 @@ impl Renderer {
             );
         }
         if let Some(border) = &layout_box.rect.border.right {
-            draw_rect_filled_clipped(
-                buffer,
-                false,
-                width,
-                height,
+            Self::push_fill(
+                commands,
                 container_start_x + layout_box.rect.width as i32 - border.size as i32,
                 container_start_y,
                 border.size,
@@ -9881,11 +10085,8 @@ impl Renderer {
             );
         }
         if let Some(border) = &layout_box.rect.border.bottom {
-            draw_rect_filled_clipped(
-                buffer,
-                false,
-                width,
-                height,
+            Self::push_fill(
+                commands,
                 container_start_x,
                 container_start_y + layout_box.rect.height as i32 - border.size as i32,
                 layout_box.rect.width,
@@ -9897,48 +10098,139 @@ impl Renderer {
         }
     }
 
-    fn apply_pixmap_on_buffer(
-        &self,
-        layout_box: &LayoutBox,
-        buffer: &mut [u32],
+    fn cached_page_image_from_premul_rgba(
+        &mut self,
+        resource_id: u64,
         width: u32,
         height: u32,
+        premul_rgba: &[u8],
+    ) -> Arc<PageImage> {
+        let mut hasher = DefaultHasher::new();
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+        premul_rgba.hash(&mut hasher);
+        let revision = hasher.finish();
+        if let Some(cached) = self.page_image_cache.get(&resource_id)
+            && cached.revision == revision
+        {
+            return cached.clone();
+        }
+        let mut bgra = Vec::with_capacity(premul_rgba.len());
+        #[cfg(test)]
+        let mut premul_bgra = Vec::with_capacity(premul_rgba.len());
+        for rgba in premul_rgba.chunks_exact(4) {
+            #[cfg(test)]
+            premul_bgra.extend_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+            let alpha = rgba[3];
+            if alpha > 0 && alpha < 255 {
+                let alpha_scale = alpha as f32 / 255.0;
+                bgra.extend_from_slice(&[
+                    (rgba[2] as f32 / alpha_scale).min(255.0) as u8,
+                    (rgba[1] as f32 / alpha_scale).min(255.0) as u8,
+                    (rgba[0] as f32 / alpha_scale).min(255.0) as u8,
+                    alpha,
+                ]);
+            } else {
+                bgra.extend_from_slice(&[rgba[2], rgba[1], rgba[0], alpha]);
+            }
+        }
+        let image = Arc::new(PageImage {
+            id: PageImageId {
+                renderer: self.paint_namespace,
+                resource: resource_id,
+            },
+            revision,
+            width,
+            height,
+            bgra: bgra.into(),
+            #[cfg(test)]
+            premul_bgra: premul_bgra.into(),
+        });
+        self.page_image_cache.insert(resource_id, image.clone());
+        image
+    }
+
+    fn push_pixmap(
+        &mut self,
+        resource_id: u64,
+        layout_box: &LayoutBox,
+        commands: &mut Vec<PagePaintCommand>,
         container_start_x: i32,
         container_start_y: i32,
         pixmap_buffer: &tiny_skia::Pixmap,
         opaque: bool,
         clip: PaintClip,
     ) {
-        let pixels = pixmap_buffer.pixels();
         let pixmap_width = layout_box.rect.width.min(pixmap_buffer.width());
         let pixmap_height = layout_box.rect.height.min(pixmap_buffer.height());
-        let pixmap_stride = pixmap_buffer.width();
-        let Some(blit) = clipped_blit(
-            width,
-            height,
-            pixmap_width,
-            pixmap_height,
-            container_start_x,
-            container_start_y,
-            clip,
-        ) else {
+        if pixmap_width == 0 || pixmap_height == 0 || clip.is_empty() {
             return;
-        };
+        }
+        let image = self.cached_page_image_from_premul_rgba(
+            resource_id,
+            pixmap_buffer.width(),
+            pixmap_buffer.height(),
+            pixmap_buffer.data(),
+        );
+        commands.push(PagePaintCommand::Image {
+            x: container_start_x,
+            y: container_start_y,
+            width: pixmap_width,
+            height: pixmap_height,
+            image,
+            opaque,
+            clip,
+        });
+    }
 
-        for row in 0..blit.height {
-            let src_start = ((blit.src_y + row) * pixmap_stride + blit.src_x) as usize;
-            let src_row = &pixels[src_start..src_start + blit.width as usize];
-            let dst_start = ((blit.dst_y + row) * width + blit.dst_x) as usize;
-            let dst_row = &mut buffer[dst_start..dst_start + blit.width as usize];
-            for pixel_x in 0..blit.width as usize {
-                let pixel = src_row[pixel_x];
-                if opaque {
-                    dst_row[pixel_x] = ((pixel.red() as u32) << 16)
-                        | ((pixel.green() as u32) << 8)
-                        | (pixel.blue() as u32);
-                } else {
-                    dst_row[pixel_x] = self.blend_premul_over_rgb(dst_row[pixel_x], pixel);
-                }
+    fn push_iframe_display_list(
+        commands: &mut Vec<PagePaintCommand>,
+        display_list: &PageDisplayList,
+        offset_x: i32,
+        offset_y: i32,
+        width: u32,
+        height: u32,
+        parent_clip: PaintClip,
+    ) {
+        let iframe_clip = parent_clip
+            .intersect_x(offset_x, offset_x.saturating_add_unsigned(width))
+            .intersect_y(offset_y, offset_y.saturating_add_unsigned(height));
+        for command in &display_list.commands {
+            match command {
+                PagePaintCommand::Fill {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                    border_radius,
+                    clip,
+                } => commands.push(PagePaintCommand::Fill {
+                    x: x.saturating_add(offset_x),
+                    y: y.saturating_add(offset_y),
+                    width: *width,
+                    height: *height,
+                    color: *color,
+                    border_radius: border_radius.clone(),
+                    clip: clip.translated(offset_x, offset_y).intersect(iframe_clip),
+                }),
+                PagePaintCommand::Image {
+                    x,
+                    y,
+                    width,
+                    height,
+                    image,
+                    opaque,
+                    clip,
+                } => commands.push(PagePaintCommand::Image {
+                    x: x.saturating_add(offset_x),
+                    y: y.saturating_add(offset_y),
+                    width: *width,
+                    height: *height,
+                    image: image.clone(),
+                    opaque: *opaque,
+                    clip: clip.translated(offset_x, offset_y).intersect(iframe_clip),
+                }),
             }
         }
     }
@@ -9946,7 +10238,7 @@ impl Renderer {
     fn paint_layout_box(
         &mut self,
         layout_box_idx: usize,
-        buffer: &mut [u32],
+        commands: &mut Vec<PagePaintCommand>,
         width: u32,
         height: u32,
         parent_offset_x: i32,
@@ -9960,7 +10252,7 @@ impl Renderer {
             return;
         }
 
-        let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
+        let layout_box = self.layout_table.get(&layout_box_idx).unwrap().clone();
         let style = self.node_styles.get(&layout_box.node_idx).cloned();
         let creates_stacking_context = style.as_ref().is_some_and(Self::creates_stacking_context);
         if defer_positive_z_index && layout_box.z_index > 0 && creates_stacking_context {
@@ -9969,7 +10261,7 @@ impl Renderer {
         }
         let (transform_x, transform_y) = style
             .as_ref()
-            .map(|style| self.resolve_transform_offset(style, layout_box))
+            .map(|style| self.resolve_transform_offset(style, &layout_box))
             .unwrap_or((0, 0));
         let offset_x = parent_offset_x + transform_x;
         let offset_y = parent_offset_y + transform_y;
@@ -10030,34 +10322,32 @@ impl Renderer {
             LayoutKind::Element => {
                 match &layout_box.rect.background {
                     StyleBackground::Hex(code) => {
-                        draw_rect_filled_clipped(
-                            buffer,
-                            false,
-                            width,
-                            height,
+                        Self::push_fill(
+                            commands,
                             container_start_x + left_border_size,
                             container_start_y + top_border_size,
                             (layout_box.rect.width as i32 - left_border_size - right_border_size)
                                 .max(0) as u32,
                             (layout_box.rect.height as i32 - top_border_size - bottom_border_size)
                                 .max(0) as u32,
-                            code.clone(),
+                            *code,
                             &layout_box.rect.border_radius,
                             clip,
                         );
                     }
                     StyleBackground::DataUrl(_) => {
-                        if let Some(pixmap) =
-                            self.resolved_pixmaps.get(&layout_box.node_idx.to_string())
+                        if let Some(pixmap) = self
+                            .resolved_pixmaps
+                            .get(&layout_box.node_idx.to_string())
+                            .cloned()
                         {
-                            self.apply_pixmap_on_buffer(
-                                layout_box,
-                                buffer,
-                                width,
-                                height,
+                            self.push_pixmap(
+                                (1_u64 << 60) | layout_box_idx as u64,
+                                &layout_box,
+                                commands,
                                 container_start_x,
                                 container_start_y,
-                                pixmap,
+                                &pixmap,
                                 false,
                                 clip,
                             );
@@ -10065,7 +10355,7 @@ impl Renderer {
                     }
                     _ => {}
                 };
-                self.paint_borders(&layout_box, buffer, width, height, offset_x, offset_y, clip);
+                Self::paint_borders(&layout_box, commands, offset_x, offset_y, clip);
             }
             LayoutKind::Text(text) => {
                 let bg_hex: Option<u32> = match layout_box.rect.background {
@@ -10073,11 +10363,8 @@ impl Renderer {
                     _ => None,
                 };
                 if let Some(bg) = bg_hex {
-                    draw_rect_filled_clipped(
-                        buffer,
-                        false,
-                        width,
-                        height,
+                    Self::push_fill(
+                        commands,
                         container_start_x,
                         container_start_y,
                         layout_box.rect.width,
@@ -10087,28 +10374,29 @@ impl Renderer {
                         clip,
                     );
                 }
-                self.apply_pixmap_on_buffer(
-                    layout_box,
-                    buffer,
-                    width,
-                    height,
+                let text = text.clone();
+                self.push_pixmap(
+                    (2_u64 << 60) | layout_box_idx as u64,
+                    &layout_box,
+                    commands,
                     container_start_x,
                     container_start_y,
-                    text,
+                    &text,
                     false,
                     clip,
                 );
             }
             LayoutKind::PixMap((pixmap_buffer, opaque)) => {
-                self.apply_pixmap_on_buffer(
-                    layout_box,
-                    buffer,
-                    width,
-                    height,
+                let pixmap_buffer = pixmap_buffer.clone();
+                let opaque = *opaque;
+                self.push_pixmap(
+                    (3_u64 << 60) | layout_box_idx as u64,
+                    &layout_box,
+                    commands,
                     container_start_x,
                     container_start_y,
-                    pixmap_buffer,
-                    *opaque,
+                    &pixmap_buffer,
+                    opaque,
                     clip,
                 );
             }
@@ -10125,11 +10413,10 @@ impl Renderer {
                         )
                     });
                 if let Some(pixmap) = pixmap {
-                    self.apply_pixmap_on_buffer(
-                        layout_box,
-                        buffer,
-                        width,
-                        height,
+                    self.push_pixmap(
+                        (4_u64 << 60) | layout_box.node_idx as u64,
+                        &layout_box,
+                        commands,
                         container_start_x,
                         container_start_y,
                         &pixmap,
@@ -10139,19 +10426,19 @@ impl Renderer {
                 }
             }
             LayoutKind::Iframe => {
-                if let Some(handle) = self
+                let node_idx = self.layout_to_node_idx(&layout_box_idx);
+                if let Some(display_list) = self
                     .frames
-                    .get_mut(&self.layout_to_node_idx(&layout_box_idx))
+                    .get(&node_idx)
+                    .map(|handle| handle.display_list.lock().unwrap().clone())
                 {
-                    blit_rgb_buffer(
-                        buffer,
-                        width,
-                        height,
-                        handle.surface.lock().unwrap().as_ref(),
-                        layout_box.rect.width,
-                        layout_box.rect.height,
+                    Self::push_iframe_display_list(
+                        commands,
+                        &display_list,
                         container_start_x,
                         container_start_y,
+                        layout_box.rect.width,
+                        layout_box.rect.height,
                         clip,
                     );
                 } else {
@@ -10189,7 +10476,7 @@ impl Renderer {
         for child in layout_box.children.clone() {
             self.paint_layout_box(
                 child,
-                buffer,
+                commands,
                 width,
                 height,
                 offset_x,
@@ -10203,7 +10490,7 @@ impl Renderer {
         if creates_stacking_context {
             self.paint_deferred_z_index(
                 &mut local_deferred_z_index,
-                buffer,
+                commands,
                 width,
                 height,
                 rendered_nodes_ordered,
@@ -10222,7 +10509,7 @@ impl Renderer {
     fn paint_deferred_z_index(
         &mut self,
         deferred_z_index: &mut Vec<DeferredPaint>,
-        buffer: &mut [u32],
+        commands: &mut Vec<PagePaintCommand>,
         width: u32,
         height: u32,
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
@@ -10237,7 +10524,7 @@ impl Renderer {
         {
             self.paint_layout_box(
                 child,
-                buffer,
+                commands,
                 width,
                 height,
                 child_parent_offset_x,
@@ -10729,7 +11016,6 @@ impl ExecutedScripts {
 struct Frame {
     url: String,
     renderer: Option<Rc<RefCell<Renderer>>>,
-    window: Option<Arc<Window>>,
     js_runtime: Option<Rc<RefCell<JsRuntime>>>,
     tokio: Option<Rc<RefCell<tokio::runtime::Runtime>>>,
     html_parser: Option<HtmlParser>,
@@ -10743,7 +11029,7 @@ struct Frame {
     load_dispatched: bool,
     is_top: bool,
     hover_debugging: bool,
-    render_size: PhysicalSize<u32>,
+    render_size: ViewportSize,
     loaded_nodes: HashSet<usize>,
     last_hover_position: Option<Position>,
     animation_frame_requested: bool,
@@ -10762,7 +11048,6 @@ impl std::fmt::Debug for Frame {
         f.debug_struct("Frame")
             .field("url", &self.url)
             .field("renderer", &self.renderer)
-            .field("window", &self.window)
             .field("js_runtime", &self.js_runtime.is_some())
             .field("tokio", &self.tokio)
             .field("html_parser", &self.html_parser)
@@ -10782,7 +11067,7 @@ impl std::fmt::Debug for Frame {
 }
 
 impl Frame {
-    fn new(url: String, hover_debugging: bool, render_size: PhysicalSize<u32>) -> Self {
+    fn new(url: String, hover_debugging: bool, render_size: ViewportSize) -> Self {
         install_default_crypto_provider();
 
         let font_handler = Rc::new(FontHandler::new().unwrap());
@@ -10790,7 +11075,6 @@ impl Frame {
         Self {
             url,
             renderer: None,
-            window: None,
             js_runtime: None,
             tokio: None,
             html_parser: None,
@@ -10813,6 +11097,7 @@ impl Frame {
         }
     }
 
+    #[cfg(test)]
     pub fn render_into(
         &mut self,
         buffer: &mut [u32],
@@ -10962,8 +11247,8 @@ impl Frame {
         &mut self,
         cmd: FrameCommand,
         parent_proxy: &RendererProxy,
-        size: &PhysicalSize<u32>,
-        bitmap_for_thread: &Arc<Mutex<Vec<u32>>>,
+        size: &ViewportSize,
+        display_list_for_thread: &Arc<Mutex<PageDisplayList>>,
     ) {
         match cmd {
             cmd @ (FrameCommand::Render
@@ -10998,30 +11283,26 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    !canvas_updated,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
+                let display_list = self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .build_display_list(size.width, size.height, !canvas_updated);
+                *display_list_for_thread.lock().unwrap() = display_list;
 
                 let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
                 self.apply_hovering(&position);
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    true,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
+                let display_list = self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .build_display_list(size.width, size.height, true);
+                *display_list_for_thread.lock().unwrap() = display_list;
                 let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
             }
             FrameCommand::UserEvent(UserEvent::Click) => {
@@ -11037,15 +11318,13 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    true,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
+                let display_list = self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .build_display_list(size.width, size.height, true);
+                *display_list_for_thread.lock().unwrap() = display_list;
                 let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
             }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
@@ -11471,10 +11750,7 @@ impl Frame {
                 js_result
             );
         }
-        if let Some(window) = self.window.as_mut() {
-            self.layout_dirty = true;
-            window.request_redraw();
-        }
+        self.layout_dirty = true;
         Ok(())
     }
 
@@ -11946,8 +12222,8 @@ impl Frame {
         .unwrap();
     }
 
-    fn render_loop(&mut self) -> Vec<u32> {
-        let animation_redraw = self.tick_animations();
+    fn render_loop(&mut self) -> PageDisplayList {
+        let needs_animation = self.tick_animations();
         let prev_loaded_images: HashSet<usize> = self
             .renderer
             .as_ref()
@@ -11968,23 +12244,17 @@ impl Frame {
             );
             self.fire_load_phase(&LoadPhase::JsDone, None);
         }
-        let mut buffer =
-            vec![0; self.render_size.width as usize * self.render_size.height as usize];
-        self.render(&mut buffer);
+        let mut display_list = self.render_display_list();
+        display_list.needs_animation = needs_animation;
         self.refresh_hover_after_render();
         let _ = self.refresh_intersections();
         self.decode_detached_images();
         self.update_newly_loaded_images(&prev_loaded_images);
 
-        // If there are animations, continue re-rendering until there aren't
-        if animation_redraw && let Some(window) = &self.window {
-            window.request_redraw();
-        }
-
-        buffer
+        display_list
     }
 
-    fn render(&mut self, buffer: &mut Vec<u32>) -> bool {
+    fn render_display_list(&mut self) -> PageDisplayList {
         if self
             .renderer
             .as_ref()
@@ -11995,12 +12265,16 @@ impl Frame {
 
         let start = Instant::now();
 
-        self.renderer.as_mut().unwrap().borrow_mut().render_into(
-            buffer,
-            self.render_size.width,
-            self.render_size.height,
-            self.layout_dirty,
-        );
+        let display_list = self
+            .renderer
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .build_display_list(
+                self.render_size.width,
+                self.render_size.height,
+                self.layout_dirty,
+            );
         self.layout_dirty = false;
 
         println!(
@@ -12010,10 +12284,8 @@ impl Frame {
 
         if !self.layout_booted {
             self.layout_booted = true;
-            true
-        } else {
-            false
         }
+        display_list
     }
 
     fn process_dom_update(&mut self) {
@@ -12049,9 +12321,6 @@ impl Frame {
 
     fn execute_dom_update(&mut self) {
         self.process_dom_update();
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
-        }
     }
 
     fn apply_debug_hover(&mut self, hovering_layout_idx: usize) {
@@ -12137,12 +12406,10 @@ impl Frame {
             {
                 self.apply_debug_hover(hovering);
             }
-            if let Some(window) = self.window.as_mut() {
-                window.request_redraw();
-            }
         }
     }
 
+    #[cfg(test)]
     pub fn pump_with_limit(&mut self, latest_end: Instant) -> Result<()> {
         match self.pump_js_event_loop_once() {
             Ok(js_pending) => {
@@ -12165,14 +12432,14 @@ impl Frame {
     pub fn handle_main_event(&mut self, proxy: &RendererProxy, event: FrameCommand) {
         match event {
             FrameCommand::Render => {
-                let buffer = self.render_loop();
-                let _ = proxy.fire_tab_updated(buffer);
+                let display_list = self.render_loop();
+                let _ = proxy.fire_tab_updated(display_list);
             }
             FrameCommand::Resized(new_size) => {
                 self.render_size = new_size;
                 self.layout_dirty = true;
-                let buffer = self.render_loop();
-                let _ = proxy.fire_tab_updated(buffer);
+                let display_list = self.render_loop();
+                let _ = proxy.fire_tab_updated(display_list);
             }
             FrameCommand::UserEvent(
                 event @ (UserEvent::FrameUpdated
@@ -12194,8 +12461,8 @@ impl Frame {
                     UserEvent::FrameUpdated => {}
                     _ => unreachable!(),
                 }
-                let buffer = self.render_loop();
-                let _ = proxy.fire_tab_updated(buffer);
+                let display_list = self.render_loop();
+                let _ = proxy.fire_tab_updated(display_list);
             }
             FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
                 self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
@@ -12209,6 +12476,8 @@ impl Frame {
                     self.renderer.as_ref().unwrap().borrow().pending_dom_update;
                 if pending_dom_update {
                     self.execute_dom_update();
+                    let display_list = self.render_loop();
+                    let _ = proxy.fire_tab_updated(display_list);
                 }
             }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
@@ -12249,6 +12518,8 @@ impl Frame {
                     self.setup_js_dom().unwrap();
                     let _ = proxy.fire_tab_url_updated(self.url.clone());
                 }
+                let display_list = self.render_loop();
+                let _ = proxy.fire_tab_updated(display_list);
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
                 self.apply_hovering(&position);
@@ -12322,16 +12593,11 @@ impl Frame {
         let _ = self
             .execute_host_script("script onscroll", code)
             .inspect_err(|err| eprintln!("Script onscroll handler failed with err: {}", err));
-        if let Some(window) = self.window.as_mut() {
-            window.request_redraw();
-        }
     }
 
-    fn handle_keyup(&mut self, event: KeyEvent) {
+    fn handle_keyup(&mut self, input_text: String) {
         let focusable = self.renderer.as_ref().unwrap().borrow().focusable;
-        if let Some(focusable) = focusable
-            && let Some(input_text) = event.text
-        {
+        if let Some(focusable) = focusable {
             let new_text = {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 if let Some(Node::Element(element)) = renderer.nodes.get_mut(focusable) {
@@ -12400,13 +12666,13 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
     let mut frame = Frame::new(
         url.to_string(),
         false,
-        PhysicalSize {
+        ViewportSize {
             width: WINDOW_WIDTH,
             height: WINDOW_HEIGHT,
         },
     );
     let mut params = frame.open()?;
-    let window_size = PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
+    let window_size = ViewportSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
     let hovering_chain = vec![];
     let mut css_parse_cache = HashMap::new();
     let mut flattened_css_cache = None;
@@ -12439,28 +12705,50 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
 }
 
 pub struct Browser {
-    pub tabs: Vec<TabHandle>,
-    window: Arc<Window>,
-    event_loop_proxy: EventLoopProxy<UserEvent>,
+    tabs: Vec<TabHandle>,
     current_tab_idx: usize,
+    event_tx: async_channel::Sender<BrowserEvent>,
+    page_size: ViewportSize,
+    hover_debugging: bool,
+    address: String,
+    address_focused: bool,
+    focus_handle: FocusHandle,
     fps_counter: Option<FpsCounter>,
+    fps: Option<u32>,
+    animation_frame_scheduled: bool,
 }
 
-pub struct TabHandle {
+#[derive(Clone)]
+enum GpuiPaintCommand {
+    Fill {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        color: u32,
+        border_radius: BorderRadius,
+        clip: PaintClip,
+    },
+    Image {
+        x: i32,
+        y: i32,
+        painted_width: u32,
+        painted_height: u32,
+        source_width: u32,
+        source_height: u32,
+        image: Arc<RenderImage>,
+        clip: PaintClip,
+    },
+}
+
+struct TabHandle {
     tx: Sender<FrameCommand>,
     url: String,
-}
-
-enum BrowserAction {
-    OpenTab(String),
-    SelectTab(usize),
-    Rerender,
-    Navigate(String),
-}
-
-struct HeaderState {
-    url: String,
-    fps: Option<u32>,
+    display_list: Arc<Vec<GpuiPaintCommand>>,
+    image_cache: HashMap<PageImageId, (u64, Arc<RenderImage>)>,
+    render_pending: bool,
+    render_again: bool,
+    needs_animation: bool,
 }
 
 struct FpsCounter {
@@ -12493,430 +12781,601 @@ impl FpsCounter {
 }
 
 impl Browser {
-    pub fn current_tab(&self) -> &TabHandle {
+    fn new(
+        url: String,
+        hover_debugging: bool,
+        show_fps_counter: bool,
+        cx: &mut GpuiContext<Self>,
+    ) -> Self {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let page_size = ViewportSize::new(WINDOW_WIDTH, WINDOW_HEIGHT - HEADER_HEIGHT);
+        let mut browser = Self {
+            tabs: Vec::new(),
+            current_tab_idx: 0,
+            event_tx,
+            page_size,
+            hover_debugging,
+            address: url.clone(),
+            address_focused: false,
+            focus_handle: cx.focus_handle(),
+            fps_counter: show_fps_counter.then(FpsCounter::new),
+            fps: None,
+            animation_frame_scheduled: false,
+        };
+        let tab = browser.open_tab(url, 0);
+        browser.tabs.push(tab);
+        browser.request_current_render();
+        cx.spawn(async move |browser, cx| {
+            while let Ok(event) = event_rx.recv().await {
+                if browser
+                    .update(cx, |browser, cx| {
+                        browser.handle_browser_event(event, cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        browser
+    }
+
+    fn current_tab(&self) -> &TabHandle {
         &self.tabs[self.current_tab_idx]
     }
 
-    fn build_header(
-        &self,
-        builder: &mut UiBuilder,
-        state: &Rc<RefCell<HeaderState>>,
-        action_tx: Sender<BrowserAction>,
-    ) -> Result<()> {
-        builder.clean();
-
-        builder.start_element();
-        builder.width(WINDOW_WIDTH)?;
-        builder.height(HEADER_HEIGHT)?;
-        builder.bg(0x2e2e2eFF)?;
-
-        builder.start_element();
-        builder.width(WINDOW_WIDTH)?;
-        builder.height(60)?;
-        builder.padding(10)?;
-        builder.hor()?;
-        builder.gap(10)?;
-
-        for (tab_idx, _) in self.tabs.iter().enumerate() {
-            builder.start_element();
-            builder.padding(10)?;
-            builder.width(100)?;
-            builder.height(40)?;
-            builder.rounded(10)?;
-            builder.bg(0x363636FF)?;
-            builder.text(format!("Tab {}", tab_idx + 1))?;
-            let tx = action_tx.clone();
-            builder.on_click(move || {
-                let _ = tx.send(BrowserAction::SelectTab(tab_idx));
-            })?;
-            builder.finish_element()?;
-        }
-
-        builder.start_element();
-        builder.padding(10)?;
-        builder.width(100)?;
-        builder.height(40)?;
-        builder.bg(0x363636FF)?;
-        builder.rounded(10)?;
-        builder.text("NEW".to_string())?;
-        let tx = action_tx.clone();
-        builder.on_click(move || {
-            let _ = tx.send(BrowserAction::OpenTab("https://www.google.com".to_string()));
-        })?;
-        builder.finish_element()?;
-
-        if self.fps_counter.is_some() {
-            builder.start_element();
-            builder.padding(10)?;
-            builder.width(100)?;
-            builder.height(40)?;
-            builder.bg(0x363636FF)?;
-            builder.text(match state.borrow().fps {
-                Some(fps) => format!("{fps} FPS"),
-                None => "-- FPS".to_string(),
-            })?;
-            builder.finish_element()?;
-        }
-
-        builder.finish_element()?;
-
-        builder.start_element();
-        builder.bg(0x363636FF)?;
-        builder.padding(10)?;
-        builder.width(WINDOW_WIDTH)?;
-        builder.height(40)?;
-        let enter_tx = action_tx.clone();
-        let on_input_state = state.clone();
-        builder.typeable(Typeable {
-            text: state.borrow().url.clone(),
-            color: 0xFF_FF_FF_FF,
-            on_input: Some(Box::new(move |typeable: &Typeable| {
-                on_input_state.borrow_mut().url = typeable.text.clone();
-            })),
-            on_enter: Some(Box::new(move |typeable: &Typeable| {
-                let _ = enter_tx.send(BrowserAction::Navigate(typeable.text.clone()));
-            })),
-        })?;
-        builder.finish_element()?;
-
-        builder.finish_element()?;
-
-        Ok(())
+    fn current_tab_mut(&mut self) -> &mut TabHandle {
+        &mut self.tabs[self.current_tab_idx]
     }
 
-    fn get_header_buffer(
-        &self,
-        url: &String,
-        action_tx: Sender<BrowserAction>,
-    ) -> Result<ui::UiRuntime<HeaderState>> {
-        let state = HeaderState {
-            url: url.clone(),
-            fps: None,
-        };
-        let mut runtime =
-            UiRuntime::new_empty(WINDOW_WIDTH, HEADER_HEIGHT, action_tx.clone(), state)?;
-        self.build_header(&mut runtime.builder, &runtime.state, action_tx)?;
-        runtime.rerender()?;
-        Ok(runtime)
+    fn send_current(&self, command: FrameCommand) {
+        let _ = self.current_tab().tx.send(command);
     }
 
-    pub fn open_tab(
-        &self,
-        url: String,
-        hover_debugging: bool,
-        tab_idx: usize,
-    ) -> Result<TabHandle> {
+    fn send_current_and_render(&mut self, command: FrameCommand) {
+        self.send_current(command);
+        self.request_current_render();
+    }
+
+    fn request_current_render(&mut self) {
+        let tab = self.current_tab_mut();
+        if tab.render_pending {
+            tab.render_again = true;
+        } else if tab.tx.send(FrameCommand::Render).is_ok() {
+            tab.render_pending = true;
+        }
+    }
+
+    fn open_tab(&self, url: String, tab_idx: usize) -> TabHandle {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = TabHandle {
-            tx: tx.clone(),
-            url: url.clone(),
-        };
-        let proxy = self.event_loop_proxy.clone();
-        let tab_window = Some(self.window.clone());
+        let frame_tx = tx.clone();
+        let event_tx = self.event_tx.clone();
+        let render_size = self.page_size;
+        let hover_debugging = self.hover_debugging;
+        let thread_url = url.clone();
+
         std::thread::spawn(move || {
-            let mut tab = Frame::new(
-                url,
-                hover_debugging,
-                PhysicalSize {
-                    width: WINDOW_WIDTH,
-                    height: WINDOW_HEIGHT - HEADER_HEIGHT,
-                },
-            );
-            tab.window = tab_window;
+            let mut tab = Frame::new(thread_url, hover_debugging, render_size);
             match tab.open() {
                 Ok(params) => {
-                    let window_proxy = RendererProxy::WindowLoop { proxy, tab_idx };
-                    let frame_proxy = RendererProxy::FrameLoop(tx);
-                    tab.set_up_without_event_loop(params, frame_proxy).unwrap();
-                    tab.start_main_loop(window_proxy, rx);
+                    let browser_proxy = RendererProxy::WindowLoop {
+                        tx: event_tx,
+                        tab_idx,
+                    };
+                    let frame_proxy = RendererProxy::FrameLoop(frame_tx);
+                    if let Err(err) = tab.set_up_without_event_loop(params, frame_proxy) {
+                        eprintln!("Failed to initialize frame: {err:?}");
+                        return;
+                    }
+                    tab.start_main_loop(browser_proxy, rx);
                 }
-                Err(err) => eprintln!("Failed to open frame due to {}", err),
-            };
+                Err(err) => eprintln!("Failed to open frame: {err:?}"),
+            }
         });
-        Ok(handle)
+
+        TabHandle {
+            tx,
+            url,
+            display_list: Arc::new(vec![]),
+            image_cache: HashMap::new(),
+            render_pending: false,
+            render_again: false,
+            needs_animation: false,
+        }
     }
 
-    fn poll_header_events(
-        &mut self,
-        header: &mut UiRuntime<HeaderState>,
-        window: &Arc<Window>,
-        header_comms_rx: &Receiver<BrowserAction>,
-        hover_debugging: bool,
-    ) {
-        while let Ok(action) = header_comms_rx.try_recv() {
-            match action {
-                BrowserAction::OpenTab(url) => {
-                    match self.open_tab(url.clone(), hover_debugging, self.tabs.len()) {
-                        Ok(handle) => {
-                            self.tabs.push(handle);
-                            self.current_tab_idx = self.tabs.len() - 1;
-                            header.state.borrow_mut().url = self.current_tab().url.clone();
-                            let comms_tx = header.builder.comms_tx.clone();
-                            self.build_header(&mut header.builder, &header.state, comms_tx)
-                                .unwrap();
-                            match header.rerender() {
-                                Ok(_) => {
-                                    window.request_redraw();
-                                }
-                                Err(err) => {
-                                    eprintln!("Failed to render header: {err:?}");
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("Failed to open tab: {err:?}")
-                        }
+    fn open_new_tab(&mut self) {
+        let url = "https://www.google.com".to_string();
+        let tab_idx = self.tabs.len();
+        let tab = self.open_tab(url.clone(), tab_idx);
+        self.tabs.push(tab);
+        self.current_tab_idx = tab_idx;
+        self.address = url;
+        self.address_focused = false;
+        self.request_current_render();
+    }
+
+    fn select_tab(&mut self, tab_idx: usize) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+
+        self.current_tab_idx = tab_idx;
+        self.address = self.current_tab().url.clone();
+        self.address_focused = false;
+        let _ = self
+            .current_tab()
+            .tx
+            .send(FrameCommand::Resized(self.page_size));
+        self.current_tab_mut().render_pending = true;
+    }
+
+    fn navigate(&mut self) {
+        let Ok(url) = ReqwestUrl::parse(&self.address) else {
+            return;
+        };
+        let url_text = url.to_string();
+        self.address = url_text.clone();
+        self.address_focused = false;
+        self.current_tab_mut().url = url_text;
+        self.send_current(FrameCommand::UserEvent(UserEvent::Navigate((
+            UserNavigateUrl::Form(FormNavigation {
+                url,
+                method: FormMethod::Get,
+                body: None,
+            }),
+            true,
+        ))));
+    }
+
+    fn resize_page(&mut self, window: &Window) {
+        let viewport = window.viewport_size();
+        let viewport_width = f32::from(viewport.width);
+        let viewport_height = f32::from(viewport.height);
+        let page_size = ViewportSize::new(
+            (viewport_width.round() as u32).max(1),
+            ((viewport_height - HEADER_HEIGHT as f32).round() as u32).max(1),
+        );
+        if page_size == self.page_size {
+            return;
+        }
+
+        self.page_size = page_size;
+        if self
+            .current_tab()
+            .tx
+            .send(FrameCommand::Resized(page_size))
+            .is_ok()
+        {
+            self.current_tab_mut().render_pending = true;
+        }
+    }
+
+    fn handle_browser_event(&mut self, event: BrowserEvent, cx: &mut GpuiContext<Self>) {
+        match event {
+            BrowserEvent::TabUpdated {
+                tab_idx,
+                display_list,
+            } => {
+                let is_current = tab_idx == self.current_tab_idx;
+                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                    tab.render_pending = false;
+                    tab.needs_animation = display_list.needs_animation;
+                    tab.update_display_list(display_list);
+                    if std::mem::take(&mut tab.render_again)
+                        && tab.tx.send(FrameCommand::Render).is_ok()
+                    {
+                        tab.render_pending = true;
                     }
                 }
-                BrowserAction::SelectTab(tab_idx) => {
-                    self.current_tab_idx = tab_idx;
-                    header.state.borrow_mut().url = self.current_tab().url.clone();
-                    let comms_tx = header.builder.comms_tx.clone();
-                    self.build_header(&mut header.builder, &header.state, comms_tx)
-                        .unwrap();
-                    match header.rerender() {
-                        Ok(_) => {
-                            window.request_redraw();
-                        }
-                        Err(err) => {
-                            eprintln!("Failed to render header: {err:?}");
-                        }
+                if is_current {
+                    self.fps = self
+                        .fps_counter
+                        .as_mut()
+                        .and_then(FpsCounter::record_present)
+                        .or(self.fps);
+                    if self.current_tab().needs_animation {
+                        self.schedule_animation_frame(cx);
                     }
                 }
-                BrowserAction::Rerender => {
-                    let comms_tx = header.builder.comms_tx.clone();
-                    self.build_header(&mut header.builder, &header.state, comms_tx)
-                        .unwrap();
-                    match header.rerender() {
-                        Ok(_) => {
-                            window.request_redraw();
-                        }
-                        Err(err) => {
-                            eprintln!("Failed to render header: {err:?}");
-                        }
-                    };
+            }
+            BrowserEvent::TabUrlUpdated { tab_idx, url } => {
+                let is_current = tab_idx == self.current_tab_idx;
+                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                    tab.url = url.clone();
                 }
-                BrowserAction::Navigate(text) => {
-                    let Ok(url) = ReqwestUrl::parse(&text) else {
-                        return;
-                    };
-                    let url_text = url.to_string();
-                    if let Some(tab) = self.tabs.get_mut(self.current_tab_idx) {
-                        tab.url = url_text.clone();
-                    }
-                    header.state.borrow_mut().url = url_text;
-                    let _ =
-                        self.current_tab()
-                            .tx
-                            .send(FrameCommand::UserEvent(UserEvent::Navigate((
-                                UserNavigateUrl::Form(FormNavigation {
-                                    url,
-                                    method: FormMethod::Get,
-                                    body: None,
-                                }),
-                                true,
-                            ))));
+                if is_current && !self.address_focused {
+                    self.address = url;
                 }
             }
         }
     }
 
-    pub fn open(url: String, hover_debugging: bool, show_fps_counter: bool) -> Result<()> {
-        let event_loop = EventLoopBuilder::with_user_event()
-            .build()
-            .expect("Failed to create event loop");
-        let window = Arc::new(
-            WindowBuilder::new()
-                .with_title("XML demo")
-                .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
-                .build(&event_loop)
-                .expect("Failed to create window"),
+    fn schedule_animation_frame(&mut self, cx: &mut GpuiContext<Self>) {
+        if self.animation_frame_scheduled {
+            return;
+        }
+        self.animation_frame_scheduled = true;
+        cx.spawn(async move |browser, cx| {
+            cx.background_executor()
+                .timer(ANIMATION_FRAME_INTERVAL)
+                .await;
+            let _ = browser.update(cx, |browser, _| {
+                browser.animation_frame_scheduled = false;
+                browser.request_current_render();
+            });
+        })
+        .detach();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window) {
+        if self.address_focused {
+            window.prevent_default();
+            match event.keystroke.key.as_str() {
+                "enter" => self.navigate(),
+                "backspace" => {
+                    self.address.pop();
+                }
+                "escape" => {
+                    self.address = self.current_tab().url.clone();
+                    self.address_focused = false;
+                }
+                _ => {
+                    if !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                        && let Some(text) = &event.keystroke.key_char
+                    {
+                        self.address.push_str(text);
+                    }
+                }
+            }
+            return;
+        }
+
+        let text = event
+            .keystroke
+            .key_char
+            .clone()
+            .or_else(|| (event.keystroke.key == "enter").then(|| "\n".to_string()));
+        if let Some(text) = text {
+            self.send_current_and_render(FrameCommand::UserEvent(UserEvent::Keyup(text)));
+        }
+    }
+
+    fn open(url: String, hover_debugging: bool, show_fps_counter: bool) {
+        Application::new().run(move |cx: &mut App| {
+            let bounds = gpui::Bounds::centered(
+                None,
+                size(px(WINDOW_WIDTH as f32), px(WINDOW_HEIGHT as f32)),
+                cx,
+            );
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: true,
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    window.set_window_title("Browser");
+                    cx.new(|cx| Browser::new(url, hover_debugging, show_fps_counter, cx))
+                },
+            )
+            .expect("Failed to open browser window");
+            cx.on_window_closed(|cx| cx.quit()).detach();
+            cx.activate(true);
+        });
+    }
+}
+
+impl Focusable for Browser {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for Browser {
+    fn render(&mut self, window: &mut Window, cx: &mut GpuiContext<Self>) -> impl IntoElement {
+        self.resize_page(window);
+
+        let mut tabs = div()
+            .h(px(60.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .bg(rgb(0x2e2e2e));
+
+        for tab_idx in 0..self.tabs.len() {
+            let selected = tab_idx == self.current_tab_idx;
+            tabs = tabs.child(
+                div()
+                    .id(("tab", tab_idx))
+                    .w(px(100.0))
+                    .h(px(40.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if selected {
+                        rgb(0x4a4a4a)
+                    } else {
+                        rgb(0x363636)
+                    })
+                    .text_color(gpui::white())
+                    .child(format!("Tab {}", tab_idx + 1))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_tab(tab_idx);
+                        if this.current_tab().needs_animation {
+                            this.schedule_animation_frame(cx);
+                        }
+                        this.focus_handle.focus(window);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        tabs = tabs.child(
+            div()
+                .id("new-tab")
+                .w(px(70.0))
+                .h(px(40.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(0x363636))
+                .text_color(gpui::white())
+                .child("NEW")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_new_tab();
+                    this.focus_handle.focus(window);
+                    cx.notify();
+                })),
         );
-        let mut size = window.inner_size();
 
-        let ctx_window = window.clone();
-        let ctx = SoftContext::new(ctx_window.display_handle().expect("Display handle"))
-            .expect("Softbuffer context failed");
-        let surf_window = window.clone();
-        let mut surf = Surface::new(&ctx, surf_window.window_handle().expect("Window handle"))
-            .expect("Softbuffer surface failed");
+        if self.fps_counter.is_some() {
+            tabs = tabs.child(
+                div().ml_auto().px_2().text_color(gpui::white()).child(
+                    self.fps
+                        .map(|fps| format!("{fps} FPS"))
+                        .unwrap_or_else(|| "-- FPS".to_string()),
+                ),
+            );
+        }
 
-        let mut browser = Browser {
-            tabs: vec![],
-            current_tab_idx: 0,
-            window: window.clone(),
-            event_loop_proxy: event_loop.create_proxy(),
-            fps_counter: show_fps_counter.then(FpsCounter::new),
+        let address = if self.address_focused {
+            format!("{}▏", self.address)
+        } else {
+            self.address.clone()
         };
-        let handle = browser.open_tab(url.clone(), hover_debugging, 0)?;
-        browser.tabs.push(handle);
+        let address_bar = div()
+            .id("address")
+            .h(px(40.0))
+            .w_full()
+            .px_2()
+            .flex()
+            .items_center()
+            .cursor_text()
+            .overflow_hidden()
+            .bg(rgb(0x363636))
+            .text_color(gpui::white())
+            .child(address)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.address_focused = true;
+                this.focus_handle.focus(window);
+                cx.notify();
+            }));
 
-        let (browser_action_tx, browser_action_rx) = std::sync::mpsc::channel();
-        let mut header = browser.get_header_buffer(&url, browser_action_tx.clone())?;
-
-        event_loop
-            .run(move |event, elwt| {
-                match event {
-                    Event::WindowEvent { event, .. } => match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(new_size) => {
-                            size = new_size;
-                            let tab_size = PhysicalSize {
-                                width: new_size.width,
-                                height: new_size.height - HEADER_HEIGHT,
-                            };
-                            let _ = browser
-                                .current_tab()
-                                .tx
-                                .send(FrameCommand::Resized(tab_size));
-                        }
-                        WindowEvent::ScaleFactorChanged { .. } => {
-                            size = window.inner_size();
-                        }
-                        WindowEvent::RedrawRequested => {
-                            let width = NonZeroU32::new(size.width.max(1)).expect("Non-zero width");
-                            let height =
-                                NonZeroU32::new(size.height.max(1)).expect("Non-zero height");
-                            surf.resize(width, height).expect("Resize failed");
-                            let _ = browser.current_tab().tx.send(FrameCommand::Render);
-                        }
-                        WindowEvent::CursorMoved {
-                            device_id: _,
-                            position,
-                        } => {
-                            header.apply_hovering(Position {
-                                x: position.x as i32,
-                                y: position.y as i32,
-                            });
-                            let tab_cursor = Position {
-                                x: position.x as i32,
-                                y: position.y as i32 - HEADER_HEIGHT as i32,
-                            };
-                            let _ = browser
-                                .current_tab()
-                                .tx
-                                .send(FrameCommand::UserEvent(UserEvent::Hover(tab_cursor)));
-                            browser.poll_header_events(
-                                &mut header,
-                                &window,
-                                &browser_action_rx,
-                                hover_debugging,
-                            );
-                        }
-                        WindowEvent::MouseInput {
-                            device_id: _,
-                            state,
-                            button,
-                        } => match (button, state) {
-                            (MouseButton::Left, ElementState::Released) => {
-                                header.on_click();
-                                let _ = browser
-                                    .current_tab()
-                                    .tx
-                                    .send(FrameCommand::UserEvent(UserEvent::Click));
-                                browser.poll_header_events(
-                                    &mut header,
-                                    &window,
-                                    &browser_action_rx,
-                                    hover_debugging,
-                                );
-                            }
-                            _ => {}
-                        },
-                        WindowEvent::MouseWheel {
-                            device_id: _,
-                            delta,
-                            phase: _,
-                        } => {
-                            match delta {
-                                MouseScrollDelta::LineDelta(_, y) => {
-                                    let _ = browser.current_tab().tx.send(FrameCommand::UserEvent(
-                                        UserEvent::ScrollBy((0., y * 140.)),
-                                    ));
-                                }
-                                _ => {}
-                            };
-                        }
-                        WindowEvent::KeyboardInput {
-                            device_id: _,
-                            event,
-                            is_synthetic: _,
-                        } => {
-                            if event.state == ElementState::Released {
-                                let _ = browser
-                                    .current_tab()
-                                    .tx
-                                    .send(FrameCommand::UserEvent(UserEvent::Keyup(event.clone())));
-                                header.on_keyup(event);
-                                browser.poll_header_events(
-                                    &mut header,
-                                    &window,
-                                    &browser_action_rx,
-                                    hover_debugging,
-                                );
-                            }
-                        }
-                        _ => {}
+        let display_list = self.current_tab().display_list.clone();
+        let page = div()
+            .id("page")
+            .flex_1()
+            .w_full()
+            .overflow_hidden()
+            .bg(gpui::white())
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        paint_gpui_display_list(&display_list, bounds, window);
                     },
-                    Event::UserEvent(UserEvent::TabUpdated {
-                        tab_idx,
-                        buffer: tab_buffer,
-                    }) if tab_idx == browser.current_tab_idx => {
-                        let mut buffer = surf.buffer_mut().expect("Failed to get back buffer");
+                )
+                .size_full(),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                this.send_current_and_render(FrameCommand::UserEvent(UserEvent::Hover(Position {
+                    x: f32::from(event.position.x).round() as i32,
+                    y: (f32::from(event.position.y) - HEADER_HEIGHT as f32).round() as i32,
+                })));
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    this.address_focused = false;
+                    this.focus_handle.focus(window);
+                    this.send_current_and_render(FrameCommand::UserEvent(UserEvent::Click));
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, _| {
+                let delta = event.delta.pixel_delta(px(140.0));
+                this.send_current_and_render(FrameCommand::UserEvent(UserEvent::ScrollBy((
+                    f32::from(delta.x),
+                    f32::from(delta.y),
+                ))));
+            }));
 
-                        // Apply data to buffer
-                        let offset = (HEADER_HEIGHT * size.width) as usize;
-                        buffer[offset..offset + tab_buffer.len()].copy_from_slice(&tab_buffer);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x2e2e2e))
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event, window, _| {
+                this.on_key_down(event, window);
+            }))
+            .child(tabs)
+            .child(address_bar)
+            .child(page)
+    }
+}
 
-                        buffer[0..offset].copy_from_slice(&header.buffer);
-
-                        buffer.present().expect("Failed to present");
-
-                        if let Some(fps) = browser
-                            .fps_counter
-                            .as_mut()
-                            .and_then(FpsCounter::record_present)
-                        {
-                            header.state.borrow_mut().fps = Some(fps);
-                            let comms_tx = header.builder.comms_tx.clone();
-                            browser
-                                .build_header(&mut header.builder, &header.state, comms_tx)
-                                .unwrap();
-                            match header.rerender() {
-                                Ok(_) => window.request_redraw(),
-                                Err(err) => eprintln!("Failed to render header: {err:?}"),
-                            }
-                        }
-                    }
-                    Event::UserEvent(UserEvent::TabUpdated { .. }) => {}
-                    Event::UserEvent(UserEvent::TabUrlUpdated { tab_idx, url }) => {
-                        let is_current = tab_idx == browser.current_tab_idx;
-                        if let Some(tab) = browser.tabs.get_mut(tab_idx) {
-                            tab.url = url.clone();
-                        }
-
-                        if is_current {
-                            header.state.borrow_mut().url = url;
-                            let comms_tx = header.builder.comms_tx.clone();
-                            browser
-                                .build_header(&mut header.builder, &header.state, comms_tx)
-                                .unwrap();
-                            match header.rerender() {
-                                Ok(_) => {
-                                    window.request_redraw();
-                                }
-                                Err(err) => {
-                                    eprintln!("Failed to render header: {err:?}");
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+impl TabHandle {
+    fn update_display_list(&mut self, display_list: PageDisplayList) {
+        let mut used_images = HashSet::new();
+        let commands = display_list
+            .commands
+            .into_iter()
+            .filter_map(|command| match command {
+                PagePaintCommand::Fill {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                    border_radius,
+                    clip,
+                } => Some(GpuiPaintCommand::Fill {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                    border_radius,
+                    clip,
+                }),
+                PagePaintCommand::Image {
+                    x,
+                    y,
+                    width,
+                    height,
+                    image,
+                    clip,
+                    ..
+                } => {
+                    used_images.insert(image.id);
+                    let render_image = if let Some((revision, render_image)) =
+                        self.image_cache.get(&image.id)
+                        && *revision == image.revision
+                    {
+                        render_image.clone()
+                    } else {
+                        let rgba =
+                            RgbaImage::from_raw(image.width, image.height, image.bgra.to_vec())?;
+                        let render_image = Arc::new(RenderImage::new([ImageFrame::new(rgba)]));
+                        self.image_cache
+                            .insert(image.id, (image.revision, render_image.clone()));
+                        render_image
+                    };
+                    Some(GpuiPaintCommand::Image {
+                        x,
+                        y,
+                        painted_width: width,
+                        painted_height: height,
+                        source_width: image.width,
+                        source_height: image.height,
+                        image: render_image,
+                        clip,
+                    })
                 }
             })
-            .context("Event loop failed")?;
+            .collect();
+        self.image_cache
+            .retain(|resource_id, _| used_images.contains(resource_id));
+        self.display_list = Arc::new(commands);
+    }
+}
 
-        Ok(())
+fn paint_gpui_display_list(
+    display_list: &[GpuiPaintCommand],
+    canvas_bounds: gpui::Bounds<gpui::Pixels>,
+    window: &mut Window,
+) {
+    let page_bounds = |x: i32, y: i32, width: u32, height: u32| gpui::Bounds {
+        origin: gpui::point(
+            canvas_bounds.origin.x + px(x as f32),
+            canvas_bounds.origin.y + px(y as f32),
+        ),
+        size: size(px(width as f32), px(height as f32)),
+    };
+
+    for command in display_list {
+        match command {
+            GpuiPaintCommand::Fill {
+                x,
+                y,
+                width,
+                height,
+                color,
+                border_radius,
+                clip,
+            } => {
+                let paint_bounds = page_bounds(*x, *y, *width, *height);
+                let clip_bounds = page_bounds(
+                    clip.start_x,
+                    clip.start_y,
+                    (clip.end_x - clip.start_x).max(0) as u32,
+                    (clip.end_y - clip.start_y).max(0) as u32,
+                );
+                let radii = gpui::Corners {
+                    top_left: px(border_radius.top_left as f32),
+                    top_right: px(border_radius.top_right as f32),
+                    bottom_right: px(border_radius.bottom_right as f32),
+                    bottom_left: px(border_radius.bottom_left as f32),
+                };
+                window.with_content_mask(
+                    Some(gpui::ContentMask {
+                        bounds: clip_bounds,
+                    }),
+                    |window| {
+                        window.paint_quad(
+                            gpui::fill(paint_bounds, gpui::rgba(*color)).corner_radii(radii),
+                        );
+                    },
+                );
+            }
+            GpuiPaintCommand::Image {
+                x,
+                y,
+                painted_width,
+                painted_height,
+                source_width,
+                source_height,
+                image,
+                clip,
+            } => {
+                let image_clip = clip
+                    .intersect_x(*x, x.saturating_add_unsigned(*painted_width))
+                    .intersect_y(*y, y.saturating_add_unsigned(*painted_height));
+                let clip_bounds = page_bounds(
+                    image_clip.start_x,
+                    image_clip.start_y,
+                    (image_clip.end_x - image_clip.start_x).max(0) as u32,
+                    (image_clip.end_y - image_clip.start_y).max(0) as u32,
+                );
+                let paint_bounds = page_bounds(*x, *y, *source_width, *source_height);
+                window.with_content_mask(
+                    Some(gpui::ContentMask {
+                        bounds: clip_bounds,
+                    }),
+                    |window| {
+                        let _ = window.paint_image(
+                            paint_bounds,
+                            Default::default(),
+                            image.clone(),
+                            0,
+                            false,
+                        );
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -12935,11 +13394,12 @@ fn main() -> Result<()> {
         "https://vite.dev/guide/features".to_string(),
         hover_debugging,
         show_fps_counter,
-    )?;
+    );
 
     Ok(())
 }
 
+#[cfg(test)]
 fn clear_buffer(buffer: &mut [u32], color: u32) {
     buffer.fill(color);
 }
@@ -13160,18 +13620,6 @@ fn rgba_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
-fn rgba_buffer_to_premul_bytes(buffer: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(buffer.len() * 4);
-
-    for pixel in buffer {
-        let (r, g, b, a) = rgba_to_premul_tuple(*pixel);
-
-        bytes.extend_from_slice(&[r, g, b, a]);
-    }
-
-    bytes
-}
-
 fn rgb_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
     let [_, r, g, b] = src.to_be_bytes();
     let a = 255;
@@ -13385,20 +13833,148 @@ pub fn ensure_snapshot_matches(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Result, anyhow, bail};
-    use std::{
-        ops::Add,
-        sync::mpsc::{Receiver, RecvTimeoutError},
-        time::{Duration, Instant},
-    };
-    use winit::dpi::PhysicalSize;
-
     use crate::{
-        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
+        BorderRadius, Frame, FrameCommand, PageDisplayList, PageImage, PageImageId,
+        PagePaintCommand, PaintClip, Position, Renderer, RendererProxy, SizeUnit, TabHandle,
+        UserEvent, ViewportSize, ensure_snapshot_matches,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
     };
+    use anyhow::{Result, anyhow, bail};
+    use std::{
+        ops::Add,
+        sync::{
+            Arc,
+            mpsc::{Receiver, RecvTimeoutError},
+        },
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn display_list_rasterizer_preserves_paint_order_and_alpha() {
+        let clip = PaintClip::viewport(2, 1);
+        let display_list = PageDisplayList {
+            commands: vec![
+                PagePaintCommand::Fill {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                    color: 0xFF_00_00_FF,
+                    border_radius: BorderRadius::new_empty(),
+                    clip,
+                },
+                PagePaintCommand::Image {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    image: Arc::new(PageImage {
+                        id: crate::PageImageId {
+                            renderer: 1,
+                            resource: 1,
+                        },
+                        revision: 1,
+                        width: 1,
+                        height: 1,
+                        bgra: vec![255, 0, 0, 128].into(),
+                        premul_bgra: vec![128, 0, 0, 128].into(),
+                    }),
+                    opaque: false,
+                    clip,
+                },
+            ],
+            needs_animation: false,
+        };
+        let mut buffer = vec![0; 2];
+
+        display_list.rasterize_into(&mut buffer, 2, 1);
+
+        assert_eq!(buffer, vec![0x00_FF_00_00, 0x00_7F_00_80]);
+    }
+
+    #[test]
+    fn iframe_display_list_is_translated_and_clipped() {
+        let nested = PageDisplayList {
+            commands: vec![PagePaintCommand::Fill {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+                color: 0xFF_00_00_FF,
+                border_radius: BorderRadius::new_empty(),
+                clip: PaintClip::viewport(2, 1),
+            }],
+            needs_animation: false,
+        };
+        let mut commands = vec![];
+        Renderer::push_iframe_display_list(
+            &mut commands,
+            &nested,
+            1,
+            0,
+            1,
+            1,
+            PaintClip::viewport(3, 1),
+        );
+        let mut buffer = vec![0; 3];
+
+        PageDisplayList {
+            commands,
+            needs_animation: false,
+        }
+        .rasterize_into(&mut buffer, 3, 1);
+
+        assert_eq!(buffer, vec![0xFF_FF_FF_FF, 0x00_FF_00_00, 0xFF_FF_FF_FF]);
+    }
+
+    #[test]
+    fn gpui_image_cache_uses_stable_id_and_revision() {
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut tab = TabHandle {
+            tx,
+            url: String::new(),
+            display_list: Arc::new(vec![]),
+            image_cache: Default::default(),
+            render_pending: false,
+            render_again: false,
+            needs_animation: false,
+        };
+        let id = PageImageId {
+            renderer: 1,
+            resource: 2,
+        };
+        let display_list = |revision, blue| PageDisplayList {
+            commands: vec![PagePaintCommand::Image {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                image: Arc::new(PageImage {
+                    id,
+                    revision,
+                    width: 1,
+                    height: 1,
+                    bgra: vec![blue, 0, 0, 255].into(),
+                    premul_bgra: vec![blue, 0, 0, 255].into(),
+                }),
+                opaque: true,
+                clip: PaintClip::viewport(1, 1),
+            }],
+            needs_animation: false,
+        };
+
+        tab.update_display_list(display_list(7, 10));
+        let first = tab.image_cache.get(&id).unwrap().1.clone();
+        tab.update_display_list(display_list(7, 20));
+        let unchanged_revision = tab.image_cache.get(&id).unwrap().1.clone();
+        tab.update_display_list(display_list(8, 20));
+        let changed_revision = tab.image_cache.get(&id).unwrap().1.clone();
+
+        assert!(Arc::ptr_eq(&first, &unchanged_revision));
+        assert!(!Arc::ptr_eq(&first, &changed_revision));
+    }
 
     impl Frame {
         fn wait_for_images_to_load(
@@ -13474,7 +14050,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://www.google.com".to_string(),
             false,
-            PhysicalSize::new(1920, 1080),
+            ViewportSize::new(1920, 1080),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13495,7 +14071,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://widget.swapped.com/".to_string(),
             false,
-            PhysicalSize::new(1920, 1080),
+            ViewportSize::new(1920, 1080),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13545,7 +14121,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://vite.dev".to_string(),
             false,
-            PhysicalSize::new(1920, 4320),
+            ViewportSize::new(1920, 4320),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13561,7 +14137,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://vite.dev/guide/features".to_string(),
             false,
-            PhysicalSize::new(1920, 1080),
+            ViewportSize::new(1920, 1080),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13578,7 +14154,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://marblematch.io".to_string(),
             false,
-            PhysicalSize::new(1920, 1080),
+            ViewportSize::new(1920, 1080),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13595,7 +14171,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://pixel-time-tracker.pages.dev/".to_string(),
             false,
-            PhysicalSize::new(1920, 1080),
+            ViewportSize::new(1920, 1080),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13611,7 +14187,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://slack.com/".to_string(),
             false,
-            PhysicalSize::new(1920, 8640),
+            ViewportSize::new(1920, 8640),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13628,7 +14204,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://nodejs.org/en".to_string(),
             false,
-            PhysicalSize::new(1920, 2160),
+            ViewportSize::new(1920, 2160),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13645,7 +14221,7 @@ mod tests {
         let mut frame = Frame::new(
             "https://mingolf.golf.se/".to_string(),
             false,
-            PhysicalSize::new(1920, 2160),
+            ViewportSize::new(1920, 2160),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
@@ -13707,7 +14283,7 @@ mod tests {
                 16,
                 None,
                 None,
-                &PhysicalSize::new(100, 100),
+                &ViewportSize::new(100, 100),
                 &SizeUnit::Px
             ),
             Some(2)
@@ -13727,7 +14303,7 @@ mod tests {
                 16,
                 None,
                 None,
-                &PhysicalSize::new(100, 100),
+                &ViewportSize::new(100, 100),
                 &SizeUnit::Px
             ),
             Some(14)
