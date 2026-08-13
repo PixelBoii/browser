@@ -282,7 +282,7 @@ enum LayoutKind {
     Element,
     PixMap((tiny_skia::Pixmap, bool)),
     Canvas,
-    Text(tiny_skia::Pixmap),
+    Text(Rc<tiny_skia::Pixmap>),
     Iframe,
 }
 
@@ -1515,7 +1515,8 @@ struct Renderer {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
-    cached_text_buffers: HashMap<(String, u32, Option<u32>, Option<u32>, u32), (Pixmap, u32, u32)>,
+    cached_text_buffers:
+        HashMap<(String, u32, Option<u32>, Option<u32>, u32), (Rc<Pixmap>, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     flattened_css_cache: Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     variable_definitions: VariableDefinitions,
@@ -7438,7 +7439,7 @@ impl Renderer {
                     if let Some(cached) = self.cached_text_buffers.get(&cache_key) {
                         cached
                     } else {
-                        let result = text_to_buffer_with_line_height(
+                        let (buffer, width, height) = text_to_buffer_with_line_height(
                             &self.font_handler,
                             text_hex,
                             &text.clone(),
@@ -7446,6 +7447,7 @@ impl Renderer {
                             max_width,
                             line_height,
                         )?;
+                        let result = (Rc::new(buffer), width, height);
                         self.cached_text_buffers.insert(cache_key.clone(), result);
                         self.cached_text_buffers.get(&cache_key)?
                     };
@@ -7461,8 +7463,7 @@ impl Renderer {
                             border: RectBorder::new_empty(),
                             border_radius: BorderRadius::new_empty(),
                         },
-                        // TODO: Can probably avoid cloning here
-                        kind: LayoutKind::Text(buffer.clone()),
+                        kind: LayoutKind::Text(Rc::clone(buffer)),
                         children: vec![],
                         node_idx,
                         content_height: *height,
@@ -8212,8 +8213,10 @@ impl Renderer {
         {
             cached
         } else {
-            let result = text_to_buffer(&self.font_handler, text_hex, &text, font_size, None)
-                .with_context(|| "Failed to build pixmap for input text")?;
+            let (buffer, width, height) =
+                text_to_buffer(&self.font_handler, text_hex, &text, font_size, None)
+                    .with_context(|| "Failed to build pixmap for input text")?;
+            let result = (Rc::new(buffer), width, height);
             self.cached_text_buffers.insert(cache_key.clone(), result);
             self.cached_text_buffers
                 .get(&cache_key)
@@ -8231,8 +8234,7 @@ impl Renderer {
                     border: RectBorder::new_empty(),
                     border_radius: BorderRadius::new_empty(),
                 },
-                // TODO: Could avoid a clone here
-                kind: LayoutKind::Text(buffer.clone()),
+                kind: LayoutKind::Text(Rc::clone(buffer)),
                 children: vec![],
                 node_idx,
                 content_height: *height,
