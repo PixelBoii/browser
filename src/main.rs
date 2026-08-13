@@ -16,8 +16,8 @@ use resvg::usvg::Tree;
 use serde::Serialize;
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
-    StyleSize, StyleTransform, StyleTransformOperation, StyleVisibility, get_base_style,
-    parse_style,
+    StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility,
+    get_base_style, parse_style,
 };
 
 use std::borrow::Cow;
@@ -2595,7 +2595,7 @@ fn compute_node_style(
     children_index: &HashMap<usize, Vec<usize>>,
     css_nodes: &Vec<CssNode>,
     parent_style: Option<usize>,
-    parent_variables: &Rc<HashMap<usize, String>>,
+    parent_variables: &Rc<StyleVariables>,
     parent_font_size: Option<u32>,
     collected_class_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
@@ -4077,7 +4077,7 @@ fn compute_node_styles(
         &dom_indexes.children_index,
         &parsed_css_nodes,
         None,
-        &Rc::new(default_variables),
+        &StyleVariables::from_values(default_variables),
         None,
         &collected_class_nodes,
         &css_children_index,
@@ -7235,7 +7235,7 @@ impl Renderer {
         Some(result)
     }
 
-    fn inject_css_variables_into_str(&self, str: &mut String, variables: &HashMap<usize, String>) {
+    fn inject_css_variables_into_str(&self, str: &mut String, variables: &StyleVariables) {
         // Return early if string doesn't need any vars
         if !str.contains("var(") {
             return;

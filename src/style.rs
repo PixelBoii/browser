@@ -16,6 +16,77 @@ use crate::css::{
 };
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
+// Custom properties form an immutable chain so a child only stores its overrides.
+#[derive(Debug, Default)]
+pub struct StyleVariables {
+    values: HashMap<usize, String>,
+    parent: Option<Rc<StyleVariables>>,
+}
+
+impl StyleVariables {
+    pub fn from_values(values: HashMap<usize, String>) -> Rc<Self> {
+        Rc::new(Self {
+            values,
+            parent: None,
+        })
+    }
+
+    fn extend(parent: &Rc<Self>, values: HashMap<usize, String>) -> Rc<Self> {
+        if values.is_empty() {
+            return Rc::clone(parent);
+        }
+        Rc::new(Self {
+            values,
+            parent: Some(Rc::clone(parent)),
+        })
+    }
+
+    pub fn get(&self, key: &usize) -> Option<&String> {
+        let mut layer = Some(self);
+        while let Some(variables) = layer {
+            if let Some(value) = variables.values.get(key) {
+                return Some(value);
+            }
+            layer = variables.parent.as_deref();
+        }
+        None
+    }
+
+    pub fn iter(&self) -> StyleVariablesIter<'_> {
+        StyleVariablesIter {
+            next_layer: Some(self),
+            values: None,
+            seen: HashSet::new(),
+        }
+    }
+}
+
+pub struct StyleVariablesIter<'a> {
+    next_layer: Option<&'a StyleVariables>,
+    values: Option<std::collections::hash_map::Iter<'a, usize, String>>,
+    seen: HashSet<usize>,
+}
+
+impl<'a> Iterator for StyleVariablesIter<'a> {
+    type Item = (&'a usize, &'a String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(values) = &mut self.values {
+                while let Some((key, value)) = values.next() {
+                    if self.seen.insert(*key) {
+                        return Some((key, value));
+                    }
+                }
+            }
+
+            let layer = self.next_layer.take()?;
+            self.next_layer = layer.parent.as_deref();
+            self.values = Some(layer.values.iter());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleCalcOperator {
     Plus,
@@ -388,7 +459,7 @@ impl Display for StyleTransform {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Style {
     pub width: StyleSize,
     pub height: StyleSize,
@@ -422,7 +493,7 @@ pub struct Style {
     pub top: StyleSize,
     pub bottom: StyleSize,
     pub text_align: StyleAlign,
-    pub variables: Rc<HashMap<usize, String>>,
+    pub variables: Rc<StyleVariables>,
     pub font_size: StyleSize,
     pub line_height: StyleSize,
     pub align_self: StyleJustifyContent,
@@ -481,7 +552,7 @@ impl Style {
             top: self.top.clone(),
             bottom: self.bottom.clone(),
             text_align: self.text_align,
-            variables: Rc::new(HashMap::new()),
+            variables: Rc::new(StyleVariables::default()),
             font_size: self.font_size.clone(),
             line_height: self.line_height.clone(),
             align_self: self.align_self,
@@ -639,7 +710,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             }
             HtmlNode::Text(_) | HtmlNode::Comment(_) => implied_text_align,
         },
-        variables: Rc::new(HashMap::new()),
+        variables: Rc::new(StyleVariables::default()),
         font_size: parent_style
             .clone()
             .and_then(|v| Some(v.font_size.clone()))
@@ -1498,7 +1569,7 @@ fn parse_variable_template(value: &str) -> Vec<VariableTemplatePart> {
 fn resolve_node_variable(
     value: &PropertyValue,
     map: &HashMap<String, PropertyValue>,
-    parent_variables: &Rc<HashMap<usize, String>>,
+    parent_variables: &StyleVariables,
     variable_definitions: &VariableDefinitions,
 ) -> Option<String> {
     resolve_node_variable_inner(
@@ -1513,7 +1584,7 @@ fn resolve_node_variable(
 fn resolve_node_variable_inner(
     value: &PropertyValue,
     map: &HashMap<String, PropertyValue>,
-    parent_variables: &Rc<HashMap<usize, String>>,
+    parent_variables: &StyleVariables,
     variable_definitions: &VariableDefinitions,
     resolving: &mut HashSet<String>,
 ) -> Option<String> {
@@ -1565,10 +1636,10 @@ fn resolve_node_variable_inner(
 
 fn apply_node_variables(
     nodes: &[(usize, Cow<'_, Node>)],
-    variables: &Rc<HashMap<usize, String>>,
+    variables: &Rc<StyleVariables>,
     css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
-) -> Rc<HashMap<usize, String>> {
+) -> Rc<StyleVariables> {
     let mut variables_to_parse: Vec<(usize, usize, &Variable)> = nodes
         .iter()
         .enumerate()
@@ -1595,7 +1666,7 @@ fn apply_node_variables(
         map.insert(var.variable.clone(), var.value.clone());
     }
 
-    let mut new_variables = (**variables).clone();
+    let mut new_variables = HashMap::with_capacity(variables_to_parse.len());
 
     for (_, _, var) in variables_to_parse {
         if let Some(resolved) =
@@ -1607,12 +1678,12 @@ fn apply_node_variables(
         }
     }
 
-    Rc::new(new_variables)
+    StyleVariables::extend(variables, new_variables)
 }
 
 fn resolve_variable_template(
     template: &Vec<VariableTemplatePart>,
-    resolved_variables: &Rc<HashMap<usize, String>>,
+    resolved_variables: &StyleVariables,
     variable_definitions: &VariableDefinitions,
 ) -> String {
     let mut out = String::new();
@@ -1654,11 +1725,10 @@ fn resolve_variable_template(
 
 pub fn resolve_node_variables<'nodes, 'css>(
     nodes: &'nodes mut [(usize, Cow<'css, Node>)],
-    variables: &Rc<HashMap<usize, String>>,
+    variables: &Rc<StyleVariables>,
     css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
-) -> (Vec<&'nodes Property>, Rc<HashMap<usize, String>>) {
-    // TODO: Might make sense for the variables to just be represented by idx references instead so that we dont have to clone expensive hashmaps
+) -> (Vec<&'nodes Property>, Rc<StyleVariables>) {
     let resolved_variables =
         apply_node_variables(nodes, variables, css_node_ranking, variable_definitions);
 
@@ -1716,7 +1786,7 @@ mod tests {
         let resolved = resolve_node_variable(
             map.get("--color").unwrap(),
             &map,
-            &Rc::new(HashMap::new()),
+            &StyleVariables::default(),
             &VariableDefinitions::new(),
         );
 
@@ -2550,7 +2620,7 @@ pub fn parse_style(
     node: &HtmlNode,
     css_nodes: &Vec<Node>,
     parent_style: Option<&Style>,
-    parent_variables: &Rc<HashMap<usize, String>>,
+    parent_variables: &Rc<StyleVariables>,
     collected_css_nodes: &HashMap<usize, Vec<usize>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
     css_node_ranking: &[usize],
