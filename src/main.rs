@@ -1482,11 +1482,51 @@ impl NodesTable {
 }
 
 #[derive(Debug)]
+struct CachedNodeStyle {
+    matched_css_nodes: Vec<usize>,
+    local_revision: u64,
+    parent_style_revision: Option<u64>,
+    style_revision: u64,
+}
+
+#[derive(Debug, Default)]
+struct StyleCache {
+    nodes: HashMap<usize, CachedNodeStyle>,
+    local_revisions: HashMap<usize, u64>,
+    css_node_ranking: Vec<usize>,
+    window_size: Option<PhysicalSize<u32>>,
+    next_style_revision: u64,
+}
+
+impl StyleCache {
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.local_revisions.clear();
+        self.css_node_ranking.clear();
+        self.window_size = None;
+    }
+
+    fn mark_node_dirty(&mut self, node_idx: usize) {
+        let revision = self.local_revisions.entry(node_idx).or_default();
+        *revision = revision.checked_add(1).expect("style revision overflow");
+    }
+
+    fn next_style_revision(&mut self) -> u64 {
+        self.next_style_revision = self
+            .next_style_revision
+            .checked_add(1)
+            .expect("style revision overflow");
+        self.next_style_revision
+    }
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
     node_styles: HashMap<usize, Style>,
+    style_cache: StyleCache,
     layout_table: HashMap<usize, LayoutBox>,
     node_layout_mapping: HashMap<usize, usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
@@ -2587,9 +2627,17 @@ fn get_expandable_css_nodes(
     expandable
 }
 
+#[derive(Default)]
+struct StyleRecomputeStats {
+    visited: usize,
+    rebuilt: usize,
+    reused: usize,
+}
+
 fn compute_node_style(
     node_styles: &mut HashMap<usize, Style>,
     resolved_font_sizes: &mut HashMap<usize, u32>,
+    style_cache: &mut StyleCache,
     nodes: &NodesTable,
     node_idx: usize,
     children_index: &HashMap<usize, Vec<usize>>,
@@ -2603,69 +2651,110 @@ fn compute_node_style(
     css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
     ancestor_hidden: bool,
+    parent_style_revision: Option<u64>,
+    stats: &mut StyleRecomputeStats,
 ) {
+    stats.visited += 1;
     // Keep cached descendants until their hidden ancestor can render again.
     if ancestor_hidden && node_styles.contains_key(&node_idx) {
         return;
     }
-    let parent_style = parent_style.and_then(|idx| Some(node_styles.get(&idx).unwrap()));
-    let node = &nodes.get(node_idx).unwrap();
-    let mut style = if matches!(node, Node::Element(_)) {
-        parse_style(
-            node_idx,
-            node,
-            css_nodes,
-            parent_style,
-            parent_variables,
-            collected_class_nodes,
-            css_children_index,
-            css_node_ranking,
-            variable_definitions,
-        )
-        .unwrap()
-    } else {
-        get_base_style(node, parent_style)
-    };
 
-    let resolved_font_size = get_specified_size(
-        parent_font_size.unwrap_or(16),
-        &style.font_size,
-        Some(parent_font_size.unwrap_or(16)),
-        None,
-        window_size,
-        &SizeUnit::Px,
-    )
-    .unwrap_or_else(|| {
-        println!("Failed to get font size for node idx {}", node_idx);
-        16
+    let matched_css_nodes = collected_class_nodes
+        .get(&node_idx)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let local_revision = style_cache
+        .local_revisions
+        .get(&node_idx)
+        .copied()
+        .unwrap_or_default();
+    let can_reuse = style_cache.nodes.get(&node_idx).is_some_and(|cached| {
+        cached.matched_css_nodes.as_slice() == matched_css_nodes
+            && cached.local_revision == local_revision
+            && cached.parent_style_revision == parent_style_revision
+            && node_styles.contains_key(&node_idx)
+            && resolved_font_sizes.contains_key(&node_idx)
     });
-    resolved_font_sizes.insert(node_idx, resolved_font_size as u32);
 
-    // Set to resolved size in px so that ems dont stack on top of each other
-    style.font_size = StyleSize::Px(resolved_font_size as f32);
+    if can_reuse {
+        stats.reused += 1;
+    } else {
+        stats.rebuilt += 1;
+        let parent_style = parent_style.map(|idx| node_styles.get(&idx).unwrap());
+        let node = nodes.get(node_idx).unwrap();
+        let mut style = if matches!(node, Node::Element(_)) {
+            parse_style(
+                node_idx,
+                node,
+                css_nodes,
+                parent_style,
+                parent_variables,
+                collected_class_nodes,
+                css_children_index,
+                css_node_ranking,
+                variable_definitions,
+            )
+            .unwrap()
+        } else {
+            get_base_style(node, parent_style)
+        };
 
+        let resolved_font_size = get_specified_size(
+            parent_font_size.unwrap_or(16),
+            &style.font_size,
+            Some(parent_font_size.unwrap_or(16)),
+            None,
+            window_size,
+            &SizeUnit::Px,
+        )
+        .unwrap_or_else(|| {
+            println!("Failed to get font size for node idx {}", node_idx);
+            16
+        }) as u32;
+
+        // Set to resolved size in px so that ems dont stack on top of each other
+        style.font_size = StyleSize::Px(resolved_font_size as f32);
+        let style_revision = style_cache.next_style_revision();
+        style_cache.nodes.insert(
+            node_idx,
+            CachedNodeStyle {
+                matched_css_nodes: matched_css_nodes.to_vec(),
+                local_revision,
+                parent_style_revision,
+                style_revision,
+            },
+        );
+        resolved_font_sizes.insert(node_idx, resolved_font_size);
+        node_styles.insert(node_idx, style);
+    }
+
+    let style_revision = style_cache.nodes[&node_idx].style_revision;
+    let resolved_font_size = resolved_font_sizes[&node_idx];
+    let style = &node_styles[&node_idx];
     let subtree_hidden = ancestor_hidden || style.display == StyleDisplay::None;
     let resolved_variables = Rc::clone(&style.variables);
-
-    node_styles.insert(node_idx, style);
 
     for child_idx in children_index.get(&node_idx).unwrap().iter() {
         compute_node_style(
             node_styles,
             resolved_font_sizes,
+            style_cache,
             nodes,
             *child_idx,
             children_index,
             css_nodes,
             Some(node_idx),
             &resolved_variables,
-            Some(resolved_font_size as u32),
+            Some(resolved_font_size),
             collected_class_nodes,
             css_children_index,
             window_size,
             css_node_ranking,
             variable_definitions,
             subtree_hidden,
+            Some(style_revision),
+            stats,
         );
     }
 }
@@ -3865,13 +3954,13 @@ fn get_css_nodes(
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
     flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     css_parser: &mut CssParser,
-) -> Vec<CssNode> {
+) -> (Vec<CssNode>, bool) {
     let expandable = get_expandable_css_nodes(nodes, root_indice, &dom_indexes.children_index);
     if let Some((cached_base_url, cached_expandable, cached_nodes)) = flattened_css_cache
         && cached_base_url == base_url
         && cached_expandable == &expandable
     {
-        return cached_nodes.clone();
+        return (cached_nodes.clone(), true);
     }
     let mut parsed_css_chunks = vec![];
     let mut needs_fetching = vec![];
@@ -3902,7 +3991,7 @@ fn get_css_nodes(
     }
     let parsed_css_nodes = flatten_css_chunks(parsed_css_chunks);
     *flattened_css_cache = Some((base_url.clone(), expandable, parsed_css_nodes.clone()));
-    parsed_css_nodes
+    (parsed_css_nodes, false)
 }
 
 #[derive(Debug)]
@@ -4013,6 +4102,7 @@ fn compute_node_styles(
     css_parser: &mut CssParser,
     mut node_styles: HashMap<usize, Style>,
     mut resolved_font_sizes: HashMap<usize, u32>,
+    style_cache: &mut StyleCache,
 ) -> (
     HashMap<usize, Style>,
     HashMap<usize, u32>,
@@ -4021,8 +4111,12 @@ fn compute_node_styles(
 ) {
     node_styles.retain(|idx, _| nodes.contains_key(*idx));
     resolved_font_sizes.retain(|idx, _| nodes.contains_key(*idx));
+    style_cache.nodes.retain(|idx, _| nodes.contains_key(*idx));
+    style_cache
+        .local_revisions
+        .retain(|idx, _| nodes.contains_key(*idx));
     let start = Instant::now();
-    let mut parsed_css_nodes = get_css_nodes(
+    let (mut parsed_css_nodes, stylesheet_unchanged) = get_css_nodes(
         base_url,
         tokio,
         network_fetch,
@@ -4043,7 +4137,7 @@ fn compute_node_styles(
         build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
 
     let start = Instant::now();
-    let (collected_class_nodes, class_node_specificity, hovering_impact) =
+    let (mut collected_class_nodes, class_node_specificity, hovering_impact) =
         collect_class_nodes_for_elements(
             &mut parsed_css_nodes,
             &nodes,
@@ -4051,6 +4145,9 @@ fn compute_node_styles(
             dom_indexes,
             hovering_chain,
         );
+    for matched_nodes in collected_class_nodes.values_mut() {
+        matched_nodes.sort_unstable();
+    }
     println!(
         "collect_class_nodes_for_elements took {} microseconds",
         Instant::now().duration_since(start).as_micros()
@@ -4058,6 +4155,17 @@ fn compute_node_styles(
 
     let start = Instant::now();
     let css_node_ranking = compute_css_node_ranking(&parsed_css_nodes, &class_node_specificity);
+    let ranking_changed = style_cache.css_node_ranking != css_node_ranking;
+    if !stylesheet_unchanged
+        || ranking_changed
+        || style_cache.window_size.as_ref() != Some(window_size)
+    {
+        style_cache.nodes.clear();
+    }
+    if ranking_changed {
+        style_cache.css_node_ranking.clone_from(&css_node_ranking);
+    }
+    style_cache.window_size = Some(*window_size);
 
     let mut default_variables = HashMap::new();
     let parsed_definitions =
@@ -4069,9 +4177,11 @@ fn compute_node_styles(
         }
     }
 
+    let mut stats = StyleRecomputeStats::default();
     compute_node_style(
         &mut node_styles,
         &mut resolved_font_sizes,
+        style_cache,
         nodes,
         dom_indexes.root_indice,
         &dom_indexes.children_index,
@@ -4085,10 +4195,15 @@ fn compute_node_styles(
         &css_node_ranking,
         &definitions_map,
         false,
+        None,
+        &mut stats,
     );
     println!(
-        "computing styles took {} microseconds",
-        Instant::now().duration_since(start).as_micros()
+        "computing styles took {} microseconds (visited={}, rebuilt={}, reused={})",
+        Instant::now().duration_since(start).as_micros(),
+        stats.visited,
+        stats.rebuilt,
+        stats.reused,
     );
     (
         node_styles,
@@ -5093,6 +5208,7 @@ fn op_remove_attribute(
     renderer
         .dom_indexes
         .remove_attribute_node(&attribute, node_idx);
+    renderer.style_cache.mark_node_dirty(node_idx);
     renderer.schedule_dom_update();
     Ok(())
 }
@@ -6021,6 +6137,7 @@ impl Renderer {
         let mut css_parse_cache = HashMap::new();
         let mut flattened_css_cache = None;
         let mut css_parser = CssParser::new();
+        let mut style_cache = StyleCache::default();
 
         let (node_styles, resolved_font_sizes, variable_definitions, hovering_impact) =
             compute_node_styles(
@@ -6038,6 +6155,7 @@ impl Renderer {
                 &mut css_parser,
                 HashMap::new(),
                 HashMap::new(),
+                &mut style_cache,
             );
 
         Self {
@@ -6045,6 +6163,7 @@ impl Renderer {
             nodes_idxs,
             nodes: nodes_table,
             node_styles,
+            style_cache,
             layout_table,
             node_layout_mapping,
             containing_nodes,
@@ -6398,6 +6517,7 @@ impl Renderer {
             _ => {}
         };
         if changed {
+            self.style_cache.mark_node_dirty(node_idx);
             self.schedule_dom_update();
         }
         Ok(())
@@ -6427,6 +6547,7 @@ impl Renderer {
         self.canvas_buffers.clear();
         self.pending_canvas_update = false;
         self.animations.clear();
+        self.style_cache.clear();
         self.clear_layout_state();
         self.recompute_nodes();
     }
@@ -10409,6 +10530,7 @@ impl Renderer {
             &mut self.css_parser,
             node_styles,
             resolved_font_sizes,
+            &mut self.style_cache,
         );
     }
 
@@ -12059,6 +12181,7 @@ impl Frame {
     fn apply_debug_hover(&mut self, hovering_layout_idx: usize) {
         let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
         let hovering_node_idx = renderer.layout_to_node_idx(&hovering_layout_idx);
+        renderer.style_cache.mark_node_dirty(hovering_node_idx);
         let style = renderer.node_styles.get_mut(&hovering_node_idx).unwrap();
         style.background = StyleBackground::Hex(0x32_a8_52_FF);
     }
@@ -12413,8 +12536,11 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
     let mut css_parse_cache = HashMap::new();
     let mut flattened_css_cache = None;
     let mut css_parser = CssParser::new();
+    let mut node_styles = HashMap::new();
+    let mut resolved_font_sizes = HashMap::new();
+    let mut style_cache = StyleCache::default();
     let mut compute = || {
-        compute_node_styles(
+        let result = compute_node_styles(
             &frame.url,
             frame.tokio.as_ref().unwrap(),
             &frame.network_fetch,
@@ -12427,14 +12553,18 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
             &mut flattened_css_cache,
             &hovering_chain,
             &mut css_parser,
-            HashMap::new(),
-            HashMap::new(),
-        )
+            std::mem::take(&mut node_styles),
+            std::mem::take(&mut resolved_font_sizes),
+            &mut style_cache,
+        );
+        node_styles = result.0;
+        resolved_font_sizes = result.1;
+        std::hint::black_box((&node_styles, &resolved_font_sizes));
     };
 
-    std::hint::black_box(compute());
+    compute();
     for _ in 0..iterations {
-        std::hint::black_box(compute());
+        compute();
     }
 
     Ok(())
@@ -13389,14 +13519,21 @@ pub fn ensure_snapshot_matches(
 mod tests {
     use anyhow::{Result, anyhow, bail};
     use std::{
+        cell::RefCell,
+        collections::HashMap,
         ops::Add,
+        rc::Rc,
+        sync::Arc,
         sync::mpsc::{Receiver, RecvTimeoutError},
         time::{Duration, Instant},
     };
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
+        BlobStore, FontHandler, Frame, FrameCommand, NetworkFetch, NodesTable, Position, Renderer,
+        RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches, get_dom_indexes,
+        parser::{Attributes, HtmlParser},
+        sorted_node_idxs,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
@@ -13468,6 +13605,66 @@ mod tests {
             self.render_into(buffer, width, height, true);
             Ok(())
         }
+    }
+
+    #[test]
+    fn reuses_unchanged_node_styles() -> Result<()> {
+        let mut parser = HtmlParser::new(
+            r#"<html><body><div id="changed"><span></span></div><div id="sibling"></div></body></html>"#
+                .to_string(),
+        );
+        parser.parse()?;
+        let nodes = NodesTable::new_from_nodes(parser.nodes);
+        let nodes_idxs = sorted_node_idxs(&nodes);
+        let mut class_indexes = crate::css::ClassIndexes::new();
+        let dom_indexes = get_dom_indexes(&nodes, &nodes_idxs, &mut class_indexes);
+        let tokio = Rc::new(RefCell::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+        ));
+        let mut renderer = Renderer::new(
+            "about:blank".to_string(),
+            tokio,
+            nodes,
+            PhysicalSize::new(800, 600),
+            Rc::new(FontHandler::new()?),
+            Rc::new(RefCell::new(NetworkFetch::new())),
+            dom_indexes,
+            nodes_idxs,
+            Arc::new(BlobStore::default()),
+        );
+
+        let changed = renderer.dom_indexes.id_elements["changed"]
+            .minimum()
+            .unwrap();
+        let sibling = renderer.dom_indexes.id_elements["sibling"]
+            .minimum()
+            .unwrap();
+        let changed_child = renderer.dom_indexes.children_index[&changed][0];
+        let revisions = |renderer: &Renderer| {
+            [changed, changed_child, sibling]
+                .map(|idx| renderer.style_cache.nodes[&idx].style_revision)
+        };
+        let old_revisions = revisions(&renderer);
+
+        renderer.recompute_nodes();
+        assert_eq!(revisions(&renderer), old_revisions);
+
+        renderer.update_element_attributes(
+            changed,
+            Attributes::from_hash_map(HashMap::from([(
+                "style".to_string(),
+                "color: #ff0000".to_string(),
+            )])),
+        )?;
+        renderer.recompute_nodes();
+
+        let new_revisions = revisions(&renderer);
+        assert_ne!(new_revisions[0], old_revisions[0]);
+        assert_ne!(new_revisions[1], old_revisions[1]);
+        assert_eq!(new_revisions[2], old_revisions[2]);
+        Ok(())
     }
 
     #[test]
