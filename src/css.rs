@@ -69,6 +69,12 @@ pub struct ClassName {
     pub parent: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchedCssRule {
+    pub node_idx: usize,
+    pub specificity: [i32; 3],
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaQuery {
     pub criterias: Vec<MediaQueryCriteria>,

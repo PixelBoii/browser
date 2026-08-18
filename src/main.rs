@@ -49,17 +49,18 @@ use winit::event_loop::{EventLoopBuilder, EventLoopProxy};
 use winit::window::{Window, WindowBuilder};
 
 use crate::css::{
-    ClassIndexes, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MediaQuery,
-    Node as CssNode, PropertyValue, PseudoClass, parse_media_query_parts, selector_to_parts,
+    ClassIndexes, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MatchedCssRule,
+    MediaQuery, Node as CssNode, PropertyValue, PseudoClass, parse_media_query_parts,
+    selector_to_parts,
 };
 use crate::loader::HttpModuleLoader;
 use crate::parser::{Attributes, CommentElement, TextElement};
 use crate::style::{
-    CalcExpression, GridColumnSize, GridTemplateColumns, GridTemplateColumnsValue, StyleAlign,
-    StyleBorderStyle, StyleCalcOperator, StylePointerEvents, StyleSizeAndColor, StyleZIndex,
-    build_css_children_index, element_matched_attributes, format_css_number, get_chain_order,
-    get_class_list, get_parent_chain, get_parent_layer, get_specificity_order, media_query_matches,
-    split_ignoring_parentheses,
+    CalcExpression, CssCascadeMetadata, GridColumnSize, GridTemplateColumns,
+    GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StylePointerEvents,
+    StyleSizeAndColor, StyleZIndex, build_css_cascade_metadata, build_css_children_index,
+    element_matched_attributes, format_css_number, get_class_list, get_specificity_order,
+    media_query_matches, split_ignoring_parentheses,
 };
 use crate::ui::{Typeable, UiBuilder, UiRuntime};
 
@@ -1483,7 +1484,7 @@ impl NodesTable {
 
 #[derive(Debug)]
 struct CachedNodeStyle {
-    matched_css_nodes: Vec<usize>,
+    matched_css_rules: Vec<MatchedCssRule>,
     local_revision: u64,
     parent_style_revision: Option<u64>,
     style_revision: u64,
@@ -1493,7 +1494,6 @@ struct CachedNodeStyle {
 struct StyleCache {
     nodes: HashMap<usize, CachedNodeStyle>,
     local_revisions: HashMap<usize, u64>,
-    css_node_ranking: Vec<usize>,
     window_size: Option<PhysicalSize<u32>>,
     next_style_revision: u64,
 }
@@ -1502,7 +1502,6 @@ impl StyleCache {
     fn clear(&mut self) {
         self.nodes.clear();
         self.local_revisions.clear();
-        self.css_node_ranking.clear();
         self.window_size = None;
     }
 
@@ -2645,10 +2644,10 @@ fn compute_node_style(
     parent_style: Option<usize>,
     parent_variables: &Rc<StyleVariables>,
     parent_font_size: Option<u32>,
-    collected_class_nodes: &HashMap<usize, Vec<usize>>,
+    collected_class_nodes: &HashMap<usize, Vec<MatchedCssRule>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
+    css_cascade_metadata: &[Option<CssCascadeMetadata>],
     window_size: &PhysicalSize<u32>,
-    css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
     ancestor_hidden: bool,
     parent_style_revision: Option<u64>,
@@ -2660,7 +2659,7 @@ fn compute_node_style(
         return;
     }
 
-    let matched_css_nodes = collected_class_nodes
+    let matched_css_rules = collected_class_nodes
         .get(&node_idx)
         .map(Vec::as_slice)
         .unwrap_or_default();
@@ -2670,7 +2669,7 @@ fn compute_node_style(
         .copied()
         .unwrap_or_default();
     let can_reuse = style_cache.nodes.get(&node_idx).is_some_and(|cached| {
-        cached.matched_css_nodes.as_slice() == matched_css_nodes
+        cached.matched_css_rules.as_slice() == matched_css_rules
             && cached.local_revision == local_revision
             && cached.parent_style_revision == parent_style_revision
             && node_styles.contains_key(&node_idx)
@@ -2692,7 +2691,7 @@ fn compute_node_style(
                 parent_variables,
                 collected_class_nodes,
                 css_children_index,
-                css_node_ranking,
+                css_cascade_metadata,
                 variable_definitions,
             )
             .unwrap()
@@ -2719,7 +2718,7 @@ fn compute_node_style(
         style_cache.nodes.insert(
             node_idx,
             CachedNodeStyle {
-                matched_css_nodes: matched_css_nodes.to_vec(),
+                matched_css_rules: matched_css_rules.to_vec(),
                 local_revision,
                 parent_style_revision,
                 style_revision,
@@ -2749,8 +2748,8 @@ fn compute_node_style(
             Some(resolved_font_size),
             collected_class_nodes,
             css_children_index,
+            css_cascade_metadata,
             window_size,
-            css_node_ranking,
             variable_definitions,
             subtree_hidden,
             Some(style_revision),
@@ -3357,11 +3356,7 @@ fn collect_class_nodes_for_elements(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
-) -> (
-    HashMap<usize, Vec<usize>>,
-    HashMap<usize, [i32; 3]>,
-    HashSet<usize>,
-) {
+) -> (HashMap<usize, Vec<MatchedCssRule>>, HashSet<usize>) {
     // All class names and media queries that have properties/children and need to be resolved
     let mut to_resolve = HashSet::new();
     for (idx, n) in css_nodes.iter().enumerate() {
@@ -3395,19 +3390,20 @@ fn filter_to_elements(html_nodes: &NodesTable) -> Vec<usize> {
         .collect()
 }
 
+type Specificity = [i32; 3];
+
 // Returns a tuple representing scores to be ordered by
 // (IDs   classes/attrs/pseudo-classes   elements)
 // TODO: Implement nested pseudo classes like NOT
-fn get_specificity_tuple(parts: &Vec<ClassNamePart>) -> [i32; 3] {
+fn get_specificity_tuple(parts: &[ClassNamePart]) -> Specificity {
     let mut tuple = [0; 3];
-    for part in parts.iter() {
+    for part in parts {
         match part {
             ClassNamePart::Id(_) => tuple[0] += 1,
             ClassNamePart::Attributes(_)
             | ClassNamePart::PseudoClass(_)
             | ClassNamePart::Class(_) => tuple[1] += 1,
             ClassNamePart::Tag(tag) if tag != "*" => tuple[2] += 1,
-            ClassNamePart::Tag(_) => {}
             ClassNamePart::Combined(combined) => {
                 let specificity = get_specificity_tuple(combined);
                 for (idx, value) in specificity.iter().enumerate() {
@@ -3415,9 +3411,31 @@ fn get_specificity_tuple(parts: &Vec<ClassNamePart>) -> [i32; 3] {
                 }
             }
             _ => {}
-        };
+        }
     }
     tuple
+}
+
+fn record_matched_rule(
+    matches: &mut HashMap<usize, Vec<MatchedCssRule>>,
+    element_idx: usize,
+    node_idx: usize,
+    specificity: Specificity,
+) {
+    let matched_rules = matches.entry(element_idx).or_default();
+    if let Some(existing) = matched_rules
+        .iter_mut()
+        .find(|matched| matched.node_idx == node_idx)
+    {
+        if get_specificity_order(&specificity, &existing.specificity).is_gt() {
+            existing.specificity = specificity;
+        }
+    } else {
+        matched_rules.push(MatchedCssRule {
+            node_idx,
+            specificity,
+        });
+    }
 }
 
 #[inline(never)]
@@ -3546,20 +3564,14 @@ fn search_elements_for_css_nodes(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
-) -> (
-    HashMap<usize, Vec<usize>>,
-    HashMap<usize, [i32; 3]>,
-    HashSet<usize>,
-) {
+) -> (HashMap<usize, Vec<MatchedCssRule>>, HashSet<usize>) {
     let class_elements = &dom_indexes.class_elements;
     let id_elements = &dom_indexes.id_elements;
     let tag_elements = &dom_indexes.tag_elements;
 
-    let mut matches: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut specificity: HashMap<usize, [i32; 3]> = HashMap::new();
+    let mut matches: HashMap<usize, Vec<MatchedCssRule>> = HashMap::new();
 
     let mut hovering_has_impact = HashSet::new();
-
     let mut unique_selectors = vec![];
     let mut selector_indexes = HashMap::new();
     for node in css_nodes.iter_mut() {
@@ -3778,9 +3790,12 @@ fn search_elements_for_css_nodes(
                             };
 
                             if is_match {
-                                matches.entry(el).or_default().push(css_node_idx);
-                                // TODO: Probably index this by css node idx + name part idx
-                                specificity.insert(css_node_idx, node_specificity);
+                                record_matched_rule(
+                                    &mut matches,
+                                    el,
+                                    css_node_idx,
+                                    node_specificity,
+                                );
                             }
                         }
                     }
@@ -3814,7 +3829,7 @@ fn search_elements_for_css_nodes(
                         );
 
                         if is_match {
-                            matches.entry(el).or_default().push(css_node_idx);
+                            record_matched_rule(&mut matches, el, css_node_idx, [0; 3]);
                         }
                     }
                 }
@@ -3847,7 +3862,7 @@ fn search_elements_for_css_nodes(
                     );
 
                     if is_match {
-                        matches.entry(el).or_default().push(css_node_idx);
+                        record_matched_rule(&mut matches, el, css_node_idx, [0; 3]);
                     }
                 }
             }
@@ -3859,72 +3874,7 @@ fn search_elements_for_css_nodes(
         }
     }
 
-    (matches, specificity, hovering_has_impact)
-}
-
-fn compute_css_node_ranking(
-    raw_nodes: &[CssNode],
-    class_node_specificity: &HashMap<usize, [i32; 3]>,
-) -> Vec<usize> {
-    let nodes: Vec<(usize, &CssNode)> = raw_nodes.into_iter().enumerate().collect();
-    let node_idxs: Vec<usize> = nodes
-        .iter()
-        .filter(|(_, node)| matches!(node, CssNode::Property(_) | CssNode::Variable(_)))
-        .map(|(idx, _)| *idx)
-        .collect();
-    let mut chains = vec![Vec::new(); raw_nodes.len()];
-    let mut important_scores = vec![0; raw_nodes.len()];
-    let mut parent_layers = vec![None; raw_nodes.len()];
-    let mut specificities = vec![[0; 3]; raw_nodes.len()];
-
-    for idx in node_idxs.iter().copied() {
-        get_parent_chain(&nodes, idx, &mut chains[idx]);
-
-        important_scores[idx] = match nodes[idx].1 {
-            CssNode::Property(property) => property.important as i32,
-            _ => 0i32,
-        };
-        parent_layers[idx] = get_parent_layer(&nodes, idx);
-        if let Some(specificity) = chains[idx]
-            .get(1)
-            .and_then(|parent| class_node_specificity.get(parent))
-        {
-            specificities[idx] = *specificity;
-        }
-    }
-
-    let mut sorted_idxs = node_idxs;
-    sorted_idxs.sort_unstable_by(|a, b| {
-        match important_scores[*a].cmp(&important_scores[*b]) {
-            Ordering::Equal => {
-                let layer_ordering = match (parent_layers[*a], parent_layers[*b]) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    (None, Some(_)) => Ordering::Greater,
-                    (Some(_), None) => Ordering::Less,
-                    (None, None) => Ordering::Equal,
-                };
-
-                if layer_ordering != Ordering::Equal {
-                    // TODO: Might want to flip this if both nodes have !important
-                    return layer_ordering;
-                }
-
-                let specificity_order =
-                    get_specificity_order(&specificities[*a], &specificities[*b]);
-
-                match specificity_order {
-                    Ordering::Equal => get_chain_order(&chains[*a], &chains[*b]),
-                    ordering => ordering,
-                }
-            }
-            ordering => ordering,
-        }
-    });
-    let mut rankings = vec![0; raw_nodes.len()];
-    for (ranking, idx) in sorted_idxs.into_iter().enumerate() {
-        rankings[idx] = ranking;
-    }
-    rankings
+    (matches, hovering_has_impact)
 }
 
 fn fetch_expandable_css(
@@ -4135,18 +4085,18 @@ fn compute_node_styles(
 
     let css_children_index =
         build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
+    let css_cascade_metadata = build_css_cascade_metadata(&parsed_css_nodes);
 
     let start = Instant::now();
-    let (mut collected_class_nodes, class_node_specificity, hovering_impact) =
-        collect_class_nodes_for_elements(
-            &mut parsed_css_nodes,
-            &nodes,
-            window_size,
-            dom_indexes,
-            hovering_chain,
-        );
-    for matched_nodes in collected_class_nodes.values_mut() {
-        matched_nodes.sort_unstable();
+    let (mut collected_class_nodes, hovering_impact) = collect_class_nodes_for_elements(
+        &mut parsed_css_nodes,
+        &nodes,
+        window_size,
+        dom_indexes,
+        hovering_chain,
+    );
+    for matched_rules in collected_class_nodes.values_mut() {
+        matched_rules.sort_unstable_by_key(|matched| matched.node_idx);
     }
     println!(
         "collect_class_nodes_for_elements took {} microseconds",
@@ -4154,16 +4104,8 @@ fn compute_node_styles(
     );
 
     let start = Instant::now();
-    let css_node_ranking = compute_css_node_ranking(&parsed_css_nodes, &class_node_specificity);
-    let ranking_changed = style_cache.css_node_ranking != css_node_ranking;
-    if !stylesheet_unchanged
-        || ranking_changed
-        || style_cache.window_size.as_ref() != Some(window_size)
-    {
+    if !stylesheet_unchanged || style_cache.window_size.as_ref() != Some(window_size) {
         style_cache.nodes.clear();
-    }
-    if ranking_changed {
-        style_cache.css_node_ranking.clone_from(&css_node_ranking);
     }
     style_cache.window_size = Some(*window_size);
 
@@ -4191,8 +4133,8 @@ fn compute_node_styles(
         None,
         &collected_class_nodes,
         &css_children_index,
+        &css_cascade_metadata,
         window_size,
-        &css_node_ranking,
         &definitions_map,
         false,
         None,
@@ -5618,7 +5560,7 @@ fn query_selector_all(
     let mut css_vec = vec![class];
     let mut to_resolve = HashSet::new();
     to_resolve.insert(0);
-    let (collected, _, _) = search_elements_for_css_nodes(
+    let (collected, _) = search_elements_for_css_nodes(
         to_resolve,
         &mut css_vec,
         nodes_table,
