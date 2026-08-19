@@ -3022,6 +3022,9 @@ fn element_matches_class_part(
                 | PseudoClass::Is(_)
                 | PseudoClass::Where(_) => unreachable!("selectors must be indexed before matching"),
                 PseudoClass::Hover => {
+                    // This is recorded before the rest of the selector has matched. For example,
+                    // `.stacked-blocks > :first-child:hover` can incorrectly mark an unrelated
+                    // first child as hover-sensitive even when its parent is not `.stacked-blocks`.
                     hovering_has_impact.insert(element);
                     hovering_chain.contains(&element)
                 }
