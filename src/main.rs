@@ -5929,6 +5929,50 @@ struct GridBaseItem {
     row: i32,
 }
 
+fn resolve_auto_fit(
+    template: &GridTemplateColumns,
+    size: u32,
+    gap: u32,
+    item_count: usize,
+) -> GridTemplateColumns {
+    let GridTemplateColumns::Values(columns) = template else {
+        return GridTemplateColumns::None;
+    };
+    let Some(index) = columns
+        .iter()
+        .position(|column| matches!(column, GridTemplateColumnsValue::AutoFit(_)))
+    else {
+        return template.clone();
+    };
+    let GridTemplateColumnsValue::AutoFit(repeated) = &columns[index] else {
+        unreachable!()
+    };
+    let fixed_count = columns.len() - 1;
+    let px = |column: &GridTemplateColumnsValue| match column {
+        GridTemplateColumnsValue::MinMax((GridColumnSize::Px(px), _))
+        | GridTemplateColumnsValue::Size(GridColumnSize::Px(px)) => *px as u32,
+        _ => 0,
+    };
+    let fixed_width = columns.iter().map(px).sum::<u32>();
+    let repeated_width = repeated.iter().map(px).sum::<u32>();
+    let available = size
+        .saturating_add(gap)
+        .saturating_sub(fixed_width + gap * fixed_count as u32);
+    let by_space = available / (repeated_width + gap * repeated.len() as u32).max(1);
+    let by_items = item_count
+        .saturating_sub(fixed_count)
+        .div_ceil(repeated.len());
+    let repeat_count = (by_space as usize).max(1).min(by_items.max(1));
+    let mut resolved = columns.clone();
+    resolved.splice(
+        index..=index,
+        std::iter::repeat_n(repeated, repeat_count)
+            .flatten()
+            .cloned(),
+    );
+    GridTemplateColumns::Values(resolved)
+}
+
 pub enum HtmlEvent {
     Click,
     Change,
@@ -8335,6 +8379,7 @@ impl Renderer {
             return 0;
         };
         match value {
+            GridTemplateColumnsValue::AutoFit(_) => unreachable!(),
             GridTemplateColumnsValue::Size(size) => match size {
                 GridColumnSize::Px(px) => *px,
                 GridColumnSize::Rem(rem) => (rem * 16.) as i32,
@@ -8420,6 +8465,15 @@ impl Renderer {
         };
         let original_content_position = content_position.clone();
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
+        let grid_gap = get_specified_size(
+            font_size,
+            &style.gap,
+            Some(container_sizes.inner_width),
+            None,
+            &self.window_size,
+            &SizeUnit::Px,
+        )
+        .unwrap_or(0) as u32;
         let (containing_block_height, containing_block_width) =
             self.get_containing_block_size(containing_node_idx, node_idx, style);
         let specified_height = forced_size.height.or(get_specified_size(
@@ -8481,6 +8535,18 @@ impl Renderer {
                 style.is_some_and(|style| style.position.is_free())
             })
             .collect();
+        let grid_template_columns = resolve_auto_fit(
+            &style.grid_template_columns,
+            container_sizes.inner_width,
+            grid_gap,
+            immediate_children.len(),
+        );
+        let grid_template_rows = resolve_auto_fit(
+            &style.grid_template_rows,
+            container_sizes.inner_height,
+            grid_gap,
+            immediate_children.len(),
+        );
         let mut current_column = 0;
         let mut definitely_used_width = 0;
         let mut definitely_used_height = 0;
@@ -8488,9 +8554,12 @@ impl Renderer {
         let mut max_row_fractions = 0;
         let mut total_auto_columns = 0;
         let mut total_auto_rows = 0;
-        if let GridTemplateColumns::Values(template_columns) = style.grid_template_columns.clone() {
+        let mut column_gap_total = 0;
+        if let GridTemplateColumns::Values(template_columns) = &grid_template_columns {
+            column_gap_total = grid_gap * template_columns.len().saturating_sub(1) as u32;
             for value in template_columns.iter() {
                 match value {
+                    GridTemplateColumnsValue::AutoFit(_) => unreachable!(),
                     GridTemplateColumnsValue::Size(size) => {
                         definitely_used_width += match size {
                             GridColumnSize::Px(px) => *px,
@@ -8516,9 +8585,10 @@ impl Renderer {
                 };
             }
         }
-        if let GridTemplateColumns::Values(template_rows) = style.grid_template_rows.clone() {
+        if let GridTemplateColumns::Values(template_rows) = &grid_template_rows {
             for value in template_rows.iter() {
                 match value {
+                    GridTemplateColumnsValue::AutoFit(_) => unreachable!(),
                     GridTemplateColumnsValue::Size(size) => {
                         definitely_used_height += match size {
                             GridColumnSize::Px(px) => *px,
@@ -8544,7 +8614,8 @@ impl Renderer {
                 };
             }
         }
-        let mut dynamic_width_to_give = width_to_distribute - definitely_used_width as u32;
+        let mut dynamic_width_to_give =
+            width_to_distribute.saturating_sub(column_gap_total + definitely_used_width as u32);
         let mut dynamic_height_to_give = height_to_distribute - definitely_used_height as u32;
         let justify_items = style.justify_items;
         let align_items = style.align_items;
@@ -8553,8 +8624,6 @@ impl Renderer {
         } else {
             allow_fill
         };
-        let grid_template_columns = style.grid_template_columns.clone();
-        let grid_template_rows = style.grid_template_rows.clone();
         let mut base_items = vec![];
         let mut column_count = 1usize;
         let mut row_count = 1usize;
@@ -8682,7 +8751,7 @@ impl Renderer {
             last_column = base_item.column;
             if wrap {
                 content_position.x = original_content_position.x;
-                content_position.y += max_child_height;
+                content_position.y += max_child_height + grid_gap as i32;
                 max_child_height = 0;
             }
             let free_x = (base_item.target_width as i32 - base_item.base_width as i32).max(0);
@@ -8736,6 +8805,7 @@ impl Renderer {
                 content_position.x += base_item.target_width as i32;
                 longest_row_width =
                     longest_row_width.max(content_position.x - original_content_position.x);
+                content_position.x += grid_gap as i32;
                 max_child_height =
                     max_child_height.max(self.layout_table.get(&child).unwrap().rect.height as i32);
                 children.push(child);
@@ -13471,8 +13541,7 @@ mod tests {
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, FrameCommand, Position,
-        RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
+        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },

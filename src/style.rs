@@ -215,6 +215,7 @@ pub enum GridColumnSize {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridTemplateColumnsValue {
+    AutoFit(Vec<GridTemplateColumnsValue>),
     MinMax((GridColumnSize, GridColumnSize)),
     Size(GridColumnSize),
 }
@@ -1931,23 +1932,25 @@ fn parse_overflow(value: String) -> Result<PropertyValue> {
 
 fn parse_grid_template_columns_value(value: String) -> Result<PropertyValue> {
     let parts: Vec<String> = split_ignoring_parentheses(value, ' ', &[]);
-    // TODO: Also support minmax etc. here
     let mut parsed: Vec<GridTemplateColumnsValue> = vec![];
     for p in parts {
         if let Some(stripped) = strip_prefix_and_suffix(&p, "repeat(", ")") {
             let (count, sizes) = stripped
                 .split_once(",")
                 .with_context(|| format!("Failed to parse repeat: {}", stripped))?;
+            let parsed_sizes = split_ignoring_parentheses(sizes.trim().to_string(), ' ', &[])
+                .into_iter()
+                .map(parse_grid_template_columns_inner_value)
+                .collect::<Result<Vec<_>>>()?;
+            if count.trim() == "auto-fit" {
+                parsed.push(GridTemplateColumnsValue::AutoFit(parsed_sizes));
+                continue;
+            }
             let parsed_count = count
                 .parse::<i32>()
                 .with_context(|| format!("Failed to parse count: {}", count))?;
-            let sizes_split: Vec<&str> = sizes.trim().split(" ").collect();
             for _ in 0..parsed_count {
-                for size in sizes_split.iter() {
-                    parsed.push(parse_grid_template_columns_inner_value(
-                        size.trim().to_string(),
-                    )?);
-                }
+                parsed.extend(parsed_sizes.iter().cloned());
             }
             continue;
         }
