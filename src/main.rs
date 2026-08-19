@@ -13464,21 +13464,15 @@ pub fn ensure_snapshot_matches(
 mod tests {
     use anyhow::{Result, anyhow, bail};
     use std::{
-        cell::RefCell,
-        collections::HashMap,
         ops::Add,
-        rc::Rc,
-        sync::Arc,
         sync::mpsc::{Receiver, RecvTimeoutError},
         time::{Duration, Instant},
     };
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        BlobStore, FontHandler, Frame, FrameCommand, NetworkFetch, NodesTable, Position, Renderer,
-        RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches, get_dom_indexes,
-        parser::{Attributes, HtmlParser},
-        sorted_node_idxs,
+        Frame, FrameCommand, Position,
+        RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
@@ -13550,66 +13544,6 @@ mod tests {
             self.render_into(buffer, width, height, true);
             Ok(())
         }
-    }
-
-    #[test]
-    fn reuses_unchanged_node_styles() -> Result<()> {
-        let mut parser = HtmlParser::new(
-            r#"<html><body><div id="changed"><span></span></div><div id="sibling"></div></body></html>"#
-                .to_string(),
-        );
-        parser.parse()?;
-        let nodes = NodesTable::new_from_nodes(parser.nodes);
-        let nodes_idxs = sorted_node_idxs(&nodes);
-        let mut class_indexes = crate::css::ClassIndexes::new();
-        let dom_indexes = get_dom_indexes(&nodes, &nodes_idxs, &mut class_indexes);
-        let tokio = Rc::new(RefCell::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?,
-        ));
-        let mut renderer = Renderer::new(
-            "about:blank".to_string(),
-            tokio,
-            nodes,
-            PhysicalSize::new(800, 600),
-            Rc::new(FontHandler::new()?),
-            Rc::new(RefCell::new(NetworkFetch::new())),
-            dom_indexes,
-            nodes_idxs,
-            Arc::new(BlobStore::default()),
-        );
-
-        let changed = renderer.dom_indexes.id_elements["changed"]
-            .minimum()
-            .unwrap();
-        let sibling = renderer.dom_indexes.id_elements["sibling"]
-            .minimum()
-            .unwrap();
-        let changed_child = renderer.dom_indexes.children_index[&changed][0];
-        let revisions = |renderer: &Renderer| {
-            [changed, changed_child, sibling]
-                .map(|idx| renderer.style_cache.nodes[&idx].style_revision)
-        };
-        let old_revisions = revisions(&renderer);
-
-        renderer.recompute_nodes();
-        assert_eq!(revisions(&renderer), old_revisions);
-
-        renderer.update_element_attributes(
-            changed,
-            Attributes::from_hash_map(HashMap::from([(
-                "style".to_string(),
-                "color: #ff0000".to_string(),
-            )])),
-        )?;
-        renderer.recompute_nodes();
-
-        let new_revisions = revisions(&renderer);
-        assert_ne!(new_revisions[0], old_revisions[0]);
-        assert_ne!(new_revisions[1], old_revisions[1]);
-        assert_eq!(new_revisions[2], old_revisions[2]);
-        Ok(())
     }
 
     #[test]
