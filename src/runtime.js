@@ -710,6 +710,24 @@ class HtmlElement extends BaseNode {
         return this.getAttribute(attr) != null
     }
 
+    toggleAttribute(attr, force = undefined) {
+        if (arguments.length === 0) {
+            throw new TypeError("toggleAttribute requires an attribute name")
+        }
+
+        const name = String(attr)
+        const present = this.hasAttribute(name)
+        const shouldBePresent = force === undefined ? !present : Boolean(force)
+
+        if (shouldBePresent && !present) {
+            this.setAttribute(name, "")
+        } else if (!shouldBePresent && present) {
+            this.removeAttribute(name)
+        }
+
+        return shouldBePresent
+    }
+
     remove() {
         this.parentNode?.removeChild(this)
     }

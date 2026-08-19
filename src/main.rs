@@ -13819,6 +13819,23 @@ mod tests {
     }
 
     #[test]
+    fn render_cloudflare() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://www.cloudflare.com/".to_string(),
+            false,
+            PhysicalSize::new(1920, 2160),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 2160];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
+        ensure_snapshot_matches(&buffer, "cloudflarecom", 1920, 2160)
+    }
+
+    #[test]
     fn render_nodejs() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
@@ -13855,6 +13872,55 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
+    fn element_toggle_attribute_follows_force_semantics() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script(
+            "toggleAttribute test",
+            r#"
+                (() => {
+                    const element = document.createElement("div")
+
+                    if (element.toggleAttribute("data-active") !== true ||
+                        element.getAttribute("data-active") !== "") {
+                        throw new Error("toggleAttribute should add a missing attribute")
+                    }
+                    if (element.toggleAttribute("data-active") !== false ||
+                        element.hasAttribute("data-active")) {
+                        throw new Error("toggleAttribute should remove a present attribute")
+                    }
+                    if (element.toggleAttribute("data-active", true) !== true ||
+                        !element.hasAttribute("data-active")) {
+                        throw new Error("toggleAttribute should honor a true force value")
+                    }
+                    if (element.toggleAttribute("data-active", false) !== false ||
+                        element.hasAttribute("data-active")) {
+                        throw new Error("toggleAttribute should honor a false force value")
+                    }
+
+                    let missingNameThrew = false
+                    try {
+                        element.toggleAttribute()
+                    } catch (error) {
+                        missingNameThrew = error instanceof TypeError
+                    }
+                    if (!missingNameThrew) {
+                        throw new Error("toggleAttribute should require an attribute name")
+                    }
+                })()
+            "#
+            .to_string(),
+        )?;
+        Ok(())
     }
 
     #[test]
