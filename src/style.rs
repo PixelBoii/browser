@@ -10,9 +10,9 @@ use winit::dpi::PhysicalSize;
 
 use crate::VariableDefinitions;
 use crate::css::{
-    BorderSideValue, ClassNamePartAttribute, CssParser, MediaQuery, MediaQueryCriteria,
-    MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow, Property, PropertyValue,
-    StyleComplexBackground, Variable, VariableTemplatePart, unquote,
+    BorderSideValue, ClassNamePartAttribute, CssParser, MatchedCssRule, MediaQuery,
+    MediaQueryCriteria, MediaQueryCriteriaComparison, MediaQueryCriteriaValue, Node, Overflow,
+    Property, PropertyValue, StyleComplexBackground, Variable, VariableTemplatePart, unquote,
 };
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
@@ -1637,14 +1637,12 @@ fn resolve_node_variable_inner(
 fn apply_node_variables(
     nodes: &[(usize, Cow<'_, Node>)],
     variables: &Rc<StyleVariables>,
-    css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
 ) -> Rc<StyleVariables> {
-    let mut variables_to_parse: Vec<(usize, usize, &Variable)> = nodes
+    let variables_to_parse: Vec<&Variable> = nodes
         .iter()
-        .enumerate()
-        .filter_map(|(source_order, (idx, node))| match node.as_ref() {
-            Node::Variable(variable) => Some((source_order, *idx, variable)),
+        .filter_map(|(_, node)| match node.as_ref() {
+            Node::Variable(variable) => Some(variable),
             _ => None,
         })
         .collect();
@@ -1652,23 +1650,14 @@ fn apply_node_variables(
         return Rc::clone(variables);
     }
 
-    variables_to_parse.sort_by_key(|(source_order, idx, _)| {
-        let rank = if *idx == usize::MAX {
-            usize::MAX
-        } else {
-            css_node_ranking[*idx]
-        };
-        (rank, *source_order)
-    });
-
     let mut map = HashMap::new();
-    for (_, _, var) in variables_to_parse.iter() {
+    for var in variables_to_parse.iter() {
         map.insert(var.variable.clone(), var.value.clone());
     }
 
     let mut new_variables = HashMap::with_capacity(variables_to_parse.len());
 
-    for (_, _, var) in variables_to_parse {
+    for var in variables_to_parse {
         if let Some(resolved) =
             resolve_node_variable(&var.value, &map, variables, variable_definitions)
         {
@@ -1726,11 +1715,9 @@ fn resolve_variable_template(
 pub fn resolve_node_variables<'nodes, 'css>(
     nodes: &'nodes mut [(usize, Cow<'css, Node>)],
     variables: &Rc<StyleVariables>,
-    css_node_ranking: &[usize],
     variable_definitions: &VariableDefinitions,
 ) -> (Vec<&'nodes Property>, Rc<StyleVariables>) {
-    let resolved_variables =
-        apply_node_variables(nodes, variables, css_node_ranking, variable_definitions);
+    let resolved_variables = apply_node_variables(nodes, variables, variable_definitions);
 
     for (_, node) in nodes.iter_mut() {
         let parsed_value = match node.as_ref() {
@@ -2569,21 +2556,21 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
     Ok(())
 }
 
-pub fn get_parent_chain(nodes: &Vec<(usize, &Node)>, node_idx: usize, chain: &mut Vec<usize>) {
-    let node = nodes[node_idx].1;
+fn get_parent_chain(nodes: &[Node], node_idx: usize, chain: &mut Vec<usize>) {
+    let node = &nodes[node_idx];
     chain.push(node_idx);
     if let Some(parent) = node.get_parent() {
         // Only save class names in chain
-        if let Node::ClassName(_) = nodes[parent].1 {
+        if let Node::ClassName(_) = &nodes[parent] {
             get_parent_chain(nodes, parent, chain)
         }
     }
 }
 
-pub fn get_parent_layer(nodes: &Vec<(usize, &Node)>, node_idx: usize) -> Option<usize> {
-    let node = nodes[node_idx].1;
+fn get_parent_layer(nodes: &[Node], node_idx: usize) -> Option<usize> {
+    let node = &nodes[node_idx];
     if let Some(parent) = node.get_parent() {
-        if let Node::Layer(_) = nodes[parent].1 {
+        if let Node::Layer(_) = &nodes[parent] {
             return Some(parent);
         } else {
             return get_parent_layer(nodes, parent);
@@ -2604,7 +2591,7 @@ pub fn get_specificity_order(a_specificity: &[i32; 3], b_specificity: &[i32; 3])
     Ordering::Equal
 }
 
-pub fn get_chain_order(a_chain: &Vec<usize>, b_chain: &Vec<usize>) -> Ordering {
+fn get_chain_order(a_chain: &[usize], b_chain: &[usize]) -> Ordering {
     // At first parent which is different, compare and order ascending
     for (a, b) in a_chain.iter().rev().zip(b_chain.iter().rev()) {
         if a != b {
@@ -2615,15 +2602,73 @@ pub fn get_chain_order(a_chain: &Vec<usize>, b_chain: &Vec<usize>) -> Ordering {
     Ordering::Equal
 }
 
+pub struct CssCascadeMetadata {
+    important: bool,
+    parent_layer: Option<usize>,
+    chain: Vec<usize>,
+}
+
+pub fn build_css_cascade_metadata(css_nodes: &[Node]) -> Vec<Option<CssCascadeMetadata>> {
+    css_nodes
+        .iter()
+        .enumerate()
+        .map(|(node_idx, node)| match node {
+            Node::Property(_) | Node::Variable(_) => {
+                let important = match node {
+                    Node::Property(property) => property.important,
+                    Node::Variable(_) => false,
+                    _ => unreachable!(),
+                };
+                let mut chain = vec![];
+                get_parent_chain(css_nodes, node_idx, &mut chain);
+                Some(CssCascadeMetadata {
+                    important,
+                    parent_layer: get_parent_layer(css_nodes, node_idx),
+                    chain,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn compare_applicable_css_nodes(
+    left: &(usize, [i32; 3]),
+    right: &(usize, [i32; 3]),
+    cascade_metadata: &[Option<CssCascadeMetadata>],
+) -> Ordering {
+    let left_metadata = cascade_metadata[left.0].as_ref().unwrap();
+    let right_metadata = cascade_metadata[right.0].as_ref().unwrap();
+    match left_metadata.important.cmp(&right_metadata.important) {
+        Ordering::Equal => {
+            let layer_ordering = match (left_metadata.parent_layer, right_metadata.parent_layer) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            };
+            if layer_ordering != Ordering::Equal {
+                return layer_ordering;
+            }
+
+            match get_specificity_order(&left.1, &right.1) {
+                Ordering::Equal => get_chain_order(&left_metadata.chain, &right_metadata.chain),
+                ordering => ordering,
+            }
+        }
+        ordering => ordering,
+    }
+}
+
 pub fn parse_style(
     node_idx: usize,
     node: &HtmlNode,
     css_nodes: &Vec<Node>,
     parent_style: Option<&Style>,
     parent_variables: &Rc<StyleVariables>,
-    collected_css_nodes: &HashMap<usize, Vec<usize>>,
+    collected_css_nodes: &HashMap<usize, Vec<MatchedCssRule>>,
     css_children_index: &HashMap<usize, Vec<usize>>,
-    css_node_ranking: &[usize],
+    cascade_metadata: &[Option<CssCascadeMetadata>],
     variable_definitions: &VariableDefinitions,
 ) -> Result<Style> {
     let mut style = get_base_style(node, parent_style);
@@ -2636,29 +2681,26 @@ pub fn parse_style(
 
     let mut applicable_class_properties = vec![];
     if let Some(applicable_class_nodes) = collected_css_nodes.get(&node_idx) {
-        for class_node in applicable_class_nodes.iter() {
-            let children = css_children_index.get(&class_node).unwrap();
+        for matched_rule in applicable_class_nodes {
+            let children = css_children_index.get(&matched_rule.node_idx).unwrap();
             for c in children {
                 let would = match css_nodes[*c] {
                     Node::Property(_) | Node::Variable(_) => true,
                     _ => false,
                 };
                 if would {
-                    applicable_class_properties.push(c);
+                    applicable_class_properties.push((*c, matched_rule.specificity));
                 }
             }
         }
     }
 
-    applicable_class_properties.sort_by(|a, b| {
-        let a_rank = css_node_ranking[**a];
-        let b_rank = css_node_ranking[**b];
-        a_rank.cmp(&b_rank)
-    });
+    applicable_class_properties
+        .sort_by(|left, right| compare_applicable_css_nodes(left, right, cascade_metadata));
 
     let mut nodes: Vec<(usize, Cow<'_, Node>)> = applicable_class_properties
         .iter()
-        .map(|idx| (**idx, Cow::Borrowed(&css_nodes[**idx])))
+        .map(|(node_idx, _)| (*node_idx, Cow::Borrowed(&css_nodes[*node_idx])))
         .collect();
     // This is a bit hacky, but we don't have an ID for inline nodes, but we also don't need one, so we just set it to usize::MAX
     nodes.extend(
@@ -2667,12 +2709,8 @@ pub fn parse_style(
             .map(|node| (usize::MAX, Cow::Owned(node))),
     );
 
-    let (properties, resolved_variables) = resolve_node_variables(
-        &mut nodes,
-        parent_variables,
-        css_node_ranking,
-        variable_definitions,
-    );
+    let (properties, resolved_variables) =
+        resolve_node_variables(&mut nodes, parent_variables, variable_definitions);
     style.variables = resolved_variables;
 
     for property in properties {
