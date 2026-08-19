@@ -11187,6 +11187,23 @@ impl Frame {
                 *bitmap_for_thread.lock().unwrap() = pixels;
                 let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
             }
+            FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
+                if let Err(err) = self.perform_navigation(href, reload) {
+                    eprintln!("Iframe navigation failed: {err:?}");
+                    return;
+                }
+
+                let mut pixels = vec![0; (size.width * size.height) as usize];
+                self.renderer.as_ref().unwrap().borrow_mut().render_into(
+                    &mut pixels,
+                    size.width,
+                    size.height,
+                    true,
+                );
+
+                *bitmap_for_thread.lock().unwrap() = pixels;
+                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+            }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
             }
@@ -11523,7 +11540,9 @@ impl Frame {
                 return None;
             };
             println!("Detected HTML redirect to {}", resolved_url);
-            return Some(self.navigate(resolved_url.to_string()));
+            return Some(
+                self.perform_navigation(UserNavigateUrl::Raw(resolved_url.to_string()), true),
+            );
         }
         None
     }
@@ -11561,13 +11580,26 @@ impl Frame {
         self.detect_html_redirect_walk(dom_indexes.root_indice, dom_indexes)
     }
 
-    pub fn navigate(&mut self, href: String) -> Result<()> {
-        let url = resolve_url(&href, None)?;
-        self.navigate_with_request(FormNavigation {
-            url,
-            method: FormMethod::Get,
-            body: None,
-        })
+    fn perform_navigation(&mut self, href: UserNavigateUrl, reload: bool) -> Result<()> {
+        let navigation = match href {
+            UserNavigateUrl::Raw(raw) => {
+                let current_url = ReqwestUrl::parse(&self.url)?;
+                FormNavigation {
+                    url: current_url.join(&raw)?,
+                    method: FormMethod::Get,
+                    body: None,
+                }
+            }
+            UserNavigateUrl::Form(navigation) => navigation,
+        };
+
+        if reload {
+            self.navigate_with_request(navigation)
+        } else {
+            self.url = navigation.url.to_string();
+            self.renderer.as_mut().unwrap().borrow_mut().url = self.url.clone();
+            self.setup_js_dom()
+        }
     }
 
     pub fn navigate_with_request(&mut self, request: FormNavigation) -> Result<()> {
@@ -11689,7 +11721,7 @@ impl Frame {
 
     pub fn open(&mut self) -> Result<BootParams> {
         self.register_tokio_runtime()?;
-        self.navigate(self.url.clone())?;
+        self.perform_navigation(UserNavigateUrl::Raw(self.url.clone()), true)?;
         self.install_js_host();
         let nodes_table =
             NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
@@ -11896,9 +11928,17 @@ impl Frame {
                 if let Some(href) = parent_href
                     && !default_prevented
                 {
-                    let current_url = url::Url::parse(&self.url)?;
-                    let resolved_url = current_url.join(&href)?;
-                    self.navigate(resolved_url.to_string()).unwrap();
+                    let proxy = self
+                        .renderer
+                        .as_ref()
+                        .unwrap()
+                        .borrow()
+                        .event_loop_proxy
+                        .as_ref()
+                        .cloned()
+                        .context("Renderer event loop proxy is not configured")?;
+                    proxy
+                        .fire_user_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), true)))?;
                 }
             }
         } else {
@@ -12366,27 +12406,9 @@ impl Frame {
                     .unwrap();
             }
             FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
-                let navigation = match href {
-                    UserNavigateUrl::Raw(raw) => {
-                        let current_url = url::Url::parse(&self.url).unwrap();
-                        FormNavigation {
-                            url: current_url.join(&raw).unwrap(),
-                            method: FormMethod::Get,
-                            body: None,
-                        }
-                    }
-                    UserNavigateUrl::Form(navigation) => navigation,
-                };
-                if reload {
-                    if let Err(err) = self.navigate_with_request(navigation) {
-                        eprintln!("Navigation failed: {err:?}");
-                    } else {
-                        let _ = proxy.fire_tab_url_updated(self.url.clone());
-                    }
+                if let Err(err) = self.perform_navigation(href, reload) {
+                    eprintln!("Navigation failed: {err:?}");
                 } else {
-                    self.url = navigation.url.to_string();
-                    self.renderer.as_mut().unwrap().borrow_mut().url = self.url.clone();
-                    self.setup_js_dom().unwrap();
                     let _ = proxy.fire_tab_url_updated(self.url.clone());
                 }
             }
@@ -12394,7 +12416,9 @@ impl Frame {
                 self.apply_hovering(&position);
             }
             FrameCommand::UserEvent(UserEvent::Click) => {
-                self.on_click().unwrap();
+                if let Err(err) = self.on_click() {
+                    eprintln!("Click failed: {err:?}");
+                }
             }
             FrameCommand::UserEvent(UserEvent::Keyup(event)) => {
                 self.handle_keyup(event);
@@ -13548,6 +13572,30 @@ mod tests {
     };
 
     impl Frame {
+        fn process_pending_navigation_events(
+            &mut self,
+            frame_rx: &Receiver<FrameCommand>,
+        ) -> Result<()> {
+            while let Ok(command) = frame_rx.try_recv() {
+                match command {
+                    FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
+                        self.perform_navigation(href, reload)?;
+                    }
+                    FrameCommand::UserEvent(UserEvent::ImagesPrefetched(entries)) => {
+                        self.renderer
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .finish_image_prefetch(entries);
+                        self.layout_dirty = true;
+                    }
+                    // Headless tests apply DOM and rendering updates directly.
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+
         fn wait_for_images_to_load(
             &mut self,
             frame_rx: &Receiver<FrameCommand>,
@@ -13631,6 +13679,7 @@ mod tests {
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         frame.apply_hovering(&Position { x: 864, y: 770 });
         frame.on_click()?;
+        frame.process_pending_navigation_events(&rx)?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
@@ -13802,6 +13851,7 @@ mod tests {
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         frame.apply_hovering(&Position { x: 1140, y: 1850 });
         frame.on_click()?;
+        frame.process_pending_navigation_events(&rx)?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
