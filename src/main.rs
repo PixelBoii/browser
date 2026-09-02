@@ -2525,37 +2525,59 @@ async fn fetch_link_strings(
     links: &Vec<&String>,
     map_fn: impl Fn(String) -> RequestCacheEntry,
 ) -> Result<Vec<String>> {
-    let mut results = vec![];
+    // TODO: Don't hardcode this
+    let base = ReqwestUrl::parse(base_url)?;
+    let mut urls = Vec::with_capacity(links.len());
     for link in links.iter() {
-        // TODO: Don't hardcode this
-        let base = ReqwestUrl::parse(base_url)?;
-        let url = resolve_url(link, Some(&base))?;
+        urls.push(resolve_url(link, Some(&base))?);
+    }
 
-        if let Some(cache) = network_fetch.borrow_mut().request_cache.get(&url) {
-            results.push(cache.clone());
-        } else {
-            println!("Fetching {}", url);
-            let resp = network_fetch
-                .borrow_mut()
-                .client
-                .get(url.clone())
-                .send()
-                .await?
-                .text()
-                .await?;
-            let cache_entry = map_fn(resp);
-            network_fetch
-                .borrow_mut()
-                .request_cache
-                .insert(url, cache_entry.clone());
-
-            results.push(cache_entry);
+    // Serve whatever is already cached, and fetch the rest concurrently so
+    // that N stylesheets cost ~1 RTT instead of N sequential RTTs.
+    let client = network_fetch.borrow().client.clone();
+    let mut results: Vec<Option<RequestCacheEntry>> = Vec::with_capacity(urls.len());
+    let mut missing: Vec<(usize, ReqwestUrl)> = vec![];
+    {
+        let fetch = network_fetch.borrow();
+        for (idx, url) in urls.iter().enumerate() {
+            match fetch.request_cache.get(url) {
+                Some(entry) => results.push(Some(entry.clone())),
+                None => {
+                    results.push(None);
+                    missing.push((idx, url.clone()));
+                }
+            }
         }
     }
+
+    if !missing.is_empty() {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, url) in missing {
+            let client = client.clone();
+            join_set.spawn(async move {
+                println!("Fetching {}", url);
+                let text = client.get(url.clone()).send().await?.text().await?;
+                Ok::<_, anyhow::Error>((idx, url, text))
+            });
+        }
+        let mut fetched: Vec<(usize, ReqwestUrl, String)> = vec![];
+        while let Some(join_result) = join_set.join_next().await {
+            fetched.push(join_result??);
+        }
+        // Reassemble in link order so callers see deterministic results.
+        fetched.sort_by_key(|(idx, _, _)| *idx);
+        let mut fetch = network_fetch.borrow_mut();
+        for (idx, url, text) in fetched {
+            let cache_entry = map_fn(text);
+            fetch.request_cache.insert(url, cache_entry.clone());
+            results[idx] = Some(cache_entry);
+        }
+    }
+
     let strings = results
         .iter()
         .map(|r| match r {
-            RequestCacheEntry::CssData(data) => Some(data.clone()),
+            Some(RequestCacheEntry::CssData(data)) => Some(data.clone()),
             _ => None,
         })
         .flatten()
@@ -11373,7 +11395,58 @@ impl Frame {
             })
     }
 
-    async fn execute_js_script(&mut self, js: &Script) -> Result<()> {
+    // Fetch every linked script body concurrently. Execution still happens
+    // serially in document order in `execute_js`; this only overlaps the
+    // network waits. A failed fetch is left out of the map, and execution
+    // reports it as a failed load, as a failing direct fetch did before.
+    async fn prefetch_js_bodies(&self, scripts: &[Script]) -> HashMap<String, String> {
+        let Ok(base) = ReqwestUrl::parse(&self.url) else {
+            return HashMap::new();
+        };
+        let mut urls: Vec<ReqwestUrl> = vec![];
+        for js in scripts {
+            let ScriptContent::Link(link) = &js.content else {
+                continue;
+            };
+            let Ok(url) = resolve_url(link, Some(&base)) else {
+                continue;
+            };
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        if urls.is_empty() {
+            return HashMap::new();
+        }
+        let client = self.network_fetch.borrow().client.clone();
+        let mut join_set = tokio::task::JoinSet::new();
+        for url in urls {
+            let client = client.clone();
+            join_set.spawn(async move {
+                let body = client
+                    .get(url.clone())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .text()
+                    .await?;
+                Ok::<_, anyhow::Error>((url, body))
+            });
+        }
+        let mut bodies = HashMap::new();
+        while let Some(join_result) = join_set.join_next().await {
+            if let Ok(Ok((url, body))) = join_result {
+                bodies.insert(url.to_string(), body);
+            }
+        }
+        bodies
+    }
+
+    async fn execute_js_script(
+        &mut self,
+        js: &Script,
+        prefetched: &HashMap<String, String>,
+    ) -> Result<()> {
         let document_id = self.document_id;
         let Some(mut runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) else {
             return Ok(());
@@ -11400,17 +11473,13 @@ impl Frame {
                 };
                 match js.script_type {
                     ScriptType::Classic => {
-                        let code = self
-                            .network_fetch
-                            .borrow_mut()
-                            .client
-                            .get(url.clone())
-                            .send()
-                            .await?
-                            .text()
-                            .await?;
+                        // A prefetch miss is a failed load, just as a failing
+                        // direct fetch was before prefetching existed.
+                        let Some(code) = prefetched.get(&url.to_string()) else {
+                            return Err(anyhow!("Failed to fetch script {link}"));
+                        };
                         Self::set_current_script(&mut runtime, js.node_idx)?;
-                        let result = runtime.execute_script(url.to_string(), code);
+                        let result = runtime.execute_script(url.to_string(), code.clone());
                         Self::set_current_script(&mut runtime, None)?;
                         match result {
                             Ok(_) => Self::drain_microtasks(&mut runtime),
@@ -11420,36 +11489,39 @@ impl Frame {
                         };
                     }
                     ScriptType::Module => {
-                        let module_id = if document_id == 0 {
-                            runtime.load_side_es_module(&url).await
+                        if let Some(code) = prefetched.get(&url.to_string()) {
+                            let module_id = if document_id == 0 {
+                                runtime
+                                    .load_side_es_module_from_code(&url, code.clone())
+                                    .await
+                            } else {
+                                let mut module_url = url.clone();
+                                module_url
+                                    .query_pairs_mut()
+                                    .append_pair("__frame_document", &document_id.to_string());
+                                runtime
+                                    .load_side_es_module_from_code(&module_url, code.clone())
+                                    .await
+                            };
+                            if let Ok(module_id) = module_id.inspect_err(|err| {
+                                eprintln!("Failed to load JS module at {} with error: {}", url, err)
+                            }) {
+                                let result = runtime.mod_evaluate(module_id);
+                                let _ = runtime
+                                    .with_event_loop_promise(result, Default::default())
+                                    .await
+                                    .inspect_err(|err| {
+                                        eprintln!(
+                                            "Failed to execute JS at {} with error: {}",
+                                            url, err
+                                        )
+                                    });
+                            }
                         } else {
-                            let code = self
-                                .network_fetch
-                                .borrow_mut()
-                                .client
-                                .get(url.clone())
-                                .send()
-                                .await?
-                                .text()
-                                .await?;
-                            let mut module_url = url.clone();
-                            module_url
-                                .query_pairs_mut()
-                                .append_pair("__frame_document", &document_id.to_string());
-                            runtime
-                                .load_side_es_module_from_code(&module_url, code)
-                                .await
-                        };
-                        if let Ok(module_id) = module_id.inspect_err(|err| {
-                            eprintln!("Failed to load JS module at {} with error: {}", url, err)
-                        }) {
-                            let result = runtime.mod_evaluate(module_id);
-                            let _ = runtime
-                                .with_event_loop_promise(result, Default::default())
-                                .await
-                                .inspect_err(|err| {
-                                    eprintln!("Failed to execute JS at {} with error: {}", url, err)
-                                });
+                            eprintln!(
+                                "Failed to load JS module at {} with error: prefetch failed",
+                                url
+                            );
                         }
                     }
                 }
@@ -11470,8 +11542,9 @@ impl Frame {
     }
 
     async fn execute_js(&mut self, scripts: Vec<Script>) -> Result<()> {
+        let prefetched = self.prefetch_js_bodies(&scripts).await;
         for js in scripts {
-            self.execute_js_script(&js).await?;
+            self.execute_js_script(&js, &prefetched).await?;
         }
 
         Ok(())
