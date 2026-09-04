@@ -43,6 +43,7 @@ pub enum PseudoClass {
     NthOfType(String),
     NthLastChild(String),
     Has(Vec<ClassNamePart>),
+    IndexedHas(usize),
     Not(Vec<ClassNamePart>),
     IndexedNot(usize),
 }

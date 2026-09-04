@@ -3217,8 +3217,12 @@ fn element_matches_class_part(
         | ClassNamePart::AdjacentSibling => true,
         ClassNamePart::PseudoClass(class) => class_name_part_match_pseudo(|| {
             match class {
-                // All elements are children of root
-                PseudoClass::Root => true,
+                PseudoClass::Root => element == dom_indexes.root_indice,
+                PseudoClass::IndexedHas(selector) => precomputed_selectors[*selector]
+                    .ones()
+                    .any(|descendant| {
+                        descendant != element && has_parent(html_nodes, descendant, element)
+                    }),
                 PseudoClass::IndexedNot(selector) => {
                     let negative_matches = &precomputed_selectors[*selector];
                     !negative_matches.contains(element)
@@ -3707,6 +3711,7 @@ impl SelectorInvalidationIndex {
                     // variants. If that ordering ever changes, rematch the rule conservatively.
                     PseudoClass::IndexedIs(_)
                     | PseudoClass::IndexedWhere(_)
+                    | PseudoClass::IndexedHas(_)
                     | PseudoClass::IndexedNot(_) => {
                         self.untracked.insert(rule_idx);
                     }
@@ -3971,6 +3976,12 @@ fn walk_selectors(
 ) {
     match part {
         ClassNamePart::PseudoClass(pseudo_class) => match pseudo_class {
+            // A single compound selector needs only a strict descendant check.
+            // More complex relative selectors need matching anchored to the subject.
+            PseudoClass::Has(selector) if selector.len() == 1 => {
+                let index = selector_index(selectors, selector_indexes, selector);
+                *pseudo_class = PseudoClass::IndexedHas(index);
+            }
             PseudoClass::Is(nested_selectors) => {
                 let mut indexes = vec![];
                 for selector in nested_selectors {
@@ -14740,6 +14751,41 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
+    fn banner_has_selector_matches_only_ancestors() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script(
+            "banner selector test",
+            r#"
+                document.body.innerHTML = '<div class="Layout"><div><div class="top-banner"></div></div></div><div class="unrelated banner-dismissed"></div>'
+                const expectCount = (selector, count) => {
+                    if (document.querySelectorAll(selector).length !== count) {
+                        throw new Error(`Unexpected match count for ${selector}`)
+                    }
+                }
+                expectCount(':root:has(.top-banner):not(.banner-dismissed)', 1)
+                expectCount('.Layout:has(.top-banner)', 1)
+                expectCount('.Layout:has(div.top-banner)', 1)
+                expectCount('.unrelated:has(.top-banner)', 0)
+                expectCount('.top-banner:has(.top-banner)', 0)
+                expectCount('.Layout:has(.missing)', 0)
+                document.documentElement.classList.add('banner-dismissed')
+                expectCount(':root:has(.top-banner):not(.banner-dismissed)', 0)
+                document.querySelector('.top-banner').remove()
+                expectCount('.Layout:has(.top-banner)', 0)
+            "#
+            .to_string(),
+        )?;
+        Ok(())
     }
 
     #[test]
