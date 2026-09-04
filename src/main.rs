@@ -2802,6 +2802,7 @@ fn compute_node_style(
     ancestor_hidden: bool,
     parent_style_revision: Option<u64>,
     stats: &mut StyleRecomputeStats,
+    variable_cache: &mut style::VariableCache,
 ) {
     stats.visited += 1;
     // Keep cached descendants until their hidden ancestor can render again.
@@ -2843,6 +2844,7 @@ fn compute_node_style(
                 css_children_index,
                 css_cascade_metadata,
                 variable_definitions,
+                variable_cache,
             )
             .unwrap()
         } else {
@@ -2919,6 +2921,7 @@ fn compute_node_style(
             subtree_hidden,
             Some(style_revision),
             stats,
+            variable_cache,
         );
     }
 }
@@ -4779,6 +4782,7 @@ fn compute_node_styles(
         false,
         None,
         &mut stats,
+        &mut style::VariableCache::default(),
     );
     println!(
         "computing styles took {} microseconds (visited={}, rebuilt={}, reused={})",
@@ -5724,6 +5728,34 @@ fn op_get_child_nodes(
 }
 
 #[op2]
+fn op_get_next_sibling(state: &mut OpState, #[number] node_idx: usize) -> Option<(usize, Node)> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let parent = renderer.nodes.get(node_idx)?.get_parent()?;
+    let children = renderer.dom_indexes.children_index.get(&parent)?;
+    let position = children.iter().position(|idx| *idx == node_idx)?;
+    let sibling = *children.get(position + 1)?;
+    Some((sibling, renderer.nodes.get(sibling)?.clone()))
+}
+
+#[op2]
+fn op_get_edge_child(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    last: bool,
+) -> Option<(usize, Node)> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let children = renderer.dom_indexes.children_index.get(&node_idx)?;
+    let child = *(if last {
+        children.last()
+    } else {
+        children.first()
+    })?;
+    Some((child, renderer.nodes.get(child)?.clone()))
+}
+
+#[op2]
 fn op_get_parent_node(
     state: &mut OpState,
     #[number] node_idx: usize,
@@ -6259,6 +6291,8 @@ extension!(
     op_append_child,
     op_remove_child,
     op_get_child_nodes,
+    op_get_next_sibling,
+    op_get_edge_child,
     op_get_parent_node,
     op_get_element_by_id,
     op_get_elements_by_tag_name,

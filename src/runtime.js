@@ -184,18 +184,13 @@ class BaseNode extends EventTarget {
     }
 
     get nextSibling() {
-        // TODO: Probably want to port this to rust later
-        const parent = this.parentNode
-        const siblings = parent.childNodes
-        const me = siblings.findIndex(node => node.__node_idx == this.__node_idx)
-        if (me === -1) {
-            throw new Error("nextSibling: Failed to locate self")
-        }
-        return siblings.length - 1 >= me + 1 ? siblings[me + 1] : null
+        const sibling = core.ops.op_get_next_sibling(this.__node_idx)
+        return sibling ? nodeToElement(sibling) : null
     }
 
     get firstChild() {
-        return this.childNodes.length > 0 ? this.childNodes[0] : null
+        const child = core.ops.op_get_edge_child(this.__node_idx, false)
+        return child ? nodeToElement(child) : null
     }
 
     getRootNode() {
@@ -654,12 +649,9 @@ class HtmlElement extends BaseNode {
         return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
     }
 
-    get firstChild() {
-        return this.childNodes.at(0)
-    }
-
     get lastChild() {
-        return this.childNodes.at(-1)
+        const child = core.ops.op_get_edge_child(this.__node_idx, true)
+        return child ? nodeToElement(child) : null
     }
 
     hasChildNodes() {

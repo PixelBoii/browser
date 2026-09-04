@@ -31,7 +31,8 @@ impl StyleVariables {
         })
     }
 
-    fn extend(parent: &Rc<Self>, values: HashMap<usize, String>) -> Rc<Self> {
+    fn extend(parent: &Rc<Self>, mut values: HashMap<usize, String>) -> Rc<Self> {
+        values.retain(|key, value| parent.get(key) != Some(value));
         if values.is_empty() {
             return Rc::clone(parent);
         }
@@ -1635,10 +1636,18 @@ fn resolve_node_variable_inner(
     None
 }
 
+// Scoped to one style pass: declaration IDs and variable definitions are stable.
+// Cached results retain their parent chain, so parent pointer keys cannot be reused.
+#[derive(Default)]
+pub struct VariableCache {
+    resolved: HashMap<(Vec<usize>, *const StyleVariables), Rc<StyleVariables>>,
+}
+
 fn apply_node_variables(
     nodes: &[(usize, Cow<'_, Node>)],
     variables: &Rc<StyleVariables>,
     variable_definitions: &VariableDefinitions,
+    cache: &mut VariableCache,
 ) -> Rc<StyleVariables> {
     let variables_to_parse: Vec<&Variable> = nodes
         .iter()
@@ -1649,6 +1658,17 @@ fn apply_node_variables(
         .collect();
     if variables_to_parse.len() == 0 {
         return Rc::clone(variables);
+    }
+
+    let declaration_ids: Vec<usize> = nodes
+        .iter()
+        .filter_map(|(idx, node)| matches!(node.as_ref(), Node::Variable(_)).then_some(*idx))
+        .collect();
+    // Inline declarations share the sentinel ID, so they cannot use this key.
+    let cacheable = !declaration_ids.contains(&usize::MAX);
+    let key = (declaration_ids, Rc::as_ptr(variables));
+    if cacheable && let Some(resolved) = cache.resolved.get(&key) {
+        return Rc::clone(resolved);
     }
 
     let mut map = HashMap::new();
@@ -1668,7 +1688,11 @@ fn apply_node_variables(
         }
     }
 
-    StyleVariables::extend(variables, new_variables)
+    let resolved = StyleVariables::extend(variables, new_variables);
+    if cacheable {
+        cache.resolved.insert(key, Rc::clone(&resolved));
+    }
+    resolved
 }
 
 fn resolve_variable_template(
@@ -1717,8 +1741,9 @@ pub fn resolve_node_variables<'nodes, 'css>(
     nodes: &'nodes mut [(usize, Cow<'css, Node>)],
     variables: &Rc<StyleVariables>,
     variable_definitions: &VariableDefinitions,
+    cache: &mut VariableCache,
 ) -> (Vec<&'nodes Property>, Rc<StyleVariables>) {
-    let resolved_variables = apply_node_variables(nodes, variables, variable_definitions);
+    let resolved_variables = apply_node_variables(nodes, variables, variable_definitions, cache);
 
     for (_, node) in nodes.iter_mut() {
         let parsed_value = match node.as_ref() {
@@ -2673,6 +2698,7 @@ pub fn parse_style(
     css_children_index: &HashMap<usize, Vec<usize>>,
     cascade_metadata: &[Option<CssCascadeMetadata>],
     variable_definitions: &VariableDefinitions,
+    variable_cache: &mut VariableCache,
 ) -> Result<Style> {
     let mut style = get_base_style(node, parent_style);
 
@@ -2712,8 +2738,12 @@ pub fn parse_style(
             .map(|node| (usize::MAX, Cow::Owned(node))),
     );
 
-    let (properties, resolved_variables) =
-        resolve_node_variables(&mut nodes, parent_variables, variable_definitions);
+    let (properties, resolved_variables) = resolve_node_variables(
+        &mut nodes,
+        parent_variables,
+        variable_definitions,
+        variable_cache,
+    );
     style.variables = resolved_variables;
 
     for property in properties {
