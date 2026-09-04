@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
-use ab_glyph::{Font, FontRef, Glyph, OutlinedGlyph, ScaleFont};
+use ab_glyph::{Font, FontRef, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use deno_core::error::JsError;
@@ -345,6 +345,48 @@ struct DomIndexes {
 }
 
 impl DomIndexes {
+    fn add_node(&mut self, idx: usize, node: &Node, class_indexes: &mut ClassIndexes) {
+        self.children_index.get_or_insert_default(idx);
+        if let Some(parent) = node.get_parent() {
+            self.children_index.get_or_insert_default(parent).push(idx);
+        }
+        let Node::Element(element) = node else {
+            return;
+        };
+        self.tag_elements
+            .entry(element.tag.clone())
+            .or_default()
+            .grow_and_insert(idx);
+        if let Some(id) = element.attributes.get_str("id") {
+            self.add_id_node(&id.into_owned(), idx);
+        }
+        for class in get_class_list(element) {
+            let (_, class_idx) = class_indexes.upsert_definition(class);
+            self.class_elements
+                .resize_with(class_indexes.len(), FixedBitSet::default);
+            self.class_elements[class_idx].grow_and_insert(idx);
+        }
+        for attribute in element.attributes.keys() {
+            self.add_attribute_node(attribute, idx);
+        }
+    }
+
+    fn remove_nodes(&mut self, removed: &FixedBitSet) {
+        for elements in &mut self.class_elements {
+            elements.difference_with(removed);
+        }
+        for index in [
+            &mut self.tag_elements,
+            &mut self.id_elements,
+            &mut self.attribute_elements,
+        ] {
+            index.retain(|_, elements| {
+                elements.difference_with(removed);
+                !elements.is_clear()
+            });
+        }
+    }
+
     pub fn recompute_class_elements(
         &mut self,
         html_nodes: &NodesTable,
@@ -7013,7 +7055,6 @@ impl Renderer {
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
         self.remove_children(node_idx);
         self.create_children_from_html(node_idx, html);
-        self.recompute_dom_indexes();
         self.schedule_dom_update();
     }
 
@@ -7024,7 +7065,11 @@ impl Renderer {
             parent: None,
         }));
         let node_idx = self.nodes.cursor;
-        self.dom_indexes.children_index.insert(node_idx, vec![]);
+        self.dom_indexes.add_node(
+            node_idx,
+            self.nodes.get(node_idx).unwrap(),
+            &mut self.css_parser.class_definitions,
+        );
         node_idx
     }
 
@@ -11211,18 +11256,20 @@ impl Renderer {
             .get(&parent_idx)
             .cloned()
             .unwrap_or_default();
-        let mut removed = HashSet::with_capacity(pending.len());
+        let mut removed = FixedBitSet::with_capacity(self.nodes.data.len());
         while let Some(node_idx) = pending.pop() {
-            if !removed.insert(node_idx) {
+            if removed.contains(node_idx) {
                 continue;
             }
+            removed.insert(node_idx);
             if let Some(children) = self.dom_indexes.children_index.get(&node_idx) {
                 pending.extend(children);
             }
         }
 
-        self.nodes_idxs.retain(|idx| !removed.contains(idx));
-        for node_idx in removed {
+        self.dom_indexes.remove_nodes(&removed);
+        self.nodes_idxs.retain(|idx| !removed.contains(*idx));
+        for node_idx in removed.ones() {
             self.nodes.remove(node_idx);
             self.node_layout_mapping.remove(&node_idx);
             self.dom_indexes.children_index.remove(&node_idx);
@@ -11506,7 +11553,10 @@ impl Renderer {
             } else {
                 let _ = node.set_parent(idx_mapping.get(&node.get_parent().unwrap()).copied());
             }
-            self.insert_node_at_idx(*idx_mapping.get(&node_internal_idx).unwrap(), node.clone());
+            let idx = *idx_mapping.get(&node_internal_idx).unwrap();
+            self.dom_indexes
+                .add_node(idx, node, &mut self.css_parser.class_definitions);
+            self.insert_node_at_idx(idx, node.clone());
         }
     }
 
@@ -11534,20 +11584,41 @@ impl Renderer {
 #[derive(Debug)]
 struct FontHandler {
     font: FontRef<'static>,
+    glyphs: RefCell<HashMap<(char, u32), Option<Rc<RasterizedGlyph>>>>,
+}
+
+#[derive(Debug)]
+struct RasterizedGlyph {
+    top: f32,
+    pixels: Vec<(u32, u32, f32)>,
 }
 
 impl FontHandler {
     pub fn new() -> Result<Self> {
         let font = FontRef::try_from_slice(include_bytes!("./InterVariable.ttf"))?;
-        Ok(Self { font })
+        Ok(Self {
+            font,
+            glyphs: RefCell::new(HashMap::new()),
+        })
     }
 
-    pub fn outline_glyph_for(&self, char: char, scale: f32) -> Option<OutlinedGlyph> {
-        self.font.outline_glyph(self.glyph_for(char, scale))
-    }
-
-    pub fn glyph_for(&self, char: char, scale: f32) -> Glyph {
-        self.font.glyph_id(char).with_scale(scale)
+    // Coverage can be shared across strings and colors; placement and blending happen later.
+    fn rasterized_glyph_for(&self, char: char, size: u32) -> Option<Rc<RasterizedGlyph>> {
+        self.glyphs
+            .borrow_mut()
+            .entry((char, size))
+            .or_insert_with(|| {
+                let glyph = self
+                    .font
+                    .outline_glyph(self.font.glyph_id(char).with_scale(size as f32))?;
+                let mut pixels = Vec::new();
+                glyph.draw(|x, y, coverage| pixels.push((x, y, coverage)));
+                Some(Rc::new(RasterizedGlyph {
+                    top: glyph.px_bounds().min.y,
+                    pixels,
+                }))
+            })
+            .clone()
     }
 }
 
@@ -14002,7 +14073,7 @@ fn collapse_whitespace(text: &str) -> Option<String> {
 struct GlyphPosition {
     x: f32,
     y: f32,
-    glyph: OutlinedGlyph,
+    glyph: Rc<RasterizedGlyph>,
 }
 
 fn premul_rgba_buffer_to_bytes(buffer: &[u32]) -> Vec<u8> {
@@ -14054,7 +14125,7 @@ fn text_to_buffer_with_line_height(
         if let Some(previous_id) = previous {
             pen_x += scaled_font.kern(previous_id, glyph_id);
         }
-        if let Some(glyph) = font_handler.outline_glyph_for(ch, font_px as f32) {
+        if let Some(glyph) = font_handler.rasterized_glyph_for(ch, font_px) {
             glyph_positions.push(GlyphPosition {
                 x: pen_x,
                 y: pen_y,
@@ -14081,8 +14152,7 @@ fn text_to_buffer_with_line_height(
             width,
             height,
             glyph_pos.x as i32,
-            (glyph_pos.y + leading + scaled_font.ascent() + glyph_pos.glyph.px_bounds().min.y)
-                as i32,
+            (glyph_pos.y + leading + scaled_font.ascent() + glyph_pos.glyph.top) as i32,
             &glyph_pos.glyph,
             color,
         );
@@ -14107,10 +14177,10 @@ fn draw_glyph(
     height: u32,
     x: i32,
     y: i32,
-    glyph: &OutlinedGlyph,
+    glyph: &RasterizedGlyph,
     color: u32,
 ) {
-    glyph.draw(|glyph_x, glyph_y, c| {
+    for &(glyph_x, glyph_y, c) in &glyph.pixels {
         draw_rect_filled(
             buffer,
             true,
@@ -14123,7 +14193,7 @@ fn draw_glyph(
             with_coverage(color, c),
             &BorderRadius::new_empty(),
         );
-    });
+    }
 }
 
 fn rgba_to_premul_tuple(src: u32) -> (u8, u8, u8, u8) {
