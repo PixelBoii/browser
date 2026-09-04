@@ -357,18 +357,14 @@ fn parse_pseudo_class(value: &str, class_definitions: &mut ClassIndexes) -> Opti
     }
     if let Some(stripped) = value.strip_prefix("not(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
-            return Some(PseudoClass::Not(selector_to_parts(
-                &stripped.to_string(),
-                class_definitions,
-            )));
+            let parts = selector_to_parts(&stripped.to_string(), class_definitions);
+            return (!parts.is_empty()).then_some(PseudoClass::Not(parts));
         }
     }
     if let Some(stripped) = value.strip_prefix("has(") {
         if let Some(stripped) = stripped.strip_suffix(")") {
-            return Some(PseudoClass::Has(selector_to_parts(
-                &stripped.to_string(),
-                class_definitions,
-            )));
+            let parts = selector_to_parts(&stripped.to_string(), class_definitions);
+            return (!parts.is_empty()).then_some(PseudoClass::Has(parts));
         }
     }
     if let Some(stripped) = value.strip_prefix("lang(") {
@@ -482,10 +478,8 @@ pub fn selector_to_parts(
     let nested_parts = split_ignoring_parentheses(selector.clone(), ' ', &['>', '~', '+']);
     nested_parts
         .into_iter()
-        .filter_map(|p| -> Option<ClassNamePart> {
-            if p.is_empty() {
-                return None;
-            }
+        .filter(|p| !p.is_empty())
+        .map(|p| -> Option<ClassNamePart> {
             let mut conditions = vec![];
             let mut buffer = String::new();
             let new_statement = ['.', '#', '[', '>', '~', '+', ':'];
@@ -562,8 +556,7 @@ pub fn selector_to_parts(
                             Some(parsed) => Some(ClassNamePart::PseudoClass(parsed)),
                             None => {
                                 println!("Failed to parse pseudo class: {}", chars.as_str());
-                                // This intentionally returns the entire function
-                                // If we fail to parse pseudo class, consider the whole class invalid
+                                // Invalidate the whole selector, not just this compound.
                                 return None;
                             }
                         }
@@ -577,7 +570,7 @@ pub fn selector_to_parts(
                 };
                 match parsed {
                     Some(parsed) => parsed_conditions.push(parsed),
-                    None => println!("Failed to parse condition: {}", cond),
+                    None => return None,
                 };
             }
             if parsed_conditions.len() > 1 {
@@ -588,7 +581,8 @@ pub fn selector_to_parts(
                 None
             }
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 3] = [

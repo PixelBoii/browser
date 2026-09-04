@@ -185,7 +185,7 @@ impl StylePosition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StyleAlign {
     Left,
     Center,

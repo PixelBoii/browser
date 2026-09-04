@@ -1725,7 +1725,7 @@ struct Renderer {
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
     cached_text_buffers:
-        HashMap<(String, u32, Option<u32>, Option<u32>, u32), (Rc<Pixmap>, u32, u32)>,
+        HashMap<(String, u32, Option<u32>, Option<u32>, u32, StyleAlign), (Rc<Pixmap>, u32, u32)>,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     flattened_css_cache: Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     variable_definitions: VariableDefinitions,
@@ -3010,7 +3010,9 @@ fn move_up_ancestor_chain(
             let mut is_match = false;
             for (name_part_idx, _) in parent_node_class.name_parts.iter().enumerate() {
                 let nested_parts = &parent_node_class.name_parts[name_part_idx];
-                let next_class_part = &nested_parts[nested_parts.len() - 1];
+                let Some(next_class_part) = nested_parts.last() else {
+                    continue;
+                };
                 let el = if walk_up_parent && walk_into_part(next_class_part) {
                     get_parent_html_idx(element, html_nodes)
                 } else {
@@ -8309,6 +8311,7 @@ impl Renderer {
                     max_width,
                     line_height,
                     text_hex,
+                    style.text_align,
                 );
                 let (buffer, width, height) =
                     if let Some(cached) = self.cached_text_buffers.get(&cache_key) {
@@ -8321,6 +8324,7 @@ impl Renderer {
                             resolved_font_size,
                             max_width,
                             line_height,
+                            style.text_align,
                         )?;
                         let result = (Rc::new(buffer), width, height);
                         self.cached_text_buffers.insert(cache_key.clone(), result);
@@ -8874,6 +8878,7 @@ impl Renderer {
         children_rows: &MarginRows,
         container_width: i32,
         free_space_y: u32,
+        text_align: Option<StyleAlign>,
     ) {
         let mut free_space_to_give_y = 0;
         // TODO: I don't think this is 100% accurate
@@ -8917,17 +8922,19 @@ impl Renderer {
 
             let mut first_margin = first_child_style.margin_left.clone();
             let mut last_margin = last_child_style.margin_right.clone();
-            // If the text-align isn't left, and all children in this row are the same, use that instead of the margin
-            if first_child_style.text_align != StyleAlign::Left
+            // Text alignment belongs to the containing block's inline content.
+            // It must not move block children or re-align flex items.
+            if let Some(text_align) = text_align
+                && text_align != StyleAlign::Left
                 && row.iter().all(|c| {
                     self.node_styles
                         .get(&self.layout_to_node_idx(c))
                         .unwrap()
-                        .text_align
-                        == first_child_style.text_align
+                        .display
+                        .is_inline()
                 })
             {
-                (first_margin, last_margin) = match first_child_style.text_align {
+                (first_margin, last_margin) = match text_align {
                     StyleAlign::Left => panic!(),
                     StyleAlign::Center => (StyleSize::Auto, StyleSize::Auto),
                     StyleAlign::Right => (StyleSize::Auto, StyleSize::Px(0.)),
@@ -9080,7 +9087,7 @@ impl Renderer {
             _ => None,
         }
         .with_context(|| "No color was specified for text")?;
-        let cache_key = (text.clone(), font_size, None, None, text_hex);
+        let cache_key = (text.clone(), font_size, None, None, text_hex, StyleAlign::Left);
         let (buffer, width, height) = if let Some(cached) = self.cached_text_buffers.get(&cache_key)
         {
             cached
@@ -9798,6 +9805,7 @@ impl Renderer {
 
         let mut children_rows = MarginRows::new();
 
+        let text_align = style.text_align;
         // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
         let shrink_to_content_width = matches!(
             &style.width,
@@ -9973,6 +9981,7 @@ impl Renderer {
             &children_rows,
             width as i32 - padding_left_size - padding_right_size,
             free_space_y,
+            Some(text_align),
         );
 
         if *mode != LayoutMode::BaseCalculation {
@@ -10548,6 +10557,7 @@ impl Renderer {
                     &children_rows,
                     width as i32 - padding_left_size - padding_right_size,
                     free_space_y,
+                    None,
                 );
 
                 (width, height, max_child_height)
@@ -10566,7 +10576,8 @@ impl Renderer {
                             child_style.position.is_free(),
                         )
                     };
-                    let (margin_left_size, _, margin_top_size, margin_bottom_size) = margins;
+                    let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
+                        margins;
                     content_position.x = original_content_cursor.x + margin_left_size;
                     // TODO: This should probably go into the flex calculation
                     content_position.y += margin_top_size;
@@ -10590,8 +10601,8 @@ impl Renderer {
                     ) {
                         let child_box = self.layout_table.get(child).unwrap();
                         let outer_cross = child_box.rect.width
-                            + margin_top_size.max(0) as u32
-                            + margin_bottom_size.max(0) as u32;
+                            + margin_left_size.max(0) as u32
+                            + margin_right_size.max(0) as u32;
                         let cross_offset = self.calculate_cross_offset(
                             item.node_idx,
                             outer_cross,
@@ -10641,6 +10652,7 @@ impl Renderer {
                     &children_rows,
                     width as i32 - padding_left_size - padding_right_size,
                     free_space_y,
+                    None,
                 );
 
                 (width, height, content_height as u32)
@@ -14105,7 +14117,15 @@ fn text_to_buffer(
     font_px: u32,
     max_width: Option<u32>,
 ) -> Option<(Pixmap, u32, u32)> {
-    text_to_buffer_with_line_height(font_handler, color, text, font_px, max_width, None)
+    text_to_buffer_with_line_height(
+        font_handler,
+        color,
+        text,
+        font_px,
+        max_width,
+        None,
+        StyleAlign::Left,
+    )
 }
 
 fn text_to_buffer_with_line_height(
@@ -14115,6 +14135,7 @@ fn text_to_buffer_with_line_height(
     font_px: u32,
     max_width: Option<u32>,
     line_height_px: Option<u32>,
+    text_align: StyleAlign,
 ) -> Option<(Pixmap, u32, u32)> {
     let scaled_font = font_handler.font.as_scaled(font_px as f32);
     let mut width = 0f32;
@@ -14125,6 +14146,8 @@ fn text_to_buffer_with_line_height(
     let mut previous = None;
 
     let mut glyph_positions = vec![];
+    let mut lines = vec![];
+    let mut line_start = 0;
 
     let default_line_height = scaled_font.height() + scaled_font.line_gap();
     let line_height = line_height_px
@@ -14146,6 +14169,8 @@ fn text_to_buffer_with_line_height(
         let advance = scaled_font.h_advance(glyph_id);
         // Line break
         if max_width.is_some_and(|max_width| pen_x + advance >= max_width as f32) && ch == ' ' {
+            lines.push((line_start, glyph_positions.len(), pen_x));
+            line_start = glyph_positions.len();
             pen_x = x as f32;
             pen_y += line_height;
         } else {
@@ -14153,6 +14178,19 @@ fn text_to_buffer_with_line_height(
             width = width.max(pen_x)
         }
         previous = Some(glyph_id);
+    }
+    lines.push((line_start, glyph_positions.len(), pen_x));
+    // Align each wrapped line inside the text box; its parent positions the box itself.
+    for (start, end, line_width) in lines {
+        let free_space = (width - line_width).max(0.);
+        let offset = match text_align {
+            StyleAlign::Left => 0.,
+            StyleAlign::Center => free_space / 2.,
+            StyleAlign::Right => free_space,
+        };
+        for glyph in &mut glyph_positions[start..end] {
+            glyph.x += offset;
+        }
     }
     let width = width as u32;
     let height = (pen_y + line_height) as u32;
@@ -14751,6 +14789,121 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
+    fn unsupported_selector_parts_do_not_broaden_matches() {
+        let mut classes = crate::css::ClassIndexes::new();
+        for selector in [
+            "[data-header] #button:focus-visible",
+            "#button:unsupported span",
+            "[data-header] > #button:unsupported",
+            "[data-header] :not(#button:unsupported)",
+            "[data-header] :has(#button:unsupported)",
+        ] {
+            assert!(
+                crate::css::selector_to_parts(&selector.to_string(), &mut classes).is_empty(),
+                "{selector}"
+            );
+        }
+        assert_eq!(
+            crate::css::selector_to_parts(&"[data-header] #button:hover".to_string(), &mut classes)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn wrapped_text_alignment_positions_each_line() -> Result<()> {
+        let font = std::rc::Rc::new(crate::FontHandler::new()?);
+        let render = |text: &str, align| {
+            crate::text_to_buffer_with_line_height(
+                &font,
+                0xffffffff,
+                &text.to_string(),
+                20,
+                Some(10),
+                Some(40),
+                align,
+            )
+            .unwrap()
+        };
+        let (left, width, height) = render("WWWW i", crate::StyleAlign::Left);
+        let (_, short_width, _) = render("i", crate::StyleAlign::Left);
+        assert_eq!(height, 80);
+        let first_ink_x = |pixmap: &resvg::tiny_skia::Pixmap, from_y: u32, to_y: u32| {
+            (0..pixmap.width())
+                .find(|&x| (from_y..to_y).any(|y| pixmap.pixel(x, y).unwrap().alpha() > 0))
+                .unwrap() as i32
+        };
+        for (align, divisor) in [
+            (crate::StyleAlign::Center, 2),
+            (crate::StyleAlign::Right, 1),
+        ] {
+            let (aligned, aligned_width, aligned_height) = render("WWWW i", align);
+            assert_eq!((aligned_width, aligned_height), (width, height));
+            assert_eq!(first_ink_x(&aligned, 0, 40), first_ink_x(&left, 0, 40));
+            let shift = first_ink_x(&aligned, 40, 80) - first_ink_x(&left, 40, 80);
+            let expected = ((width - short_width) / divisor) as i32;
+            assert!(
+                (shift - expected).abs() <= 1,
+                "{align:?}: {shift} vs {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_alignment_does_not_reposition_block_or_flex_items() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script(
+            "alignment fixture",
+            r#"
+                document.body.innerHTML = `
+                    <div style="width:600px;text-align:center">
+                        <div id="block" style="width:100px;height:20px"></div>
+                        <div id="auto" style="width:100px;height:20px;margin:0 auto"></div>
+                    </div>
+                    <div style="width:600px;text-align:center">
+                        <span id="inline" style="display:inline-block;width:100px;height:20px;text-align:right"></span>
+                    </div>
+                    <div style="display:flex;flex-direction:column;align-items:center;width:600px;text-align:center">
+                        <div id="column" style="display:flex;flex-direction:column;align-items:center;width:200px">
+                            <div id="nested" style="width:100px;height:20px;margin-top:20px"></div>
+                        </div>
+                    </div>
+                    <div style="display:flex;justify-content:center;width:600px;text-align:right">
+                        <div id="row" style="width:100px;height:20px"></div>
+                    </div>`;
+                document.body.style.margin = '0';
+            "#
+            .to_string(),
+        )?;
+        frame.process_dom_update();
+        frame.render_into(&mut vec![0; 800 * 600], 800, 600, true);
+        let renderer = frame.renderer.as_ref().unwrap().borrow();
+        for (id, expected_x) in [
+            ("block", 0),
+            ("auto", 250),
+            ("inline", 250),
+            ("column", 200),
+            ("nested", 250),
+            ("row", 250),
+        ] {
+            let layout = renderer.layout_table.iter().find(|layout| {
+                matches!(renderer.nodes.get(layout.node_idx), Some(crate::Node::Element(element))
+                    if element.attributes.get_str("id").as_deref() == Some(id))
+            }).unwrap();
+            assert_eq!(layout.rect.x, expected_x, "{id}");
+        }
+        Ok(())
     }
 
     #[test]
