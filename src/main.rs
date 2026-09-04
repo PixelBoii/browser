@@ -3897,7 +3897,7 @@ fn get_base_elements_by_attributes(
     dom_indexes: &DomIndexes,
     attributes: &Vec<ClassNamePartAttribute>,
 ) -> FixedBitSet {
-    let mut base_items = FixedBitSet::with_capacity(html_nodes.keys().max().unwrap_or(0));
+    let mut base_items = FixedBitSet::with_capacity(html_nodes.data.len());
     let mut base_items_init = false;
     // Base items are the elements that contain all the keys in attributes
     for attr in attributes.iter() {
@@ -14181,18 +14181,13 @@ fn draw_glyph(
     color: u32,
 ) {
     for &(glyph_x, glyph_y, c) in &glyph.pixels {
-        draw_rect_filled(
-            buffer,
-            true,
-            width,
-            height,
-            x + glyph_x as i32,
-            y + glyph_y as i32,
-            1,
-            1,
-            with_coverage(color, c),
-            &BorderRadius::new_empty(),
-        );
+        let px = x + glyph_x as i32;
+        let py = y + glyph_y as i32;
+        if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
+            continue;
+        }
+        let pixel = &mut buffer[py as usize * width as usize + px as usize];
+        *pixel = blend_rgba_with_rgba(*pixel, rgba_to_premul_tuple(with_coverage(color, c)));
     }
 }
 

@@ -1640,7 +1640,7 @@ fn resolve_node_variable_inner(
 // Cached results retain their parent chain, so parent pointer keys cannot be reused.
 #[derive(Default)]
 pub struct VariableCache {
-    resolved: HashMap<(Vec<usize>, *const StyleVariables), Rc<StyleVariables>>,
+    resolved: HashMap<(Vec<usize>, Option<String>, *const StyleVariables), Rc<StyleVariables>>,
 }
 
 fn apply_node_variables(
@@ -1648,6 +1648,7 @@ fn apply_node_variables(
     variables: &Rc<StyleVariables>,
     variable_definitions: &VariableDefinitions,
     cache: &mut VariableCache,
+    inline_style: Option<&str>,
 ) -> Rc<StyleVariables> {
     let variables_to_parse: Vec<&Variable> = nodes
         .iter()
@@ -1664,9 +1665,16 @@ fn apply_node_variables(
         .iter()
         .filter_map(|(idx, node)| matches!(node.as_ref(), Node::Variable(_)).then_some(*idx))
         .collect();
-    // Inline declarations share the sentinel ID, so they cannot use this key.
-    let cacheable = !declaration_ids.contains(&usize::MAX);
-    let key = (declaration_ids, Rc::as_ptr(variables));
+    // Inline declarations share the sentinel ID; their source distinguishes the values/order.
+    let has_inline_variables = declaration_ids.contains(&usize::MAX);
+    let cacheable = !has_inline_variables || inline_style.is_some();
+    let key = (
+        declaration_ids,
+        inline_style
+            .filter(|_| has_inline_variables)
+            .map(str::to_owned),
+        Rc::as_ptr(variables),
+    );
     if cacheable && let Some(resolved) = cache.resolved.get(&key) {
         return Rc::clone(resolved);
     }
@@ -1742,8 +1750,10 @@ pub fn resolve_node_variables<'nodes, 'css>(
     variables: &Rc<StyleVariables>,
     variable_definitions: &VariableDefinitions,
     cache: &mut VariableCache,
+    inline_style: Option<&str>,
 ) -> (Vec<&'nodes Property>, Rc<StyleVariables>) {
-    let resolved_variables = apply_node_variables(nodes, variables, variable_definitions, cache);
+    let resolved_variables =
+        apply_node_variables(nodes, variables, variable_definitions, cache, inline_style);
 
     for (_, node) in nodes.iter_mut() {
         let parsed_value = match node.as_ref() {
@@ -2738,11 +2748,16 @@ pub fn parse_style(
             .map(|node| (usize::MAX, Cow::Owned(node))),
     );
 
+    let inline_style = match node {
+        HtmlNode::Element(element) => element.attributes.get_str("style"),
+        _ => None,
+    };
     let (properties, resolved_variables) = resolve_node_variables(
         &mut nodes,
         parent_variables,
         variable_definitions,
         variable_cache,
+        inline_style.as_deref(),
     );
     style.variables = resolved_variables;
 
