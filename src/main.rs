@@ -1560,6 +1560,9 @@ struct CachedNodeStyle {
 struct StyleCache {
     nodes: NodeMap<CachedNodeStyle>,
     local_revisions: HashMap<usize, u64>,
+    selector_matches: Vec<Vec<MatchedCssRule>>,
+    selector_invalidation: Option<SelectorInvalidationIndex>,
+    selector_hovering_impact: HashSet<usize>,
     window_size: Option<PhysicalSize<u32>>,
     next_style_revision: u64,
 }
@@ -1568,6 +1571,9 @@ impl StyleCache {
     fn clear(&mut self) {
         self.nodes.clear();
         self.local_revisions.clear();
+        self.selector_matches.clear();
+        self.selector_invalidation = None;
+        self.selector_hovering_impact.clear();
         self.window_size = None;
     }
 
@@ -1586,12 +1592,68 @@ impl StyleCache {
 }
 
 #[derive(Debug)]
+struct AttributeChange {
+    node_idx: usize,
+    name: String,
+    old_value: Option<String>,
+    new_value: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct SelectorChanges {
+    attributes: Vec<AttributeChange>,
+    dirty_subtrees: HashSet<usize>,
+    tree_changed: bool,
+    state_changed: bool,
+    force_full: bool,
+}
+
+impl SelectorChanges {
+    fn attribute_changed(
+        &mut self,
+        node_idx: usize,
+        name: String,
+        old_value: Option<String>,
+        new_value: Option<String>,
+    ) {
+        self.attributes.push(AttributeChange {
+            node_idx,
+            name,
+            old_value,
+            new_value,
+        });
+    }
+
+    fn child_list_changed(&mut self, dirty_subtree: usize) {
+        self.tree_changed = true;
+        self.dirty_subtrees.insert(dirty_subtree);
+    }
+
+    fn state_changed(&mut self) {
+        self.state_changed = true;
+    }
+
+    fn force_full_rematch(&mut self) {
+        self.force_full = true;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.attributes.is_empty()
+            && self.dirty_subtrees.is_empty()
+            && !self.tree_changed
+            && !self.state_changed
+            && !self.force_full
+    }
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
     node_styles: NodeMap<Style>,
     style_cache: StyleCache,
+    selector_changes: SelectorChanges,
     layout_table: Vec<LayoutBox>,
     node_layout_mapping: NodeMap<usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
@@ -3454,6 +3516,257 @@ fn get_parent_html_idx(node_idx: usize, html_nodes: &NodesTable) -> Option<usize
     html_nodes.get(node_idx).unwrap().get_parent()
 }
 
+#[derive(Debug)]
+struct SelectorInvalidationIndex {
+    rule_capacity: usize,
+    all_rules: FixedBitSet,
+    classes: Vec<FixedBitSet>,
+    ids: HashMap<String, FixedBitSet>,
+    attributes: HashMap<String, FixedBitSet>,
+    tree_sensitive: FixedBitSet,
+    state_sensitive: FixedBitSet,
+    untracked: FixedBitSet,
+}
+
+impl SelectorInvalidationIndex {
+    fn compile(css_nodes: &[CssNode]) -> Self {
+        let rule_capacity = css_nodes.len();
+        let empty = || FixedBitSet::with_capacity(rule_capacity);
+        let mut index = Self {
+            rule_capacity,
+            all_rules: empty(),
+            classes: vec![],
+            ids: HashMap::new(),
+            attributes: HashMap::new(),
+            tree_sensitive: empty(),
+            state_sensitive: empty(),
+            untracked: empty(),
+        };
+
+        for rule_idx in css_rules_to_resolve(css_nodes) {
+            index.all_rules.insert(rule_idx);
+            let mut node_idx = Some(rule_idx);
+            while let Some(current_idx) = node_idx {
+                let node = &css_nodes[current_idx];
+                match node {
+                    CssNode::ClassName(class) => {
+                        for selector in &class.name_parts {
+                            index.index_parts(rule_idx, selector);
+                        }
+                    }
+                    _ => {}
+                }
+                node_idx = node.get_parent();
+            }
+        }
+
+        index
+    }
+
+    fn empty_rule_set(&self) -> FixedBitSet {
+        FixedBitSet::with_capacity(self.rule_capacity)
+    }
+
+    fn insert_named_rule(
+        map: &mut HashMap<String, FixedBitSet>,
+        capacity: usize,
+        value: &str,
+        rule_idx: usize,
+    ) {
+        map.entry(value.to_string())
+            .or_insert_with(|| FixedBitSet::with_capacity(capacity))
+            .insert(rule_idx);
+    }
+
+    fn index_parts(&mut self, rule_idx: usize, parts: &[ClassNamePart]) {
+        for part in parts {
+            match part {
+                ClassNamePart::Class(class_idx) => {
+                    if self.classes.len() <= *class_idx {
+                        self.classes.resize_with(class_idx + 1, || {
+                            FixedBitSet::with_capacity(self.rule_capacity)
+                        });
+                    }
+                    self.classes[*class_idx].insert(rule_idx);
+                }
+                ClassNamePart::Id(id) => {
+                    Self::insert_named_rule(&mut self.ids, self.rule_capacity, id, rule_idx)
+                }
+                ClassNamePart::Attributes(attributes) => {
+                    for attribute in attributes {
+                        let name = match attribute {
+                            ClassNamePartAttribute::Key(name)
+                            | ClassNamePartAttribute::KeyValue((name, ..)) => name,
+                        };
+                        Self::insert_named_rule(
+                            &mut self.attributes,
+                            self.rule_capacity,
+                            name,
+                            rule_idx,
+                        );
+                    }
+                }
+                ClassNamePart::Combined(parts) => self.index_parts(rule_idx, parts),
+                ClassNamePart::Tilde | ClassNamePart::AdjacentSibling => {
+                    self.tree_sensitive.insert(rule_idx);
+                }
+                ClassNamePart::PseudoClass(pseudo) => match pseudo {
+                    PseudoClass::Hover | PseudoClass::Focus | PseudoClass::Active => {
+                        self.state_sensitive.insert(rule_idx);
+                    }
+                    PseudoClass::FirstChild
+                    | PseudoClass::FirstOfType
+                    | PseudoClass::LastChild
+                    | PseudoClass::OnlyChild
+                    | PseudoClass::Empty
+                    | PseudoClass::NthChild(_)
+                    | PseudoClass::NthOfType(_)
+                    | PseudoClass::NthLastChild(_) => {
+                        self.tree_sensitive.insert(rule_idx);
+                    }
+                    PseudoClass::Link => Self::insert_named_rule(
+                        &mut self.attributes,
+                        self.rule_capacity,
+                        "href",
+                        rule_idx,
+                    ),
+                    PseudoClass::Disabled => Self::insert_named_rule(
+                        &mut self.attributes,
+                        self.rule_capacity,
+                        "disabled",
+                        rule_idx,
+                    ),
+                    PseudoClass::Checked => Self::insert_named_rule(
+                        &mut self.attributes,
+                        self.rule_capacity,
+                        "checked",
+                        rule_idx,
+                    ),
+                    PseudoClass::Lang(_) => Self::insert_named_rule(
+                        &mut self.attributes,
+                        self.rule_capacity,
+                        "lang",
+                        rule_idx,
+                    ),
+                    PseudoClass::Is(selectors) | PseudoClass::Where(selectors) => {
+                        for selector in selectors {
+                            self.index_parts(rule_idx, selector);
+                        }
+                    }
+                    PseudoClass::Not(selector) => self.index_parts(rule_idx, selector),
+                    PseudoClass::Has(selector) => {
+                        self.tree_sensitive.insert(rule_idx);
+                        self.index_parts(rule_idx, selector);
+                    }
+                    // The index is compiled before selectors are rewritten to these matcher-only
+                    // variants. If that ordering ever changes, rematch the rule conservatively.
+                    PseudoClass::IndexedIs(_)
+                    | PseudoClass::IndexedWhere(_)
+                    | PseudoClass::IndexedNot(_) => {
+                        self.untracked.insert(rule_idx);
+                    }
+                    PseudoClass::Root
+                    | PseudoClass::Visited
+                    | PseudoClass::Before
+                    | PseudoClass::After
+                    | PseudoClass::Host => {}
+                },
+                ClassNamePart::Tag(_) | ClassNamePart::ArrowRight | ClassNamePart::Ampersand => {}
+            }
+        }
+    }
+
+    fn add_attribute_rules(
+        &self,
+        rules: &mut FixedBitSet,
+        change: &AttributeChange,
+        class_definitions: &ClassIndexes,
+    ) {
+        if let Some(attribute_rules) = self.attributes.get(&change.name) {
+            rules.union_with(attribute_rules);
+        }
+
+        if change.name == "class" {
+            for value in [&change.old_value, &change.new_value].into_iter().flatten() {
+                for class in value.split_whitespace() {
+                    if let Some(class_idx) = class_definitions.class_to_idx.get(class)
+                        && let Some(class_rules) = self.classes.get(*class_idx)
+                    {
+                        rules.union_with(class_rules);
+                    }
+                }
+            }
+        } else if change.name == "id" {
+            for value in [&change.old_value, &change.new_value].into_iter().flatten() {
+                if let Some(id_rules) = self.ids.get(value) {
+                    rules.union_with(id_rules);
+                }
+            }
+        }
+    }
+}
+
+fn css_rules_to_resolve(css_nodes: &[CssNode]) -> HashSet<usize> {
+    let mut to_resolve = HashSet::new();
+    for node in css_nodes {
+        if matches!(node, CssNode::Property(_) | CssNode::Variable(_)) {
+            if let Some(parent) = node.get_parent() {
+                to_resolve.insert(parent);
+            }
+        }
+    }
+    to_resolve
+}
+
+enum SelectorMatchScope<'a> {
+    All,
+    Full(&'a FixedBitSet),
+    Incremental {
+        connected_elements: &'a FixedBitSet,
+        global_rules: &'a FixedBitSet,
+        dirty_elements: &'a FixedBitSet,
+    },
+}
+
+impl SelectorMatchScope<'_> {
+    fn all() -> Self {
+        Self::All
+    }
+
+    fn allows_element(&self, element_idx: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Full(connected_elements)
+            | Self::Incremental {
+                connected_elements, ..
+            } => connected_elements.contains(element_idx),
+        }
+    }
+
+    fn matches(&self, rule_idx: usize, element_idx: usize) -> bool {
+        self.allows_element(element_idx)
+            && match self {
+                Self::Incremental {
+                    global_rules,
+                    dirty_elements,
+                    ..
+                } => global_rules.contains(rule_idx) || dirty_elements.contains(element_idx),
+                Self::All | Self::Full(_) => true,
+            }
+    }
+
+    fn rule_has_work(&self, rule_idx: usize) -> bool {
+        match self {
+            Self::Incremental {
+                global_rules,
+                dirty_elements,
+                ..
+            } => global_rules.contains(rule_idx) || !dirty_elements.is_clear(),
+            Self::All | Self::Full(_) => true,
+        }
+    }
+}
+
 // Wrapper around search_elements_for_css_nodes that narrows the css_nodes down to only nodes that have property/variable children
 // Query selectors skip this step
 fn collect_class_nodes_for_elements(
@@ -3462,22 +3775,10 @@ fn collect_class_nodes_for_elements(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
+    scope: &SelectorMatchScope<'_>,
 ) -> (Vec<Vec<MatchedCssRule>>, HashSet<usize>) {
     // All class names and media queries that have properties/children and need to be resolved
-    let mut to_resolve = HashSet::new();
-    for (idx, n) in css_nodes.iter().enumerate() {
-        match n {
-            CssNode::Property(_) | CssNode::Variable(_) => {
-                // TODO: Should probably add back the variables and properties that are at the root at the end, if that's even a thing?
-                if let Some(parent) = n.get_parent() {
-                    to_resolve.insert(parent);
-                } else {
-                    println!("Found no parent for css node {}: {:?}", idx, n);
-                }
-            }
-            _ => {}
-        };
-    }
+    let to_resolve = css_rules_to_resolve(css_nodes);
     search_elements_for_css_nodes(
         to_resolve,
         css_nodes,
@@ -3485,6 +3786,7 @@ fn collect_class_nodes_for_elements(
         window_size,
         dom_indexes,
         hovering_chain,
+        scope,
     )
 }
 
@@ -3670,6 +3972,7 @@ fn search_elements_for_css_nodes(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
+    scope: &SelectorMatchScope<'_>,
 ) -> (Vec<Vec<MatchedCssRule>>, HashSet<usize>) {
     let class_elements = &dom_indexes.class_elements;
     let id_elements = &dom_indexes.id_elements;
@@ -3678,25 +3981,34 @@ fn search_elements_for_css_nodes(
     let mut hovering_has_impact = HashSet::new();
     let mut unique_selectors = vec![];
     let mut selector_indexes = HashMap::new();
-    for node in css_nodes.iter_mut() {
-        match node {
-            CssNode::ClassName(class) => {
-                for selector in &mut class.name_parts {
-                    for part in selector {
-                        walk_selectors(&mut unique_selectors, &mut selector_indexes, part);
-                    }
-                }
+    let mut selector_nodes = FixedBitSet::with_capacity(css_nodes.len());
+    for rule_idx in &to_resolve {
+        if !scope.rule_has_work(*rule_idx) {
+            continue;
+        }
+        let mut node_idx = Some(*rule_idx);
+        while let Some(current_idx) = node_idx {
+            let node = &css_nodes[current_idx];
+            if matches!(node, CssNode::ClassName(_)) {
+                selector_nodes.insert(current_idx);
             }
-            _ => {}
+            node_idx = node.get_parent();
         }
     }
-    let element_indexes = filter_to_elements(html_nodes);
-    let max_element_idx = element_indexes
-        .iter()
-        .max()
-        .cloned()
-        .map(|v| v + 1)
-        .unwrap_or(0);
+    for node_idx in selector_nodes.ones() {
+        if let CssNode::ClassName(class) = &mut css_nodes[node_idx] {
+            for selector in &mut class.name_parts {
+                for part in selector {
+                    walk_selectors(&mut unique_selectors, &mut selector_indexes, part);
+                }
+            }
+        }
+    }
+    let element_indexes = filter_to_elements(html_nodes)
+        .into_iter()
+        .filter(|idx| scope.allows_element(*idx))
+        .collect::<Vec<_>>();
+    let max_element_idx = html_nodes.keys().max().map(|v| v + 1).unwrap_or(0);
     let mut matches = vec![vec![]; max_element_idx];
 
     let mut precomputed_selectors: Vec<FixedBitSet> = vec![];
@@ -3721,6 +4033,9 @@ fn search_elements_for_css_nodes(
     let css_nodes = &css_nodes;
 
     for css_node_idx in to_resolve {
+        if !scope.rule_has_work(css_node_idx) {
+            continue;
+        }
         let node = css_nodes[css_node_idx].1;
         match node {
             CssNode::ClassName(classes) => {
@@ -3733,7 +4048,9 @@ fn search_elements_for_css_nodes(
                     let all_elements = || {
                         let mut bitset = FixedBitSet::with_capacity(max_element_idx);
                         for idx in element_indexes.iter().copied() {
-                            bitset.insert(idx);
+                            if scope.matches(css_node_idx, idx) {
+                                bitset.insert(idx);
+                            }
                         }
                         bitset
                     };
@@ -3818,6 +4135,9 @@ fn search_elements_for_css_nodes(
                                 .unwrap_or_else(|| (usize::MAX, all_elements()));
                             let mut filtered_elements = FixedBitSet::with_capacity(max_element_idx);
                             for el in base_elements.ones() {
+                                if !scope.matches(css_node_idx, el) {
+                                    continue;
+                                }
                                 let matched_all =
                                     combined.iter().enumerate().all(|(part_idx, part)| {
                                         part_idx == base_part_idx
@@ -3852,6 +4172,9 @@ fn search_elements_for_css_nodes(
 
                     if let Some(elements) = elements {
                         for el in elements.ones() {
+                            if !scope.matches(css_node_idx, el) {
+                                continue;
+                            }
                             // If there's only a single part, we've already completed this class name by doing the last one
                             let is_match = if parts.len() == 1 {
                                 move_up_ancestor_chain(
@@ -3910,15 +4233,10 @@ fn search_elements_for_css_nodes(
             }
             CssNode::MediaQuery(query) => {
                 if media_query_matches(query, window_size) {
-                    let elements: Vec<usize> = html_nodes
-                        .iter()
-                        .filter_map(|(idx, node)| match node {
-                            Node::Element(_) => Some(idx),
-                            _ => None,
-                        })
-                        .collect();
-
-                    for el in elements {
+                    for el in element_indexes.iter().copied() {
+                        if !scope.matches(css_node_idx, el) {
+                            continue;
+                        }
                         // If there's only a single part, we've already completed this class name by doing the last one
                         let is_match = move_up_ancestor_chain(
                             el,
@@ -3943,15 +4261,10 @@ fn search_elements_for_css_nodes(
             }
             // Layers and supports always pass through, they just affect sorting
             CssNode::Layer(_) | CssNode::Supports(_) => {
-                let elements: Vec<usize> = html_nodes
-                    .iter()
-                    .filter_map(|(idx, node)| match node {
-                        Node::Element(_) => Some(idx),
-                        _ => None,
-                    })
-                    .collect();
-
-                for el in elements {
+                for el in element_indexes.iter().copied() {
+                    if !scope.matches(css_node_idx, el) {
+                        continue;
+                    }
                     // If there's only a single part, we've already completed this class name by doing the last one
                     let is_match = move_up_ancestor_chain(
                         el,
@@ -4144,6 +4457,132 @@ fn build_definitions_map(
     definitions
 }
 
+#[derive(Debug)]
+enum SelectorRematchPlan {
+    Reuse,
+    Full,
+    Incremental {
+        global_rules: FixedBitSet,
+        dirty_elements: FixedBitSet,
+    },
+}
+
+fn collect_connected_elements(
+    nodes: &NodesTable,
+    root_idx: usize,
+    children_index: &NodeMap<Vec<usize>>,
+) -> FixedBitSet {
+    let mut connected = FixedBitSet::with_capacity(nodes.data.len());
+    let mut visited = FixedBitSet::with_capacity(nodes.data.len());
+    let mut pending = vec![root_idx];
+    while let Some(node_idx) = pending.pop() {
+        if visited.contains(node_idx) {
+            continue;
+        }
+        visited.insert(node_idx);
+        if matches!(nodes.get(node_idx), Some(Node::Element(_))) {
+            connected.insert(node_idx);
+        }
+        if let Some(children) = children_index.get(&node_idx) {
+            pending.extend(children);
+        }
+    }
+    connected
+}
+
+fn add_connected_subtree_elements(
+    root_idx: usize,
+    nodes: &NodesTable,
+    children_index: &NodeMap<Vec<usize>>,
+    connected: &FixedBitSet,
+    elements: &mut FixedBitSet,
+) {
+    if !connected.contains(root_idx) {
+        return;
+    }
+    let mut pending = vec![root_idx];
+    while let Some(node_idx) = pending.pop() {
+        if !connected.contains(node_idx) || elements.contains(node_idx) {
+            continue;
+        }
+        if matches!(nodes.get(node_idx), Some(Node::Element(_))) {
+            elements.insert(node_idx);
+        }
+        if let Some(children) = children_index.get(&node_idx) {
+            pending.extend(children);
+        }
+    }
+}
+
+fn plan_selector_rematch(
+    changes: &SelectorChanges,
+    index: &SelectorInvalidationIndex,
+    class_definitions: &ClassIndexes,
+    nodes: &NodesTable,
+    children_index: &NodeMap<Vec<usize>>,
+    connected: &FixedBitSet,
+) -> SelectorRematchPlan {
+    if changes.force_full {
+        return SelectorRematchPlan::Full;
+    }
+    if changes.is_empty() {
+        return SelectorRematchPlan::Reuse;
+    }
+
+    let mut dirty_elements = FixedBitSet::with_capacity(nodes.data.len());
+    for root_idx in &changes.dirty_subtrees {
+        add_connected_subtree_elements(
+            *root_idx,
+            nodes,
+            children_index,
+            connected,
+            &mut dirty_elements,
+        );
+    }
+
+    let mut global_rules = index.empty_rule_set();
+    for change in &changes.attributes {
+        if !dirty_elements.contains(change.node_idx) {
+            index.add_attribute_rules(&mut global_rules, change, class_definitions);
+        }
+    }
+    if changes.tree_changed {
+        global_rules.union_with(&index.tree_sensitive);
+    }
+    if changes.state_changed {
+        global_rules.union_with(&index.state_sensitive);
+    }
+    // Unknown matcher-only selector forms are deliberately rare, but must never make the cache
+    // stale if one reaches the compiler.
+    global_rules.union_with(&index.untracked);
+
+    let global_count = global_rules.count_ones(..);
+    let dirty_count = dirty_elements.count_ones(..);
+    if global_count == 0 && dirty_count == 0 {
+        return SelectorRematchPlan::Reuse;
+    }
+
+    let rule_count = index.all_rules.count_ones(..) as u128;
+    let element_count = connected.count_ones(..) as u128;
+    let global_count = global_count as u128;
+    let dirty_count = dirty_count as u128;
+    let full_work = rule_count * element_count;
+    let incremental_work =
+        dirty_count * rule_count + global_count * element_count - dirty_count * global_count;
+
+    // Candidate indexes make this only an estimate. Once the rematch rectangle covers most of
+    // the rule/element matrix, the simpler full matcher is generally faster as well as cheaper to
+    // merge.
+    if full_work == 0 || incremental_work * 5 >= full_work * 3 {
+        SelectorRematchPlan::Full
+    } else {
+        SelectorRematchPlan::Incremental {
+            global_rules,
+            dirty_elements,
+        }
+    }
+}
+
 fn compute_node_styles(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
@@ -4160,6 +4599,7 @@ fn compute_node_styles(
     mut node_styles: NodeMap<Style>,
     mut resolved_font_sizes: NodeMap<u32>,
     style_cache: &mut StyleCache,
+    selector_changes: &SelectorChanges,
 ) -> (
     NodeMap<Style>,
     NodeMap<u32>,
@@ -4197,23 +4637,114 @@ fn compute_node_styles(
     let css_cascade_metadata = build_css_cascade_metadata(&parsed_css_nodes);
 
     let start = Instant::now();
-    let (mut collected_class_nodes, hovering_impact) = collect_class_nodes_for_elements(
-        &mut parsed_css_nodes,
-        &nodes,
-        window_size,
-        dom_indexes,
-        hovering_chain,
-    );
-    for matched_rules in &mut collected_class_nodes {
-        matched_rules.sort_unstable_by_key(|matched| matched.node_idx);
+    let window_changed = style_cache.window_size.as_ref() != Some(window_size);
+    if !stylesheet_unchanged || style_cache.selector_invalidation.is_none() {
+        style_cache.selector_invalidation =
+            Some(SelectorInvalidationIndex::compile(&parsed_css_nodes));
     }
+    let connected_elements =
+        collect_connected_elements(nodes, dom_indexes.root_indice, &dom_indexes.children_index);
+    let rematch_plan =
+        if !stylesheet_unchanged || window_changed || style_cache.selector_matches.is_empty() {
+            SelectorRematchPlan::Full
+        } else {
+            plan_selector_rematch(
+                selector_changes,
+                style_cache.selector_invalidation.as_ref().unwrap(),
+                &css_parser.class_definitions,
+                nodes,
+                &dom_indexes.children_index,
+                &connected_elements,
+            )
+        };
+    let mut collected_class_nodes = std::mem::take(&mut style_cache.selector_matches);
+    match &rematch_plan {
+        SelectorRematchPlan::Reuse => {
+            collected_class_nodes.resize_with(nodes.data.len(), Vec::new);
+            collected_class_nodes.truncate(nodes.data.len());
+            for (idx, matches) in collected_class_nodes.iter_mut().enumerate() {
+                if !connected_elements.contains(idx) {
+                    matches.clear();
+                }
+            }
+        }
+        SelectorRematchPlan::Full => {
+            let scope = SelectorMatchScope::Full(&connected_elements);
+            let (mut matches, hovering_impact) = collect_class_nodes_for_elements(
+                &mut parsed_css_nodes,
+                &nodes,
+                window_size,
+                dom_indexes,
+                hovering_chain,
+                &scope,
+            );
+            for matched_rules in &mut matches {
+                matched_rules.sort_unstable_by_key(|matched| matched.node_idx);
+            }
+            collected_class_nodes = matches;
+            style_cache.selector_hovering_impact = hovering_impact;
+        }
+        SelectorRematchPlan::Incremental {
+            global_rules,
+            dirty_elements,
+        } => {
+            let scope = SelectorMatchScope::Incremental {
+                connected_elements: &connected_elements,
+                global_rules,
+                dirty_elements,
+            };
+            let (mut partial_matches, hovering_impact) = collect_class_nodes_for_elements(
+                &mut parsed_css_nodes,
+                &nodes,
+                window_size,
+                dom_indexes,
+                hovering_chain,
+                &scope,
+            );
+            for matched_rules in &mut partial_matches {
+                matched_rules.sort_unstable_by_key(|matched| matched.node_idx);
+            }
+
+            collected_class_nodes.resize_with(nodes.data.len(), Vec::new);
+            collected_class_nodes.truncate(nodes.data.len());
+            for (idx, matches) in collected_class_nodes.iter_mut().enumerate() {
+                if !connected_elements.contains(idx) {
+                    matches.clear();
+                } else if dirty_elements.contains(idx) {
+                    *matches = std::mem::take(&mut partial_matches[idx]);
+                } else {
+                    matches.retain(|matched| !global_rules.contains(matched.node_idx));
+                    matches.append(&mut partial_matches[idx]);
+                    matches.sort_unstable_by_key(|matched| matched.node_idx);
+                }
+            }
+            // Keeping a stale positive only causes an unnecessary hover rematch; dropping one can
+            // miss a style change. A later full rematch replaces the set exactly.
+            style_cache.selector_hovering_impact.extend(hovering_impact);
+        }
+    }
+    style_cache
+        .selector_hovering_impact
+        .retain(|idx| connected_elements.contains(*idx));
+    let plan_summary = match &rematch_plan {
+        SelectorRematchPlan::Reuse => "reused".to_string(),
+        SelectorRematchPlan::Full => "full".to_string(),
+        SelectorRematchPlan::Incremental {
+            global_rules,
+            dirty_elements,
+        } => format!(
+            "incremental ({} global rules, {} dirty elements)",
+            global_rules.count_ones(..),
+            dirty_elements.count_ones(..)
+        ),
+    };
     println!(
-        "collect_class_nodes_for_elements took {} microseconds",
-        Instant::now().duration_since(start).as_micros()
+        "selector matching {plan_summary} in {} microseconds",
+        Instant::now().duration_since(start).as_micros(),
     );
 
     let start = Instant::now();
-    if !stylesheet_unchanged || style_cache.window_size.as_ref() != Some(window_size) {
+    if !stylesheet_unchanged || window_changed {
         style_cache.nodes.clear();
     }
     style_cache.window_size = Some(*window_size);
@@ -4256,11 +4787,12 @@ fn compute_node_styles(
         stats.rebuilt,
         stats.reused,
     );
+    style_cache.selector_matches = collected_class_nodes;
     (
         node_styles,
         resolved_font_sizes,
         definitions_map,
-        hovering_impact,
+        style_cache.selector_hovering_impact.clone(),
     )
 }
 
@@ -4761,6 +5293,7 @@ fn op_append_child<'s>(
             .dom_indexes
             .children_index
             .get_or_insert_default(node_idx);
+        renderer.selector_changes.child_list_changed(node_idx);
 
         if let Some(before_reference_idx) = before_reference_idx {
             let mut node_pos = None;
@@ -5099,14 +5632,15 @@ fn op_set_text_content(
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
 
-    let needs_index_rebuild = match renderer.nodes.get_mut(node_idx).unwrap() {
+    let (needs_index_rebuild, child_list_changed) = match renderer.nodes.get_mut(node_idx).unwrap()
+    {
         Node::Text(element) => {
             element.text = text;
-            false
+            (false, false)
         }
         Node::Comment(element) => {
             element.comment = text;
-            false
+            (false, false)
         }
         Node::Element(_) => {
             let children = renderer
@@ -5129,9 +5663,13 @@ fn op_set_text_content(
                 .children_index
                 .insert(node_idx, vec![text_idx]);
             renderer.dom_indexes.children_index.insert(text_idx, vec![]);
-            had_children
+            (had_children, true)
         }
     };
+
+    if child_list_changed {
+        renderer.selector_changes.child_list_changed(node_idx);
+    }
 
     // Text nodes are absent from the tag/class/id/attribute indexes, and the new parent-child
     // relationship was recorded above. Only removed descendants can invalidate those indexes.
@@ -5257,6 +5795,9 @@ fn op_remove_attribute(
     renderer
         .dom_indexes
         .remove_attribute_node(&attribute, node_idx);
+    renderer
+        .selector_changes
+        .attribute_changed(node_idx, attribute, Some(removed), None);
     renderer.style_cache.mark_node_dirty(node_idx);
     renderer.schedule_dom_update();
     Ok(())
@@ -5674,6 +6215,7 @@ fn query_selector_all(
         window_size,
         dom_indexes,
         hovering_chain,
+        &SelectorMatchScope::all(),
     );
 
     let mut node_idxs: Vec<usize> = collected
@@ -6252,6 +6794,7 @@ impl Renderer {
                 NodeMap::default(),
                 NodeMap::default(),
                 &mut style_cache,
+                &SelectorChanges::default(),
             );
 
         Self {
@@ -6260,6 +6803,7 @@ impl Renderer {
             nodes: nodes_table,
             node_styles,
             style_cache,
+            selector_changes: SelectorChanges::default(),
             layout_table,
             node_layout_mapping,
             containing_nodes,
@@ -6566,7 +7110,7 @@ impl Renderer {
     }
 
     fn update_element_attributes(&mut self, node_idx: usize, attributes: Attributes) -> Result<()> {
-        let mut changed = false;
+        let mut attribute_changes = vec![];
         match self
             .nodes
             .get_mut(node_idx)
@@ -6582,6 +7126,7 @@ impl Renderer {
                     {
                         continue;
                     }
+                    let old_value = element.attributes.values.get(&key).cloned();
                     if key == "id" {
                         if let Some(existing_id) = element.attributes.get_str("id") {
                             self.dom_indexes
@@ -6606,13 +7151,26 @@ impl Renderer {
                     if !element.attributes.contains_key(&key) {
                         self.dom_indexes.add_attribute_node(&key, node_idx);
                     }
-                    element.attributes.insert(key, value);
-                    changed = true;
+                    element.attributes.insert(key.clone(), value.clone());
+                    attribute_changes.push(AttributeChange {
+                        node_idx,
+                        name: key,
+                        old_value,
+                        new_value: Some(value),
+                    });
                 }
             }
             _ => {}
         };
-        if changed {
+        if !attribute_changes.is_empty() {
+            for change in attribute_changes {
+                self.selector_changes.attribute_changed(
+                    change.node_idx,
+                    change.name,
+                    change.old_value,
+                    change.new_value,
+                );
+            }
             self.style_cache.mark_node_dirty(node_idx);
             self.schedule_dom_update();
         }
@@ -6644,6 +7202,8 @@ impl Renderer {
         self.pending_canvas_update = false;
         self.animations.clear();
         self.style_cache.clear();
+        self.selector_changes = SelectorChanges::default();
+        self.selector_changes.force_full_rematch();
         self.clear_layout_state();
         self.recompute_nodes();
     }
@@ -10570,6 +11130,9 @@ impl Renderer {
     }
 
     pub fn remove_node(&mut self, node_idx: usize, remove_from_parent: bool) {
+        if remove_from_parent {
+            self.selector_changes.child_list_changed(node_idx);
+        }
         // Remove children
         for child in self
             .dom_indexes
@@ -10607,6 +11170,7 @@ impl Renderer {
     }
 
     fn remove_children(&mut self, parent_idx: usize) {
+        self.selector_changes.child_list_changed(parent_idx);
         let mut pending = self
             .dom_indexes
             .children_index
@@ -10636,6 +11200,8 @@ impl Renderer {
         let Some(parent) = self.nodes.get(node_idx).and_then(|node| node.get_parent()) else {
             return;
         };
+
+        self.selector_changes.child_list_changed(node_idx);
 
         if let Some(children) = self.dom_indexes.children_index.get_mut(&parent) {
             children.retain(|idx| *idx != node_idx);
@@ -10667,6 +11233,7 @@ impl Renderer {
         let hover_chain = self.get_hover_chain();
         let node_styles = std::mem::take(&mut self.node_styles);
         let resolved_font_sizes = std::mem::take(&mut self.resolved_font_sizes);
+        let selector_changes = std::mem::take(&mut self.selector_changes);
         (
             self.node_styles,
             self.resolved_font_sizes,
@@ -10688,6 +11255,7 @@ impl Renderer {
             node_styles,
             resolved_font_sizes,
             &mut self.style_cache,
+            &selector_changes,
         );
     }
 
@@ -10889,6 +11457,7 @@ impl Renderer {
     }
 
     pub fn create_children_from_html(&mut self, parent_idx: usize, html: String) {
+        self.selector_changes.child_list_changed(parent_idx);
         let mut parser = HtmlParser::new(html);
         parser.parse().expect("Failed to parse inner html");
         let first_node_idx = self.reserve_node_idxs(parser.nodes.len());
@@ -12393,7 +12962,9 @@ impl Frame {
         {
             let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
             renderer.pending_dom_update = false;
-            renderer.hovering = None;
+            if renderer.hovering.take().is_some() {
+                renderer.selector_changes.state_changed();
+            }
             renderer.clear_layout_state();
             renderer.recompute_nodes();
         }
@@ -12502,6 +13073,7 @@ impl Frame {
             let styles_changed = {
                 let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
                 let previous_revision = renderer.style_cache.next_style_revision;
+                renderer.selector_changes.state_changed();
                 renderer.recompute_nodes();
                 renderer.style_cache.next_style_revision != previous_revision
             };
@@ -12692,22 +13264,23 @@ impl Frame {
         if let Some(focusable) = focusable
             && let Some(input_text) = event.text
         {
-            let new_text = {
+            let value_change = {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 if let Some(Node::Element(element)) = renderer.nodes.get_mut(focusable) {
+                    let old_value = element.attributes.values.get("value").cloned();
                     let entry = element
                         .attributes
                         .values
                         .entry("value".to_string())
                         .or_default();
                     *entry += input_text.as_str();
-                    Some(entry.clone())
+                    Some((old_value, entry.clone()))
                 } else {
                     None
                 }
             };
 
-            if new_text.is_some() {
+            if let Some((old_value, new_value)) = value_change {
                 let input_data = js_string_literal(&input_text);
                 let input_type =
                     js_string_literal(if input_text.contains('\n') || input_text.contains('\r') {
@@ -12715,11 +13288,16 @@ impl Frame {
                     } else {
                         "insertText"
                     });
-                self.renderer
-                    .as_ref()
-                    .unwrap()
-                    .borrow_mut()
-                    .schedule_dom_update();
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                renderer.selector_changes.attribute_changed(
+                    focusable,
+                    "value".to_string(),
+                    old_value,
+                    Some(new_value),
+                );
+                renderer.style_cache.mark_node_dirty(focusable);
+                renderer.schedule_dom_update();
+                drop(renderer);
 
                 self.execute_host_script(
                     "input event handler",
@@ -12791,6 +13369,7 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
             std::mem::take(&mut node_styles),
             std::mem::take(&mut resolved_font_sizes),
             &mut style_cache,
+            &SelectorChanges::default(),
         );
         node_styles = result.0;
         resolved_font_sizes = result.1;
