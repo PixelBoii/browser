@@ -339,7 +339,7 @@ struct DomIndexes {
     class_elements: Vec<FixedBitSet>,
     tag_elements: HashMap<String, FixedBitSet>,
     id_elements: HashMap<String, FixedBitSet>,
-    children_index: HashMap<usize, Vec<usize>>,
+    children_index: NodeMap<Vec<usize>>,
     attribute_elements: HashMap<String, FixedBitSet>,
     root_indice: usize,
 }
@@ -1483,6 +1483,72 @@ impl NodesTable {
 }
 
 #[derive(Debug)]
+struct NodeMap<T> {
+    data: Vec<Option<T>>,
+}
+
+impl<T> Default for NodeMap<T> {
+    fn default() -> Self {
+        Self { data: vec![] }
+    }
+}
+
+impl<T> NodeMap<T> {
+    fn get(&self, idx: &usize) -> Option<&T> {
+        self.data.get(*idx)?.as_ref()
+    }
+
+    fn get_mut(&mut self, idx: &usize) -> Option<&mut T> {
+        self.data.get_mut(*idx)?.as_mut()
+    }
+
+    fn insert(&mut self, idx: usize, value: T) -> Option<T> {
+        if idx >= self.data.len() {
+            self.data.resize_with(idx + 1, || None);
+        }
+        self.data[idx].replace(value)
+    }
+
+    fn get_or_insert_default(&mut self, idx: usize) -> &mut T
+    where
+        T: Default,
+    {
+        if idx >= self.data.len() {
+            self.data.resize_with(idx + 1, || None);
+        }
+        self.data[idx].get_or_insert_default()
+    }
+
+    fn remove(&mut self, idx: &usize) -> Option<T> {
+        self.data.get_mut(*idx).and_then(Option::take)
+    }
+
+    fn contains_key(&self, idx: &usize) -> bool {
+        self.get(idx).is_some()
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&usize, &mut T) -> bool) {
+        for (idx, value) in self.data.iter_mut().enumerate() {
+            if value.as_mut().is_some_and(|value| !keep(&idx, value)) {
+                *value = None;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+    }
+}
+
+impl<T> std::ops::Index<&usize> for NodeMap<T> {
+    type Output = T;
+
+    fn index(&self, idx: &usize) -> &Self::Output {
+        self.get(idx).unwrap()
+    }
+}
+
+#[derive(Debug)]
 struct CachedNodeStyle {
     matched_css_rules: Vec<MatchedCssRule>,
     local_revision: u64,
@@ -1492,7 +1558,7 @@ struct CachedNodeStyle {
 
 #[derive(Debug, Default)]
 struct StyleCache {
-    nodes: HashMap<usize, CachedNodeStyle>,
+    nodes: NodeMap<CachedNodeStyle>,
     local_revisions: HashMap<usize, u64>,
     window_size: Option<PhysicalSize<u32>>,
     next_style_revision: u64,
@@ -1524,10 +1590,10 @@ struct Renderer {
     url: String,
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
-    node_styles: HashMap<usize, Style>,
+    node_styles: NodeMap<Style>,
     style_cache: StyleCache,
-    layout_table: HashMap<usize, LayoutBox>,
-    node_layout_mapping: HashMap<usize, usize>,
+    layout_table: Vec<LayoutBox>,
+    node_layout_mapping: NodeMap<usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
     request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
     pending_image_fetches: HashSet<ReqwestUrl>,
@@ -1535,7 +1601,7 @@ struct Renderer {
     pub hovering: Option<usize>,
     pub focusable: Option<usize>,
     tokio: Rc<RefCell<tokio::runtime::Runtime>>,
-    resolved_font_sizes: HashMap<usize, u32>,
+    resolved_font_sizes: NodeMap<u32>,
     resolved_pixmaps: HashMap<String, tiny_skia::Pixmap>,
     window_size: PhysicalSize<u32>,
     font_handler: Rc<FontHandler>,
@@ -1543,11 +1609,11 @@ struct Renderer {
     event_loop_notify: Rc<tokio::sync::Notify>,
     scroll_y: HashMap<usize, i32>,
     layout_roots: Vec<usize>,
-    resolved_specified_heights: HashMap<usize, Option<u32>>,
-    resolved_specified_widths: HashMap<usize, Option<u32>>,
-    resolved_content_sizes: HashMap<usize, OptionalSize>,
-    resolved_heights: HashMap<usize, u32>,
-    resolved_widths: HashMap<usize, u32>,
+    resolved_specified_heights: NodeMap<Option<u32>>,
+    resolved_specified_widths: NodeMap<Option<u32>>,
+    resolved_content_sizes: NodeMap<OptionalSize>,
+    resolved_heights: NodeMap<u32>,
+    resolved_widths: NodeMap<u32>,
     dom_indexes: DomIndexes,
     canvas_buffers: HashMap<usize, CanvasBuffer>,
     pending_canvas_update: bool,
@@ -1809,7 +1875,7 @@ impl ContainingNode {
                 true,
                 mode,
             ) {
-                let waiter_layout_box = renderer.layout_table.get(&layout_idx).unwrap().clone();
+                let waiter_layout_box = renderer.layout_table.get(layout_idx).unwrap().clone();
 
                 if style.position.is_free() {
                     if style.width == StyleSize::Auto && left.is_some() && right.is_some() {
@@ -2595,7 +2661,7 @@ enum ExpandableCssNode {
 fn get_expandable_css_nodes_walk(
     expandable: &mut Vec<ExpandableCssNode>,
     nodes: &NodesTable,
-    children_index: &HashMap<usize, Vec<usize>>,
+    children_index: &NodeMap<Vec<usize>>,
     idx: usize,
 ) {
     let Some(Node::Element(element)) = nodes.get(idx) else {
@@ -2639,7 +2705,7 @@ fn get_expandable_css_nodes_walk(
 fn get_expandable_css_nodes(
     nodes: &NodesTable,
     root_indice: usize,
-    children_index: &HashMap<usize, Vec<usize>>,
+    children_index: &NodeMap<Vec<usize>>,
 ) -> Vec<ExpandableCssNode> {
     let mut expandable = vec![];
 
@@ -2656,17 +2722,17 @@ struct StyleRecomputeStats {
 }
 
 fn compute_node_style(
-    node_styles: &mut HashMap<usize, Style>,
-    resolved_font_sizes: &mut HashMap<usize, u32>,
+    node_styles: &mut NodeMap<Style>,
+    resolved_font_sizes: &mut NodeMap<u32>,
     style_cache: &mut StyleCache,
     nodes: &NodesTable,
     node_idx: usize,
-    children_index: &HashMap<usize, Vec<usize>>,
+    children_index: &NodeMap<Vec<usize>>,
     css_nodes: &Vec<CssNode>,
     parent_style: Option<usize>,
     parent_variables: &Rc<StyleVariables>,
     parent_font_size: Option<u32>,
-    collected_class_nodes: &HashMap<usize, Vec<MatchedCssRule>>,
+    collected_class_nodes: &[Vec<MatchedCssRule>],
     css_children_index: &HashMap<usize, Vec<usize>>,
     css_cascade_metadata: &[Option<CssCascadeMetadata>],
     window_size: &PhysicalSize<u32>,
@@ -2682,7 +2748,7 @@ fn compute_node_style(
     }
 
     let matched_css_rules = collected_class_nodes
-        .get(&node_idx)
+        .get(node_idx)
         .map(Vec::as_slice)
         .unwrap_or_default();
     let local_revision = style_cache
@@ -2736,7 +2802,20 @@ fn compute_node_style(
 
         // Set to resolved size in px so that ems dont stack on top of each other
         style.font_size = StyleSize::Px(resolved_font_size as f32);
-        let style_revision = style_cache.next_style_revision();
+        let previous_style_revision = style_cache
+            .nodes
+            .get(&node_idx)
+            .map(|cached| cached.style_revision);
+        let style_unchanged = previous_style_revision.is_some()
+            && node_styles
+                .get(&node_idx)
+                .is_some_and(|cached| cached == &style)
+            && resolved_font_sizes.get(&node_idx) == Some(&resolved_font_size);
+        let style_revision = if style_unchanged {
+            previous_style_revision.unwrap()
+        } else {
+            style_cache.next_style_revision()
+        };
         style_cache.nodes.insert(
             node_idx,
             CachedNodeStyle {
@@ -2746,8 +2825,10 @@ fn compute_node_style(
                 style_revision,
             },
         );
-        resolved_font_sizes.insert(node_idx, resolved_font_size);
-        node_styles.insert(node_idx, style);
+        if !style_unchanged {
+            resolved_font_sizes.insert(node_idx, resolved_font_size);
+            node_styles.insert(node_idx, style);
+        }
     }
 
     let style_revision = style_cache.nodes[&node_idx].style_revision;
@@ -2966,32 +3047,32 @@ where
     }
 }
 
-#[inline(never)]
+#[inline(always)]
 fn class_name_part_match_class<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[inline(never)]
+#[inline(always)]
 fn class_name_part_match_id<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[inline(never)]
+#[inline(always)]
 fn class_name_part_match_pseudo<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[inline(never)]
+#[inline(always)]
 fn class_name_part_match_tag<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[inline(never)]
+#[inline(always)]
 fn class_name_part_match_attributes<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[inline(never)]
+#[inline(always)]
 fn class_name_part_match_combined<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
@@ -3381,7 +3462,7 @@ fn collect_class_nodes_for_elements(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
-) -> (HashMap<usize, Vec<MatchedCssRule>>, HashSet<usize>) {
+) -> (Vec<Vec<MatchedCssRule>>, HashSet<usize>) {
     // All class names and media queries that have properties/children and need to be resolved
     let mut to_resolve = HashSet::new();
     for (idx, n) in css_nodes.iter().enumerate() {
@@ -3442,12 +3523,12 @@ fn get_specificity_tuple(parts: &[ClassNamePart]) -> Specificity {
 }
 
 fn record_matched_rule(
-    matches: &mut HashMap<usize, Vec<MatchedCssRule>>,
+    matches: &mut [Vec<MatchedCssRule>],
     element_idx: usize,
     node_idx: usize,
     specificity: Specificity,
 ) {
-    let matched_rules = matches.entry(element_idx).or_default();
+    let matched_rules = &mut matches[element_idx];
     if let Some(existing) = matched_rules
         .iter_mut()
         .find(|matched| matched.node_idx == node_idx)
@@ -3463,7 +3544,7 @@ fn record_matched_rule(
     }
 }
 
-#[inline(never)]
+#[inline(always)]
 fn get_base_elements_by_attributes(
     html_nodes: &NodesTable,
     dom_indexes: &DomIndexes,
@@ -3589,12 +3670,10 @@ fn search_elements_for_css_nodes(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &DomIndexes,
     hovering_chain: &Vec<usize>,
-) -> (HashMap<usize, Vec<MatchedCssRule>>, HashSet<usize>) {
+) -> (Vec<Vec<MatchedCssRule>>, HashSet<usize>) {
     let class_elements = &dom_indexes.class_elements;
     let id_elements = &dom_indexes.id_elements;
     let tag_elements = &dom_indexes.tag_elements;
-
-    let mut matches: HashMap<usize, Vec<MatchedCssRule>> = HashMap::new();
 
     let mut hovering_has_impact = HashSet::new();
     let mut unique_selectors = vec![];
@@ -3618,6 +3697,7 @@ fn search_elements_for_css_nodes(
         .cloned()
         .map(|v| v + 1)
         .unwrap_or(0);
+    let mut matches = vec![vec![]; max_element_idx];
 
     let mut precomputed_selectors: Vec<FixedBitSet> = vec![];
     for selector in &unique_selectors {
@@ -4075,12 +4155,12 @@ fn compute_node_styles(
     flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     hovering_chain: &Vec<usize>,
     css_parser: &mut CssParser,
-    mut node_styles: HashMap<usize, Style>,
-    mut resolved_font_sizes: HashMap<usize, u32>,
+    mut node_styles: NodeMap<Style>,
+    mut resolved_font_sizes: NodeMap<u32>,
     style_cache: &mut StyleCache,
 ) -> (
-    HashMap<usize, Style>,
-    HashMap<usize, u32>,
+    NodeMap<Style>,
+    NodeMap<u32>,
     VariableDefinitions,
     HashSet<usize>,
 ) {
@@ -4120,7 +4200,7 @@ fn compute_node_styles(
         dom_indexes,
         hovering_chain,
     );
-    for matched_rules in collected_class_nodes.values_mut() {
+    for matched_rules in &mut collected_class_nodes {
         matched_rules.sort_unstable_by_key(|matched| matched.node_idx);
     }
     println!(
@@ -4668,8 +4748,7 @@ fn op_append_child<'s>(
         let children = renderer
             .dom_indexes
             .children_index
-            .entry(parent_idx)
-            .or_default();
+            .get_or_insert_default(parent_idx);
         let insert_pos = before_reference_idx
             .and_then(|before_idx| children.iter().position(|idx| *idx == before_idx))
             .unwrap_or(children.len());
@@ -4677,8 +4756,7 @@ fn op_append_child<'s>(
         renderer
             .dom_indexes
             .children_index
-            .entry(node_idx)
-            .or_default();
+            .get_or_insert_default(node_idx);
 
         if let Some(before_reference_idx) = before_reference_idx {
             let mut node_pos = None;
@@ -5594,8 +5672,11 @@ fn query_selector_all(
         hovering_chain,
     );
 
-    let mut node_idxs: Vec<usize> = collected.keys().cloned().collect();
-    node_idxs.sort();
+    let mut node_idxs: Vec<usize> = collected
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, rules)| (!rules.is_empty()).then_some(idx))
+        .collect();
 
     if let Some(required_parent) = required_parent {
         node_idxs = node_idxs
@@ -6138,9 +6219,9 @@ impl Renderer {
     ) -> Self {
         let request_cache = HashMap::new();
 
-        let layout_table = HashMap::new();
+        let layout_table = vec![];
         let containing_nodes = HashMap::new();
-        let node_layout_mapping = HashMap::new();
+        let node_layout_mapping = NodeMap::default();
 
         let rendered_nodes_ordered = vec![];
         let hovering = None;
@@ -6164,8 +6245,8 @@ impl Renderer {
                 &mut flattened_css_cache,
                 &vec![],
                 &mut css_parser,
-                HashMap::new(),
-                HashMap::new(),
+                NodeMap::default(),
+                NodeMap::default(),
                 &mut style_cache,
             );
 
@@ -6191,11 +6272,11 @@ impl Renderer {
             event_loop_notify: Rc::new(tokio::sync::Notify::new()),
             scroll_y: HashMap::new(),
             layout_roots: vec![],
-            resolved_specified_heights: HashMap::new(),
-            resolved_specified_widths: HashMap::new(),
-            resolved_content_sizes: HashMap::new(),
-            resolved_heights: HashMap::new(),
-            resolved_widths: HashMap::new(),
+            resolved_specified_heights: NodeMap::default(),
+            resolved_specified_widths: NodeMap::default(),
+            resolved_content_sizes: NodeMap::default(),
+            resolved_heights: NodeMap::default(),
+            resolved_widths: NodeMap::default(),
             dom_indexes,
             canvas_buffers: HashMap::new(),
             pending_canvas_update: false,
@@ -6256,7 +6337,7 @@ impl Renderer {
             let Some(layout_idx) = self.node_layout_mapping.get(node_idx) else {
                 continue;
             };
-            let Some(layout) = self.layout_table.get(layout_idx) else {
+            let Some(layout) = self.layout_table.get(*layout_idx) else {
                 let changed = self.nodes_intersecting.remove(node_idx);
                 if changed {
                     not_intersecting.push(*node_idx);
@@ -6596,7 +6677,7 @@ impl Renderer {
     fn get_scrollable_dimensions(&self) -> Option<(usize, u32, u32)> {
         if let Some(hovering) = self.get_scrollable_node_idx() {
             let hovering_layout_idx = self.node_layout_mapping.get(&hovering).unwrap();
-            if let Some(layout) = self.layout_table.get(hovering_layout_idx) {
+            if let Some(layout) = self.layout_table.get(*hovering_layout_idx) {
                 return Some((hovering, layout.content_height, layout.rect.height));
             }
         }
@@ -6605,7 +6686,7 @@ impl Renderer {
         let root_node_idx = self.layout_to_node_idx(&layout_root_idx);
         let root_height = self
             .layout_table
-            .get(&layout_root_idx)
+            .get(*layout_root_idx)
             .and_then(|l| Some(l.content_height))
             .unwrap();
         Some((root_node_idx, root_height, self.window_size.height))
@@ -6616,7 +6697,7 @@ impl Renderer {
         let allow_scroll = if let Some(layout) = self
             .node_layout_mapping
             .get(&node_idx)
-            .and_then(|layout_idx| self.layout_table.get(layout_idx))
+            .and_then(|layout_idx| self.layout_table.get(*layout_idx))
         {
             layout.content_height > layout.rect.height
         } else {
@@ -6903,7 +6984,7 @@ impl Renderer {
     }
 
     fn move_entire_box(&mut self, layout_box_idx: usize, x: i32, y: i32) {
-        let layout_box = self.layout_table.get_mut(&layout_box_idx).unwrap();
+        let layout_box = self.layout_table.get_mut(layout_box_idx).unwrap();
         layout_box.rect.x += x;
         layout_box.rect.y += y;
         for child in layout_box.children.clone() {
@@ -7453,10 +7534,9 @@ impl Renderer {
     }
 
     fn register_layout_box(&mut self, layout_box: LayoutBox, save_as_final: bool) -> usize {
-        // This effectively acts as a vector right now
         let node_idx = layout_box.node_idx;
-        let idx = self.layout_table.len() + 1;
-        self.layout_table.insert(idx, layout_box);
+        let idx = self.layout_table.len();
+        self.layout_table.push(layout_box);
         // Only store first team as that'll be the highest parent
         if save_as_final && !self.node_layout_mapping.contains_key(&node_idx) {
             self.node_layout_mapping.insert(node_idx, idx);
@@ -7957,8 +8037,8 @@ impl Renderer {
                         }
 
                         children.sort_by(|a, b| {
-                            let a_z = self.layout_table.get(a).unwrap().z_index;
-                            let b_z = self.layout_table.get(b).unwrap().z_index;
+                            let a_z = self.layout_table.get(*a).unwrap().z_index;
+                            let b_z = self.layout_table.get(*b).unwrap().z_index;
                             a_z.cmp(&b_z)
                         });
 
@@ -8126,7 +8206,7 @@ impl Renderer {
     }
 
     fn layout_to_node_idx(&self, layout_box_idx: &usize) -> usize {
-        self.layout_table.get(layout_box_idx).unwrap().node_idx
+        self.layout_table.get(*layout_box_idx).unwrap().node_idx
     }
 
     fn divide_free_space_for_margin(
@@ -8170,7 +8250,7 @@ impl Renderer {
 
             let mut used_space = 0i32;
             for child in row.iter() {
-                let child_box = &self.layout_table.get(child).unwrap();
+                let child_box = &self.layout_table.get(*child).unwrap();
                 used_space += child_box.rect.width as i32;
             }
             let free_space_x = (container_width - used_space).max(0) as u32;
@@ -8684,7 +8764,7 @@ impl Renderer {
                 false,
                 &LayoutMode::BaseCalculation,
             ) {
-                let child_box = self.layout_table.get(&child).unwrap();
+                let child_box = self.layout_table.get(child).unwrap();
                 base_items.push(GridBaseItem {
                     node_idx: *child_idx,
                     base_width: child_box.rect.width,
@@ -8829,7 +8909,7 @@ impl Renderer {
                     longest_row_width.max(content_position.x - original_content_position.x);
                 content_position.x += grid_gap as i32;
                 max_child_height =
-                    max_child_height.max(self.layout_table.get(&child).unwrap().rect.height as i32);
+                    max_child_height.max(self.layout_table.get(child).unwrap().rect.height as i32);
                 children.push(child);
             }
         }
@@ -9110,7 +9190,7 @@ impl Renderer {
                 save_as_final,
                 mode,
             ) {
-                let child_box = self.layout_table.get(&child).unwrap();
+                let child_box = self.layout_table.get(child).unwrap();
                 let child_width = child_box.rect.width;
                 let child_height = child_box.rect.height;
                 let prev_child_display: Option<StyleDisplay> =
@@ -9186,7 +9266,7 @@ impl Renderer {
                     save_as_final,
                 )
                 .unwrap();
-            max_child_width = self.layout_table.get(&layout_box).unwrap().rect.width;
+            max_child_width = self.layout_table.get(layout_box).unwrap().rect.width;
             children.push(layout_box);
         }
 
@@ -9501,7 +9581,7 @@ impl Renderer {
                 false,
                 &LayoutMode::BaseCalculation,
             ) {
-                let child_box = self.layout_table.get(&child).unwrap();
+                let child_box = self.layout_table.get(child).unwrap();
                 let size = match style.flex_direction {
                     StyleFlexDirection::Row => child_box.rect.width,
                     StyleFlexDirection::Column => child_box.rect.height,
@@ -9727,7 +9807,7 @@ impl Renderer {
                         save_as_final,
                         mode,
                     ) {
-                        let child_box = self.layout_table.get(&child).unwrap();
+                        let child_box = self.layout_table.get(child).unwrap();
                         // Adjust by cross offset after laying it out, as the final height may change from base due to different width
                         let outer_cross = child_box.rect.height
                             + margin_top_size.max(0) as u32
@@ -9815,7 +9895,7 @@ impl Renderer {
                         save_as_final,
                         mode,
                     ) {
-                        let child_box = self.layout_table.get(&child).unwrap();
+                        let child_box = self.layout_table.get(child).unwrap();
                         let outer_cross = child_box.rect.width
                             + margin_top_size.max(0) as u32
                             + margin_bottom_size.max(0) as u32;
@@ -9960,10 +10040,7 @@ impl Renderer {
                 if !style.visibility.is_visible() {
                     return false;
                 }
-                let layout_box = self
-                    .layout_table
-                    .get(&renderer_node.layout_box_idx)
-                    .unwrap();
+                let layout_box = self.layout_table.get(renderer_node.layout_box_idx).unwrap();
                 let start_x =
                     (layout_box.rect.x + renderer_node.offset_x).max(renderer_node.clip.start_x);
                 let start_y =
@@ -10120,7 +10197,7 @@ impl Renderer {
             return;
         }
 
-        let layout_box = self.layout_table.get(&layout_box_idx).unwrap();
+        let layout_box = self.layout_table.get(layout_box_idx).unwrap();
         let style = self.node_styles.get(&layout_box.node_idx).cloned();
         let creates_stacking_context = style.as_ref().is_some_and(Self::creates_stacking_context);
         if defer_positive_z_index && layout_box.z_index > 0 && creates_stacking_context {
@@ -10388,8 +10465,8 @@ impl Renderer {
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
     ) {
         deferred_z_index.sort_by(|(a, ..), (b, ..)| {
-            let a_z = self.layout_table.get(a).unwrap().z_index;
-            let b_z = self.layout_table.get(b).unwrap().z_index;
+            let a_z = self.layout_table.get(*a).unwrap().z_index;
+            let b_z = self.layout_table.get(*b).unwrap().z_index;
             a_z.cmp(&b_z)
         });
         let deferred_z_index_to_paint = std::mem::take(deferred_z_index);
@@ -12346,7 +12423,7 @@ impl Frame {
                     .and_then(|rendered_node| {
                         renderer
                             .layout_table
-                            .get(&hovering_layout_idx)
+                            .get(hovering_layout_idx)
                             .map(|layout_box| {
                                 (
                                     hovering_node_idx,
@@ -12379,19 +12456,22 @@ impl Frame {
             }
         }
         if should_re_render || self.hover_debugging {
-            self.layout_dirty = true;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .borrow_mut()
-                .recompute_nodes();
-            if let Some(hovering) = hovering
-                && self.hover_debugging
-            {
-                self.apply_debug_hover(hovering);
-            }
-            if let Some(window) = self.window.as_mut() {
-                window.request_redraw();
+            let styles_changed = {
+                let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+                let previous_revision = renderer.style_cache.next_style_revision;
+                renderer.recompute_nodes();
+                renderer.style_cache.next_style_revision != previous_revision
+            };
+            if styles_changed || self.hover_debugging {
+                self.layout_dirty = true;
+                if let Some(hovering) = hovering
+                    && self.hover_debugging
+                {
+                    self.apply_debug_hover(hovering);
+                }
+                if let Some(window) = self.window.as_mut() {
+                    window.request_redraw();
+                }
             }
         }
     }
@@ -12648,8 +12728,8 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
     let mut css_parse_cache = HashMap::new();
     let mut flattened_css_cache = None;
     let mut css_parser = CssParser::new();
-    let mut node_styles = HashMap::new();
-    let mut resolved_font_sizes = HashMap::new();
+    let mut node_styles = NodeMap::default();
+    let mut resolved_font_sizes = NodeMap::default();
     let mut style_cache = StyleCache::default();
     let mut compute = || {
         let result = compute_node_styles(
@@ -13188,20 +13268,14 @@ fn clear_buffer(buffer: &mut [u32], color: u32) {
     buffer.fill(color);
 }
 
-fn build_children_index(nodes: &NodesTable, node_idxs: &Vec<usize>) -> HashMap<usize, Vec<usize>> {
-    let mut children_index = HashMap::new();
-
-    for idx in node_idxs.iter() {
-        if let Some(parent_idx) = nodes.get(*idx).unwrap().get_parent() {
-            let entry: &mut Vec<usize> = children_index.entry(parent_idx).or_default();
-            entry.push(*idx);
-        }
+fn build_children_index(nodes: &NodesTable, node_idxs: &Vec<usize>) -> NodeMap<Vec<usize>> {
+    let mut children_index = NodeMap::default();
+    for idx in node_idxs {
+        children_index.insert(*idx, vec![]);
     }
-
-    // Insert something for everyone
-    for idx in node_idxs.iter() {
-        if !children_index.contains_key(idx) {
-            children_index.insert(*idx, vec![]);
+    for idx in node_idxs {
+        if let Some(parent_idx) = nodes.get(*idx).unwrap().get_parent() {
+            children_index.get_or_insert_default(parent_idx).push(*idx);
         }
     }
 
@@ -13211,9 +13285,9 @@ fn build_children_index(nodes: &NodesTable, node_idxs: &Vec<usize>) -> HashMap<u
 fn get_node_text_representation(
     node_idx: usize,
     nodes: &NodesTable,
-    layout_node_mapping: &HashMap<usize, usize>,
-    layout_table: &HashMap<usize, LayoutBox>,
-    node_styles: &HashMap<usize, Style>,
+    layout_node_mapping: &NodeMap<usize>,
+    layout_table: &[LayoutBox],
+    node_styles: &NodeMap<Style>,
 ) -> String {
     let mut label = match &nodes.get(node_idx).unwrap() {
         Node::Element(element) => format_element_tree_label(element),
@@ -13226,7 +13300,7 @@ fn get_node_text_representation(
     label.push_str(&format!(" [idx={}]", node_idx));
     match layout_node_mapping
         .get(&node_idx)
-        .and_then(|idx| layout_table.get(idx).and_then(|layout| Some((idx, layout))))
+        .and_then(|idx| layout_table.get(*idx).map(|layout| (idx, layout)))
     {
         Some((layout_idx, info)) => {
             label.push_str(&format!(

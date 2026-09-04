@@ -17,7 +17,7 @@ use crate::css::{
 use crate::parser::{Element as HtmlElement, Node as HtmlNode};
 
 // Custom properties form an immutable chain so a child only stores its overrides.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct StyleVariables {
     values: HashMap<usize, String>,
     parent: Option<Rc<StyleVariables>>,
@@ -460,7 +460,7 @@ impl Display for StyleTransform {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     pub width: StyleSize,
     pub height: StyleSize,
@@ -2669,7 +2669,7 @@ pub fn parse_style(
     css_nodes: &Vec<Node>,
     parent_style: Option<&Style>,
     parent_variables: &Rc<StyleVariables>,
-    collected_css_nodes: &HashMap<usize, Vec<MatchedCssRule>>,
+    collected_css_nodes: &[Vec<MatchedCssRule>],
     css_children_index: &HashMap<usize, Vec<usize>>,
     cascade_metadata: &[Option<CssCascadeMetadata>],
     variable_definitions: &VariableDefinitions,
@@ -2683,7 +2683,7 @@ pub fn parse_style(
     };
 
     let mut applicable_class_properties = vec![];
-    if let Some(applicable_class_nodes) = collected_css_nodes.get(&node_idx) {
+    if let Some(applicable_class_nodes) = collected_css_nodes.get(node_idx) {
         for matched_rule in applicable_class_nodes {
             let children = css_children_index.get(&matched_rule.node_idx).unwrap();
             for c in children {
