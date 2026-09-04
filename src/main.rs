@@ -3738,9 +3738,11 @@ fn search_elements_for_css_nodes(
                         bitset
                     };
 
-                    let elements: Option<FixedBitSet> = match last_part {
-                        ClassNamePart::Class(class) => class_elements.get(*class).cloned(),
-                        ClassNamePart::Id(id) => id_elements.get(id).cloned(),
+                    let elements: Option<Cow<'_, FixedBitSet>> = match last_part {
+                        ClassNamePart::Class(class) => {
+                            class_elements.get(*class).map(Cow::Borrowed)
+                        }
+                        ClassNamePart::Id(id) => id_elements.get(id).map(Cow::Borrowed),
                         ClassNamePart::PseudoClass(class) => {
                             match class {
                                 // No parent means it's a root element
@@ -3754,7 +3756,7 @@ fn search_elements_for_css_nodes(
                                             bitset.insert(*idx);
                                         }
                                     }
-                                    Some(bitset)
+                                    Some(Cow::Owned(bitset))
                                 }
                                 PseudoClass::IndexedNot(selector) => {
                                     let negative_matches = &precomputed_selectors[*selector];
@@ -3764,16 +3766,16 @@ fn search_elements_for_css_nodes(
                                             bitset.insert(*idx);
                                         }
                                     }
-                                    Some(bitset)
+                                    Some(Cow::Owned(bitset))
                                 }
                                 _ => None,
                             }
                         }
                         ClassNamePart::Tag(tag) => {
                             if tag == "*" {
-                                Some(all_elements())
+                                Some(Cow::Owned(all_elements()))
                             } else {
-                                tag_elements.get(tag).cloned()
+                                tag_elements.get(tag).map(Cow::Borrowed)
                             }
                         }
                         ClassNamePart::Combined(combined) => {
@@ -3834,7 +3836,7 @@ fn search_elements_for_css_nodes(
                                     filtered_elements.insert(el);
                                 }
                             }
-                            Some(filtered_elements)
+                            Some(Cow::Owned(filtered_elements))
                         }
                         ClassNamePart::Attributes(attributes) => {
                             let filtered_elements = get_base_elements_by_attributes(
@@ -3842,7 +3844,7 @@ fn search_elements_for_css_nodes(
                                 dom_indexes,
                                 attributes,
                             );
-                            Some(filtered_elements)
+                            Some(Cow::Owned(filtered_elements))
                         }
                         // TODO: Implement remaining name part logic
                         _ => None,
@@ -4186,7 +4188,9 @@ fn compute_node_styles(
         "Retrieved parsed css nodes in {}ms",
         Instant::now().duration_since(start).as_millis()
     );
-    dom_indexes.recompute_class_elements(nodes, nodes_idxs, &mut css_parser.class_definitions);
+    if !stylesheet_unchanged {
+        dom_indexes.recompute_class_elements(nodes, nodes_idxs, &mut css_parser.class_definitions);
+    }
 
     let css_children_index =
         build_css_children_index(&parsed_css_nodes.iter().enumerate().collect());
@@ -6219,7 +6223,7 @@ impl Renderer {
     ) -> Self {
         let request_cache = HashMap::new();
 
-        let layout_table = vec![];
+        let layout_table = Vec::with_capacity(nodes_idxs.len());
         let containing_nodes = HashMap::new();
         let node_layout_mapping = NodeMap::default();
 
@@ -7629,11 +7633,20 @@ impl Renderer {
             self.resolved_heights.remove(&node_idx);
         }
 
-        match self.nodes.get(node_idx).unwrap().clone() {
-            Node::Comment(_) => None,
-            Node::Text(text) => {
+        enum LayoutNodeKind {
+            Text(String),
+            Element(String),
+        }
+        let node_kind = match self.nodes.get(node_idx).unwrap() {
+            Node::Comment(_) => return None,
+            Node::Text(text) => LayoutNodeKind::Text(text.text.clone()),
+            Node::Element(element) => LayoutNodeKind::Element(element.tag.clone()),
+        };
+
+        match node_kind {
+            LayoutNodeKind::Text(text) => {
                 let style = self.node_styles.get(&node_idx).unwrap();
-                let text = collapse_whitespace(&text.text).unwrap_or("".to_string());
+                let text = collapse_whitespace(&text).unwrap_or("".to_string());
                 let text_hex = match style.color {
                     StyleBackground::Hex(code) => Some(code),
                     _ => None,
@@ -7654,7 +7667,7 @@ impl Renderer {
                         let (buffer, width, height) = text_to_buffer_with_line_height(
                             &self.font_handler,
                             text_hex,
-                            &text.clone(),
+                            &text,
                             resolved_font_size,
                             max_width,
                             line_height,
@@ -7684,12 +7697,8 @@ impl Renderer {
                     save_as_final,
                 ))
             }
-            Node::Element(element) => {
-                if element.tag == "svg"
-                    || element.tag == "img"
-                    || element.tag == "video"
-                    || element.tag == "canvas"
-                {
+            LayoutNodeKind::Element(tag) => {
+                if tag == "svg" || tag == "img" || tag == "video" || tag == "canvas" {
                     let style = self.node_styles.get(&node_idx).unwrap().clone();
                     if let StyleDisplay::None = style.display {
                         return None;
@@ -7734,7 +7743,7 @@ impl Renderer {
                             .container_width_non_filling
                             .unwrap_or(available_size.width),
                     );
-                    let (kind, height, width) = match element.tag.as_str() {
+                    let (kind, height, width) = match tag.as_str() {
                         "canvas" => {
                             let (Some(canvas_width), Some(canvas_height)) =
                                 (match self.nodes.get(node_idx).unwrap() {
@@ -7798,7 +7807,7 @@ impl Renderer {
                                 Some(max_h),
                                 Some(max_w),
                             );
-                            if result.is_none() && element.tag == "img" {
+                            if result.is_none() && tag == "img" {
                                 let (height, width) =
                                     container_size.image_placeholder_size(max_w, max_h);
                                 (
@@ -7837,33 +7846,34 @@ impl Renderer {
                         },
                         save_as_final,
                     ))
-                } else if element.tag == "iframe" {
+                } else if tag == "iframe" {
                     let style = self.node_styles.get(&node_idx).unwrap();
                     if style.display == StyleDisplay::None {
                         return None;
                     }
-                    let height = element
-                        .attributes
-                        .get_str("height")
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .unwrap_or(150.) as u32;
-                    let width = element
-                        .attributes
-                        .get_str("width")
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .unwrap_or(300.) as u32;
-                    let url = element.attributes.get_str("src");
+                    let (height, width, url) = match self.nodes.get(node_idx).unwrap() {
+                        Node::Element(element) => (
+                            element
+                                .attributes
+                                .get_str("height")
+                                .and_then(|v| v.parse::<f32>().ok())
+                                .unwrap_or(150.) as u32,
+                            element
+                                .attributes
+                                .get_str("width")
+                                .and_then(|v| v.parse::<f32>().ok())
+                                .unwrap_or(300.) as u32,
+                            element.attributes.get_str("src").map(Cow::into_owned),
+                        ),
+                        _ => unreachable!(),
+                    };
                     let z_index = match style.z_index {
                         StyleZIndex::Auto => 0,
                         StyleZIndex::Number(value) => value,
                     };
                     if !self.frames.contains_key(&node_idx) {
                         let handle = self
-                            .spawn_frame(
-                                url.and_then(|v| Some(v.into_owned())),
-                                PhysicalSize { width, height },
-                                node_idx,
-                            )
+                            .spawn_frame(url, PhysicalSize { width, height }, node_idx)
                             .ok()?;
                         self.frames.insert(node_idx, handle);
                     }
@@ -8748,29 +8758,36 @@ impl Renderer {
                 current_row += 1;
                 row_count = row_count.max(current_row + 1);
             }
-            if let Some(child) = self.layout_node(
-                *child_idx,
-                content_position,
-                Size {
-                    width: container_sizes.inner_width,
-                    height: container_sizes.inner_height,
-                },
-                OptionalSize {
-                    height: None,
-                    width: None,
-                },
-                containing_node_idx,
-                false,
-                false,
-                &LayoutMode::BaseCalculation,
-            ) {
-                let child_box = self.layout_table.get(child).unwrap();
+            let layout_checkpoint = self.layout_table.len();
+            let child_size = self
+                .layout_node(
+                    *child_idx,
+                    content_position,
+                    Size {
+                        width: container_sizes.inner_width,
+                        height: container_sizes.inner_height,
+                    },
+                    OptionalSize {
+                        height: None,
+                        width: None,
+                    },
+                    containing_node_idx,
+                    false,
+                    false,
+                    &LayoutMode::BaseCalculation,
+                )
+                .map(|child| {
+                    let rect = &self.layout_table.get(child).unwrap().rect;
+                    (rect.width, rect.height)
+                });
+            self.layout_table.truncate(layout_checkpoint);
+            if let Some((base_width, base_height)) = child_size {
                 base_items.push(GridBaseItem {
                     node_idx: *child_idx,
-                    base_width: child_box.rect.width,
-                    target_width: child_box.rect.width,
-                    base_height: child_box.rect.height,
-                    target_height: child_box.rect.height,
+                    base_width,
+                    target_width: base_width,
+                    base_height,
+                    target_height: base_height,
                     column: current_column,
                     column_span,
                     row: current_row as i32,
@@ -9152,8 +9169,15 @@ impl Renderer {
                 .checked_sub(1)
                 .map(|idx| immediate_children[idx]);
             let next_child_idx = immediate_children.get(child_local_idx + 1).copied();
-            let child_style = self.node_styles.get(&child_idx).unwrap().clone();
-            if child_style.display != StyleDisplay::None
+            let (child_display, child_position, margins) = {
+                let child_style = self.node_styles.get(&child_idx).unwrap();
+                (
+                    child_style.display,
+                    child_style.position,
+                    self.get_margins(child_idx, child_style, available_size),
+                )
+            };
+            if child_display != StyleDisplay::None
                 && matches!(
                     self.nodes.get(child_idx),
                     Some(Node::Element(element)) if element.tag == "br"
@@ -9169,7 +9193,7 @@ impl Renderer {
                 continue;
             }
             let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
-                self.get_margins(child_idx, &child_style, available_size);
+                margins;
             content_position.x += margin_left_size as i32;
             if let Some(child) = self.layout_node(
                 child_idx,
@@ -9197,7 +9221,7 @@ impl Renderer {
                     prev_child_idx.map(|idx| self.node_styles.get(&idx).unwrap().display);
                 let next_child_display: Option<StyleDisplay> =
                     next_child_idx.map(|idx| self.node_styles.get(&idx).unwrap().display);
-                if child_style.display.is_inline()
+                if child_display.is_inline()
                     && prev_child_display.is_none_or(|v| v.is_inline())
                     && next_child_display.is_none_or(|v| v.is_inline())
                 {
@@ -9227,7 +9251,7 @@ impl Renderer {
                     line_has_content = true;
                     row_height = row_height.max(child_height);
 
-                    if !child_style.position.is_free() {
+                    if !child_position.is_free() {
                         max_child_width = max_child_width.max(child_width_buffer as u32);
                         max_child_height = max_child_height.max(row_height);
                     }
@@ -9241,7 +9265,7 @@ impl Renderer {
                     line_has_content = false;
                     children_rows.new_row(child, 0);
 
-                    if !child_style.position.is_free() {
+                    if !child_position.is_free() {
                         max_child_width = max_child_width.max(child_width);
                     }
                 }
@@ -9533,63 +9557,32 @@ impl Renderer {
         }
 
         for child_idx in immediate_children {
-            let child_style = self.node_styles.get(child_idx).unwrap().clone();
             let child_font_size = self
                 .resolved_font_sizes
                 .get(child_idx)
                 .cloned()
                 .unwrap_or(font_size);
-            let (margin_left, margin_right, margin_top, margin_bottom) = self.get_margins(
-                *child_idx,
-                &child_style,
-                Size {
-                    width: container_sizes.inner_width,
-                    height: container_sizes.inner_height,
-                },
-            );
-            let main_margin = match style.flex_direction {
-                StyleFlexDirection::Row => margin_left + margin_right,
-                StyleFlexDirection::Column => margin_top + margin_bottom,
-            };
-            let flex_basis = self.resolve_flex_basis(
-                &child_style,
-                child_font_size,
-                &style,
-                &container_sizes,
-                has_definite_height,
-            );
-            let forced_size = match style.flex_direction {
-                StyleFlexDirection::Row => OptionalSize {
-                    width: flex_basis,
-                    height: None,
-                },
-                StyleFlexDirection::Column => OptionalSize {
-                    width: None,
-                    height: flex_basis,
-                },
-            };
-            if let Some(child) = self.layout_node(
-                *child_idx,
-                Position { x: 0, y: 0 },
-                Size {
-                    width: container_sizes.inner_width,
-                    height: container_sizes.inner_height,
-                },
-                forced_size,
-                containing_node_idx,
-                false,
-                false,
-                &LayoutMode::BaseCalculation,
-            ) {
-                let child_box = self.layout_table.get(child).unwrap();
-                let size = match style.flex_direction {
-                    StyleFlexDirection::Row => child_box.rect.width,
-                    StyleFlexDirection::Column => child_box.rect.height,
+            let (main_margin, flex_basis, max_size, max_cross_size, shrink, grow) = {
+                let child_style = self.node_styles.get(child_idx).unwrap();
+                let (margin_left, margin_right, margin_top, margin_bottom) = self.get_margins(
+                    *child_idx,
+                    child_style,
+                    Size {
+                        width: container_sizes.inner_width,
+                        height: container_sizes.inner_height,
+                    },
+                );
+                let main_margin = match style.flex_direction {
+                    StyleFlexDirection::Row => margin_left + margin_right,
+                    StyleFlexDirection::Column => margin_top + margin_bottom,
                 };
-                let cross_size = match style.flex_direction {
-                    StyleFlexDirection::Row => child_box.rect.height,
-                    StyleFlexDirection::Column => child_box.rect.width,
-                };
+                let flex_basis = self.resolve_flex_basis(
+                    child_style,
+                    child_font_size,
+                    &style,
+                    &container_sizes,
+                    has_definite_height,
+                );
                 let max_width = get_specified_size(
                     font_size,
                     &child_style.max_width,
@@ -9608,14 +9601,53 @@ impl Renderer {
                     &SizeUnit::Px,
                 )
                 .unwrap_or(i32::MAX);
-                let max_size = match style.flex_direction {
-                    StyleFlexDirection::Row => max_width,
-                    StyleFlexDirection::Column => max_height,
+                let (max_size, max_cross_size) = match style.flex_direction {
+                    StyleFlexDirection::Row => (max_width, max_height),
+                    StyleFlexDirection::Column => (max_height, max_width),
                 };
-                let max_cross_size = match style.flex_direction {
-                    StyleFlexDirection::Row => max_height,
-                    StyleFlexDirection::Column => max_width,
-                };
+                (
+                    main_margin,
+                    flex_basis,
+                    max_size,
+                    max_cross_size,
+                    child_style.flex_shrink,
+                    child_style.flex_grow,
+                )
+            };
+            let forced_size = match style.flex_direction {
+                StyleFlexDirection::Row => OptionalSize {
+                    width: flex_basis,
+                    height: None,
+                },
+                StyleFlexDirection::Column => OptionalSize {
+                    width: None,
+                    height: flex_basis,
+                },
+            };
+            let layout_checkpoint = self.layout_table.len();
+            let child_size = self
+                .layout_node(
+                    *child_idx,
+                    Position { x: 0, y: 0 },
+                    Size {
+                        width: container_sizes.inner_width,
+                        height: container_sizes.inner_height,
+                    },
+                    forced_size,
+                    containing_node_idx,
+                    false,
+                    false,
+                    &LayoutMode::BaseCalculation,
+                )
+                .map(|child| {
+                    let rect = &self.layout_table.get(child).unwrap().rect;
+                    match style.flex_direction {
+                        StyleFlexDirection::Row => (rect.width, rect.height),
+                        StyleFlexDirection::Column => (rect.height, rect.width),
+                    }
+                });
+            self.layout_table.truncate(layout_checkpoint);
+            if let Some((size, cross_size)) = child_size {
                 let base_size = (size as f32).min(max_size as f32);
                 base_items.push(FlexItem {
                     node_idx: *child_idx,
@@ -9625,8 +9657,8 @@ impl Renderer {
                     max_size: max_size as f32,
                     cross_size: (cross_size as f32).min(max_cross_size as f32),
                     max_cross_size: max_cross_size as f32,
-                    shrink: child_style.flex_shrink,
-                    grow: child_style.flex_grow,
+                    shrink,
+                    grow,
                 });
             }
         }
@@ -9783,9 +9815,15 @@ impl Renderer {
                 let mut children_rows = MarginRows::new();
 
                 for (item_idx, item) in base_items.iter().enumerate() {
-                    let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
+                    let (margins, child_is_free) = {
+                        let child_style = self.node_styles.get(&item.node_idx).unwrap();
+                        (
+                            self.get_margins(item.node_idx, child_style, available_size),
+                            child_style.position.is_free(),
+                        )
+                    };
                     let (margin_left_size, margin_right_size, margin_top_size, margin_bottom_size) =
-                        self.get_margins(item.node_idx, &child_style, available_size);
+                        margins;
                     // Re-compute cursor for each child so that align-self works
                     content_position.y = original_content_cursor.y + margin_top_size;
                     content_position.x += margin_left_size;
@@ -9820,7 +9858,7 @@ impl Renderer {
                             allow_fill,
                             &container_sizes,
                         );
-                        if !child_style.position.is_free() {
+                        if !child_is_free {
                             content_position.x += child_box.rect.width as i32 + margin_right_size;
                             children_rows.last_row(child, 0);
                             // Don't add gap for last item
@@ -9871,9 +9909,14 @@ impl Renderer {
                 let mut children_rows = MarginRows::new();
 
                 for (item_idx, item) in base_items.iter().enumerate() {
-                    let child_style = self.node_styles.get(&item.node_idx).unwrap().clone();
-                    let (margin_left_size, _, margin_top_size, margin_bottom_size) =
-                        self.get_margins(item.node_idx, &child_style, available_size);
+                    let (margins, child_is_free) = {
+                        let child_style = self.node_styles.get(&item.node_idx).unwrap();
+                        (
+                            self.get_margins(item.node_idx, child_style, available_size),
+                            child_style.position.is_free(),
+                        )
+                    };
+                    let (margin_left_size, _, margin_top_size, margin_bottom_size) = margins;
                     content_position.x = original_content_cursor.x + margin_left_size;
                     // TODO: This should probably go into the flex calculation
                     content_position.y += margin_top_size;
@@ -9907,7 +9950,7 @@ impl Renderer {
                             allow_fill,
                             &container_sizes,
                         );
-                        if !child_style.position.is_free() {
+                        if !child_is_free {
                             max_affecting_child_width =
                                 max_affecting_child_width.max(child_box.rect.width);
                             content_position.y += child_box.rect.height as i32 + margin_bottom_size;
