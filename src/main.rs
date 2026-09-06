@@ -8589,7 +8589,7 @@ impl Renderer {
                             save_as_final,
                             mode,
                         ),
-                        StyleDisplay::None => None,
+                        StyleDisplay::None | StyleDisplay::Contents => None,
                     };
 
                     if let Some((width, height, mut children, content_height)) = layout {
@@ -9282,12 +9282,7 @@ impl Renderer {
         let mut longest_row_width = 0;
         let width_to_distribute = container_sizes.inner_width;
         let height_to_distribute = container_sizes.inner_height;
-        let children_idxs = self
-            .dom_indexes
-            .children_index
-            .get(&node_idx)
-            .cloned()
-            .unwrap();
+        let children_idxs = self.layout_children(node_idx);
         let immediate_children: Vec<usize> = children_idxs
             .iter()
             .copied()
@@ -9530,7 +9525,18 @@ impl Renderer {
                 content_position.y += max_child_height + grid_gap as i32;
                 max_child_height = 0;
             }
-            let free_x = (base_item.target_width as i32 - base_item.base_width as i32).max(0);
+            let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
+            let forced_width = match child_style.width {
+                // Percentages on a grid item resolve against its grid area.
+                StyleSize::Percent(percent) => {
+                    (base_item.target_width as f32 * percent / 100.).max(0.) as u32
+                }
+                StyleSize::Auto if justify_items == StyleJustifyContent::Stretch => {
+                    base_item.target_width
+                }
+                _ => base_item.base_width,
+            };
+            let free_x = (base_item.target_width as i32 - forced_width as i32).max(0);
             let free_y = (base_item.target_height as i32 - base_item.base_height as i32).max(0);
             let offset_x = match justify_items {
                 StyleJustifyContent::Center => free_x / 2,
@@ -9545,13 +9551,6 @@ impl Renderer {
             let child_position = Position {
                 x: content_position.x + offset_x,
                 y: content_position.y + offset_y,
-            };
-            let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
-            let forced_width = match child_style.width {
-                StyleSize::Auto if justify_items == StyleJustifyContent::Stretch => {
-                    base_item.target_width
-                }
-                _ => base_item.base_width,
             };
             let forced_height = match (&grid_template_rows, &child_style.height) {
                 (GridTemplateColumns::Values(_), StyleSize::Auto)
@@ -9620,6 +9619,27 @@ impl Renderer {
         Some((width as u32, height as u32, children, content_height as u32))
     }
 
+    // Contents wrappers stay in the DOM for inheritance, but generate no layout box.
+    fn layout_children(&self, node_idx: usize) -> Vec<usize> {
+        let mut children = Vec::new();
+        for child in self
+            .dom_indexes
+            .children_index
+            .get(&node_idx)
+            .into_iter()
+            .flatten()
+        {
+            if self.node_styles.get(child)
+                .is_some_and(|style| style.display == StyleDisplay::Contents)
+            {
+                children.extend(self.layout_children(*child));
+            } else {
+                children.push(*child);
+            }
+        }
+        children
+    }
+
     fn get_containing_block_size(
         &self,
         containing_node_idx: usize,
@@ -9630,7 +9650,16 @@ impl Renderer {
         let containing_block = match style.position {
             StylePosition::Absolute | StylePosition::Fixed => Some(containing_node_idx),
             StylePosition::Relative | StylePosition::Static | StylePosition::Sticky => {
-                self.nodes.get(node_idx).unwrap().get_parent()
+                let mut parent = self.nodes.get(node_idx).unwrap().get_parent();
+                while let Some(idx) = parent {
+                    if !self.node_styles.get(&idx)
+                        .is_some_and(|s| s.display == StyleDisplay::Contents)
+                    {
+                        break;
+                    }
+                    parent = self.nodes.get(idx).unwrap().get_parent();
+                }
+                parent
             }
         };
 
@@ -9761,12 +9790,7 @@ impl Renderer {
             return Some((width, height, vec![], height));
         }
 
-        let children_idxs: Vec<usize> = self
-            .dom_indexes
-            .children_index
-            .get(&node_idx)
-            .unwrap()
-            .clone();
+        let children_idxs = self.layout_children(node_idx);
 
         let immediate_children: Vec<usize> = children_idxs
             .iter()
@@ -10018,6 +10042,14 @@ impl Renderer {
         let Some(item_style) = self.node_styles.get(&node_idx) else {
             return 0;
         };
+        // Auto cross-axis margins absorb free space before align-items/align-self.
+        // The margin pass below positions these items, so don't center them twice.
+        if parent_style.flex_direction == StyleFlexDirection::Column
+            && (item_style.margin_left == StyleSize::Auto
+                || item_style.margin_right == StyleSize::Auto)
+        {
+            return 0;
+        }
         let align = match item_style.align_self {
             StyleJustifyContent::Auto => parent_style.align_items,
             v => v,
@@ -10172,12 +10204,7 @@ impl Renderer {
             containing_node_idx = node_idx;
         }
 
-        let children_idxs = self
-            .dom_indexes
-            .children_index
-            .get(&node_idx)
-            .unwrap()
-            .clone();
+        let children_idxs = self.layout_children(node_idx);
 
         let mut immediate_children: Vec<&usize> = children_idxs
             .iter()
@@ -14741,15 +14768,15 @@ mod tests {
         let mut frame = Frame::new(
             "https://www.cloudflare.com/".to_string(),
             false,
-            PhysicalSize::new(1920, 2160),
+            PhysicalSize::new(1920, 6480),
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
-        let mut buffer = vec![0; 1920 * 2160];
-        frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
-        ensure_snapshot_matches(&buffer, "cloudflarecom", 1920, 2160)
+        let mut buffer = vec![0; 1920 * 6480];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 6480, Duration::from_secs(5))?;
+        ensure_snapshot_matches(&buffer, "cloudflarecom", 1920, 6480)
     }
 
     #[test]

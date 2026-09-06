@@ -136,6 +136,7 @@ pub enum StyleBackground {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StyleDisplay {
     None,
+    Contents,
     Block,
     InlineBlock,
     Inline,
@@ -371,6 +372,7 @@ macro_rules! impl_css_keyword {
 impl_css_keyword!(
     StyleDisplay,
     StyleDisplay::None => "none",
+    StyleDisplay::Contents => "contents",
     StyleDisplay::Block => "block",
     StyleDisplay::InlineBlock => "inline-block",
     StyleDisplay::Inline => "inline",
@@ -2109,6 +2111,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                     "inline-flex" => Some(StyleDisplay::InlineFlex),
                     "grid" => Some(StyleDisplay::Grid),
                     "none" => Some(StyleDisplay::None),
+                    "contents" => Some(StyleDisplay::Contents),
                     _ => None,
                 }
                 .with_context(|| "Failed to parse display")?,
