@@ -7740,15 +7740,16 @@ impl Renderer {
             .iter()
             .filter_map(|(idx, n)| match n {
                 Node::Element(element)
-                    if element.tag == "img"
+                    if (element.tag == "img" || element.tag == "video")
                         && self
                             .node_styles
                             .get(&idx)
                             .is_some_and(|v| v.display != StyleDisplay::None) =>
                 {
+                    let attribute = if element.tag == "video" { "poster" } else { "src" };
                     element
                         .attributes
-                        .get_str("src")
+                        .get_str(attribute)
                         .map(|src| src.into_owned())
                 }
                 _ => None,
