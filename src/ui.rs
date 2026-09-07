@@ -160,7 +160,7 @@ impl<T> UiRuntime<T> {
         }
     }
 
-    pub fn on_keyup(&mut self, event: KeyEvent) {
+    pub fn on_keydown(&mut self, event: KeyEvent) {
         let Some(focused) = self.focused else {
             return;
         };
@@ -170,23 +170,31 @@ impl<T> UiRuntime<T> {
         let Some(typeable) = &mut element.typeable else {
             return;
         };
-        if let Some(text) = event.text {
-            if typeable.text.len() > 0
-                && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Backspace))
-            {
-                typeable.text.pop();
-            } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Enter))
-                && let Some(on_enter) = &typeable.on_enter
-            {
-                on_enter(&*typeable);
-            } else {
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                if typeable.text.pop().is_none() {
+                    return;
+                }
+            }
+            PhysicalKey::Code(KeyCode::Enter) => {
+                if !event.repeat
+                    && let Some(on_enter) = &typeable.on_enter
+                {
+                    on_enter(&*typeable);
+                }
+                return;
+            }
+            _ => {
+                let Some(text) = event.text else {
+                    return;
+                };
                 typeable.text += &text;
             }
-            if let Some(on_input) = &typeable.on_input {
-                on_input(&*typeable);
-            }
-            let _ = self.builder.comms_tx.send(BrowserAction::Rerender);
         }
+        if let Some(on_input) = &typeable.on_input {
+            on_input(&*typeable);
+        }
+        let _ = self.builder.comms_tx.send(BrowserAction::Rerender);
     }
 
     pub fn rerender(&mut self) -> Result<()> {

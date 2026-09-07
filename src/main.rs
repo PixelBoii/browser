@@ -13948,8 +13948,9 @@ impl Browser {
                                 let _ = browser
                                     .current_tab()
                                     .tx
-                                    .send(FrameCommand::UserEvent(UserEvent::Keyup(event.clone())));
-                                header.on_keyup(event);
+                                    .send(FrameCommand::UserEvent(UserEvent::Keyup(event)));
+                            } else {
+                                header.on_keydown(event);
                                 browser.poll_header_events(
                                     &mut header,
                                     &window,
