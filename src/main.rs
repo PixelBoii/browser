@@ -14815,6 +14815,23 @@ mod tests {
     }
 
     #[test]
+    fn render_discord() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://discord.com/".to_string(),
+            false,
+            PhysicalSize::new(1920, 6480),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 6480];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 6480, Duration::from_secs(5))?;
+        ensure_snapshot_matches(&buffer, "discordcom", 1920, 6480)
+    }
+
+    #[test]
     fn render_cloudflare() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(

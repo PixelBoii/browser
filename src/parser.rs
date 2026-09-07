@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::Hash;
 
-const SELF_CLOSING_TAGS: [&str; 14] = [
+const SELF_CLOSING_TAGS: [&str; 15] = [
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr",
+    "track", "wbr", "path",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -424,6 +424,19 @@ impl HtmlParser {
                 continue;
             }
 
+            // Preserve comment contents verbatim; only --> ends an HTML comment.
+            // Other declarations (such as DOCTYPE) still end at the first >.
+            if self.stage == BuildPhase::CommentOpen {
+                if char == '>' && (!self.tag.starts_with("--") || self.tag.ends_with("--")) {
+                    self.create_comment_from_state()?;
+                    self.stage = BuildPhase::Start;
+                    self.tag.clear();
+                } else {
+                    self.tag.push(char);
+                }
+                continue;
+            }
+
             match char {
                 '<' => match self.stage {
                     BuildPhase::Start => {
@@ -490,11 +503,6 @@ impl HtmlParser {
                         }
                         self.tag = "".to_string();
                         self.value = "".to_string();
-                    }
-                    BuildPhase::CommentOpen => {
-                        self.create_comment_from_state()?;
-                        self.stage = BuildPhase::Start;
-                        self.tag.clear();
                     }
                     _ => {}
                 },
