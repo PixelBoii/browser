@@ -1408,6 +1408,7 @@ enum FrameDomCommand {
 
 #[derive(Debug)]
 enum FrameCommand {
+    Close,
     Render,
     UserEvent(UserEvent),
     Dom(FrameDomCommand),
@@ -12620,12 +12621,11 @@ impl Frame {
                 }
             };
             let had_command = cmd.is_some();
-            if let Some(cmd) = cmd {
-                self.handle_main_event(&proxy, cmd);
-
-                while let Ok(cmd) = rx.try_recv() {
-                    self.handle_main_event(&proxy, cmd);
+            for cmd in cmd.into_iter().chain(rx.try_iter()) {
+                if matches!(cmd, FrameCommand::Close) {
+                    return;
                 }
+                self.handle_main_event(&proxy, cmd);
             }
             if had_command || js_pending {
                 js_pending = self
@@ -13548,7 +13548,8 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
 }
 
 pub struct Browser {
-    pub tabs: Vec<TabHandle>,
+    // Keep closed slots so worker indices remain valid.
+    pub tabs: Vec<Option<TabHandle>>,
     window: Arc<Window>,
     event_loop_proxy: EventLoopProxy<UserEvent>,
     current_tab_idx: usize,
@@ -13563,6 +13564,7 @@ pub struct TabHandle {
 enum BrowserAction {
     OpenTab(String),
     SelectTab(usize),
+    CloseTab(usize),
     Rerender,
     Navigate(String),
 }
@@ -13603,7 +13605,7 @@ impl FpsCounter {
 
 impl Browser {
     pub fn current_tab(&self) -> &TabHandle {
-        &self.tabs[self.current_tab_idx]
+        self.tabs[self.current_tab_idx].as_ref().unwrap()
     }
 
     fn build_header(
@@ -13626,18 +13628,38 @@ impl Browser {
         builder.hor()?;
         builder.gap(10)?;
 
-        for (tab_idx, _) in self.tabs.iter().enumerate() {
+        for (tab_idx, tab) in self.tabs.iter().enumerate() {
+            if tab.is_none() {
+                continue;
+            }
+            builder.start_element();
+            builder.width(140)?;
+            builder.height(40)?;
+            builder.hor()?;
+            builder.rounded(10)?;
+            builder.bg(0x363636FF)?;
+
             builder.start_element();
             builder.padding(10)?;
             builder.width(100)?;
             builder.height(40)?;
-            builder.rounded(10)?;
-            builder.bg(0x363636FF)?;
             builder.text(format!("Tab {}", tab_idx + 1))?;
             let tx = action_tx.clone();
             builder.on_click(move || {
                 let _ = tx.send(BrowserAction::SelectTab(tab_idx));
             })?;
+            builder.finish_element()?;
+
+            builder.start_element();
+            builder.padding(10)?;
+            builder.width(40)?;
+            builder.height(40)?;
+            builder.text("×".to_string())?;
+            let tx = action_tx.clone();
+            builder.on_click(move || {
+                let _ = tx.send(BrowserAction::CloseTab(tab_idx));
+            })?;
+            builder.finish_element()?;
             builder.finish_element()?;
         }
 
@@ -13757,7 +13779,8 @@ impl Browser {
                 BrowserAction::OpenTab(url) => {
                     match self.open_tab(url.clone(), hover_debugging, self.tabs.len()) {
                         Ok(handle) => {
-                            self.tabs.push(handle);
+                            self.tabs.push(Some(handle));
+                            header.focused = None;
                             self.current_tab_idx = self.tabs.len() - 1;
                             header.state.borrow_mut().url = self.current_tab().url.clone();
                             let comms_tx = header.builder.comms_tx.clone();
@@ -13776,6 +13799,20 @@ impl Browser {
                             eprintln!("Failed to open tab: {err:?}")
                         }
                     }
+                }
+                BrowserAction::CloseTab(tab_idx) => {
+                    if let Some(tab) = self.tabs[tab_idx].take() {
+                        let _ = tab.tx.send(FrameCommand::Close);
+                    }
+                    if self.tabs[self.current_tab_idx].is_none() {
+                        let Some(next) = self.tabs.iter().position(Option::is_some) else {
+                            return;
+                        };
+                        self.current_tab_idx = next;
+                    }
+                    header.focused = None;
+                    header.state.borrow_mut().url = self.current_tab().url.clone();
+                    let _ = header.builder.comms_tx.send(BrowserAction::Rerender);
                 }
                 BrowserAction::SelectTab(tab_idx) => {
                     self.current_tab_idx = tab_idx;
@@ -13810,7 +13847,7 @@ impl Browser {
                         return;
                     };
                     let url_text = url.to_string();
-                    if let Some(tab) = self.tabs.get_mut(self.current_tab_idx) {
+                    if let Some(tab) = self.tabs[self.current_tab_idx].as_mut() {
                         tab.url = url_text.clone();
                     }
                     header.state.borrow_mut().url = url_text;
@@ -13858,13 +13895,16 @@ impl Browser {
             fps_counter: show_fps_counter.then(FpsCounter::new),
         };
         let handle = browser.open_tab(url.clone(), hover_debugging, 0)?;
-        browser.tabs.push(handle);
+        browser.tabs.push(Some(handle));
 
         let (browser_action_tx, browser_action_rx) = std::sync::mpsc::channel();
         let mut header = browser.get_header_buffer(&url, browser_action_tx.clone())?;
 
         event_loop
             .run(move |event, elwt| {
+                if elwt.exiting() {
+                    return;
+                }
                 match event {
                     Event::WindowEvent { event, .. } => match event {
                         WindowEvent::CloseRequested => elwt.exit(),
@@ -14001,7 +14041,7 @@ impl Browser {
                     Event::UserEvent(UserEvent::TabUpdated { .. }) => {}
                     Event::UserEvent(UserEvent::TabUrlUpdated { tab_idx, url }) => {
                         let is_current = tab_idx == browser.current_tab_idx;
-                        if let Some(tab) = browser.tabs.get_mut(tab_idx) {
+                        if let Some(tab) = browser.tabs.get_mut(tab_idx).and_then(Option::as_mut) {
                             tab.url = url.clone();
                         }
 
@@ -14022,6 +14062,9 @@ impl Browser {
                         }
                     }
                     _ => {}
+                }
+                if browser.tabs[browser.current_tab_idx].is_none() {
+                    elwt.exit();
                 }
             })
             .context("Event loop failed")?;

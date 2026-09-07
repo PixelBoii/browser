@@ -86,6 +86,7 @@ pub struct UiRuntime<T> {
     pub buffer: Vec<u32>,
     pub layout: Vec<LayoutBox>,
     pub hovering: Option<usize>,
+    hover_position: Option<Position>,
     pub focused: Option<usize>,
     pub state: Rc<RefCell<T>>,
 }
@@ -109,12 +110,14 @@ impl<T> UiRuntime<T> {
             buffer: vec![],
             layout: vec![],
             hovering: None,
+            hover_position: None,
             focused: None,
             state: Rc::new(RefCell::new(state)),
         })
     }
 
     pub fn apply_hovering(&mut self, position: Position) {
+        self.hover_position = Some(position);
         for layout_box in self.layout.iter().rev() {
             let start_x = layout_box.x;
             let start_y = layout_box.y;
@@ -201,6 +204,9 @@ impl<T> UiRuntime<T> {
         let (layout, buffer) = self.builder.layout_pair()?;
         self.layout = layout;
         self.buffer = buffer;
+        if let Some(position) = self.hover_position {
+            self.apply_hovering(position);
+        }
         Ok(())
     }
 }
