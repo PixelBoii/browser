@@ -11744,7 +11744,6 @@ struct Frame {
     layout_booted: bool,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
     network_fetch: Rc<RefCell<NetworkFetch>>,
-    document_id: u64,
     dom_content_loaded_dispatched: bool,
     load_dispatched: bool,
     is_top: bool,
@@ -11777,7 +11776,6 @@ impl std::fmt::Debug for Frame {
             .field("layout_booted", &self.layout_booted)
             .field("executed_scripts", &self.executed_scripts)
             .field("network_fetch", &self.network_fetch)
-            .field("document_id", &self.document_id)
             .field(
                 "dom_content_loaded_dispatched",
                 &self.dom_content_loaded_dispatched,
@@ -11805,7 +11803,6 @@ impl Frame {
             layout_dirty: true,
             layout_booted: false,
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
-            document_id: 0,
             dom_content_loaded_dispatched: false,
             load_dispatched: false,
             is_top: true,
@@ -11957,10 +11954,19 @@ impl Frame {
     }
 
     fn reset_js_document_state(&mut self) -> Result<()> {
-        self.execute_host_script(
-            "document navigation reset",
-            "globalThis.__clear_all_timers?.(); globalThis.__EVENT_LISTENERS = {}; globalThis.__clear_node_map?.(); history.state = null;".to_string(),
-        )?;
+        // A full navigation needs a fresh realm, including the entire module graph.
+        // Clearing DOM wrappers alone leaves imported modules holding old DOM nodes.
+        let proxy = self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .event_loop_proxy
+            .clone()
+            .context("Renderer event loop proxy is not configured")?;
+        self.js_runtime = None;
+        self.install_js_host();
+        self.bind_js_host(proxy);
         Ok(())
     }
 
@@ -12292,7 +12298,6 @@ impl Frame {
         js: &Script,
         prefetched: &HashMap<String, String>,
     ) -> Result<()> {
-        let document_id = self.document_id;
         let Some(mut runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) else {
             return Ok(());
         };
@@ -12335,19 +12340,9 @@ impl Frame {
                     }
                     ScriptType::Module => {
                         if let Some(code) = prefetched.get(&url.to_string()) {
-                            let module_id = if document_id == 0 {
-                                runtime
-                                    .load_side_es_module_from_code(&url, code.clone())
-                                    .await
-                            } else {
-                                let mut module_url = url.clone();
-                                module_url
-                                    .query_pairs_mut()
-                                    .append_pair("__frame_document", &document_id.to_string());
-                                runtime
-                                    .load_side_es_module_from_code(&module_url, code.clone())
-                                    .await
-                            };
+                            let module_id = runtime
+                                .load_side_es_module_from_code(&url, code.clone())
+                                .await;
                             if let Ok(module_id) = module_id.inspect_err(|err| {
                                 eprintln!("Failed to load JS module at {} with error: {}", url, err)
                             }) {
@@ -12543,7 +12538,6 @@ impl Frame {
             renderer
                 .borrow_mut()
                 .replace_document(self.url.clone(), nodes_table, nodes_idxs);
-            self.document_id += 1;
             *self.executed_scripts.borrow_mut() = ExecutedScripts::new();
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
@@ -12589,6 +12583,13 @@ impl Frame {
             .borrow_mut()
             .event_loop_proxy = Some(proxy.clone());
 
+        self.bind_js_host(proxy);
+        self.setup_js_dom()?;
+
+        Ok(())
+    }
+
+    fn bind_js_host(&mut self, proxy: RendererProxy) {
         if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
             js_runtime.op_state().borrow_mut().put(JsHostState {
                 renderer: self.renderer.as_mut().cloned().unwrap(),
@@ -12597,9 +12598,6 @@ impl Frame {
                 is_top: self.is_top,
             });
         }
-        self.setup_js_dom()?;
-
-        Ok(())
     }
 
     pub fn start_main_loop(&mut self, proxy: RendererProxy, rx: Receiver<FrameCommand>) {
@@ -14818,6 +14816,137 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
+    #[ignore = "fetches the live Vite site"]
+    fn vite_blog_navigation_keeps_article_connected() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://vite.dev/guide/features".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
+        frame.apply_hovering(&Position { x: 350, y: 20 });
+        frame.on_click()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.process_pending_navigation_events(&rx)?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
+        frame.execute_host_script(
+            "verify article",
+            r#"
+            const heading = document.querySelector('h1');
+            if (location.pathname !== '/blog/cloudflare-supports-vite' ||
+                !heading?.textContent.includes("Cloudflare supports Vite") ||
+                !document.body.contains(heading)) {
+                throw new Error("The blog article must remain attached after navigation");
+            }
+        "#
+            .to_string(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_navigation_resets_js_globals_and_imported_modules() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+
+        for page in 0..2 {
+            if page > 0 {
+                frame
+                    .perform_navigation(crate::UserNavigateUrl::Raw("about:blank".into()), true)?;
+            }
+            frame.execute_host_script(
+                "page globals",
+                format!("globalThis.documentToken = {page};"),
+            )?;
+
+            // Seed a shared dependency without fetching it. Each entry point imports
+            // the same URL, just as Vite's app imports its shared Vue framework.
+            struct FixtureModulesLoaded;
+            let tokio = frame.tokio.as_ref().unwrap().clone();
+            tokio.borrow().block_on(async {
+                let mut runtime = frame.js_runtime.as_ref().unwrap().borrow_mut();
+                if !runtime.op_state().borrow().has::<FixtureModulesLoaded>() {
+                    let shared_url = url::Url::parse("https://example.test/shared.js")?;
+                    runtime
+                        .load_side_es_module_from_code(
+                            &shared_url,
+                            r#"
+                    export const token = globalThis.documentToken;
+                    export const body = document.body;
+                "#,
+                        )
+                        .await?;
+                    runtime.op_state().borrow_mut().put(FixtureModulesLoaded);
+                }
+                let entry_url =
+                    url::Url::parse(&format!("https://example.test/app.js?page={page}"))?;
+                let module = runtime
+                    .load_side_es_module_from_code(
+                        &entry_url,
+                        r#"
+                    import { token, body } from './shared.js';
+                    if (token !== globalThis.documentToken || body !== document.body) {
+                        throw new Error('Imported module retained the previous document');
+                    }
+                    const article = document.createElement('h1');
+                    article.textContent = 'Article ' + token;
+                    body.appendChild(article);
+                "#,
+                    )
+                    .await?;
+                let result = runtime.mod_evaluate(module);
+                runtime
+                    .with_event_loop_promise(result, Default::default())
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            frame.execute_host_script(
+                "verify document",
+                format!(
+                    r#"
+                if (document.querySelector('h1')?.textContent !== 'Article {page}') {{
+                    throw new Error('Module must render into the current document');
+                }}
+            "#
+                ),
+            )?;
+
+            frame.execute_host_script(
+                "page lexical binding",
+                format!("const pageLexicalBinding = {page};"),
+            )?;
+
+            // History navigation keeps the current realm and module instances.
+            frame.perform_navigation(crate::UserNavigateUrl::Raw("about:blank".into()), false)?;
+            frame.execute_host_script(
+                "verify history navigation",
+                format!(
+                    r#"
+                if (documentToken !== {page} || pageLexicalBinding !== {page} ||
+                    document.querySelector('h1')?.textContent !== 'Article {page}') {{
+                    throw new Error('Same-document navigation must preserve script state');
+                }}
+            "#
+                ),
+            )?;
+        }
+        Ok(())
     }
 
     #[test]
