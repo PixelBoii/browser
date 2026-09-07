@@ -819,6 +819,18 @@ class HtmlElement extends BaseNode {
         this.setAttribute('href', value)
     }
 
+    get hash() {
+        return this.href ? new URL(this.href).hash : ""
+    }
+
+    get host() {
+        return this.href ? new URL(this.href).host : ""
+    }
+
+    get pathname() {
+        return this.href ? new URL(this.href).pathname : ""
+    }
+
     get rel() {
         return this.getAttribute('rel') ?? ''
     }
@@ -945,6 +957,10 @@ class HtmlElement extends BaseNode {
 
     get scrollHeight() {
         return this.clientHeight
+    }
+
+    getClientRects() {
+        return [this.getBoundingClientRect()]
     }
 
     getBoundingClientRect() {
@@ -2043,6 +2059,9 @@ class Document extends EventTarget {
     }
     get scripts() {
         return this.querySelectorAll('script')
+    }
+    get links() {
+        return this.querySelectorAll("a[href], area[href]")
     }
     get currentScript() {
         return this.__currentScript
