@@ -1737,6 +1737,13 @@ class CSSStyleDeclaration {
     }
 }
 
+Object.defineProperty(globalThis, "CSSStyleDeclaration", {
+    value: CSSStyleDeclaration,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 function cssPropertyName(key) {
     const keyString = String(key)
     if (keyString.startsWith("--")) {
@@ -2044,6 +2051,9 @@ class Document extends EventTarget {
         return ""
     }
     createEvent(interfaceName) {
+        if (String(interfaceName) === "CustomEvent") {
+            return new CustomEvent("")
+        }
         if (!["Event", "Events", "HTMLEvents"].includes(String(interfaceName))) {
             throw new DOMException.DOMException(
                 `Unsupported event interface: ${interfaceName}`,
@@ -2527,9 +2537,18 @@ Object.defineProperty(globalThis, "MediaQueryListEvent", {
 })
 
 class CustomEvent extends Event {
-    constructor(type, options) {
-        super(type)
-        this.__detail = options.detail
+    constructor(type, options = {}) {
+        super(type, options)
+        this.__detail = options.detail ?? null
+    }
+
+    get detail() {
+        return this.__detail
+    }
+
+    initCustomEvent(type, bubbles = false, cancelable = false, detail = null) {
+        this.initEvent(type, bubbles, cancelable)
+        this.__detail = detail
     }
 }
 
