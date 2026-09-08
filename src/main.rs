@@ -5850,6 +5850,107 @@ fn op_get_text_content(state: &mut OpState, #[number] node_idx: usize) -> Result
     Ok(text)
 }
 
+#[op2]
+#[serde]
+fn op_get_stylesheet_nodes(state: &mut OpState, #[number] root: usize) -> Vec<usize> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let mut result = vec![];
+    let mut pending = vec![root];
+    while let Some(idx) = pending.pop() {
+        if let Some(Node::Element(element)) = renderer.nodes.get(idx) {
+            if element.tag == "style" || element.tag == "link" {
+                result.push(idx);
+            }
+        }
+        if let Some(children) = renderer.dom_indexes.children_index.get(&idx) {
+            pending.extend(children.iter().rev().copied());
+        }
+    }
+    result
+}
+
+#[derive(Serialize)]
+struct StyleSheetData {
+    href: Option<String>,
+    selectors: Vec<Option<String>>,
+}
+
+#[op2]
+#[serde]
+fn op_get_stylesheet(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    include_rules: bool,
+) -> Result<Option<StyleSheetData>, JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let Some(Node::Element(element)) = renderer.nodes.get(node_idx) else {
+        return Ok(None);
+    };
+    if element.attributes.get_str("type").is_some_and(|value| {
+        !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("text/css")
+    }) {
+        return Ok(None);
+    }
+    let (href, key, text) = if element.tag == "style" {
+        let text = if include_rules {
+            renderer.get_text_content(node_idx)
+        } else {
+            String::new()
+        };
+        (None, ExpandableCssNode::Inline(text.clone()), text)
+    } else if element.tag == "link"
+        && element.attributes.get_str("rel").is_some_and(|rel| {
+            rel.split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+        })
+    {
+        let Some(href) = element.attributes.get_str("href") else {
+            return Ok(None);
+        };
+        let base = ReqwestUrl::parse(&renderer.url).map_err(JsErrorBox::from_err)?;
+        let url =
+            resolve_url(&href, Some(&base)).map_err(|err| JsErrorBox::generic(err.to_string()))?;
+        let network = renderer.network_fetch.borrow();
+        let Some(RequestCacheEntry::CssData(text)) = network.request_cache.get(&url) else {
+            return Ok(None); // The stylesheet has not loaded yet.
+        };
+        let key = ExpandableCssNode::Link(href.into_owned());
+        let text = if include_rules && !renderer.css_parse_cache.contains_key(&key) {
+            text.clone()
+        } else {
+            String::new()
+        };
+        (Some(url.to_string()), key, text)
+    } else {
+        return Ok(None);
+    };
+    let mut selectors = vec![];
+    if include_rules {
+        if !renderer.css_parse_cache.contains_key(&key) {
+            renderer
+                .css_parser
+                .parse(&text)
+                .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+            let nodes = renderer.css_parser.drain_result();
+            renderer.css_parse_cache.insert(key.clone(), nodes);
+        }
+        for node in &renderer.css_parse_cache[&key] {
+            if node.get_parent().is_some() {
+                continue;
+            }
+            match node {
+                CssNode::ClassName(rule) => selectors.push(Some(rule.name.join(", "))),
+                CssNode::Property(_) | CssNode::Variable(_) => {}
+                // Keep grouping/at-rules in order without presenting them as style rules.
+                _ => selectors.push(None),
+            }
+        }
+    }
+    Ok(Some(StyleSheetData { href, selectors }))
+}
+
 #[op2(fast)]
 fn op_media_query_matches(state: &mut OpState, #[string] query: String) -> Result<bool, JsError> {
     let host = state.borrow_mut::<JsHostState>();
@@ -6548,6 +6649,8 @@ extension!(
     op_set_inner_html,
     op_set_text_content,
     op_media_query_matches,
+    op_get_stylesheet,
+    op_get_stylesheet_nodes,
     op_update_attributes,
     op_remove_attribute,
     op_get_inner_html,

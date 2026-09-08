@@ -877,6 +877,20 @@ class HtmlElement extends BaseNode {
         return new ClassList(this.getAttribute('class'), this)
     }
 
+    get sheet() {
+        if ((this.tag !== "style" && this.tag !== "link") || !this.isConnected) {
+            return null
+        }
+        const data = core.ops.op_get_stylesheet(this.__node_idx, false)
+        if (!data) return null
+        let sheet = styleSheets.get(this)
+        if (!sheet || sheet.href !== data.href) {
+            sheet = new CSSStyleSheet(this, data.href)
+            styleSheets.set(this, sheet)
+        }
+        return sheet
+    }
+
     get style() {
         return new CSSStyleDeclaration(this.getAttribute('style'), this)
     }
@@ -1767,6 +1781,61 @@ Object.defineProperty(globalThis, "ResizeObserver", {
     writable: true,
 });
 
+const styleSheets = new WeakMap()
+
+// Read-only CSSOM subset. Rule declarations, nested rules and stylesheet editing
+// are not exposed yet; selectors come from the same parser used for rendering.
+class CSSRule {
+    constructor(parentStyleSheet) {
+        this.parentStyleSheet = parentStyleSheet
+        this.parentRule = null
+    }
+}
+
+CSSRule.STYLE_RULE = 1
+CSSRule.prototype.STYLE_RULE = 1
+
+class CSSStyleRule extends CSSRule {
+    constructor(parentStyleSheet, selectorText) {
+        super(parentStyleSheet)
+        this.__selectorText = selectorText
+    }
+
+    get type() { return CSSRule.STYLE_RULE }
+    get selectorText() { return this.__selectorText }
+}
+
+class CSSStyleSheet {
+    constructor(ownerNode, href = null) {
+        if (!ownerNode) throw new TypeError("Constructed stylesheets are not implemented")
+        this.ownerNode = ownerNode
+        this.href = href
+        this.type = "text/css"
+    }
+
+    get cssRules() {
+        const data = core.ops.op_get_stylesheet(this.ownerNode.__node_idx, true)
+        if (data?.href && new URL(data.href).origin !== new URL(this.ownerNode.ownerDocument.location.href).origin) {
+            throw new DOMException.DOMException("Cannot read a cross-origin stylesheet", "SecurityError")
+        }
+        const rules = (data?.selectors ?? []).map(selector => selector === null
+            ? new CSSRule(this)
+            : new CSSStyleRule(this, selector))
+        rules.item = index => rules[index] ?? null
+        return rules
+    }
+
+    get rules() { return this.cssRules }
+}
+
+for (const type of [CSSRule, CSSStyleRule, CSSStyleSheet]) {
+    Object.defineProperty(globalThis, type.name, {
+        value: type,
+        configurable: true,
+        writable: true,
+    })
+}
+
 class CSSStyleDeclaration {
     constructor(style, element) {
         this.__element = element
@@ -2157,6 +2226,13 @@ class Document extends EventTarget {
     }
     set cookie(newValue) {
         core.ops.op_set_cookie(globalThis.location.href, String(newValue))
+    }
+    get styleSheets() {
+        const root = this.documentElement
+        const sheets = root ? withDocument(this, () => core.ops.op_get_stylesheet_nodes(root.__node_idx)
+            .map(idx => elementFromNodeIdx(idx).sheet).filter(Boolean)) : []
+        sheets.item = index => sheets[index] ?? null
+        return sheets
     }
     get scripts() {
         return this.querySelectorAll('script')
