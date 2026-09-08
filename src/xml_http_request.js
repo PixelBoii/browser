@@ -84,7 +84,7 @@ class XMLHttpRequest extends EventTarget {
                     init.body = body
                 }
 
-                const response = await browserFetch(this.__url, init)
+                const response = await globalThis.fetch(this.__url, init)
 
                 this.status = response.status
                 this.statusText = response.statusText
