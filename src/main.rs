@@ -6597,6 +6597,25 @@ extension!(
         { source = "export const kKeyObject = Symbol('kKeyObject');" },],
 );
 
+// Use our local Deno event module with the browser's DOM integration.
+fn deno_web_with_dom_events(
+    blob_store: Arc<BlobStore>,
+    broadcast_channel: InMemoryBroadcastChannel,
+) -> deno_core::Extension {
+    let mut extension = deno_web::deno_web::init(blob_store, None, broadcast_channel);
+    let source = extension
+        .esm_files
+        .to_mut()
+        .iter_mut()
+        .find(|source| source.specifier == "ext:deno_web/02_event.js")
+        .unwrap();
+    *source = deno_core::ExtensionFileSource::new_computed(
+        source.specifier,
+        include_str!("deno_event.js").into(),
+    );
+    extension
+}
+
 fn deno_fetch_without_telemetry() -> deno_core::Extension {
     let mut extension = deno_fetch::deno_fetch::init(deno_fetch::Options {
         user_agent: USER_AGENT.to_string(),
@@ -8102,7 +8121,7 @@ impl Renderer {
                 extensions: vec![
                     browser_worker::init(host),
                     deno_webidl::deno_webidl::init(),
-                    deno_web::deno_web::init(blob_store, None, broadcast_channel),
+                    deno_web_with_dom_events(blob_store, broadcast_channel),
                     deno_net::deno_net::init(None, None),
                     deno_fetch_without_telemetry(),
                     deno_node_crypto_shim::init(),
@@ -12134,7 +12153,7 @@ impl Frame {
                 extensions: vec![
                     browser::init(),
                     deno_webidl::deno_webidl::init(),
-                    deno_web::deno_web::init(Arc::clone(&self.blob_store), None, broadcast_channel),
+                    deno_web_with_dom_events(Arc::clone(&self.blob_store), broadcast_channel),
                     deno_net::deno_net::init(None, None),
                     deno_fetch_without_telemetry(),
                     deno_node_crypto_shim::init(),
@@ -12667,7 +12686,7 @@ impl Frame {
         // Run onload handlers
         if let Some(node_idx) = js.node_idx {
             let code = format!(
-                "runEventListeners(`${{{}}}:load`, new Event('load'))",
+                "__elementFromNodeIdx({}).dispatchEvent(new Event('load'))",
                 node_idx
             );
             runtime.execute_script("script onload", code.clone())?;
@@ -13032,11 +13051,8 @@ impl Frame {
                         HtmlEvent::Change => Some(format!(
                             r#"
                                 (() => {{
-                                    const event = new Event("change")
-                                    const idx = {}
-                                    event.target = __elementFromNodeIdx(idx)
-                                    event.target.__node_idx = idx
-                                    runEventListeners(`${{idx}}:change`, event)
+                                    const event = new Event("change", {{ bubbles: true }})
+                                    __elementFromNodeIdx({}).dispatchEvent(event)
                                     return event.defaultPrevented
                                 }})()
                             "#,
@@ -13252,7 +13268,7 @@ impl Frame {
         (() => {{
             const idxs = [{}]
             for (let idx of idxs) {{
-                runEventListeners(`${{idx}}:load`, new Event("load", {{
+                __elementFromNodeIdx(idx).dispatchEvent(new Event("load", {{
                     bubbles: false,
                     cancelable: false,
                 }}))
@@ -13712,9 +13728,11 @@ impl Frame {
         let code = format!(
             r#"
         (() => {{
-            const event = new MouseEvent("scroll")
-            event.target = __elementFromNodeIdx({})
-            runEventListeners('window:scroll', event)
+            const target = __elementFromNodeIdx({})
+            // Viewport scrolling fires on Document and bubbles to Window.
+            const viewport = target === document.documentElement || target === document.body
+            const eventTarget = viewport ? document : target
+            eventTarget.dispatchEvent(new Event("scroll", {{ bubbles: viewport }}))
         }})()
         "#,
             scrollable_idx

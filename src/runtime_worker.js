@@ -163,6 +163,18 @@ Object.defineProperty(globalThis, "EventTarget", {
     writable: true,
 })
 
+Object.defineProperty(globalThis, "Event", {
+    value: denoEvent.Event,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "CustomEvent", {
+    value: denoEvent.CustomEvent,
+    configurable: true,
+    writable: true,
+})
+
 const navigator = {
     // This is set by setup_js_dom in rust
     userAgent: null,

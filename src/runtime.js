@@ -125,11 +125,6 @@ function scrollToImpl(x = 0, y = 0) {
     //
 }
 
-globalThis.__EVENT_LISTENERS = {}
-
-const DOCUMENT_EVENT_TARGET = "document"
-const WINDOW_EVENT_TARGET = "window"
-
 class SVGAnimatedString {
     //
 }
@@ -155,19 +150,8 @@ class BaseNode extends EventTarget {
         this.ownerDocument = currentDocument
     }
 
-    addEventListener(event, cb) {
-        if (cb == null) {
-            return
-        }
-        registerEventListener(`${this.__node_idx}:${event}`, cb)
-    }
-
-    removeEventListener(event, cb) {
-        removeEventListenerByKey(`${this.__node_idx}:${event}`, cb)
-    }
-
-    dispatchEvent(event) {
-        return dispatchEventToTarget(this, event)
+    getParent() {
+        return this.parentNode ?? (this === this.ownerDocument.documentElement ? this.ownerDocument : null)
     }
 
     get isConnected() {
@@ -620,56 +604,7 @@ Object.defineProperty(globalThis, "ProcessingInstruction", {
     writable: true,
 })
 
-const __trustedEvents = new WeakSet()
-
-class Event {
-    constructor(type, options = {}) {
-        this.type = String(type)
-        this.name = this.type
-        this.bubbles = options.bubbles ?? false
-        this.cancelable = options.cancelable ?? true
-        this.composed = options.composed ?? false
-        this.target = null
-        this.currentTarget = null
-        this.defaultPrevented = false
-        this.eventPhase = 0
-        this.timeStamp = Date.now()
-        this.__stopped = false
-        this.__immediateStopped = false
-        this.__path = []
-    }
-
-    get isTrusted() {
-        return __trustedEvents.has(this)
-    }
-
-    preventDefault() {
-        if (this.cancelable) {
-            this.defaultPrevented = true
-        }
-    }
-
-    stopPropagation() {
-        this.__stopped = true
-    }
-
-    stopImmediatePropagation() {
-        this.__stopped = true
-        this.__immediateStopped = true
-    }
-
-    composedPath() {
-        return this.__path.slice()
-    }
-
-    initEvent(type, bubbles = false, cancelable = false) {
-        this.type = String(type)
-        this.name = this.type
-        this.bubbles = Boolean(bubbles)
-        this.cancelable = Boolean(cancelable)
-        this.defaultPrevented = false
-    }
-}
+const { Event } = denoEvent
 
 Object.defineProperty(globalThis, "Event", {
     value: Event,
@@ -805,34 +740,13 @@ class HtmlElement extends BaseNode {
         cacheNodeElement(this.__node_idx, this)
     }
 
-    addEventListener(event, cb) {
-        const key = `${this.__node_idx}:${event}`
-        registerEventListener(key, cb)
-    }
-
-    removeEventListener(event, cb) {
-        removeEventListenerByKey(`${this.__node_idx}:${event}`, cb)
-    }
-
-    dispatchEvent(event) {
-        return dispatchEventToTarget(this, event)
-    }
-
     click() {
-        return dispatchEventToTarget(this, new MouseEvent("click", {
+        return this.dispatchEvent(new MouseEvent("click", {
             bubbles: true,
             cancelable: true,
             composed: true,
             detail: 1,
         }))
-    }
-
-    set onload(cb) {
-        this.addEventListener('load', cb)
-    }
-
-    set onclick(cb) {
-        this.addEventListener('click', cb)
     }
 
     get attributes() {
@@ -922,14 +836,14 @@ class HtmlElement extends BaseNode {
 
     focus() {
         document.activeElement = this
-        dispatchEventToTarget(this, new Event("focus", { bubbles: false, cancelable: false }))
+        this.dispatchEvent(new Event("focus", { bubbles: false, cancelable: false }))
     }
 
     blur() {
         if (document.activeElement?.__node_idx === this.__node_idx) {
             document.activeElement = document.body
         }
-        dispatchEventToTarget(this, new Event("blur", { bubbles: false, cancelable: false }))
+        this.dispatchEvent(new Event("blur", { bubbles: false, cancelable: false }))
     }
 
     get tagName() {
@@ -2344,17 +2258,11 @@ class Document extends EventTarget {
         const nodes = core.ops.op_query_selector_all(selector, null, this.__frameId)
         return withDocument(this, () => nodes.map(nodeToElement))
     }
-    addEventListener(event, cb) {
-        registerEventListener(`${DOCUMENT_EVENT_TARGET}:${event}`, cb)
+    getParent(event) {
+        return event?.type === "load" ? null : this.defaultView
     }
-    removeEventListener(event, cb) {
-        removeEventListenerByKey(`${DOCUMENT_EVENT_TARGET}:${event}`, cb)
-    }
-    dispatchEvent(event) {
-        return dispatchEventToTarget(this, event)
-    }
-    set onclick(cb) {
-        this.addEventListener('click', cb)
+    getRootNode() {
+        return this
     }
     isEqualNode(other) {
         return nodesAreEqual(this, other)
@@ -2782,7 +2690,6 @@ class MediaQueryList extends EventTarget {
     constructor(media) {
         super()
         this.media = String(media)
-        this.__listeners = []
         this.__onchange = null
     }
 
@@ -2812,47 +2719,6 @@ class MediaQueryList extends EventTarget {
 
     removeListener(callback) {
         this.removeEventListener("change", callback)
-    }
-
-    addEventListener(type, callback) {
-        if (type !== "change" || callback == null || this.__listeners.includes(callback)) {
-            return
-        }
-        this.__listeners.push(callback)
-    }
-
-    removeEventListener(type, callback) {
-        if (type !== "change") {
-            return
-        }
-        const idx = this.__listeners.indexOf(callback)
-        if (idx !== -1) {
-            this.__listeners.splice(idx, 1)
-        }
-    }
-
-    dispatchEvent(event) {
-        if (!(event instanceof Event)) {
-            throw new TypeError("dispatchEvent expects an Event")
-        }
-
-        event.target = event.target ?? this
-        event.currentTarget = this
-
-        for (const listener of this.__listeners.slice()) {
-            if (typeof listener === "function") {
-                listener.call(this, event)
-            } else if (typeof listener?.handleEvent === "function") {
-                listener.handleEvent(event)
-            }
-
-            if (event.__immediateStopped) {
-                break
-            }
-        }
-
-        event.currentTarget = null
-        return !event.defaultPrevented
     }
 }
 
@@ -2920,117 +2786,10 @@ Object.defineProperty(globalThis, "navigator", {
     writable: true,
 })
 
-function registerEventListener(key, cb) {
-    if (cb == null) {
-        return
-    }
-    if (!(key in globalThis.__EVENT_LISTENERS)) {
-        globalThis.__EVENT_LISTENERS[key] = []
-    }
-    if (globalThis.__EVENT_LISTENERS[key].includes(cb)) {
-        return
-    }
-    globalThis.__EVENT_LISTENERS[key].push(cb)
-}
-
-function removeEventListenerByKey(key, cb) {
-    const listeners = globalThis.__EVENT_LISTENERS[key]
-    if (!listeners) {
-        return
-    }
-
-    const idx = listeners.indexOf(cb)
-    if (idx !== -1) {
-        listeners.splice(idx, 1)
-    }
-}
-
-function hasEventListeners(event_key) {
-    return !!globalThis.__EVENT_LISTENERS[event_key]
-}
-
-function runEventListeners(event_key, event) {
-    const listeners = globalThis.__EVENT_LISTENERS[event_key]
-    if (!listeners) {
-        return event?.defaultPrevented ?? false
-    }
-
-    for (const cb of listeners.slice()) {
-        try {
-            const target = event.currentTarget ?? event.target ?? globalThis
-            if (typeof cb === "function") {
-                cb.call(target, event)
-            } else if (typeof cb?.handleEvent === "function") {
-                cb.handleEvent(event)
-            }
-        } catch (err) {
-            console.error(err)
-        }
-        if (event.__immediateStopped) {
-            break
-        }
-    }
-    return event?.defaultPrevented ?? false
-}
-
-function eventKeyForTarget(target, type) {
-    if (target === globalThis || target === globalThis.window) {
-        return `${WINDOW_EVENT_TARGET}:${type}`
-    }
-    if (target === globalThis.document) {
-        return `${DOCUMENT_EVENT_TARGET}:${type}`
-    }
-    return `${target.__node_idx}:${type}`
-}
-
-function eventPathForTarget(target) {
-    if (target === globalThis) {
-        return [globalThis]
-    }
-    if (target === globalThis.document) {
-        return [globalThis.document, globalThis]
-    }
-
-    const path = []
-    let current = target
-    while (current) {
-        path.push(current)
-        current = current.parentNode
-    }
-    path.push(globalThis.document, globalThis)
-    return path
-}
-
-function dispatchEventToPath(path, event, target = null) {
-    if (!(event instanceof Event)) {
-        throw new TypeError("dispatchEvent expects an Event")
-    }
-
-    const eventTarget = target ?? path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? path[0] ?? null
-    event.target = event.target ?? eventTarget
-    event.__path = path.slice()
-
-    for (const currentTarget of path) {
-        event.currentTarget = currentTarget
-        runEventListeners(eventKeyForTarget(currentTarget, event.type), event)
-        if (event.__stopped) {
-            break
-        }
-    }
-
-    event.currentTarget = null
-    return !event.defaultPrevented
-}
-
-function dispatchEventToTarget(target, event) {
-    return dispatchEventToPath(eventPathForTarget(target), event, target)
-}
-
 function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
     const path = pathNodeIdxs
         .map(idx => __elementFromNodeIdx(idx))
         .filter(Boolean)
-    path.push(globalThis.document, globalThis)
 
     const target = path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? __elementFromNodeIdx(targetNodeIdx)
     let clickEvent = null
@@ -3046,8 +2805,8 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
         const event = eventType.startsWith("pointer")
             ? new PointerEvent(eventType, eventOptions)
             : new MouseEvent(eventType, eventOptions)
-        __trustedEvents.add(event)
-        dispatchEventToPath(path, event, target)
+        denoEvent.setIsTrusted(event, true)
+        denoEvent.dispatch(target, event)
         if (eventType === "click") {
             clickEvent = event
         }
@@ -3055,46 +2814,17 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
     return clickEvent?.defaultPrevented ?? false
 }
 
-Object.defineProperty(globalThis, "hasEventListeners", {
-    value: hasEventListeners,
-    enumerable: true,
-    configurable: true,
-    writable: true
-})
+class Window extends EventTarget {}
 
-Object.defineProperty(globalThis, "runEventListeners", {
-    value: runEventListeners,
-    enumerable: true,
-    configurable: true,
-    writable: true
-})
+// The existing global object becomes the Window instance.
+globalThis[webidl.brand] = webidl.brand
+denoEvent.setEventTargetData(globalThis)
 
-function addEventListener(event, cb) {
-    registerEventListener(`${WINDOW_EVENT_TARGET}:${event}`, cb)
-}
-
-function removeEventListener(event, cb) {
-    removeEventListenerByKey(`${WINDOW_EVENT_TARGET}:${event}`, cb)
-}
-
-function dispatchDenoEventToWindow(event) {
-    denoEvent.setTarget(event, globalThis)
-    runEventListeners(`${WINDOW_EVENT_TARGET}:${event.type}`, event)
-    return !event.defaultPrevented
-}
-
-function dispatchEvent(event) {
-    if (event instanceof denoEvent.Event) {
-        return dispatchDenoEventToWindow(event)
+for (const prototype of [HtmlElement.prototype, Document.prototype, Window.prototype]) {
+    for (const type of ["click", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
+        denoEvent.defineEventHandler(prototype, type)
     }
-    return dispatchEventToTarget(globalThis, event)
 }
-
-function Window() {}
-
-Window.prototype.addEventListener = addEventListener
-Window.prototype.removeEventListener = removeEventListener
-Window.prototype.dispatchEvent = dispatchEvent
 
 Object.setPrototypeOf(globalThis, Window.prototype)
 
@@ -3483,7 +3213,7 @@ Object.defineProperty(globalThis, "top", {
 })
 
 function postMessage(message) {
-    dispatchDenoEventToWindow(new denoEvent.MessageEvent("message", { data: message }))
+    globalThis.dispatchEvent(new denoEvent.MessageEvent("message", { data: message }))
 }
 
 Object.defineProperty(globalThis, "postMessage", {

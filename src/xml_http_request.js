@@ -1,4 +1,4 @@
-import { EventTarget } from "./event_target.js";
+import { EventTarget, Event, defineEventHandler } from "ext:deno_web/02_event.js";
 
 function resolveBrowserUrl(value) {
     return new URL(value, globalThis.location?.href ?? "about:blank").href
@@ -21,7 +21,6 @@ class XMLHttpRequest extends EventTarget {
         this.onerror = null
         this.onabort = null
         this.onloadend = null
-        this.__listeners = {}
         this.__method = "GET"
         this.__url = ""
         this.__async = true
@@ -31,38 +30,8 @@ class XMLHttpRequest extends EventTarget {
         this.__sendFlag = false
     }
 
-    addEventListener(event, cb) {
-        if (!this.__listeners[event]) {
-            this.__listeners[event] = []
-        }
-        this.__listeners[event].push(cb)
-    }
-
-    removeEventListener(event, cb) {
-        const listeners = this.__listeners[event]
-        if (!listeners) {
-            return
-        }
-
-        const idx = listeners.indexOf(cb)
-        if (idx !== -1) {
-            listeners.splice(idx, 1)
-        }
-    }
-
-    __dispatch(event) {
-        const eventObject = new Event(event)
-        eventObject.target = this
-        eventObject.currentTarget = this
-
-        const handler = this[`on${event}`]
-        if (typeof handler === "function") {
-            handler.call(this, eventObject)
-        }
-
-        for (const cb of this.__listeners[event] ?? []) {
-            cb.call(this, eventObject)
-        }
+    __dispatch(type) {
+        this.dispatchEvent(new Event(type))
     }
 
     __setReadyState(readyState) {
@@ -172,6 +141,10 @@ class XMLHttpRequest extends EventTarget {
             this.__dispatch("loadend")
         }
     }
+}
+
+for (const type of ["readystatechange", "load", "error", "abort", "loadend"]) {
+    defineEventHandler(XMLHttpRequest.prototype, type)
 }
 
 XMLHttpRequest.UNSENT = 0
