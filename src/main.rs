@@ -14726,6 +14726,24 @@ mod tests {
     }
 
     #[test]
+    fn render_facebook() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://www.facebook.com/".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
+        // Facebook currently serves an HTTP 400 error page; see NOTES.md.
+        ensure_snapshot_matches(&buffer, "facebookcom", 1920, 1080)
+    }
+
+    #[test]
     fn renders_swapped_com() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
