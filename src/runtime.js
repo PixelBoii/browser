@@ -384,6 +384,35 @@ Object.defineProperty(globalThis, "NodeFilter", {
     writable: true,
 })
 
+class CustomElementRegistry {
+    constructor() {
+        this.definitions = new Map()
+    }
+
+    // TODO: Definition validation, element upgrades, lifecycle callbacks, and whenDefined().
+    define(name, constructor) {
+        this.definitions.set(name, constructor)
+    }
+
+    get(name) {
+        return this.definitions.get(name)
+    }
+}
+
+Object.defineProperty(globalThis, "CustomElementRegistry", {
+    value: CustomElementRegistry,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "customElements", {
+    value: new CustomElementRegistry(),
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class DocumentFragment extends BaseNode {
     // TODO: Backend storage and fragment child/insertion operations.
     get nodeType() { return Node.DOCUMENT_FRAGMENT_NODE }
@@ -573,6 +602,31 @@ Object.defineProperty(globalThis, "MouseEvent", {
     configurable: true,
     writable: true,
 });
+
+class KeyboardEvent extends Event {
+    constructor(type, options = {}) {
+        super(type, options)
+        this.key = options.key ?? ""
+        this.code = options.code ?? ""
+        this.location = options.location ?? 0
+        this.ctrlKey = options.ctrlKey ?? false
+        this.shiftKey = options.shiftKey ?? false
+        this.altKey = options.altKey ?? false
+        this.metaKey = options.metaKey ?? false
+        this.repeat = options.repeat ?? false
+        this.isComposing = options.isComposing ?? false
+        this.keyCode = options.keyCode ?? 0
+        this.charCode = options.charCode ?? 0
+        this.which = options.which ?? 0
+    }
+}
+
+Object.defineProperty(globalThis, "KeyboardEvent", {
+    value: KeyboardEvent,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 class PointerEvent extends MouseEvent {
     constructor(type, options = {}) {
@@ -1557,6 +1611,19 @@ class HTMLMediaElement extends HtmlElement {
     }
 }
 
+class HTMLDivElement extends HtmlElement {
+    constructor() {
+        super("div")
+    }
+}
+
+Object.defineProperty(globalThis, "HTMLDivElement", {
+    value: HTMLDivElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class HTMLVideoElement extends HTMLMediaElement {
     constructor() {
         super("video")
@@ -1907,12 +1974,19 @@ Object.defineProperty(globalThis, "HTMLImageElement", {
     writable: true,
 })
 
-class TemplateElement extends HtmlElement {
+class HTMLTemplateElement extends HtmlElement {
     // TODO: Actually return a fragment of children here
     get content() {
         return this
     }
 }
+
+Object.defineProperty(globalThis, "HTMLTemplateElement", {
+    value: HTMLTemplateElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 class CommentNode extends BaseNode {
     constructor(data) {
@@ -2087,7 +2161,7 @@ function tagToElement(tag) {
     return tag === "svg" ?
         SVGElement :
         tag === "template" ?
-            TemplateElement :
+            HTMLTemplateElement :
         tag === "canvas" ?
             HtmlCanvasElement :
             tag === "iframe" ?
@@ -2108,7 +2182,9 @@ function tagToElement(tag) {
                         HTMLVideoElement :
                         tag === "audio" ?
                             HTMLAudioElement :
-                            HtmlElement
+                            tag === "div" ?
+                                HTMLDivElement :
+                                HtmlElement
 }
 
 class Document extends EventTarget {
@@ -2987,43 +3063,16 @@ function dispatchEvent(event) {
     return dispatchEventToTarget(globalThis, event)
 }
 
-// TODO: Build window first, then map to globalThis
 function Window() {}
 
 Window.prototype.addEventListener = addEventListener
 Window.prototype.removeEventListener = removeEventListener
 Window.prototype.dispatchEvent = dispatchEvent
 
-Object.defineProperty(Window, Symbol.hasInstance, {
-    value(instance) {
-        return instance === globalThis
-    },
-    configurable: true,
-})
+Object.setPrototypeOf(globalThis, Window.prototype)
 
 Object.defineProperty(globalThis, "Window", {
     value: Window,
-    enumerable: true,
-    configurable: true,
-    writable: true,
-})
-
-Object.defineProperty(globalThis, "addEventListener", {
-    value: addEventListener,
-    enumerable: true,
-    configurable: true,
-    writable: true,
-})
-
-Object.defineProperty(globalThis, "removeEventListener", {
-    value: removeEventListener,
-    enumerable: true,
-    configurable: true,
-    writable: true,
-})
-
-Object.defineProperty(globalThis, "dispatchEvent", {
-    value: dispatchEvent,
     enumerable: true,
     configurable: true,
     writable: true,
