@@ -1,3 +1,4 @@
+import { serializeWorkerMessage, deserializeWorkerMessage } from "./worker_messaging.js";
 import * as webidl from "ext:deno_webidl/00_webidl.js";
 import * as url from "ext:deno_web/00_url.js";
 import * as urlPattern from "ext:deno_web/01_urlpattern.js";
@@ -3527,10 +3528,6 @@ Object.defineProperty(globalThis, "structuredClone", {
     writable: true,
 })
 
-function serializeWorkerMessage(message) {
-    return core.serialize(message)
-}
-
 const __workers = new Map()
 
 class Worker extends denoEvent.EventTarget {
@@ -3541,21 +3538,20 @@ class Worker extends denoEvent.EventTarget {
         __workers.set(this.__worker_id, this)
     }
 
-    postMessage(message) {
-        core.ops.op_post_message_to_worker(this.__worker_id, serializeWorkerMessage(message))
+    postMessage(message, transferOrOptions) {
+        core.ops.op_post_message_to_worker(this.__worker_id, serializeWorkerMessage(message, transferOrOptions))
     }
 }
 
 denoEvent.defineEventHandler(Worker.prototype, "message")
 
 // Called from Rust when a worker posts a message back to this document.
-function __dispatchWorkerMessage(workerId, serializedMessage) {
+function __dispatchWorkerMessage(workerId) {
     const worker = __workers.get(workerId)
     if (!worker) {
         return
     }
-    const event = new denoEvent.MessageEvent("message")
-    event.data = core.deserialize(new Uint8Array(serializedMessage))
+    const event = deserializeWorkerMessage(core.ops.op_take_worker_message())
     worker.dispatchEvent(event)
 }
 

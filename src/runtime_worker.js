@@ -1,3 +1,4 @@
+import { serializeWorkerMessage, deserializeWorkerMessage } from "./worker_messaging.js";
 import * as webidl from "ext:deno_webidl/00_webidl.js";
 import * as url from "ext:deno_web/00_url.js";
 import * as urlPattern from "ext:deno_web/01_urlpattern.js";
@@ -508,8 +509,8 @@ globalThis[webidl.brand] = webidl.brand
 denoEvent.setEventTargetData(globalThis)
 denoEvent.defineEventHandler(globalThis, "message")
 
-function postMessage(message) {
-    core.ops.op_worker_post_message(core.serialize(message))
+function postMessage(message, transferOrOptions) {
+    core.ops.op_worker_post_message(serializeWorkerMessage(message, transferOrOptions))
 }
 
 Object.defineProperty(globalThis, "postMessage", {
@@ -532,8 +533,7 @@ async function startWorkerMessageLoop() {
             clearAllTimers()
             break
         }
-        const event = new denoEvent.MessageEvent("message")
-        event.data = core.deserialize(serializedMessage)
+        const event = deserializeWorkerMessage(serializedMessage)
         globalThis.dispatchEvent(event)
     }
 }

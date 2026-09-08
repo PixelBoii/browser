@@ -1433,28 +1433,36 @@ enum RendererProxy {
 impl RendererProxy {
     fn fire_user_event(&self, event: UserEvent) -> Result<()> {
         match self {
-            RendererProxy::FrameLoop(tx) => tx.send(FrameCommand::UserEvent(event))?,
-            RendererProxy::WindowLoop { proxy, .. } => proxy.send_event(event)?,
+            RendererProxy::FrameLoop(tx) => tx
+                .send(FrameCommand::UserEvent(event))
+                .map_err(|err| anyhow!(err.to_string()))?,
+            RendererProxy::WindowLoop { proxy, .. } => proxy
+                .send_event(event)
+                .map_err(|err| anyhow!(err.to_string()))?,
         };
         Ok(())
     }
 
     fn fire_tab_url_updated(&self, url: String) -> Result<()> {
         if let RendererProxy::WindowLoop { proxy, tab_idx } = self {
-            proxy.send_event(UserEvent::TabUrlUpdated {
-                tab_idx: *tab_idx,
-                url,
-            })?;
+            proxy
+                .send_event(UserEvent::TabUrlUpdated {
+                    tab_idx: *tab_idx,
+                    url,
+                })
+                .map_err(|err| anyhow!(err.to_string()))?;
         }
         Ok(())
     }
 
     fn fire_tab_updated(&self, buffer: Vec<u32>) -> Result<()> {
         if let RendererProxy::WindowLoop { proxy, tab_idx } = self {
-            proxy.send_event(UserEvent::TabUpdated {
-                tab_idx: *tab_idx,
-                buffer,
-            })?;
+            proxy
+                .send_event(UserEvent::TabUpdated {
+                    tab_idx: *tab_idx,
+                    buffer,
+                })
+                .map_err(|err| anyhow!(err.to_string()))?;
         }
         Ok(())
     }
@@ -1745,14 +1753,45 @@ struct Renderer {
 
 #[derive(Debug, Clone)]
 struct WorkerHandle {
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
+}
+
+// Resources are taken from the sending runtime and installed in the receiving runtime.
+struct WorkerMessage {
+    data: deno_core::DetachedBuffer,
+    transferables: Vec<deno_web::Transferable>,
+}
+
+impl std::fmt::Debug for WorkerMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerMessage")
+            .field("transferables", &self.transferables.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkerMessage {
+    fn take(state: &mut OpState, message: deno_web::JsMessageData) -> Result<Self, JsErrorBox> {
+        Ok(Self {
+            data: message.data,
+            transferables: deno_web::deserialize_js_transferables(state, message.transferables)
+                .map_err(JsErrorBox::from_err)?,
+        })
+    }
+
+    fn into_js(self, state: &mut OpState) -> deno_web::JsMessageData {
+        deno_web::JsMessageData {
+            data: self.data,
+            transferables: deno_web::serialize_transferables(state, self.transferables),
+        }
+    }
 }
 
 // Op state for a dedicated worker runtime. Messages contain Deno-serialized data.
 struct WorkerHostState {
     worker_id: usize,
     proxy: RendererProxy,
-    rx: Rc<RefCell<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
+    rx: Rc<RefCell<tokio::sync::mpsc::UnboundedReceiver<WorkerMessage>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4892,7 +4931,7 @@ struct FormNavigation {
     body: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum UserEvent {
     DomUpdated,
     ImagesPrefetched(Vec<(ReqwestUrl, RequestCacheEntry)>),
@@ -4903,7 +4942,10 @@ enum UserEvent {
     TabUrlUpdated { tab_idx: usize, url: String },
     ChildMessage(String),
     ParentMessage(String),
-    WorkerMessage { worker_id: usize, message: Vec<u8> },
+    WorkerMessage {
+        worker_id: usize,
+        message: WorkerMessage,
+    },
     Hover(Position),
     Click,
     Keyup(KeyEvent),
@@ -6353,40 +6395,43 @@ fn op_untrack_intersection(
 
 #[op2(fast)]
 fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<u32, JsErrorBox> {
+    let buffer_store = state.borrow::<deno_core::SharedArrayBufferStore>().clone();
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     let worker_id = renderer
-        .spawn_worker(src)
+        .spawn_worker(src, buffer_store)
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn worker: {err}")))?;
     Ok(worker_id as u32)
 }
 
-#[op2(fast)]
+#[op2]
 fn op_post_message_to_worker(
     state: &mut OpState,
     #[number] worker_id: usize,
-    #[buffer] message: &[u8],
+    #[serde] message: deno_web::JsMessageData,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
+    let message = WorkerMessage::take(state, message)?;
+    let host = state.borrow::<JsHostState>();
     let renderer = host.renderer.borrow();
     let Some(worker) = renderer.workers.get(&worker_id) else {
         return Err(JsErrorBox::generic("Failed to get worker by idx"));
     };
     // A worker whose thread has exited simply drops the message.
-    let _ = worker.tx.send(message.to_vec());
+    let _ = worker.tx.send(message);
     Ok(())
 }
 
-#[op2(fast)]
+#[op2]
 fn op_worker_post_message(
     state: &mut OpState,
-    #[buffer] message: &[u8],
+    #[serde] message: deno_web::JsMessageData,
 ) -> Result<(), JsErrorBox> {
+    let message = WorkerMessage::take(state, message)?;
     let host = state.borrow::<WorkerHostState>();
     host.proxy
         .fire_user_event(UserEvent::WorkerMessage {
             worker_id: host.worker_id,
-            message: message.to_vec(),
+            message,
         })
         .map_err(|err| JsErrorBox::generic(format!("Failed to post worker message: {err}")))?;
     Ok(())
@@ -6394,11 +6439,23 @@ fn op_worker_post_message(
 
 // Resolves with the next message posted by the parent, or fails once the parent is gone.
 #[op2]
-#[buffer]
-async fn op_worker_receive_message(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, JsErrorBox> {
+#[serde]
+async fn op_worker_receive_message(
+    state: Rc<RefCell<OpState>>,
+) -> Result<deno_web::JsMessageData, JsErrorBox> {
     let rx = state.borrow().borrow::<WorkerHostState>().rx.clone();
     let message = rx.borrow_mut().recv().await;
-    message.ok_or_else(|| JsErrorBox::generic("Worker message channel closed"))
+    let message = message.ok_or_else(|| JsErrorBox::generic("Worker message channel closed"))?;
+    Ok(message.into_js(&mut state.borrow_mut()))
+}
+
+#[op2]
+#[serde]
+fn op_take_worker_message(state: &mut OpState) -> Result<deno_web::JsMessageData, JsErrorBox> {
+    let message = state
+        .try_take::<WorkerMessage>()
+        .ok_or_else(|| JsErrorBox::generic("No worker message pending"))?;
+    Ok(message.into_js(state))
 }
 
 // This should walk the tree to be fully correct I think
@@ -6453,7 +6510,7 @@ extension!(
     op_worker_receive_message,
   ],
   esm_entry_point = "ext:browser_worker/runtime_worker.js",
-  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js"],
+  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js"],
   options = {
     host: WorkerHostState,
   },
@@ -6519,12 +6576,13 @@ extension!(
     op_spawn_frame,
     op_spawn_worker,
     op_post_message_to_worker,
+    op_take_worker_message,
     op_track_intersection,
     op_untrack_intersection,
     op_request_animation_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
-  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js"],
+  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js"],
   state = |state| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,
@@ -8008,7 +8066,11 @@ impl Renderer {
         }
     }
 
-    fn spawn_worker(&mut self, src: &str) -> Result<usize> {
+    fn spawn_worker(
+        &mut self,
+        src: &str,
+        buffer_store: deno_core::SharedArrayBufferStore,
+    ) -> Result<usize> {
         let worker_id = self.next_worker_id;
         self.next_worker_id += 1;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8035,6 +8097,7 @@ impl Renderer {
             // so the runtime context must be active while scripts run, not only inside block_on.
             let _guard = tokio.enter();
             let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+                shared_array_buffer_store: Some(buffer_store),
                 module_loader: Some(Rc::new(HttpModuleLoader::new(network.client.clone()))),
                 extensions: vec![
                     browser_worker::init(host),
@@ -12061,10 +12124,12 @@ impl Frame {
     }
 
     pub fn install_js_host(&mut self) {
+        let buffer_store = deno_core::SharedArrayBufferStore::default();
         let broadcast_channel = InMemoryBroadcastChannel::default();
         let client = self.network_fetch.borrow().client.clone();
         self.js_runtime = Some(Rc::new(RefCell::new(deno_core::JsRuntime::new(
             deno_core::RuntimeOptions {
+                shared_array_buffer_store: Some(buffer_store.clone()),
                 module_loader: Some(Rc::new(HttpModuleLoader::new(client))),
                 extensions: vec![
                     browser::init(),
@@ -12078,6 +12143,13 @@ impl Frame {
                 ..Default::default()
             },
         ))));
+        self.js_runtime
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .op_state()
+            .borrow_mut()
+            .put(buffer_store);
     }
 
     fn drain_microtasks(runtime: &mut JsRuntime) {
@@ -12109,14 +12181,25 @@ impl Frame {
         Ok(value)
     }
 
-    fn dispatch_worker_message(&mut self, worker_id: usize, message: &[u8]) {
-        let code = format!(
-            "__dispatchWorkerMessage({worker_id}, {})",
-            deno_core::serde_json::to_string(message).unwrap()
-        );
+    fn dispatch_worker_message(&mut self, worker_id: usize, message: WorkerMessage) {
+        // Navigation drops old workers. Do not install their resources in the new document.
+        if !self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .workers
+            .contains_key(&worker_id)
+        {
+            return;
+        }
+        let state = self.js_runtime.as_ref().unwrap().borrow().op_state();
+        state.borrow_mut().put(message);
+        let code = format!("__dispatchWorkerMessage({worker_id})");
         if let Err(err) = self.execute_host_script("worker message handler", code) {
             eprintln!("Failed to dispatch worker message: {err}");
         }
+        state.borrow_mut().try_take::<WorkerMessage>();
     }
 
     fn dispatch_dom_content_loaded_once(&mut self) -> Result<()> {
@@ -12299,7 +12382,7 @@ impl Frame {
                     .unwrap();
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
-                self.dispatch_worker_message(worker_id, &message);
+                self.dispatch_worker_message(worker_id, message);
             }
             FrameCommand::Dom(FrameDomCommand::QuerySelector {
                 selector,
@@ -13556,7 +13639,7 @@ impl Frame {
                     .unwrap();
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
-                self.dispatch_worker_message(worker_id, &message);
+                self.dispatch_worker_message(worker_id, message);
             }
             FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
                 if let Err(err) = self.perform_navigation(href, reload) {
