@@ -1792,6 +1792,8 @@ struct WorkerHostState {
     worker_id: usize,
     proxy: RendererProxy,
     rx: Rc<RefCell<tokio::sync::mpsc::UnboundedReceiver<WorkerMessage>>>,
+    url: ReqwestUrl,
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Clone)]
@@ -6552,6 +6554,49 @@ async fn op_worker_receive_message(
 
 #[op2]
 #[serde]
+fn op_worker_resolve_script_urls(
+    state: &mut OpState,
+    #[serde] urls: Vec<String>,
+) -> Result<Vec<String>, JsErrorBox> {
+    let host = state.borrow::<WorkerHostState>();
+    urls.iter()
+        .map(|url| {
+            host.url.join(url)
+                .map(|url| url.to_string())
+                .map_err(|err| JsErrorBox::new("DOMExceptionSyntaxError", err.to_string()))
+        })
+        .collect()
+}
+
+#[op2]
+#[string]
+fn op_worker_fetch_script(
+    state: &mut OpState,
+    #[string] url: String,
+) -> Result<String, JsErrorBox> {
+    let client = state.borrow::<WorkerHostState>().client.clone();
+    // importScripts blocks JS. Fetch on a helper thread to avoid nesting block_on when
+    // it is called from an event handler while the worker's Tokio runtime is running.
+    std::thread::spawn(move || -> Result<String> {
+        let url = ReqwestUrl::parse(&url)?;
+        if url.scheme() == "file" {
+            let path = url.to_file_path().map_err(|_| anyhow!("Invalid file URL"))?;
+            return Ok(fs::read_to_string(path)?);
+        }
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        tokio.block_on(async {
+            Ok(client.get(url).send().await?.error_for_status()?.text().await?)
+        })
+    })
+    .join()
+    .map_err(|_| JsErrorBox::generic("Worker script fetch thread panicked"))?
+    .map_err(|err| JsErrorBox::new("DOMExceptionNetworkError", err.to_string()))
+}
+
+#[op2]
+#[serde]
 fn op_take_worker_message(state: &mut OpState) -> Result<deno_web::JsMessageData, JsErrorBox> {
     let message = state
         .try_take::<WorkerMessage>()
@@ -6609,6 +6654,8 @@ extension!(
     op_tls_peer_certificate,
     op_worker_post_message,
     op_worker_receive_message,
+    op_worker_resolve_script_urls,
+    op_worker_fetch_script,
   ],
   esm_entry_point = "ext:browser_worker/runtime_worker.js",
   esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js"],
@@ -8193,6 +8240,7 @@ impl Renderer {
         src: &str,
         buffer_store: deno_core::SharedArrayBufferStore,
     ) -> Result<usize> {
+        let url = resolve_url(src, Some(&ReqwestUrl::parse(&self.url)?))?;
         let worker_id = self.next_worker_id;
         self.next_worker_id += 1;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8200,8 +8248,6 @@ impl Renderer {
             .event_loop_proxy
             .clone()
             .context("Renderer event loop proxy is not configured")?;
-        let url = self.url.clone();
-        let inner_src = src.to_string();
         let network = NetworkFetch::new();
         std::thread::spawn(move || {
             let blob_store = Arc::new(BlobStore::default());
@@ -8210,6 +8256,8 @@ impl Renderer {
                 worker_id,
                 proxy,
                 rx: Rc::new(RefCell::new(rx)),
+                url: url.clone(),
+                client: network.client.clone(),
             };
             let tokio = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -8232,12 +8280,6 @@ impl Renderer {
                 ],
                 ..Default::default()
             });
-            let Ok(base) = ReqwestUrl::parse(&url) else {
-                return;
-            };
-            let Ok(url) = resolve_url(&inner_src, Some(&base)) else {
-                return;
-            };
             let fetch = async || -> Result<String> {
                 if let Some(stripped) = url.as_str().strip_prefix("file://") {
                     let contents = fs::read_to_string(stripped)?;

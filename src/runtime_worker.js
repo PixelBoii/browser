@@ -525,6 +525,27 @@ function postMessage(message, transferOrOptions) {
     core.ops.op_worker_post_message(serializeWorkerMessage(message, transferOrOptions))
 }
 
+core.registerErrorBuilder("DOMExceptionSyntaxError", message => new DOMException.DOMException(message, "SyntaxError"))
+core.registerErrorBuilder("DOMExceptionNetworkError", message => new DOMException.DOMException(message, "NetworkError"))
+
+function importScripts(...urls) {
+    const resolvedUrls = core.ops.op_worker_resolve_script_urls(
+        urls.map(value => webidl.converters.USVString(value))
+    )
+    for (const url of resolvedUrls) {
+        const source = core.ops.op_worker_fetch_script(url)
+        const [, error] = core.evalContext(source, url)
+        if (error) throw error.thrown
+    }
+}
+
+Object.defineProperty(globalThis, "importScripts", {
+    value: importScripts,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 Object.defineProperty(globalThis, "postMessage", {
     value: postMessage,
     enumerable: true,
