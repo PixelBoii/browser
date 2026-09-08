@@ -681,6 +681,16 @@ function withoutAutoRegisterNode(cb) {
     return res
 }
 
+// TODO: Live attribute access and writing dataset values back to the element.
+class DOMStringMap {}
+
+Object.defineProperty(globalThis, "DOMStringMap", {
+    value: DOMStringMap,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class HtmlElement extends BaseNode {
     constructor(tag) {
         super()
@@ -1135,7 +1145,7 @@ class HtmlElement extends BaseNode {
         let data = Object.entries(attributes)
             .filter(([key, value]) => key.startsWith('data-'))
             .map(([key, value]) => [camelize(key.replace('data-', '')).replaceAll('-', ''), value])
-        return Object.fromEntries(data)
+        return Object.setPrototypeOf(Object.fromEntries(data), DOMStringMap.prototype)
     }
 }
 

@@ -2727,7 +2727,13 @@ async fn fetch_link_strings(
             let client = client.clone();
             join_set.spawn(async move {
                 println!("Fetching {}", url);
-                let text = client.get(url.clone()).send().await?.text().await?;
+                let text = if url.scheme() == "data" {
+                    let data = deno_fetch::data_url::DataUrl::process(url.as_str())?;
+                    let (bytes, _) = data.decode_to_vec()?;
+                    String::from_utf8(bytes)?
+                } else {
+                    client.get(url.clone()).send().await?.text().await?
+                };
                 Ok::<_, anyhow::Error>((idx, url, text))
             });
         }
@@ -11890,7 +11896,7 @@ impl Frame {
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(request.body.unwrap_or_default()),
             };
-            let resp = request.send().await?;
+            let resp = request.header("Sec-Fetch-Mode", "navigate").send().await?;
             let url = resp.url().to_string();
             let text = resp.text().await?;
             Ok((text, url))
@@ -12305,13 +12311,19 @@ impl Frame {
         for url in urls {
             let client = client.clone();
             join_set.spawn(async move {
-                let body = client
-                    .get(url.clone())
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .text()
-                    .await?;
+                let body = if url.scheme() == "data" {
+                    let data = deno_fetch::data_url::DataUrl::process(url.as_str())?;
+                    let (bytes, _) = data.decode_to_vec()?;
+                    String::from_utf8(bytes)?
+                } else {
+                    client
+                        .get(url.clone())
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .text()
+                        .await?
+                };
                 Ok::<_, anyhow::Error>((url, body))
             });
         }
@@ -14739,7 +14751,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        // Facebook currently serves an HTTP 400 error page; see NOTES.md.
+        // Facebook currently renders blank with a bootstrap JS error; see NOTES.md.
         ensure_snapshot_matches(&buffer, "facebookcom", 1920, 1080)
     }
 
