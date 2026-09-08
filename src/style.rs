@@ -751,7 +751,9 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         overflow_x: Overflow::Visible,
         overflow_y: Overflow::Visible,
         z_index: StyleZIndex::Auto,
-        pointer_events: StylePointerEvents::Auto,
+        pointer_events: parent_style
+            .map(|style| style.pointer_events.clone())
+            .unwrap_or(StylePointerEvents::Auto),
         opacity: parent_style.map(|v| v.opacity).unwrap_or(1.0),
         visibility: parent_style
             .map(|style| style.visibility)

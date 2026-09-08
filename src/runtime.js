@@ -2303,11 +2303,14 @@ class Document extends EventTarget {
         return this.querySelector("body")
     }
     createElementNS(ns, tag) {
-        const element = this.createElement(tag)
+        tag = String(tag)
+        const elementClass = tagToElement(tag)
+        const element = withDocument(this, () => new elementClass(tag))
         element.namespaceURI = ns
         return element
     }
     createElement(tag, ...args) {
+        tag = String(tag).replace(/[A-Z]/g, char => char.toLowerCase())
         const elementClass = tagToElement(tag)
         const element = withDocument(this, () => new elementClass(tag, ...args))
         return element

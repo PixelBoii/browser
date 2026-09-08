@@ -14214,7 +14214,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pixel/browser/pages/templates.html".to_string(),
+        "https://www.google.com".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
