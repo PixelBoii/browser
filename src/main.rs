@@ -21,7 +21,7 @@ use style::{
 };
 
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Ref, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -1694,6 +1694,7 @@ struct Renderer {
     url: String,
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
+    template_contents: HashMap<usize, usize>,
     node_styles: NodeMap<Style>,
     style_cache: StyleCache,
     selector_changes: SelectorChanges,
@@ -2791,7 +2792,7 @@ fn get_expandable_css_nodes_walk(
                 println!("Got element when expecting CSS text {:?}", element);
                 return;
             }
-            Node::Comment(_) => {
+            Node::Comment(_) | Node::DocumentFragment => {
                 return;
             }
             Node::Text(text) => text,
@@ -5000,6 +5001,18 @@ fn op_create_element(
 }
 
 #[op2(fast)]
+fn op_create_document_fragment(state: &mut OpState) -> u32 {
+    let host = state.borrow::<JsHostState>();
+    host.renderer.borrow_mut().create_document_fragment() as u32
+}
+
+#[op2(fast)]
+fn op_get_template_content(state: &mut OpState, #[number] node_idx: usize) -> u32 {
+    let host = state.borrow::<JsHostState>();
+    host.renderer.borrow().template_content(node_idx) as u32
+}
+
+#[op2(fast)]
 fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result<i32, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -5048,9 +5061,8 @@ fn op_spawn_frame(
     Ok(())
 }
 
-// TODO: Maybe we want to copy the text children no matter what the deep parameter says, but idk
 fn clone_node(
-    renderer: &mut RefMut<'_, Renderer>,
+    renderer: &mut Renderer,
     node_idx: usize,
     new_parent: Option<usize>,
     deep: bool,
@@ -5063,16 +5075,20 @@ fn clone_node(
     node.set_parent(new_parent);
     renderer.push_node(node);
     let new_node_idx = renderer.nodes.cursor;
+    renderer.dom_indexes.add_node(
+        new_node_idx,
+        renderer.nodes.get(new_node_idx).unwrap(),
+        &mut renderer.css_parser.class_definitions,
+    );
     if deep {
-        let old_children = renderer
-            .dom_indexes
-            .children_index
-            .get(&node_idx)
-            .unwrap()
-            .clone();
+        let old_children = renderer.dom_indexes.children_index.get(&node_idx).unwrap().clone();
         for c in old_children {
             clone_node(renderer, c, Some(new_node_idx), true)?;
         }
+    }
+    if let Some(content_idx) = renderer.template_contents.get(&node_idx).copied() {
+        let content_clone = clone_node(renderer, content_idx, None, deep)?;
+        renderer.template_contents.insert(new_node_idx, content_clone);
     }
     Ok(new_node_idx)
 }
@@ -5087,7 +5103,6 @@ fn op_clone_node(
     let mut renderer = host.renderer.borrow_mut();
     let new_node_idx = clone_node(&mut renderer, node_idx, None, deep)
         .or_else(|err| Err(JsErrorBox::generic(err.root_cause().to_string())))?;
-    renderer.recompute_dom_indexes();
     Ok(new_node_idx as u32)
 }
 
@@ -5318,6 +5333,31 @@ fn op_create_comment_element(
     Ok(node_idx as i32)
 }
 
+#[op2(fast)]
+fn op_would_create_cycle(
+    state: &mut OpState,
+    #[number] parent_idx: usize,
+    #[number] node_idx: usize,
+) -> bool {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let mut current = Some(parent_idx);
+    while let Some(idx) = current {
+        if idx == node_idx {
+            return true;
+        }
+        current = match renderer.nodes.get(idx) {
+            // Template contents have no DOM parent, but still belong to a template.
+            Some(Node::DocumentFragment) => renderer.template_contents.iter().find_map(
+                |(template, content)| (*content == idx).then_some(*template),
+            ),
+            Some(node) => node.get_parent(),
+            None => None,
+        };
+    }
+    false
+}
+
 #[op2(reentrant)]
 fn op_append_child<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -5480,7 +5520,7 @@ fn op_get_element_by_id(
         .dom_indexes
         .id_elements
         .get(&id)
-        .and_then(|v| v.minimum());
+        .and_then(|v| v.ones().find(|idx| renderer.node_is_connected(*idx)));
     let node = node_idx.and_then(|idx| Some((idx, renderer.nodes.get(idx).unwrap().clone())));
     Ok(node)
 }
@@ -5708,7 +5748,7 @@ fn op_set_text_content(
             element.comment = text;
             (false, false)
         }
-        Node::Element(_) => {
+        Node::Element(_) | Node::DocumentFragment => {
             let children = renderer
                 .dom_indexes
                 .children_index
@@ -6373,8 +6413,11 @@ extension!(
   browser,
   ops = [
     op_create_element,
+    op_create_document_fragment,
+    op_get_template_content,
     op_create_text_element,
     op_create_comment_element,
+    op_would_create_cycle,
     op_append_child,
     op_remove_child,
     op_get_child_nodes,
@@ -6633,7 +6676,7 @@ fn get_dom_indexes(
         .filter_map(|(idx, node)| node.get_parent().is_none().then_some(idx))
         .filter(|idx| match html_nodes.get(*idx).unwrap() {
             Node::Element(_) | Node::Text(_) => true,
-            Node::Comment(_) => false,
+            Node::Comment(_) | Node::DocumentFragment => false,
         })
         .collect();
     root_indices.sort_unstable();
@@ -6641,7 +6684,7 @@ fn get_dom_indexes(
         .iter()
         .find(|idx| match html_nodes.get(**idx).unwrap() {
             Node::Element(element) => element.tag == "html",
-            Node::Text(_) | Node::Comment(_) => false,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => false,
         })
         .or(root_indices.first())
         .copied()
@@ -6878,6 +6921,7 @@ impl Renderer {
         url: String,
         tokio: Rc<RefCell<tokio::runtime::Runtime>>,
         nodes_table: NodesTable,
+        template_contents: HashMap<usize, usize>,
         window_size: PhysicalSize<u32>,
         font_handler: Rc<FontHandler>,
         network_fetch: Rc<RefCell<NetworkFetch>>,
@@ -6923,6 +6967,7 @@ impl Renderer {
             url,
             nodes_idxs,
             nodes: nodes_table,
+            template_contents,
             node_styles,
             style_cache,
             selector_changes: SelectorChanges::default(),
@@ -7069,6 +7114,9 @@ impl Renderer {
         }
         matches.sort_unstable();
         matches.dedup();
+        if required_parent.is_none() {
+            matches.retain(|idx| self.node_is_connected(*idx));
+        }
         matches
     }
 
@@ -7099,12 +7147,14 @@ impl Renderer {
     }
 
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
+        let node_idx = self.template_contents.get(&node_idx).copied().unwrap_or(node_idx);
         self.remove_children(node_idx);
         self.create_children_from_html(node_idx, html);
         self.schedule_dom_update();
     }
 
     fn create_element(&mut self, tag: String) -> usize {
+        let is_template = tag == "template";
         self.push_node(Node::Element(Element {
             tag,
             attributes: Attributes::new(),
@@ -7116,7 +7166,22 @@ impl Renderer {
             self.nodes.get(node_idx).unwrap(),
             &mut self.css_parser.class_definitions,
         );
+        if is_template {
+            let fragment_idx = self.create_document_fragment();
+            self.template_contents.insert(node_idx, fragment_idx);
+        }
         node_idx
+    }
+
+    fn create_document_fragment(&mut self) -> usize {
+        self.push_node(Node::DocumentFragment);
+        let idx = self.nodes.cursor;
+        self.dom_indexes.children_index.insert(idx, vec![]);
+        idx
+    }
+
+    fn template_content(&self, template_idx: usize) -> usize {
+        self.template_contents[&template_idx]
     }
 
     fn get_elements_by_tag_name(
@@ -7151,6 +7216,8 @@ impl Renderer {
                 .into_iter()
                 .filter(|(idx, _)| has_parent(&self.nodes, *idx, required_parent))
                 .collect();
+        } else {
+            nodes.retain(|(idx, _)| self.node_is_connected(*idx));
         }
         nodes
     }
@@ -7186,6 +7253,8 @@ impl Renderer {
                 .into_iter()
                 .filter(|(idx, _)| has_parent(&self.nodes, *idx, required_parent))
                 .collect();
+        } else {
+            nodes.retain(|(idx, _)| self.node_is_connected(*idx));
         }
         nodes
     }
@@ -7316,10 +7385,17 @@ impl Renderer {
         self.resolved_widths.clear();
     }
 
-    fn replace_document(&mut self, url: String, nodes_table: NodesTable, nodes_idxs: Vec<usize>) {
+    fn replace_document(
+        &mut self,
+        url: String,
+        nodes_table: NodesTable,
+        nodes_idxs: Vec<usize>,
+        template_contents: HashMap<usize, usize>,
+    ) {
         self.url = url;
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
+        self.template_contents = template_contents;
         self.hovering = None;
         self.pending_dom_update = false;
         self.scroll_y.clear();
@@ -7456,14 +7532,14 @@ impl Renderer {
                         defer,
                         is_async,
                     }),
-                    Node::Comment(_) => {
+                    Node::Comment(_) | Node::DocumentFragment => {
                         return None;
                     }
                 };
 
                 text
             }
-            Node::Text(_) | Node::Comment(_) => None,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => None,
         }
     }
 
@@ -8162,6 +8238,7 @@ impl Renderer {
     }
 
     fn get_element_inner_html(&self, node_idx: usize) -> String {
+        let node_idx = self.template_contents.get(&node_idx).copied().unwrap_or(node_idx);
         let mut str = String::new();
         for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
             str += &self.get_element_html(*child_idx);
@@ -8176,7 +8253,7 @@ impl Renderer {
             Node::Text(element) => {
                 str += &element.text;
             }
-            Node::Element(_) => {
+            Node::Element(_) | Node::DocumentFragment => {
                 for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
                     str += &self.get_text_content(*child_idx);
                 }
@@ -8204,9 +8281,7 @@ impl Renderer {
                     str += "\"";
                 }
                 str += ">";
-                for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
-                    str += &self.get_element_html(*child_idx);
-                }
+                str += &self.get_element_inner_html(node_idx);
                 str += "</";
                 str += &element.tag;
                 str += ">";
@@ -8214,6 +8289,7 @@ impl Renderer {
             Node::Comment(element) => {
                 str += &format!("<!--{}-->", element.comment);
             }
+            Node::DocumentFragment => str += &self.get_element_inner_html(node_idx),
         }
         str
     }
@@ -8328,7 +8404,7 @@ impl Renderer {
             Element(String),
         }
         let node_kind = match self.nodes.get(node_idx).unwrap() {
-            Node::Comment(_) => return None,
+            Node::Comment(_) | Node::DocumentFragment => return None,
             Node::Text(text) => LayoutNodeKind::Text(text.text.clone()),
             Node::Element(element) => LayoutNodeKind::Element(element.tag.clone()),
         };
@@ -9995,7 +10071,7 @@ impl Renderer {
 
         let input_value = match &self.nodes.get(node_idx).unwrap() {
             Node::Element(element) => element.attributes.get_str("value"),
-            Node::Text(_) | Node::Comment(_) => None,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => None,
         };
         if immediate_children.len() == 0
             && let Some(input_value) = input_value
@@ -10263,7 +10339,7 @@ impl Renderer {
 
         let input_value = match &self.nodes.get(node_idx).unwrap() {
             Node::Element(element) => element.attributes.get_str("value"),
-            Node::Text(_) | Node::Comment(_) => None,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => None,
         };
         if immediate_children.len() == 0
             && let Some(input_value) = input_value
@@ -11646,6 +11722,9 @@ impl Renderer {
                 .add_node(idx, node, &mut self.css_parser.class_definitions);
             self.insert_node_at_idx(idx, node.clone());
         }
+        for (template, content) in parser.template_contents {
+            self.template_contents.insert(idx_mapping[&template], idx_mapping[&content]);
+        }
     }
 
     pub fn schedule_dom_update(&mut self) {
@@ -11794,6 +11873,7 @@ struct Frame {
 }
 
 struct BootParams {
+    template_contents: HashMap<usize, usize>,
     nodes_idxs: Vec<usize>,
     nodes: NodesTable,
     dom_indexes: DomIndexes,
@@ -12578,9 +12658,12 @@ impl Frame {
             let nodes_table =
                 NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
             let nodes_idxs = sorted_node_idxs(&nodes_table);
-            renderer
-                .borrow_mut()
-                .replace_document(self.url.clone(), nodes_table, nodes_idxs);
+            renderer.borrow_mut().replace_document(
+                self.url.clone(),
+                nodes_table,
+                nodes_idxs,
+                self.html_parser.as_ref().unwrap().template_contents.clone(),
+            );
             *self.executed_scripts.borrow_mut() = ExecutedScripts::new();
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
@@ -12618,7 +12701,12 @@ impl Frame {
         params: BootParams,
         proxy: RendererProxy,
     ) -> Result<()> {
-        self.refresh_renderer(params.nodes, params.dom_indexes, params.nodes_idxs);
+        self.refresh_renderer(
+            params.nodes,
+            params.dom_indexes,
+            params.nodes_idxs,
+            params.template_contents,
+        );
 
         self.renderer
             .as_mut()
@@ -12687,6 +12775,7 @@ impl Frame {
         let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &mut ClassIndexes::new());
         self.detect_html_redirect(&dom_indexes);
         Ok(BootParams {
+            template_contents: self.html_parser.as_ref().unwrap().template_contents.clone(),
             nodes: nodes_table,
             nodes_idxs,
             dom_indexes,
@@ -12939,11 +13028,13 @@ impl Frame {
         nodes_table: NodesTable,
         dom_indexes: DomIndexes,
         nodes_idxs: Vec<usize>,
+        template_contents: HashMap<usize, usize>,
     ) {
         self.renderer = Some(Rc::new(RefCell::new(Renderer::new(
             self.url.clone(),
             self.tokio.as_ref().unwrap().clone(),
             nodes_table,
+            template_contents,
             self.render_size,
             Rc::clone(&self.font_handler),
             Rc::clone(&self.network_fetch),
@@ -14123,7 +14214,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://vite.dev/guide/features".to_string(),
+        "file:///home/pixel/browser/pages/templates.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
@@ -14163,6 +14254,7 @@ fn get_node_text_representation(
             None => format!("Node::Text EMPTY"),
         },
         Node::Comment(element) => format!("Node::Comment \"{}\"", element.comment),
+        Node::DocumentFragment => "Node::DocumentFragment".to_string(),
     };
     label.push_str(&format!(" [idx={}]", node_idx));
     match layout_node_mapping

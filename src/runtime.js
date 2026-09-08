@@ -170,7 +170,7 @@ class BaseNode extends EventTarget {
     }
 
     get isConnected() {
-        return this.__node_idx != null && core.ops.op_get_node(this.__node_idx) != null
+        return this.__node_idx != null && this.getRootNode() === this.ownerDocument
     }
 
     get parentNode() {
@@ -194,12 +194,16 @@ class BaseNode extends EventTarget {
     }
 
     getRootNode() {
-        return globalThis.document
+        let node = this
+        while (node.parentNode) {
+            node = node.parentNode
+        }
+        return node === this.ownerDocument.documentElement ? this.ownerDocument : node
     }
 
     cloneNode(deep = false) {
         let newNodeIdx = core.ops.op_clone_node(this.__node_idx, deep)
-        return elementFromNodeIdx(newNodeIdx)
+        return withDocument(this.ownerDocument, () => elementFromNodeIdx(newNodeIdx))
     }
 
     registerInBackend() {
@@ -230,6 +234,89 @@ class BaseNode extends EventTarget {
 
     isEqualNode(other) {
         return nodesAreEqual(this, other)
+    }
+
+    prepend(...elements) {
+        const firstChild = this.firstChild
+        for (const element of elements) {
+            this.insertBefore(element, firstChild)
+        }
+    }
+
+    appendChild(element) {
+        return this.insertBefore(element, null)
+    }
+
+    get childNodes() {
+        return withDocument(this.ownerDocument, () => core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement))
+    }
+
+    get children() {
+        return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
+    }
+
+    get lastChild() {
+        const child = core.ops.op_get_edge_child(this.__node_idx, true)
+        return child ? nodeToElement(child) : null
+    }
+
+    hasChildNodes() {
+        return this.childNodes.length > 0
+    }
+
+    removeChild(element) {
+        if (!element) {
+            throw new TypeError("Element is not an object")
+        }
+
+        if (element.__node_idx != null) {
+            core.ops.op_remove_child(element.__node_idx)
+        }
+        return element
+    }
+
+    replaceChild(newChild, oldChild) {
+        this.insertBefore(newChild, oldChild)
+        this.removeChild(oldChild)
+        return oldChild
+    }
+
+    insertBefore(newNode, referenceNode) {
+        if (!newNode) {
+            throw new TypeError("insertBefore called without newNode")
+        }
+        if (referenceNode && newNode.__node_idx === referenceNode.__node_idx) {
+            return newNode
+        }
+        if (core.ops.op_would_create_cycle(this.__node_idx, newNode.__node_idx)) {
+            throw new Error("Cannot insert a node into itself or its descendants")
+        }
+        if (newNode.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+            for (const child of newNode.childNodes) {
+                this.insertBefore(child, referenceNode)
+            }
+            return newNode
+        }
+        core.ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
+        return newNode
+    }
+
+    querySelector(selector) {
+        const node = core.ops.op_query_selector(selector, this.__node_idx)
+        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
+    }
+
+    querySelectorAll(selector) {
+        const nodes = core.ops.op_query_selector_all(selector, this.__node_idx)
+        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
+    }
+
+    get textContent() {
+        return core.ops.op_get_text_content(this.__node_idx)
+    }
+
+    set textContent(value) {
+        core.ops.op_set_text_content(this.__node_idx, value);
     }
 
     getElementsByTagName(tag) {
@@ -414,7 +501,18 @@ Object.defineProperty(globalThis, "customElements", {
 })
 
 class DocumentFragment extends BaseNode {
-    // TODO: Backend storage and fragment child/insertion operations.
+    constructor() {
+        super()
+        if (autoRegisterNode) {
+            this.registerInBackend()
+        }
+    }
+
+    registerInBackend() {
+        this.__node_idx = core.ops.op_create_document_fragment()
+        cacheNodeElement(this.__node_idx, this)
+    }
+
     get nodeType() { return Node.DOCUMENT_FRAGMENT_NODE }
     get nodeName() { return "#document-fragment" }
     get nodeValue() { return null }
@@ -736,40 +834,6 @@ class HtmlElement extends BaseNode {
         this.addEventListener('click', cb)
     }
 
-    prepend(...elements) {
-        if (this.__node_idx == null) {
-            throw new Error("Item has not been registered on rust backend yet")
-        }
-
-        for (const element of elements) {
-            if (!element) {
-                throw new TypeError("Element is not an object")
-            }
-
-            // TODO: Optimize this
-            let childNodes = this.childNodes
-            core.ops.op_append_child(this.__node_idx, element.__node_idx, childNodes.length ? childNodes[0].__node_idx : null)
-            return element
-        }
-    }
-
-    appendChild(element) {
-        if (!element) {
-            throw new TypeError("Element is not an object")
-        }
-
-        if (this.__node_idx == null) {
-            throw new Error("Item has not been registered on rust backend yet")
-        }
-
-        core.ops.op_append_child(this.__node_idx, element.__node_idx)
-        return element
-    }
-
-    get childNodes() {
-        return core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement)
-    }
-
     get attributes() {
         const attributeEntries = Object.entries(core.ops.op_get_attributes(this.__node_idx))
         const attributes = attributeEntries.map(([name, value]) => ({
@@ -794,10 +858,6 @@ class HtmlElement extends BaseNode {
         return Object.keys(core.ops.op_get_attributes(this.__node_idx))
     }
 
-    get children() {
-        return this.childNodes.filter(node => node.nodeType === Node.ELEMENT_NODE)
-    }
-
     getElementsByClassName(classNames) {
         const nodes = core.ops.op_get_elements_by_class_name(
             String(classNames),
@@ -805,43 +865,6 @@ class HtmlElement extends BaseNode {
             this.ownerDocument.__frameId,
         )
         return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
-    }
-
-    get lastChild() {
-        const child = core.ops.op_get_edge_child(this.__node_idx, true)
-        return child ? nodeToElement(child) : null
-    }
-
-    hasChildNodes() {
-        return this.childNodes.length > 0
-    }
-
-    removeChild(element) {
-        if (!element) {
-            throw new TypeError("Element is not an object")
-        }
-
-        if (element.__node_idx != null) {
-            core.ops.op_remove_child(element.__node_idx)
-        }
-        return element
-    }
-
-    replaceChild(newChild, oldChild) {
-        this.insertBefore(newChild, oldChild)
-        this.removeChild(oldChild)
-        return oldChild
-    }
-
-    insertBefore(newNode, referenceNode) {
-        if (!newNode) {
-            throw new TypeError("insertBefore called without newNode")
-        }
-        if (referenceNode && newNode.__node_idx === referenceNode.__node_idx) {
-            return newNode
-        }
-        core.ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
-        return newNode
     }
 
     getAttribute(attr) {
@@ -884,16 +907,6 @@ class HtmlElement extends BaseNode {
 
     getComputedStyle() {
         return getComputedStyle(this)
-    }
-
-    querySelector(selector) {
-        const node = core.ops.op_query_selector(selector, this.__node_idx)
-        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
-    }
-
-    querySelectorAll(selector) {
-        const nodes = core.ops.op_query_selector_all(selector, this.__node_idx)
-        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
     }
 
     closest(selector) {
@@ -943,14 +956,6 @@ class HtmlElement extends BaseNode {
 
     set innerHTML(value) {
         core.ops.op_set_inner_html(this.__node_idx, value, this.ownerDocument.__frameId);
-    }
-
-    get textContent() {
-        return core.ops.op_get_text_content(this.__node_idx)
-    }
-
-    set textContent(value) {
-        core.ops.op_set_text_content(this.__node_idx, value);
     }
 
     get classList() {
@@ -1985,9 +1990,8 @@ Object.defineProperty(globalThis, "HTMLImageElement", {
 })
 
 class HTMLTemplateElement extends HtmlElement {
-    // TODO: Actually return a fragment of children here
     get content() {
-        return this
+        return withDocument(this.ownerDocument, () => elementFromNodeIdx(core.ops.op_get_template_content(this.__node_idx)))
     }
 }
 
@@ -2138,6 +2142,8 @@ function nodeToElement(pair) {
     if (node.kind === "element") {
         const elementClass = tagToElement(node.tag)
         element = withoutAutoRegisterNode(() => new elementClass(node.tag))
+    } else if (node.kind === "fragment") {
+        element = withoutAutoRegisterNode(() => new DocumentFragment())
     } else if (node.kind === "comment") {
         element = withoutAutoRegisterNode(() => new CommentNode(node.comment))
     } else if (node.kind === "text") {
@@ -2352,6 +2358,13 @@ class Document extends EventTarget {
     createTextNode(text) {
         const element = new TextNode(text)
         return element
+    }
+    importNode(node, deep = false) {
+        // TODO: Copy nodes between document backends.
+        if (node.ownerDocument !== this) {
+            throw new Error("Cross-document importNode is not implemented")
+        }
+        return node.cloneNode(deep)
     }
     createDocumentFragment() {
         return withDocument(this, () => new DocumentFragment())

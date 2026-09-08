@@ -101,6 +101,7 @@ pub enum Node {
     Element(Element),
     Text(TextElement),
     Comment(CommentElement),
+    DocumentFragment,
 }
 
 impl Node {
@@ -109,6 +110,7 @@ impl Node {
             Node::Element(element) => element.parent,
             Node::Text(element) => element.parent,
             Node::Comment(element) => element.parent,
+            Node::DocumentFragment => None,
         }
     }
 
@@ -117,6 +119,7 @@ impl Node {
             Node::Element(element) => element.parent = parent,
             Node::Text(element) => element.parent = parent,
             Node::Comment(element) => element.parent = parent,
+            Node::DocumentFragment => {}
         }
     }
 }
@@ -206,6 +209,11 @@ impl<'a> ToV8<'a> for Node {
             Node::Element(element) => element.to_v8(scope),
             Node::Text(element) => element.to_v8(scope),
             Node::Comment(element) => element.to_v8(scope),
+            Node::DocumentFragment => {
+                let object = v8::Object::new(scope);
+                set_object_prop(scope, object, "kind", "fragment");
+                Ok(object.into())
+            }
         }
     }
 }
@@ -232,6 +240,7 @@ pub struct HtmlParser {
     value: String,
     attribute_quote: Option<char>,
     pub nodes: Vec<Node>,
+    pub template_contents: HashMap<usize, usize>,
     node: Option<usize>,
 }
 
@@ -308,6 +317,7 @@ impl HtmlParser {
             attribute_quote: None,
             stage: BuildPhase::Start,
             nodes: vec![],
+            template_contents: HashMap::new(),
             node: None,
         }
     }
@@ -346,20 +356,45 @@ impl HtmlParser {
     }
 
     fn create_node_from_state(&mut self) -> anyhow::Result<bool> {
+        let parent = self.insertion_parent();
         let node = match self.stage {
             BuildPhase::Text => Node::Text(TextElement {
                 text: decode_html_entities(&self.tag),
-                parent: self.node.clone(),
+                parent,
             }),
             _ => Node::Element(Element {
                 tag: self.tag.trim().to_string(),
                 attributes: Attributes::new(),
-                parent: self.node.clone(),
+                parent,
             }),
         };
-        self.node = Some(self.nodes.len());
+        let node_idx = self.nodes.len();
+        let is_template = matches!(&node, Node::Element(element) if element.tag == "template");
+        self.node = Some(node_idx);
         self.nodes.push(node);
+        if is_template {
+            self.template_contents.insert(node_idx, self.nodes.len());
+            self.nodes.push(Node::DocumentFragment);
+        }
         Ok(true)
+    }
+
+    fn insertion_parent(&self) -> Option<usize> {
+        self.node.map(|idx| self.template_contents.get(&idx).copied().unwrap_or(idx))
+    }
+
+    fn close_node(&mut self) -> Result<()> {
+        let parent = self.curr_node()?.get_parent();
+        // Fragments are DOM parents; the parser resumes at their owning template.
+        self.node = match parent {
+            Some(idx) if matches!(self.nodes[idx], Node::DocumentFragment) => {
+                self.template_contents.iter().find_map(|(template, fragment)| {
+                    (*fragment == idx).then_some(*template)
+                })
+            }
+            _ => parent,
+        };
+        Ok(())
     }
 
     fn create_comment_from_state(&mut self) -> anyhow::Result<bool> {
@@ -368,23 +403,15 @@ impl HtmlParser {
         comment = comment.strip_suffix("--").unwrap_or(&comment).to_string();
         let node = Node::Comment(CommentElement {
             comment,
-            parent: self.node.clone(),
+            parent: self.insertion_parent(),
         });
         self.nodes.push(node);
         Ok(true)
     }
 
     fn self_close_if_appropiate(&mut self) {
-        let curr_node = self.curr_node();
-        if let Ok(curr) = curr_node {
-            match curr {
-                Node::Element(element) => {
-                    if SELF_CLOSING_TAGS.contains(&element.tag.as_str()) {
-                        self.node = curr.get_parent();
-                    }
-                }
-                _ => {}
-            }
+        if matches!(self.curr_node(), Ok(Node::Element(element)) if SELF_CLOSING_TAGS.contains(&element.tag.as_str())) {
+            let _ = self.close_node();
         }
     }
 
@@ -414,10 +441,8 @@ impl HtmlParser {
                         .to_string();
                     self.create_node_from_state()?;
                     // Go up the tree twice, first up from the text, then up from the raw-text tag.
-                    let curr_node = self.curr_node()?;
-                    self.node = curr_node.get_parent();
-                    let curr_node = self.curr_node()?;
-                    self.node = curr_node.get_parent();
+                    self.close_node()?;
+                    self.close_node()?;
                     self.tag = "".to_string();
                     self.stage = BuildPhase::Start;
                 }
@@ -444,8 +469,7 @@ impl HtmlParser {
                     }
                     BuildPhase::Text => {
                         self.create_node_from_state()?;
-                        let curr_node = self.curr_node()?;
-                        self.node = curr_node.get_parent();
+                        self.close_node()?;
                         self.stage = BuildPhase::Tag;
                         self.tag = "".to_string();
                     }
@@ -487,8 +511,7 @@ impl HtmlParser {
                         let trimmed = self.tag.trim();
                         // If self closing tags include this tag, it's already been closed, so avoid closing it again
                         if !SELF_CLOSING_TAGS.contains(&trimmed) {
-                            let curr_node = self.curr_node()?;
-                            self.node = curr_node.get_parent();
+                            self.close_node()?;
                         }
                         self.stage = BuildPhase::Start;
                         self.tag = "".to_string();
