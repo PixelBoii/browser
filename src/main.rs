@@ -5784,6 +5784,31 @@ fn op_get_child_nodes(
 }
 
 #[op2]
+fn op_get_descendant_nodes(
+    state: &mut OpState,
+    #[number] node_idx: Option<usize>,
+) -> Vec<(usize, Node)> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let mut pending = match node_idx {
+        Some(idx) => match renderer.dom_indexes.children_index.get(&idx) {
+            Some(children) => children.iter().rev().copied().collect(),
+            None => Vec::new(),
+        },
+        // Document has no backend node; its descendants start at the HTML root.
+        None => vec![renderer.dom_indexes.root_indice],
+    };
+    let mut nodes = Vec::new();
+    while let Some(idx) = pending.pop() {
+        nodes.push((idx, renderer.nodes.get(idx).unwrap().clone()));
+        if let Some(children) = renderer.dom_indexes.children_index.get(&idx) {
+            pending.extend(children.iter().rev().copied());
+        }
+    }
+    nodes
+}
+
+#[op2]
 fn op_get_next_sibling(state: &mut OpState, #[number] node_idx: usize) -> Option<(usize, Node)> {
     let host = state.borrow::<JsHostState>();
     let renderer = host.renderer.borrow();
@@ -6347,6 +6372,7 @@ extension!(
     op_append_child,
     op_remove_child,
     op_get_child_nodes,
+    op_get_descendant_nodes,
     op_get_next_sibling,
     op_get_edge_child,
     op_get_parent_node,
@@ -14679,6 +14705,24 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
+    }
+
+    #[test]
+    fn render_youtube() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "https://www.youtube.com/".to_string(),
+            false,
+            PhysicalSize::new(1920, 1080),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.run_js()?;
+        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
+        // The current baseline is blank because app startup fails; see NOTES.md.
+        ensure_snapshot_matches(&buffer, "youtubecom", 1920, 1080)
     }
 
     #[test]

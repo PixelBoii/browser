@@ -358,6 +358,69 @@ Object.defineProperty(globalThis, "Node", {
     writable: true,
 })
 
+const NodeFilter = {
+    FILTER_ACCEPT: 1,
+    FILTER_REJECT: 2,
+    FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF,
+    SHOW_ELEMENT: 0x1,
+    SHOW_ATTRIBUTE: 0x2,
+    SHOW_TEXT: 0x4,
+    SHOW_CDATA_SECTION: 0x8,
+    SHOW_ENTITY_REFERENCE: 0x10,
+    SHOW_ENTITY: 0x20,
+    SHOW_PROCESSING_INSTRUCTION: 0x40,
+    SHOW_COMMENT: 0x80,
+    SHOW_DOCUMENT: 0x100,
+    SHOW_DOCUMENT_TYPE: 0x200,
+    SHOW_DOCUMENT_FRAGMENT: 0x400,
+    SHOW_NOTATION: 0x800,
+}
+
+Object.defineProperty(globalThis, "NodeFilter", {
+    value: NodeFilter,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class DocumentFragment extends BaseNode {
+    // TODO: Backend storage and fragment child/insertion operations.
+    get nodeType() { return Node.DOCUMENT_FRAGMENT_NODE }
+    get nodeName() { return "#document-fragment" }
+    get nodeValue() { return null }
+}
+
+Object.defineProperty(globalThis, "DocumentFragment", {
+    value: DocumentFragment,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class TreeWalker {
+    constructor(root) {
+        this.root = root
+        this.currentNode = root
+        // TODO: Filtering, live DOM changes, and repositioning currentNode.
+        this.nodes = core.ops.op_get_descendant_nodes(root.__node_idx ?? null).map(nodeToElement)
+        this.index = 0
+    }
+
+    nextNode() {
+        if (this.index === this.nodes.length) return null
+        this.currentNode = this.nodes[this.index++]
+        return this.currentNode
+    }
+}
+
+Object.defineProperty(globalThis, "TreeWalker", {
+    value: TreeWalker,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class TextNode extends BaseNode {
     constructor(text) {
         super()
@@ -393,6 +456,37 @@ class TextNode extends BaseNode {
 
 Object.defineProperty(globalThis, "Text", {
     value: TextNode,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class CDATASection extends TextNode {
+    constructor() {
+        throw new TypeError("CDATASection construction is not implemented")
+    }
+
+    get nodeType() { return 4 }
+}
+
+Object.defineProperty(globalThis, "CDATASection", {
+    value: CDATASection,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+// TODO: CharacterData inheritance once that interface is implemented.
+class ProcessingInstruction extends BaseNode {
+    constructor() {
+        throw new TypeError("ProcessingInstruction construction is not implemented")
+    }
+
+    get nodeType() { return 7 }
+}
+
+Object.defineProperty(globalThis, "ProcessingInstruction", {
+    value: ProcessingInstruction,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -2174,7 +2268,10 @@ class Document extends EventTarget {
         return element
     }
     createDocumentFragment() {
-        return this.createElement("fragment")
+        return withDocument(this, () => new DocumentFragment())
+    }
+    createTreeWalker(root) {
+        return new TreeWalker(root)
     }
     hasFocus() {
         return true
