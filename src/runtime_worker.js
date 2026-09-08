@@ -501,16 +501,46 @@ Object.defineProperty(globalThis, "structuredClone", {
     writable: true,
 })
 
-class Worker {
-    constructor(scriptURL) {
-        this.scriptURL = scriptURL
-        core.ops.op_spawn_worker(scriptURL)
+// The worker global scope is an EventTarget so scripts can use both
+// `self.onmessage = ...` and `self.addEventListener("message", ...)`.
+Object.setPrototypeOf(globalThis, globalInterfaces.DedicatedWorkerGlobalScope.prototype)
+globalThis[webidl.brand] = webidl.brand
+denoEvent.setEventTargetData(globalThis)
+denoEvent.defineEventHandler(globalThis, "message")
+
+function postMessage(message) {
+    core.ops.op_worker_post_message(core.serialize(message))
+}
+
+Object.defineProperty(globalThis, "postMessage", {
+    value: postMessage,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+// Deliver parent messages one at a time. Rust starts this loop once the worker script has run, so
+// early messages wait in the channel until the script has registered its handlers. The pending op
+// keeps an idle worker alive until the parent drops its end of the channel, at which point the loop
+// ends and the worker can exit.
+async function startWorkerMessageLoop() {
+    while (true) {
+        let serializedMessage
+        try {
+            serializedMessage = await core.ops.op_worker_receive_message()
+        } catch {
+            clearAllTimers()
+            break
+        }
+        const event = new denoEvent.MessageEvent("message")
+        event.data = core.deserialize(serializedMessage)
+        globalThis.dispatchEvent(event)
     }
 }
 
-Object.defineProperty(globalThis, "Worker", {
-    value: Worker,
-    enumerable: true,
+Object.defineProperty(globalThis, "__startWorkerMessageLoop", {
+    value: startWorkerMessageLoop,
+    enumerable: false,
     configurable: true,
     writable: true,
 })

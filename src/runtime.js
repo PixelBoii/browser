@@ -3527,12 +3527,44 @@ Object.defineProperty(globalThis, "structuredClone", {
     writable: true,
 })
 
-class Worker {
+function serializeWorkerMessage(message) {
+    return core.serialize(message)
+}
+
+const __workers = new Map()
+
+class Worker extends denoEvent.EventTarget {
     constructor(scriptURL) {
-        this.scriptURL = scriptURL
-        core.ops.op_spawn_worker(scriptURL)
+        super()
+        this.scriptURL = String(scriptURL)
+        this.__worker_id = core.ops.op_spawn_worker(this.scriptURL)
+        __workers.set(this.__worker_id, this)
+    }
+
+    postMessage(message) {
+        core.ops.op_post_message_to_worker(this.__worker_id, serializeWorkerMessage(message))
     }
 }
+
+denoEvent.defineEventHandler(Worker.prototype, "message")
+
+// Called from Rust when a worker posts a message back to this document.
+function __dispatchWorkerMessage(workerId, serializedMessage) {
+    const worker = __workers.get(workerId)
+    if (!worker) {
+        return
+    }
+    const event = new denoEvent.MessageEvent("message")
+    event.data = core.deserialize(new Uint8Array(serializedMessage))
+    worker.dispatchEvent(event)
+}
+
+Object.defineProperty(globalThis, "__dispatchWorkerMessage", {
+    value: __dispatchWorkerMessage,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+})
 
 Object.defineProperty(globalThis, "Worker", {
     value: Worker,

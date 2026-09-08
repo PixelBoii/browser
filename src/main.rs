@@ -1735,7 +1735,8 @@ struct Renderer {
     hovering_impact: HashSet<usize>,
     frames: HashMap<usize, FrameHandle>,
     css_parser: CssParser,
-    workers: HashMap<String, WorkerHandle>,
+    workers: HashMap<usize, WorkerHandle>,
+    next_worker_id: usize,
     tracking_intersection: Vec<usize>,
     nodes_intersecting: HashSet<usize>,
     blob_store: Arc<BlobStore>,
@@ -1743,7 +1744,16 @@ struct Renderer {
 }
 
 #[derive(Debug, Clone)]
-struct WorkerHandle {}
+struct WorkerHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+// Op state for a dedicated worker runtime. Messages contain Deno-serialized data.
+struct WorkerHostState {
+    worker_id: usize,
+    proxy: RendererProxy,
+    rx: Rc<RefCell<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
+}
 
 #[derive(Debug, Clone)]
 struct FlexItem {
@@ -4893,6 +4903,7 @@ enum UserEvent {
     TabUrlUpdated { tab_idx: usize, url: String },
     ChildMessage(String),
     ParentMessage(String),
+    WorkerMessage { worker_id: usize, message: Vec<u8> },
     Hover(Position),
     Click,
     Keyup(KeyEvent),
@@ -6341,13 +6352,53 @@ fn op_untrack_intersection(
 }
 
 #[op2(fast)]
-fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<(), JsErrorBox> {
+fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<u32, JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
-    renderer
+    let worker_id = renderer
         .spawn_worker(src)
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn worker: {err}")))?;
+    Ok(worker_id as u32)
+}
+
+#[op2(fast)]
+fn op_post_message_to_worker(
+    state: &mut OpState,
+    #[number] worker_id: usize,
+    #[buffer] message: &[u8],
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow_mut::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let Some(worker) = renderer.workers.get(&worker_id) else {
+        return Err(JsErrorBox::generic("Failed to get worker by idx"));
+    };
+    // A worker whose thread has exited simply drops the message.
+    let _ = worker.tx.send(message.to_vec());
     Ok(())
+}
+
+#[op2(fast)]
+fn op_worker_post_message(
+    state: &mut OpState,
+    #[buffer] message: &[u8],
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<WorkerHostState>();
+    host.proxy
+        .fire_user_event(UserEvent::WorkerMessage {
+            worker_id: host.worker_id,
+            message: message.to_vec(),
+        })
+        .map_err(|err| JsErrorBox::generic(format!("Failed to post worker message: {err}")))?;
+    Ok(())
+}
+
+// Resolves with the next message posted by the parent, or fails once the parent is gone.
+#[op2]
+#[buffer]
+async fn op_worker_receive_message(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, JsErrorBox> {
+    let rx = state.borrow().borrow::<WorkerHostState>().rx.clone();
+    let message = rx.borrow_mut().recv().await;
+    message.ok_or_else(|| JsErrorBox::generic("Worker message channel closed"))
 }
 
 // This should walk the tree to be fully correct I think
@@ -6398,14 +6449,20 @@ extension!(
   browser_worker,
   ops = [
     op_tls_peer_certificate,
+    op_worker_post_message,
+    op_worker_receive_message,
   ],
   esm_entry_point = "ext:browser_worker/runtime_worker.js",
   esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js"],
-  state = |state| {
+  options = {
+    host: WorkerHostState,
+  },
+  state = |state, options| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,
     ));
     state.put(deno_permissions::PermissionsContainer::allow_all(parser));
+    state.put(options.host);
   },
 );
 
@@ -6461,6 +6518,7 @@ extension!(
     op_clone_node,
     op_spawn_frame,
     op_spawn_worker,
+    op_post_message_to_worker,
     op_track_intersection,
     op_untrack_intersection,
     op_request_animation_frame,
@@ -7008,6 +7066,7 @@ impl Renderer {
             frames: HashMap::new(),
             css_parser,
             workers: HashMap::new(),
+            next_worker_id: 0,
             tracking_intersection: vec![],
             nodes_intersecting: HashSet::new(),
             blob_store,
@@ -7392,6 +7451,7 @@ impl Renderer {
         nodes_idxs: Vec<usize>,
         template_contents: HashMap<usize, usize>,
     ) {
+        self.workers.clear();
         self.url = url;
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
@@ -7948,18 +8008,36 @@ impl Renderer {
         }
     }
 
-    fn spawn_worker(&mut self, src: &str) -> Result<()> {
-        let handle = WorkerHandle {};
+    fn spawn_worker(&mut self, src: &str) -> Result<usize> {
+        let worker_id = self.next_worker_id;
+        self.next_worker_id += 1;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = self
+            .event_loop_proxy
+            .clone()
+            .context("Renderer event loop proxy is not configured")?;
         let url = self.url.clone();
         let inner_src = src.to_string();
         let network = NetworkFetch::new();
         std::thread::spawn(move || {
             let blob_store = Arc::new(BlobStore::default());
             let broadcast_channel = InMemoryBroadcastChannel::default();
+            let host = WorkerHostState {
+                worker_id,
+                proxy,
+                rx: Rc::new(RefCell::new(rx)),
+            };
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime in worker thread");
+            // Async ops (such as the message receive loop) spawn tasks as soon as they are called,
+            // so the runtime context must be active while scripts run, not only inside block_on.
+            let _guard = tokio.enter();
             let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
                 module_loader: Some(Rc::new(HttpModuleLoader::new(network.client.clone()))),
                 extensions: vec![
-                    browser_worker::init(),
+                    browser_worker::init(host),
                     deno_webidl::deno_webidl::init(),
                     deno_web::deno_web::init(blob_store, None, broadcast_channel),
                     deno_net::deno_net::init(None, None),
@@ -7969,10 +8047,6 @@ impl Renderer {
                 ],
                 ..Default::default()
             });
-            let tokio = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime in worker thread");
             let Ok(base) = ReqwestUrl::parse(&url) else {
                 return;
             };
@@ -8002,16 +8076,19 @@ impl Renderer {
                     return;
                 }
             };
+            if let Err(err) =
+                runtime.execute_script("<worker-messaging>", "__startWorkerMessageLoop()")
+            {
+                eprintln!("Failed to start worker message loop: {}", err);
+                return;
+            }
             let future = runtime.run_event_loop(Default::default());
             let _ = tokio.block_on(future).inspect_err(|err| {
                 eprintln!("Failed to run worker thread: {}", err);
             });
         });
-        if self.workers.contains_key(src) {
-            // TODO: Should kill the thread here
-        }
-        self.workers.insert(src.to_string(), handle);
-        Ok(())
+        self.workers.insert(worker_id, WorkerHandle { tx });
+        Ok(worker_id)
     }
 
     fn build_layout(&mut self, width: u32, height: u32) -> Vec<usize> {
@@ -12032,6 +12109,16 @@ impl Frame {
         Ok(value)
     }
 
+    fn dispatch_worker_message(&mut self, worker_id: usize, message: &[u8]) {
+        let code = format!(
+            "__dispatchWorkerMessage({worker_id}, {})",
+            deno_core::serde_json::to_string(message).unwrap()
+        );
+        if let Err(err) = self.execute_host_script("worker message handler", code) {
+            eprintln!("Failed to dispatch worker message: {err}");
+        }
+    }
+
     fn dispatch_dom_content_loaded_once(&mut self) -> Result<()> {
         if self.dom_content_loaded_dispatched {
             return Ok(());
@@ -12210,6 +12297,9 @@ impl Frame {
                 );
                 self.execute_host_script("parent message handler", code)
                     .unwrap();
+            }
+            FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
+                self.dispatch_worker_message(worker_id, &message);
             }
             FrameCommand::Dom(FrameDomCommand::QuerySelector {
                 selector,
@@ -13464,6 +13554,9 @@ impl Frame {
                 );
                 self.execute_host_script("child message handler", code)
                     .unwrap();
+            }
+            FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
+                self.dispatch_worker_message(worker_id, &message);
             }
             FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
                 if let Err(err) = self.perform_navigation(href, reload) {
