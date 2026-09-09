@@ -13348,8 +13348,10 @@ impl Frame {
             navigator.userAgent = "{}";
 
             window.__init_location("{}");
+            window.innerWidth = {};
+            window.innerHeight = {};
         "#,
-                USER_AGENT, self.url
+                USER_AGENT, self.url, self.render_size.width, self.render_size.height
             )
             .to_string(),
         );
