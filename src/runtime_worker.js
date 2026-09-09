@@ -590,5 +590,4 @@ Object.defineProperty(globalThis, "__startWorkerMessageLoop", {
     writable: true,
 })
 
-globalThis.window = globalThis
 globalThis.self = globalThis
