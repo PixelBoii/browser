@@ -606,6 +606,12 @@ Object.defineProperty(globalThis, "ProcessingInstruction", {
 
 const { Event } = denoEvent
 
+Object.defineProperty(globalThis, "ErrorEvent", {
+    value: denoEvent.ErrorEvent,
+    configurable: true,
+    writable: true,
+})
+
 Object.defineProperty(globalThis, "Event", {
     value: Event,
     enumerable: true,
