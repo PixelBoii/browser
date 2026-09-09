@@ -749,6 +749,10 @@ class HtmlElement extends BaseNode {
         }))
     }
 
+    get localName() {
+        return this.tag
+    }
+
     get attributes() {
         const attributeEntries = Object.entries(core.ops.op_get_attributes(this.__node_idx))
         const attributes = attributeEntries.map(([name, value]) => ({
@@ -771,6 +775,10 @@ class HtmlElement extends BaseNode {
 
     getAttributeNames() {
         return Object.keys(core.ops.op_get_attributes(this.__node_idx))
+    }
+
+    hasAttributes() {
+        return this.getAttributeNames().length > 0
     }
 
     getElementsByClassName(classNames) {
