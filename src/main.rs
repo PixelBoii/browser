@@ -9232,11 +9232,21 @@ impl Renderer {
         }));
         let bitmap_for_thread = Arc::clone(&latest_bitmap);
         let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
+        let window_name = self
+            .nodes
+            .get(node_idx)
+            .and_then(|node| match node {
+                Node::Element(element) => element.attributes.get_str("name"),
+                _ => None,
+            })
+            .map(Cow::into_owned)
+            .unwrap_or_default();
         tx.send(FrameCommand::Render).unwrap();
         let tx_proxy = RendererProxy::FrameLoop(tx.clone());
         std::thread::spawn(move || {
             let mut frame = Frame::new(frame_url.to_string(), false, size);
             frame.is_top = false;
+            frame.window_name = window_name;
 
             let frame_result = frame.open();
             match frame_result {
@@ -12244,6 +12254,7 @@ struct Frame {
     dom_content_loaded_dispatched: bool,
     load_dispatched: bool,
     is_top: bool,
+    window_name: String,
     hover_debugging: bool,
     render_size: PhysicalSize<u32>,
     loaded_nodes: HashSet<usize>,
@@ -12305,6 +12316,7 @@ impl Frame {
             dom_content_loaded_dispatched: false,
             load_dispatched: false,
             is_top: true,
+            window_name: String::new(),
             hover_debugging,
             render_size,
             loaded_nodes: HashSet::new(),
@@ -13411,10 +13423,15 @@ impl Frame {
             navigator.userAgent = "{}";
 
             window.__init_location("{}");
+            window.name = {};
             window.innerWidth = {};
             window.innerHeight = {};
         "#,
-                USER_AGENT, self.url, self.render_size.width, self.render_size.height
+                USER_AGENT,
+                self.url,
+                js_string_literal(&self.window_name),
+                self.render_size.width,
+                self.render_size.height
             )
             .to_string(),
         );
