@@ -1537,6 +1537,10 @@ class HTMLFormElement extends HtmlElement {
     constructor() {
         super("form")
     }
+
+    submit() {
+        core.ops.op_submit_form(this.__node_idx)
+    }
 }
 
 class HTMLMediaElement extends HtmlElement {

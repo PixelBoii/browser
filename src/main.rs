@@ -6510,6 +6510,19 @@ fn op_collect_data_for_form(
 }
 
 #[op2(fast)]
+fn op_submit_form(
+    state: &mut OpState,
+    #[number] form_node_idx: usize,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let result = host
+        .renderer
+        .borrow_mut()
+        .submit_form(form_node_idx, None);
+    result.map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
+}
+
+#[op2(fast)]
 fn op_track_intersection(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -6761,6 +6774,7 @@ extension!(
     op_post_message_to_frame,
     op_get_offset_y,
     op_collect_data_for_form,
+    op_submit_form,
     op_clone_node,
     op_spawn_frame,
     op_spawn_worker,
