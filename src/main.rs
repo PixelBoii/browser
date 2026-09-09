@@ -1357,6 +1357,9 @@ impl Animation {
 
 #[derive(Debug)]
 enum FrameDomCommand {
+    GetDocumentElement {
+        reply: std::sync::mpsc::Sender<Option<(usize, Node)>>,
+    },
     QuerySelector {
         selector: String,
         required_parent: Option<usize>,
@@ -5677,6 +5680,22 @@ fn op_get_node(
 }
 
 #[op2]
+fn op_get_document_element(
+    state: &mut OpState,
+    #[number] frame_id: Option<usize>,
+) -> Result<Option<(usize, Node)>, JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::GetDocumentElement { reply })
+        })
+    } else {
+        Ok(renderer.document_element())
+    }
+}
+
+#[op2]
 fn op_get_element_by_id(
     state: &mut OpState,
     #[string] id: String,
@@ -6821,6 +6840,7 @@ extension!(
     op_get_next_sibling,
     op_get_edge_child,
     op_get_parent_node,
+    op_get_document_element,
     op_get_element_by_id,
     op_get_elements_by_tag_name,
     op_get_elements_by_name,
@@ -7555,6 +7575,14 @@ impl Renderer {
             .map(|idx| (idx, self.nodes.get(idx).unwrap().clone()))
             .collect();
         owned
+    }
+
+    fn document_element(&self) -> Option<(usize, Node)> {
+        let idx = self.dom_indexes.root_indice;
+        self.nodes
+            .get(idx)
+            .filter(|node| matches!(node, Node::Element(_)))
+            .map(|node| (idx, node.clone()))
     }
 
     fn query_selector_node(
@@ -12733,6 +12761,10 @@ impl Frame {
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
                 self.dispatch_worker_message(worker_id, message);
+            }
+            FrameCommand::Dom(FrameDomCommand::GetDocumentElement { reply }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let _ = reply.send(renderer.document_element());
             }
             FrameCommand::Dom(FrameDomCommand::QuerySelector {
                 selector,

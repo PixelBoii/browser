@@ -2331,7 +2331,8 @@ class Document extends EventTarget {
         }
     }
     get documentElement() {
-        return this.querySelector("html")
+        const node = core.ops.op_get_document_element(this.__frameId)
+        return withDocument(this, () => node ? nodeToElement(node) : null)
     }
     get head() {
         return this.querySelector("head")
