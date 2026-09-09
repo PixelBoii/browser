@@ -1589,6 +1589,18 @@ class HTMLMediaElement extends HtmlElement {
     }
 }
 
+class HTMLAnchorElement extends HtmlElement {
+    constructor() {
+        super("a")
+    }
+}
+
+Object.defineProperty(globalThis, "HTMLAnchorElement", {
+    value: HTMLAnchorElement,
+    configurable: true,
+    writable: true,
+})
+
 class HTMLBodyElement extends HtmlElement {
     constructor() {
         super("body")
@@ -2214,7 +2226,9 @@ Object.defineProperty(globalThis, "SVGElement", {
 })
 
 function tagToElement(tag) {
-    return tag === "body" ?
+    return tag === "a" ?
+        HTMLAnchorElement :
+        tag === "body" ?
         HTMLBodyElement :
         tag === "svg" ?
         SVGElement :
