@@ -2271,6 +2271,9 @@ class Document extends EventTarget {
     get nodeType() {
         return Node.DOCUMENT_NODE
     }
+    contains(node) {
+        return node?.getRootNode() === this
+    }
     get hidden() {
         return false
     }
