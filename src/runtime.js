@@ -3299,7 +3299,7 @@ Object.defineProperty(globalThis, "top", {
 })
 
 function postMessage(message) {
-    globalThis.dispatchEvent(new denoEvent.MessageEvent("message", { data: message }))
+    globalThis.dispatchEvent(new denoEvent.MessageEvent("message", { data: message, source: globalThis }))
 }
 
 Object.defineProperty(globalThis, "postMessage", {
