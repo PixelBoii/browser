@@ -9165,6 +9165,10 @@ impl Renderer {
         size: PhysicalSize<u32>,
         node_idx: usize,
     ) -> Result<FrameHandle> {
+        let frame_url = match url.as_deref().filter(|url| !url.is_empty()) {
+            Some(url) => ReqwestUrl::parse(&self.url)?.join(url)?,
+            None => ReqwestUrl::parse("about:blank")?,
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
         let bitmap_for_thread = Arc::clone(&latest_bitmap);
@@ -9172,11 +9176,7 @@ impl Renderer {
         tx.send(FrameCommand::Render).unwrap();
         let tx_proxy = RendererProxy::FrameLoop(tx.clone());
         std::thread::spawn(move || {
-            let mut frame = Frame::new(
-                url.clone().unwrap_or("about:blank".to_string()),
-                false,
-                size,
-            );
+            let mut frame = Frame::new(frame_url.to_string(), false, size);
             frame.is_top = false;
 
             let frame_result = frame.open();
