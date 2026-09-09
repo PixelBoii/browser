@@ -8923,7 +8923,7 @@ impl Renderer {
                         &self.window_size,
                         &SizeUnit::Px,
                     )
-                    .map(|height| height as u32)
+                    .map(|height| height.max(0) as u32)
                     .unwrap_or(
                         container_size
                             .container_height_non_filling
@@ -8937,7 +8937,7 @@ impl Renderer {
                         &self.window_size,
                         &SizeUnit::Px,
                     )
-                    .map(|width| width as u32)
+                    .map(|width| width.max(0) as u32)
                     .unwrap_or(
                         container_size
                             .container_width_non_filling
@@ -9550,7 +9550,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32));
+        .map(|v| v.max(0) as u32);
         let max_height = get_specified_size(
             *resolved_font_size,
             &style.max_height,
@@ -9559,7 +9559,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32));
+        .map(|v| v.max(0) as u32);
         let min_width = get_specified_size(
             *resolved_font_size,
             &style.min_width,
@@ -9568,7 +9568,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32));
+        .map(|v| v.max(0) as u32);
         let max_width = get_specified_size(
             *resolved_font_size,
             &style.max_width,
@@ -9577,7 +9577,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32));
+        .map(|v| v.max(0) as u32);
 
         let specified_width = forced_size.width.or(get_specified_size(
             *resolved_font_size,
@@ -9587,7 +9587,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         let specified_height = forced_size.height.or(get_specified_size(
             *resolved_font_size,
             &style.height,
@@ -9596,7 +9596,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         let container_width_non_filling = specified_width.and_then(|v| {
             Some(
                 v.min(max_width.unwrap_or(u32::MAX))
@@ -9820,7 +9820,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         let specified_width = forced_size.width.or(get_specified_size(
             font_size,
             &style.width,
@@ -9829,7 +9829,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         self.resolved_specified_heights
             .insert(node_idx, specified_height);
         self.resolved_specified_widths
@@ -10313,7 +10313,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         let specified_height = forced_size.height.or(get_specified_size(
             font_size,
             &style.height,
@@ -10322,7 +10322,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
 
         self.resolved_specified_heights
             .insert(node_idx, specified_height);
@@ -10774,7 +10774,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         let specified_width = forced_size.width.or(get_specified_size(
             font_size,
             &style.width,
@@ -10783,7 +10783,7 @@ impl Renderer {
             &self.window_size,
             &SizeUnit::Px,
         )
-        .and_then(|v| Some(v as u32)));
+        .map(|v| v.max(0) as u32));
         let has_definite_height = forced_size.height.is_some() || specified_height.is_some();
         self.resolved_specified_heights
             .insert(node_idx, specified_height);
