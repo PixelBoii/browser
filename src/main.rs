@@ -1422,6 +1422,12 @@ struct FrameHandle {
     tx: std::sync::mpsc::Sender<FrameCommand>,
 }
 
+impl Drop for FrameHandle {
+    fn drop(&mut self) {
+        let _ = self.tx.send(FrameCommand::Close);
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RendererProxy {
     WindowLoop {
@@ -7687,6 +7693,7 @@ impl Renderer {
         template_contents: HashMap<usize, usize>,
     ) {
         self.workers.clear();
+        self.frames.clear();
         self.url = url;
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
