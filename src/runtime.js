@@ -1411,7 +1411,7 @@ class WindowProxy {
     }
 
     postMessage(message) {
-        core.ops.op_post_message_to_frame(message, this.__frame_id)
+        core.ops.op_post_message_to_frame(serializeWorkerMessage(message), this.__frame_id)
     }
 
     get document() {
@@ -3282,9 +3282,26 @@ Object.defineProperty(globalThis, "MutationObserver", {
 // Ideally this would be of the same structure as document, but that's a much larger change that will happen later on
 const parentStub = {
     postMessage(message) {
-        core.ops.op_post_message_to_parent(message)
+        core.ops.op_post_message_to_parent(serializeWorkerMessage(message))
     }
 }
+
+function __dispatchWindowMessage(source) {
+    const message = deserializeWorkerMessage(core.ops.op_take_worker_message())
+    const event = new denoEvent.MessageEvent("message", {
+        source,
+        ports: message.ports,
+    })
+    event.data = message.data
+    globalThis.dispatchEvent(event)
+}
+
+Object.defineProperty(globalThis, "__dispatchWindowMessage", {
+    value: __dispatchWindowMessage,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+})
 
 Object.defineProperty(globalThis, "parent", {
     get() {

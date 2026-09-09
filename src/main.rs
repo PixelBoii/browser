@@ -4975,8 +4975,8 @@ enum UserEvent {
     CanvasUpdated,
     TabUpdated { tab_idx: usize, buffer: Vec<u32> },
     TabUrlUpdated { tab_idx: usize, url: String },
-    ChildMessage(String),
-    ParentMessage(String),
+    ChildMessage(WorkerMessage),
+    ParentMessage(WorkerMessage),
     WorkerMessage {
         worker_id: usize,
         message: WorkerMessage,
@@ -5194,12 +5194,13 @@ fn op_clone_node(
     Ok(new_node_idx as u32)
 }
 
-#[op2(fast)]
+#[op2]
 fn op_post_message_to_parent(
     state: &mut OpState,
-    #[string] message: String,
-) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    #[serde] message: deno_web::JsMessageData,
+) -> Result<(), JsErrorBox> {
+    let message = WorkerMessage::take(state, message)?;
+    let host = state.borrow::<JsHostState>();
     host.proxy
         .fire_user_event(UserEvent::ChildMessage(message))
         .unwrap();
@@ -5212,13 +5213,14 @@ fn op_is_top(state: &mut OpState) -> bool {
     host.is_top
 }
 
-#[op2(fast)]
+#[op2]
 fn op_post_message_to_frame(
     state: &mut OpState,
-    #[string] message: String,
+    #[serde] message: deno_web::JsMessageData,
     #[number] frame_id: usize,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
+    let message = WorkerMessage::take(state, message)?;
+    let host = state.borrow::<JsHostState>();
     let renderer = host.renderer.borrow();
     let Some(frame) = renderer.frames.get(&frame_id) else {
         return Err(JsErrorBox::generic("Failed to get frame by idx"));
@@ -12443,6 +12445,17 @@ impl Frame {
         state.borrow_mut().try_take::<WorkerMessage>();
     }
 
+    fn dispatch_window_message(&mut self, message: WorkerMessage, source_is_parent: bool) {
+        let state = self.js_runtime.as_ref().unwrap().borrow().op_state();
+        state.borrow_mut().put(message);
+        let source = if source_is_parent { "parent" } else { "null" };
+        let code = format!("__dispatchWindowMessage({source})");
+        if let Err(err) = self.execute_host_script("window message handler", code) {
+            eprintln!("Failed to dispatch window message: {err}");
+        }
+        state.borrow_mut().try_take::<WorkerMessage>();
+    }
+
     fn dispatch_dom_content_loaded_once(&mut self) -> Result<()> {
         if self.dom_content_loaded_dispatched {
             return Ok(());
@@ -12611,18 +12624,7 @@ impl Frame {
                 let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
             }
             FrameCommand::UserEvent(UserEvent::ParentMessage(message)) => {
-                let data = js_string_literal(&message);
-                let code = format!(
-                    r#"
-                (() => {{
-                    const event = new MessageEvent("message", {{ data: {}, source: parent }})
-                    window.dispatchEvent(event)
-                }})()
-                "#,
-                    data
-                );
-                self.execute_host_script("parent message handler", code)
-                    .unwrap();
+                self.dispatch_window_message(message, true);
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
                 self.dispatch_worker_message(worker_id, message);
@@ -13866,18 +13868,7 @@ impl Frame {
                 }
             }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
-                let data = js_string_literal(&message);
-                let code = format!(
-                    r#"
-                (() => {{
-                    const event = new MessageEvent("message", {{ data: {} }})
-                    window.dispatchEvent(event)
-                }})()
-                "#,
-                    data
-                );
-                self.execute_host_script("child message handler", code)
-                    .unwrap();
+                self.dispatch_window_message(message, false);
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
                 self.dispatch_worker_message(worker_id, message);
