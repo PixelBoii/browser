@@ -9216,12 +9216,11 @@ impl Renderer {
                     }
                 };
                 let had_command = cmd.is_some();
-                if let Some(cmd) = cmd {
-                    frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
-
-                    while let Ok(cmd) = rx.try_recv() {
-                        frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
+                for cmd in cmd.into_iter().chain(rx.try_iter()).take(64) {
+                    if matches!(cmd, FrameCommand::Close) {
+                        return;
                     }
+                    frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
                 }
                 if had_command || js_pending {
                     js_pending = frame
@@ -13103,7 +13102,7 @@ impl Frame {
                 }
             };
             let had_command = cmd.is_some();
-            for cmd in cmd.into_iter().chain(rx.try_iter()) {
+            for cmd in cmd.into_iter().chain(rx.try_iter()).take(64) {
                 if matches!(cmd, FrameCommand::Close) {
                     return;
                 }
