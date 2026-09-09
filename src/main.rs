@@ -1418,6 +1418,7 @@ enum FrameCommand {
 #[derive(Debug)]
 struct FrameHandle {
     surface: Arc<Mutex<Vec<u32>>>,
+    surface_size: PhysicalSize<u32>,
     tx: std::sync::mpsc::Sender<FrameCommand>,
 }
 
@@ -9237,6 +9238,7 @@ impl Renderer {
         });
         Ok(FrameHandle {
             surface: latest_bitmap,
+            surface_size: size,
             tx,
         })
     }
@@ -11537,13 +11539,23 @@ impl Renderer {
                     .frames
                     .get_mut(&self.layout_to_node_idx(&layout_box_idx))
                 {
+                    let surface = handle.surface.lock().unwrap();
+                    let clip = clip
+                        .intersect_x(
+                            container_start_x,
+                            container_start_x.saturating_add_unsigned(layout_box.rect.width),
+                        )
+                        .intersect_y(
+                            container_start_y,
+                            container_start_y.saturating_add_unsigned(layout_box.rect.height),
+                        );
                     blit_rgb_buffer(
                         buffer,
                         width,
                         height,
-                        handle.surface.lock().unwrap().as_ref(),
-                        layout_box.rect.width,
-                        layout_box.rect.height,
+                        &surface,
+                        handle.surface_size.width,
+                        handle.surface_size.height,
                         container_start_x,
                         container_start_y,
                         clip,
