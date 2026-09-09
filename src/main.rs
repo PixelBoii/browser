@@ -1834,7 +1834,7 @@ struct OptionalSize {
     width: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Position {
     x: i32,
     y: i32,
@@ -12212,6 +12212,7 @@ struct Frame {
     render_size: PhysicalSize<u32>,
     loaded_nodes: HashSet<usize>,
     last_hover_position: Option<Position>,
+    last_forwarded_iframe_hover: Option<(usize, Position)>,
     animation_frame_requested: bool,
     last_animation_frame: Instant,
     blob_store: Arc<BlobStore>,
@@ -12272,6 +12273,7 @@ impl Frame {
             render_size,
             loaded_nodes: HashSet::new(),
             last_hover_position: None,
+            last_forwarded_iframe_hover: None,
             animation_frame_requested: false,
             last_animation_frame: Instant::now(),
             blob_store: Arc::new(BlobStore::default()),
@@ -13048,6 +13050,7 @@ impl Frame {
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
             self.loaded_nodes.clear();
+            self.last_forwarded_iframe_hover = None;
             self.animation_frame_requested = false;
             self.last_animation_frame = Instant::now();
             self.reset_js_document_state()?;
@@ -13718,7 +13721,9 @@ impl Frame {
                 iframe_hover,
             )
         };
-        if let Some((iframe_node_idx, local_position)) = iframe_hover {
+        if iframe_hover != self.last_forwarded_iframe_hover
+            && let Some((iframe_node_idx, local_position)) = iframe_hover
+        {
             let frame_tx = {
                 self.renderer
                     .as_ref()
@@ -13732,6 +13737,7 @@ impl Frame {
                 let _ = frame_tx.send(FrameCommand::UserEvent(UserEvent::Hover(local_position)));
             }
         }
+        self.last_forwarded_iframe_hover = iframe_hover;
         if should_re_render || self.hover_debugging {
             let styles_changed = {
                 let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
