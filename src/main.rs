@@ -1415,6 +1415,26 @@ enum FrameCommand {
     Resized(PhysicalSize<u32>),
 }
 
+fn collect_frame_commands(
+    first: Option<FrameCommand>,
+    rx: &Receiver<FrameCommand>,
+) -> Vec<FrameCommand> {
+    let mut commands = Vec::new();
+    for command in first.into_iter().chain(rx.try_iter()).take(64) {
+        if matches!(
+            (commands.last(), &command),
+            (
+                Some(FrameCommand::UserEvent(UserEvent::Hover(_))),
+                FrameCommand::UserEvent(UserEvent::Hover(_))
+            )
+        ) {
+            commands.pop();
+        }
+        commands.push(command);
+    }
+    commands
+}
+
 #[derive(Debug)]
 struct FrameSurface {
     size: PhysicalSize<u32>,
@@ -9239,7 +9259,7 @@ impl Renderer {
                     }
                 };
                 let had_command = cmd.is_some();
-                for cmd in cmd.into_iter().chain(rx.try_iter()).take(64) {
+                for cmd in collect_frame_commands(cmd, &rx) {
                     if matches!(cmd, FrameCommand::Close) {
                         return;
                     }
@@ -13130,7 +13150,7 @@ impl Frame {
                 }
             };
             let had_command = cmd.is_some();
-            for cmd in cmd.into_iter().chain(rx.try_iter()).take(64) {
+            for cmd in collect_frame_commands(cmd, &rx) {
                 if matches!(cmd, FrameCommand::Close) {
                     return;
                 }
