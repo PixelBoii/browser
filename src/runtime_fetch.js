@@ -5,12 +5,14 @@
 import { core, primordials } from "ext:core/mod.js";
 import {
   op_fetch,
+  op_fetch_site,
   op_fetch_send,
   op_wasm_streaming_feed,
   op_wasm_streaming_set_url,
 } from "ext:core/ops";
 const {
   ArrayPrototypePush,
+  ArrayPrototypeMap,
   ArrayPrototypeSplice,
   ArrayPrototypeFilter,
   ArrayPrototypeIncludes,
@@ -93,9 +95,10 @@ function createResponseBodyStream(responseBodyRid, terminator) {
  * @param {InnerRequest} req
  * @param {boolean} recursive
  * @param {AbortSignal} terminator
+ * @param {string | null} initiator
  * @returns {Promise<InnerResponse>}
  */
-async function mainFetch(req, recursive, terminator) {
+async function mainFetch(req, recursive, terminator, initiator = null) {
   if (req.blobUrlEntry !== null) {
     if (req.method !== "GET") {
       throw new TypeError("Blob URL fetch only supports GET method");
@@ -146,6 +149,19 @@ async function mainFetch(req, recursive, terminator) {
     } else {
       throw new TypeError("Invalid body");
     }
+  }
+
+  // Keep the initiating URL across redirects; every hop contributes to the site relationship.
+  const [source, site] = op_fetch_site(
+    initiator,
+    ArrayPrototypeMap(req.urlList, (url) => url()),
+  );
+  req.headerList = ArrayPrototypeFilter(
+    req.headerList,
+    (header) => byteLowerCase(header[0]) !== "sec-fetch-site",
+  );
+  if (site !== null) {
+    ArrayPrototypePush(req.headerList, ["Sec-Fetch-Site", site]);
   }
 
   const { requestRid, cancelHandleRid } = op_fetch(
@@ -206,7 +222,7 @@ async function mainFetch(req, recursive, terminator) {
         );
       case "follow":
         core.close(resp.responseRid);
-        return httpRedirectFetch(req, response, terminator);
+        return httpRedirectFetch(req, response, terminator, source);
       case "manual":
         break;
     }
@@ -239,9 +255,10 @@ async function mainFetch(req, recursive, terminator) {
  * @param {InnerRequest} request
  * @param {InnerResponse} response
  * @param {AbortSignal} terminator
+ * @param {string} initiator
  * @returns {Promise<InnerResponse>}
  */
-function httpRedirectFetch(request, response, terminator) {
+function httpRedirectFetch(request, response, terminator, initiator) {
   const locationHeaders = ArrayPrototypeFilter(
     response.headerList,
     (entry) => byteLowerCase(entry[0]) === "location",
@@ -322,7 +339,7 @@ function httpRedirectFetch(request, response, terminator) {
     request.body = res.body;
   }
   ArrayPrototypePush(request.urlList, () => locationURL.href);
-  return mainFetch(request, true, terminator);
+  return mainFetch(request, true, terminator, initiator);
 }
 
 /**

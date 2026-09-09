@@ -5008,6 +5008,64 @@ struct JsHostState {
     is_top: bool,
 }
 
+fn is_trustworthy_http_url(url: &ReqwestUrl) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http"
+            && match url.host() {
+                Some(url::Host::Domain(host)) => {
+                    let host = host.trim_end_matches('.');
+                    host == "localhost" || host.ends_with(".localhost")
+                }
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            })
+}
+
+#[op2]
+#[serde]
+fn op_fetch_site(
+    state: &mut OpState,
+    #[string] initiator: Option<String>,
+    #[serde] urls: Vec<String>,
+) -> (String, Option<String>) {
+    let initiator = initiator.unwrap_or_else(|| {
+        if let Some(host) = state.try_borrow::<JsHostState>() {
+            host.renderer.borrow().url.clone()
+        } else {
+            state.borrow::<WorkerHostState>().url.to_string()
+        }
+    });
+    let site = |url: &ReqwestUrl| match url.origin() {
+        url::Origin::Tuple(scheme, host, _) => {
+            let domain = match host {
+                url::Host::Domain(domain) => {
+                    psl::domain_str(&domain).unwrap_or(&domain).to_string()
+                }
+                host => host.to_string(),
+            };
+            Some((scheme, domain))
+        }
+        url::Origin::Opaque(_) => None,
+    };
+    let source = ReqwestUrl::parse(&initiator).ok();
+    let mut value = "same-origin";
+    let mut trustworthy = false;
+    for target in urls.iter().filter_map(|url| ReqwestUrl::parse(url).ok()) {
+        trustworthy = is_trustworthy_http_url(&target);
+        match &source {
+            Some(source) if source.origin() == target.origin() => {}
+            Some(source) if site(source).is_some() && site(source) == site(&target) => {
+                if value == "same-origin" {
+                    value = "same-site";
+                }
+            }
+            _ => value = "cross-site",
+        }
+    }
+    (initiator, trustworthy.then(|| value.to_string()))
+}
+
 #[op2]
 fn op_tls_peer_certificate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -6714,6 +6772,7 @@ fn query_selector_all(
 extension!(
   browser_worker,
   ops = [
+    op_fetch_site,
     op_tls_peer_certificate,
     op_worker_post_message,
     op_worker_receive_message,
@@ -6738,6 +6797,7 @@ extension!(
 extension!(
   browser,
   ops = [
+    op_fetch_site,
     op_create_element,
     op_create_document_fragment,
     op_get_template_content,
