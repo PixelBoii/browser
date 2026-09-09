@@ -1740,6 +1740,7 @@ struct Renderer {
     style_cache: StyleCache,
     selector_changes: SelectorChanges,
     layout_table: Vec<LayoutBox>,
+    flex_measurements: HashMap<FlexMeasurementKey, Option<Size>>,
     node_layout_mapping: NodeMap<usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
     request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
@@ -1842,13 +1843,22 @@ struct FlexItem {
     grow: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FlexMeasurementKey {
+    node_idx: usize,
+    available_size: Size,
+    forced_size: OptionalSize,
+    containing_node_idx: usize,
+    containing_size: (Option<u32>, Option<u32>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Size {
     height: u32,
     width: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OptionalSize {
     height: Option<u32>,
     width: Option<u32>,
@@ -7312,6 +7322,7 @@ impl Renderer {
             style_cache,
             selector_changes: SelectorChanges::default(),
             layout_table,
+            flex_measurements: HashMap::new(),
             node_layout_mapping,
             containing_nodes,
             request_cache,
@@ -7714,6 +7725,7 @@ impl Renderer {
 
     fn clear_layout_state(&mut self) {
         self.layout_table.clear();
+        self.flex_measurements.clear();
         self.node_layout_mapping.clear();
         self.containing_nodes.clear();
         self.rendered_nodes_ordered.clear();
@@ -10607,6 +10619,54 @@ impl Renderer {
         .and_then(|v| if v >= 0 { Some(v as u32) } else { None })
     }
 
+    fn measure_flex_item(
+        &mut self,
+        node_idx: usize,
+        available_size: Size,
+        forced_size: OptionalSize,
+        containing_node_idx: usize,
+    ) -> Option<Size> {
+        let key = FlexMeasurementKey {
+            node_idx,
+            available_size,
+            forced_size,
+            containing_node_idx,
+            containing_size: self.get_containing_block_size(
+                containing_node_idx,
+                node_idx,
+                self.node_styles.get(&node_idx).unwrap(),
+            ),
+        };
+        if let Some(size) = self.flex_measurements.get(&key) {
+            return *size;
+        }
+
+        // Only measurements are reused, within this layout build. Placement still
+        // visits the subtree to construct boxes and resolve its final dimensions.
+        let checkpoint = self.layout_table.len();
+        let size = self
+            .layout_node(
+                node_idx,
+                Position { x: 0, y: 0 },
+                available_size,
+                forced_size,
+                containing_node_idx,
+                false,
+                false,
+                &LayoutMode::BaseCalculation,
+            )
+            .map(|child| {
+                let rect = &self.layout_table[child].rect;
+                Size {
+                    width: rect.width,
+                    height: rect.height,
+                }
+            });
+        self.layout_table.truncate(checkpoint);
+        self.flex_measurements.insert(key, size);
+        size
+    }
+
     fn layout_flex(
         &mut self,
         node_idx: usize,
@@ -10805,30 +10865,19 @@ impl Renderer {
                     height: flex_basis,
                 },
             };
-            let layout_checkpoint = self.layout_table.len();
-            let child_size = self
-                .layout_node(
-                    *child_idx,
-                    Position { x: 0, y: 0 },
-                    Size {
-                        width: container_sizes.inner_width,
-                        height: container_sizes.inner_height,
-                    },
-                    forced_size,
-                    containing_node_idx,
-                    false,
-                    false,
-                    &LayoutMode::BaseCalculation,
-                )
-                .map(|child| {
-                    let rect = &self.layout_table.get(child).unwrap().rect;
-                    match style.flex_direction {
-                        StyleFlexDirection::Row => (rect.width, rect.height),
-                        StyleFlexDirection::Column => (rect.height, rect.width),
-                    }
-                });
-            self.layout_table.truncate(layout_checkpoint);
-            if let Some((size, cross_size)) = child_size {
+            if let Some(child_size) = self.measure_flex_item(
+                *child_idx,
+                Size {
+                    width: container_sizes.inner_width,
+                    height: container_sizes.inner_height,
+                },
+                forced_size,
+                containing_node_idx,
+            ) {
+                let (size, cross_size) = match style.flex_direction {
+                    StyleFlexDirection::Row => (child_size.width, child_size.height),
+                    StyleFlexDirection::Column => (child_size.height, child_size.width),
+                };
                 let base_size = (size as f32).min(max_size as f32);
                 base_items.push(FlexItem {
                     node_idx: *child_idx,
@@ -15257,6 +15306,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_flex_measurements_follow_size_and_content_changes() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script("nested flex fixture", r#"
+            document.body.innerHTML = '<div id="outer" style="display:flex;flex-direction:column;width:400px">' +
+                '<div style="display:flex;flex-direction:column;position:relative">'.repeat(23) +
+                '<div id="leaf" style="width:50%;height:20px;background:red"></div>' + '</div>'.repeat(24);
+        "#.to_string())?;
+        for (width, height) in [(400, 20), (200, 20), (200, 40)] {
+            frame.execute_host_script(
+                "resize flex fixture",
+                format!(
+                    r#"
+                document.getElementById('outer').style.width = '{width}px';
+                document.getElementById('leaf').style.height = '{height}px';
+            "#
+                ),
+            )?;
+            frame.process_dom_update();
+            let mut buffer = vec![0; 800 * 600];
+            frame.render_into(&mut buffer, 800, 600, true);
+            let renderer = frame.renderer.as_ref().unwrap().borrow();
+            let leaf = renderer.layout_table.iter().find(|layout| {
+                matches!(renderer.nodes.get(layout.node_idx), Some(super::Node::Element(element))
+                    if element.attributes.get_str("id").as_deref() == Some("leaf"))
+            }).unwrap();
+            assert_eq!((leaf.rect.width, leaf.rect.height), (width / 2, height));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn render_facebook() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut frame = Frame::new(
@@ -15270,7 +15357,7 @@ mod tests {
         frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        // Facebook currently renders blank with a bootstrap JS error; see NOTES.md.
+        // Facebook can still capture an empty app shell before initialization; see NOTES.md.
         ensure_snapshot_matches(&buffer, "facebookcom", 1920, 1080)
     }
 
