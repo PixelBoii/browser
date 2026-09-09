@@ -1416,9 +1416,15 @@ enum FrameCommand {
 }
 
 #[derive(Debug)]
+struct FrameSurface {
+    size: PhysicalSize<u32>,
+    pixels: Vec<u32>,
+}
+
+#[derive(Debug)]
 struct FrameHandle {
-    surface: Arc<Mutex<Vec<u32>>>,
-    surface_size: PhysicalSize<u32>,
+    surface: Arc<Mutex<FrameSurface>>,
+    requested_size: PhysicalSize<u32>,
     tx: std::sync::mpsc::Sender<FrameCommand>,
 }
 
@@ -8963,6 +8969,14 @@ impl Renderer {
                             .ok()?;
                         self.frames.insert(node_idx, handle);
                     }
+                    if save_as_final {
+                        let handle = self.frames.get_mut(&node_idx).unwrap();
+                        let size = PhysicalSize::new(width, height);
+                        if handle.requested_size != size {
+                            let _ = handle.tx.send(FrameCommand::Resized(size));
+                            handle.requested_size = size;
+                        }
+                    }
                     Some(self.register_layout_box(
                         LayoutBox {
                             rect: Rect {
@@ -9176,7 +9190,10 @@ impl Renderer {
             None => ReqwestUrl::parse("about:blank")?,
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let latest_bitmap = Arc::new(Mutex::new(vec![0; (size.width * size.height) as usize]));
+        let latest_bitmap = Arc::new(Mutex::new(FrameSurface {
+            size,
+            pixels: vec![0; (size.width * size.height) as usize],
+        }));
         let bitmap_for_thread = Arc::clone(&latest_bitmap);
         let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
         tx.send(FrameCommand::Render).unwrap();
@@ -9226,7 +9243,7 @@ impl Renderer {
                     if matches!(cmd, FrameCommand::Close) {
                         return;
                     }
-                    frame.handle_frame_command(cmd, &parent_proxy, &size, &bitmap_for_thread);
+                    frame.handle_frame_command(cmd, &parent_proxy, &bitmap_for_thread);
                 }
                 if had_command || js_pending {
                     js_pending = frame
@@ -9243,7 +9260,7 @@ impl Renderer {
         });
         Ok(FrameHandle {
             surface: latest_bitmap,
-            surface_size: size,
+            requested_size: size,
             tx,
         })
     }
@@ -11558,9 +11575,9 @@ impl Renderer {
                         buffer,
                         width,
                         height,
-                        &surface,
-                        handle.surface_size.width,
-                        handle.surface_size.height,
+                        &surface.pixels,
+                        surface.size.width,
+                        surface.size.height,
                         container_start_x,
                         container_start_y,
                         clip,
@@ -12445,12 +12462,29 @@ impl Frame {
         Ok(())
     }
 
+    fn paint_iframe(
+        &mut self,
+        parent_proxy: &RendererProxy,
+        surface: &Arc<Mutex<FrameSurface>>,
+        rebuild_layout: bool,
+    ) {
+        let size = self.render_size;
+        let mut pixels = vec![0; (size.width * size.height) as usize];
+        self.renderer.as_ref().unwrap().borrow_mut().render_into(
+            &mut pixels,
+            size.width,
+            size.height,
+            rebuild_layout,
+        );
+        *surface.lock().unwrap() = FrameSurface { size, pixels };
+        let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+    }
+
     fn handle_frame_command(
         &mut self,
         cmd: FrameCommand,
         parent_proxy: &RendererProxy,
-        size: &PhysicalSize<u32>,
-        bitmap_for_thread: &Arc<Mutex<Vec<u32>>>,
+        bitmap_for_thread: &Arc<Mutex<FrameSurface>>,
     ) {
         match cmd {
             cmd @ (FrameCommand::Render
@@ -12486,31 +12520,12 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    !canvas_updated,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
-
-                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+                self.paint_iframe(parent_proxy, bitmap_for_thread, !canvas_updated);
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
                 self.apply_hovering(&position);
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    true,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
-                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
             }
             FrameCommand::UserEvent(UserEvent::Click) => {
                 if let Err(err) = self.on_click() {
@@ -12525,16 +12540,7 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    true,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
-                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
             }
             FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
                 if let Err(err) = self.perform_navigation(href, reload) {
@@ -12542,19 +12548,28 @@ impl Frame {
                     return;
                 }
 
-                let mut pixels = vec![0; (size.width * size.height) as usize];
-                self.renderer.as_ref().unwrap().borrow_mut().render_into(
-                    &mut pixels,
-                    size.width,
-                    size.height,
-                    true,
-                );
-
-                *bitmap_for_thread.lock().unwrap() = pixels;
-                let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
             }
             FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
                 self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
+            }
+            FrameCommand::Resized(new_size) => {
+                self.render_size = new_size;
+                {
+                    let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                    renderer.window_size = new_size;
+                    renderer.recompute_styles();
+                }
+
+                let code = format!(
+                    "innerWidth = {}; innerHeight = {}; dispatchEvent(new Event('resize'))",
+                    new_size.width, new_size.height,
+                );
+                if let Err(err) = self.execute_host_script("iframe resize", code) {
+                    eprintln!("Failed to dispatch iframe resize: {err}");
+                }
+
+                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
             }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
