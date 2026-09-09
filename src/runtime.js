@@ -619,10 +619,23 @@ Object.defineProperty(globalThis, "Event", {
     writable: true,
 });
 
-class MouseEvent extends Event {
+class UIEvent extends Event {
     constructor(type, options = {}) {
         super(type, options)
+        this.view = options.view ?? null
         this.detail = options.detail ?? 0
+    }
+}
+
+Object.defineProperty(globalThis, "UIEvent", {
+    value: UIEvent,
+    configurable: true,
+    writable: true,
+})
+
+class MouseEvent extends UIEvent {
+    constructor(type, options = {}) {
+        super(type, options)
         this.clientX = options.clientX ?? 0
         this.clientY = options.clientY ?? 0
         this.screenX = options.screenX ?? this.clientX
@@ -643,7 +656,41 @@ Object.defineProperty(globalThis, "MouseEvent", {
     writable: true,
 });
 
-class KeyboardEvent extends Event {
+class WheelEvent extends MouseEvent {
+    constructor(type, options = {}) {
+        super(type, options)
+        this.deltaX = options.deltaX ?? 0
+        this.deltaY = options.deltaY ?? 0
+        this.deltaZ = options.deltaZ ?? 0
+        this.deltaMode = options.deltaMode ?? 0
+    }
+}
+
+for (const [name, value] of Object.entries({ DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 })) {
+    Object.defineProperty(WheelEvent, name, { value, enumerable: true })
+    Object.defineProperty(WheelEvent.prototype, name, { value, enumerable: true })
+}
+
+Object.defineProperty(globalThis, "WheelEvent", {
+    value: WheelEvent,
+    configurable: true,
+    writable: true,
+})
+
+class FocusEvent extends UIEvent {
+    constructor(type, options = {}) {
+        super(type, options)
+        this.relatedTarget = options.relatedTarget ?? null
+    }
+}
+
+Object.defineProperty(globalThis, "FocusEvent", {
+    value: FocusEvent,
+    configurable: true,
+    writable: true,
+})
+
+class KeyboardEvent extends UIEvent {
     constructor(type, options = {}) {
         super(type, options)
         this.key = options.key ?? ""
@@ -691,7 +738,7 @@ Object.defineProperty(globalThis, "PointerEvent", {
     writable: true,
 });
 
-class InputEvent extends Event {
+class InputEvent extends UIEvent {
     constructor(type, options = {}) {
         super(type, options)
         this.data = options.data ?? null
