@@ -1888,9 +1888,8 @@ struct ResumableNode {
     static_position_offset: Option<StaticPositionOffset>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ContainingNode {
-    node_idx: usize,
     cursor: Position,
     waiters: Vec<ResumableNode>,
 }
@@ -1940,28 +1939,36 @@ impl ContainerSizes {
     }
 }
 
-impl ContainingNode {
+impl Renderer {
     pub fn layout_waiters(
         &mut self,
-        renderer: &mut Renderer,
+        containing_node_idx: usize,
         height: u32,
         width: u32,
         children: &mut Vec<usize>,
         mode: &LayoutMode,
     ) -> Result<()> {
-        for waiter in &self.waiters {
-            let style = renderer.node_styles.get(&waiter.node_idx).unwrap().clone();
+        let containing_cursor = self.containing_nodes[&containing_node_idx].cursor;
+        // Laying out a waiter can add fixed descendants to this same queue.
+        let mut next_waiter = 0;
+        while let Some(waiter) = self.containing_nodes[&containing_node_idx]
+            .waiters
+            .get(next_waiter)
+            .copied()
+        {
+            next_waiter += 1;
+            let style = self.node_styles.get(&waiter.node_idx).unwrap().clone();
             let mut forced_size = OptionalSize {
                 height: None,
                 width: None,
             };
             let positioning_width = if style.position == StylePosition::Fixed {
-                renderer.window_size.width
+                self.window_size.width
             } else {
                 width
             };
             let positioning_height = if style.position == StylePosition::Fixed {
-                renderer.window_size.height
+                self.window_size.height
             } else {
                 height
             };
@@ -1969,25 +1976,24 @@ impl ContainingNode {
                 width: positioning_width,
                 height: positioning_height,
             };
-            let resolved_parent_font_size = renderer.get_parent_font_size(waiter.node_idx);
+            let resolved_parent_font_size = self.get_parent_font_size(waiter.node_idx);
             let font_size = get_specified_size(
                 resolved_parent_font_size,
                 &style.font_size,
                 Some(resolved_parent_font_size),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             )
             .with_context(|| "Failed to get specific size")? as u32;
-            renderer
-                .resolved_font_sizes
+            self.resolved_font_sizes
                 .insert(waiter.node_idx, font_size as u32);
             let top = get_specified_size(
                 font_size,
                 &style.top,
                 Some(positioning_height),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             );
             let right = get_specified_size(
@@ -1995,7 +2001,7 @@ impl ContainingNode {
                 &style.right,
                 Some(positioning_width),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             );
             let bottom = get_specified_size(
@@ -2003,7 +2009,7 @@ impl ContainingNode {
                 &style.bottom,
                 Some(positioning_height),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             );
             let left = get_specified_size(
@@ -2011,7 +2017,7 @@ impl ContainingNode {
                 &style.left,
                 Some(positioning_width),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             );
             let auto_left = left.is_none() && right.is_none();
@@ -2026,8 +2032,8 @@ impl ContainingNode {
                 Position { x: 0, y: 0 }
             } else {
                 Position {
-                    x: self.cursor.x + if auto_left { static_offset.x } else { 0 },
-                    y: self.cursor.y + if auto_top { static_offset.y } else { 0 },
+                    x: containing_cursor.x + if auto_left { static_offset.x } else { 0 },
+                    y: containing_cursor.y + if auto_top { static_offset.y } else { 0 },
                 }
             };
 
@@ -2036,7 +2042,7 @@ impl ContainingNode {
                 &style.margin_right,
                 Some(positioning_width),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             );
             let margin_left = get_specified_size(
@@ -2044,7 +2050,7 @@ impl ContainingNode {
                 &style.margin_left,
                 Some(positioning_width),
                 None,
-                &renderer.window_size,
+                &self.window_size,
                 &SizeUnit::Px,
             );
 
@@ -2065,30 +2071,30 @@ impl ContainingNode {
                     Some((positioning_height as i32 - top.unwrap() - bottom.unwrap()) as u32);
             }
 
-            if let Some(layout_idx) = renderer.layout_node(
+            if let Some(layout_idx) = self.layout_node(
                 waiter.node_idx,
                 cursor,
                 available_size,
                 forced_size,
-                self.node_idx,
+                containing_node_idx,
                 true,
                 true,
                 mode,
             ) {
-                let waiter_layout_box = renderer.layout_table.get(layout_idx).unwrap().clone();
+                let waiter_layout_box = self.layout_table.get(layout_idx).unwrap().clone();
 
                 if style.position.is_free() {
                     if style.width == StyleSize::Auto && left.is_some() && right.is_some() {
                         // Width is taken care of above, so just move by left
-                        renderer.move_entire_box(layout_idx, left.unwrap(), 0);
+                        self.move_entire_box(layout_idx, left.unwrap(), 0);
                     } else if right.is_some() {
                         let move_by = positioning_width as i32
                             - waiter_layout_box.rect.width as i32
                             - right.unwrap()
                             - margin_right.unwrap_or(0);
-                        renderer.move_entire_box(layout_idx, move_by, 0);
+                        self.move_entire_box(layout_idx, move_by, 0);
                     } else if left.is_some() {
-                        renderer.move_entire_box(
+                        self.move_entire_box(
                             layout_idx,
                             left.unwrap() - margin_left.unwrap_or(0),
                             0,
@@ -2098,7 +2104,7 @@ impl ContainingNode {
                     {
                         let free_space =
                             positioning_width.saturating_sub(waiter_layout_box.rect.width);
-                        renderer.move_entire_box(layout_idx, (free_space / 2) as i32, 0);
+                        self.move_entire_box(layout_idx, (free_space / 2) as i32, 0);
                     }
 
                     if auto_top
@@ -2106,7 +2112,7 @@ impl ContainingNode {
                             static_position_offset.and_then(|offset| offset.size_dependent_offset)
                     {
                         let (_, _, margin_top, margin_bottom) =
-                            renderer.get_margins(waiter.node_idx, &style, available_size);
+                            self.get_margins(waiter.node_idx, &style, available_size);
                         let margin_y = (margin_top + margin_bottom).max(0) as u32;
                         let used_height = waiter_layout_box.rect.height.saturating_add(margin_y);
                         let offset_y = match size_dependent_offset {
@@ -2117,7 +2123,7 @@ impl ContainingNode {
                                 available.saturating_sub(used_height)
                             }
                         };
-                        renderer.move_entire_box(
+                        self.move_entire_box(
                             layout_idx,
                             0,
                             offset_y as i32 + margin_top.max(0),
@@ -2126,21 +2132,25 @@ impl ContainingNode {
 
                     if top.is_some() && bottom.is_some() {
                         // Height is taken care of above, so just move by top
-                        renderer.move_entire_box(layout_idx, 0, top.unwrap());
+                        self.move_entire_box(layout_idx, 0, top.unwrap());
                     } else if top.is_some() {
-                        renderer.move_entire_box(layout_idx, 0, top.unwrap());
+                        self.move_entire_box(layout_idx, 0, top.unwrap());
                     } else if bottom.is_some() {
                         let move_by = positioning_height as i32
                             - waiter_layout_box.rect.height as i32
                             - bottom.unwrap();
-                        renderer.move_entire_box(layout_idx, 0, move_by);
+                        self.move_entire_box(layout_idx, 0, move_by);
                     }
                 }
 
                 children.push(layout_idx);
             }
         }
-        self.waiters.clear();
+        self.containing_nodes
+            .get_mut(&containing_node_idx)
+            .unwrap()
+            .waiters
+            .clear();
         Ok(())
     }
 }
@@ -8457,7 +8467,6 @@ impl Renderer {
         self.containing_nodes.insert(
             self.dom_indexes.root_indice,
             ContainingNode {
-                node_idx: self.dom_indexes.root_indice,
                 cursor: Position { x: 0, y: 0 },
                 waiters: vec![],
             },
@@ -9785,7 +9794,6 @@ impl Renderer {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
-                    node_idx,
                     cursor,
                     waiters: vec![],
                 },
@@ -10171,16 +10179,8 @@ impl Renderer {
             }
 
             if containing_node_idx == node_idx {
-                let mut containing_node = self
-                    .containing_nodes
-                    .get_mut(&containing_node_idx)
-                    .unwrap()
-                    .clone();
-                containing_node
-                    .layout_waiters(self, height, width, &mut children, mode)
+                self.layout_waiters(containing_node_idx, height, width, &mut children, mode)
                     .ok()?;
-                self.containing_nodes
-                    .insert(containing_node_idx, containing_node);
             }
         }
         Some((width as u32, height as u32, children, content_height as u32))
@@ -10380,7 +10380,6 @@ impl Renderer {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
-                    node_idx,
                     cursor,
                     waiters: vec![],
                 },
@@ -10581,16 +10580,8 @@ impl Renderer {
             }
 
             if containing_node_idx == node_idx {
-                let mut containing_node = self
-                    .containing_nodes
-                    .get_mut(&containing_node_idx)
-                    .unwrap()
-                    .clone();
-                containing_node
-                    .layout_waiters(self, height, width, &mut children, mode)
+                self.layout_waiters(containing_node_idx, height, width, &mut children, mode)
                     .ok()?;
-                self.containing_nodes
-                    .insert(containing_node_idx, containing_node);
             }
         }
 
@@ -10811,7 +10802,6 @@ impl Renderer {
             self.containing_nodes.insert(
                 node_idx,
                 ContainingNode {
-                    node_idx,
                     cursor,
                     waiters: vec![],
                 },
@@ -11340,16 +11330,8 @@ impl Renderer {
             }
 
             if containing_node_idx == node_idx {
-                let mut containing_node = self
-                    .containing_nodes
-                    .get_mut(&containing_node_idx)
-                    .unwrap()
-                    .clone();
-                containing_node
-                    .layout_waiters(self, height, width, &mut children, mode)
+                self.layout_waiters(containing_node_idx, height, width, &mut children, mode)
                     .ok()?;
-                self.containing_nodes
-                    .insert(containing_node_idx, containing_node);
             }
         }
 
