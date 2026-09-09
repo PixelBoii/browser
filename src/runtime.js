@@ -1384,6 +1384,9 @@ class HTMLIFrameElement extends HtmlElement {
         }
     }
 
+    get name() { return this.getAttribute("name") ?? "" }
+    set name(value) { this.setAttribute("name", String(value)) }
+
     get contentDocument() {
         // Frame idx is the node idx
         this.spawnFrame()
