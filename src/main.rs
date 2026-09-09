@@ -6553,6 +6553,12 @@ async fn op_worker_receive_message(
 }
 
 #[op2]
+#[string]
+fn op_worker_get_location_href(state: &mut OpState) -> String {
+    state.borrow::<WorkerHostState>().url.to_string()
+}
+
+#[op2]
 #[serde]
 fn op_worker_resolve_script_urls(
     state: &mut OpState,
@@ -6654,6 +6660,7 @@ extension!(
     op_tls_peer_certificate,
     op_worker_post_message,
     op_worker_receive_message,
+    op_worker_get_location_href,
     op_worker_resolve_script_urls,
     op_worker_fetch_script,
   ],

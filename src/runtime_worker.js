@@ -15,7 +15,7 @@ import * as streams from "ext:deno_web/06_streams.js";
 import * as encoding from "ext:deno_web/08_text_encoding.js";
 import * as file from "ext:deno_web/09_file.js";
 import * as fileReader from "ext:deno_web/10_filereader.js";
-// import * as location from "ext:deno_web/12_location.js";
+import * as location from "ext:deno_web/12_location.js";
 import * as messagePort from "ext:deno_web/13_message_port.js";
 import * as compression from "ext:deno_web/14_compression.js";
 import * as performance from "ext:deno_web/15_performance.js";
@@ -34,6 +34,12 @@ import { XMLHttpRequest } from "ext:browser_worker/xml_http_request.js";
 denoEvent.saveGlobalThisReference(globalThis)
 
 const { core } = Deno
+location.setLocationHref(core.ops.op_worker_get_location_href())
+Object.defineProperties(globalThis, {
+    location: location.workerLocationDescriptor,
+    WorkerLocation: location.workerLocationConstructorDescriptor,
+})
+
 let nextTimerId = 1
 const activeTimers = new Map()
 
@@ -217,6 +223,12 @@ const navigator = {
 Object.defineProperty(globalThis, "navigator", {
     value: navigator,
     enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "performance", {
+    value: performance.performance,
     configurable: true,
     writable: true,
 })
