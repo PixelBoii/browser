@@ -12454,6 +12454,7 @@ impl Frame {
     ) {
         match cmd {
             cmd @ (FrameCommand::Render
+            | FrameCommand::UserEvent(UserEvent::FrameUpdated)
             | FrameCommand::UserEvent(UserEvent::DomUpdated)
             | FrameCommand::UserEvent(UserEvent::CanvasUpdated)
             | FrameCommand::UserEvent(UserEvent::ImagesPrefetched(_))) => {
@@ -12551,6 +12552,9 @@ impl Frame {
 
                 *bitmap_for_thread.lock().unwrap() = pixels;
                 let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
+            }
+            FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
+                self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
             }
             FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
                 let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
