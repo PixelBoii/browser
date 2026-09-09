@@ -547,7 +547,9 @@ class TextNode extends BaseNode {
         cacheNodeElement(this.__node_idx, this)
     }
 
-    get data() { return this.text }
+    get data() {
+        return this.__node_idx == null ? this.text : core.ops.op_get_text_content(this.__node_idx)
+    }
     set data(value) {
         this.text = String(value)
         if (this.__node_idx != null) {
@@ -555,10 +557,10 @@ class TextNode extends BaseNode {
         }
     }
 
-    get nodeValue() { return this.text }
+    get nodeValue() { return this.data }
     set nodeValue(value) { this.data = value }
 
-    get textContent() { return this.text }
+    get textContent() { return this.data }
     set textContent(value) { this.data = value }
 
     get nodeType() {
@@ -3369,17 +3371,38 @@ Object.defineProperty(globalThis, "XMLHttpRequest", {
     writable: true,
 })
 
+function mutationRecordsFromBackend(records) {
+    return records.map(record => ({
+        ...record, target: elementFromNodeIdx(record.target),
+        addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null,
+        attributeNamespace: null,
+    }))
+}
+
 class MutationObserver {
-    constructor(cb) {
-        //
+    #id
+    #deliver
+
+    constructor(callback) {
+        if (typeof callback !== "function") throw new TypeError("MutationObserver requires a callback")
+        this.#id = core.ops.op_mutation_observer_create()
+        this.#deliver = records => {
+            callback.call(this, mutationRecordsFromBackend(records), this)
+        }
     }
 
-    observe(node, config) {
-        //
+    observe(node, config = {}) {
+        if (!(node instanceof BaseNode) && !(node instanceof Document)) throw new TypeError("Expected a Node")
+        if ((node.ownerDocument ?? node).__frameId != null) throw new Error("Cross-frame observation is not implemented")
+        core.ops.op_mutation_observer_observe(this.#id, node.__node_idx ?? null, config, this.#deliver)
     }
 
     disconnect() {
-        //
+        core.ops.op_mutation_observer_disconnect(this.#id)
+    }
+
+    takeRecords() {
+        return mutationRecordsFromBackend(core.ops.op_mutation_observer_take_records(this.#id))
     }
 }
 

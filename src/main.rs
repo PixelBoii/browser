@@ -1,11 +1,16 @@
 mod css;
 mod loader;
+mod mutation_observer;
 mod parser;
 mod style;
 mod ui;
 
 use deno_core::serde::Deserialize;
 use deno_error::JsErrorBox;
+use mutation_observer::{
+    op_mutation_observer_create, op_mutation_observer_disconnect, op_mutation_observer_observe,
+    op_mutation_observer_take_records,
+};
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use fixedbitset::FixedBitSet;
 use image::{DynamicImage, ImageReader};
@@ -1742,6 +1747,7 @@ struct Renderer {
     node_styles: NodeMap<Style>,
     style_cache: StyleCache,
     selector_changes: SelectorChanges,
+    mutation_observers: mutation_observer::Observers,
     layout_table: Vec<LayoutBox>,
     flex_measurements: HashMap<FlexMeasurementKey, Option<Size>>,
     node_layout_mapping: NodeMap<usize>,
@@ -5915,71 +5921,28 @@ fn op_set_inner_html(
     }
 }
 
-#[op2(fast)]
+#[op2(nofast)]
 fn op_set_text_content(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] text: String,
-) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-
-    let (needs_index_rebuild, child_list_changed) = match renderer.nodes.get_mut(node_idx).unwrap()
-    {
-        Node::Text(element) => {
-            element.text = text;
-            (false, false)
-        }
-        Node::Comment(element) => {
-            element.comment = text;
-            (false, false)
-        }
-        Node::Element(_) | Node::DocumentFragment => {
-            let children = renderer
-                .dom_indexes
-                .children_index
-                .get(&node_idx)
-                .cloned()
-                .unwrap_or_default();
-            let had_children = !children.is_empty();
-            for child in children {
-                renderer.remove_node(child, true);
-            }
-            renderer.push_node(Node::Text(TextElement {
-                text,
-                parent: Some(node_idx),
-            }));
-            let text_idx = renderer.nodes.cursor;
-            renderer
-                .dom_indexes
-                .children_index
-                .insert(node_idx, vec![text_idx]);
-            renderer.dom_indexes.children_index.insert(text_idx, vec![]);
-            (had_children, true)
-        }
-    };
-
-    if child_list_changed {
-        renderer.selector_changes.child_list_changed(node_idx);
-    }
-
-    // Text nodes are absent from the tag/class/id/attribute indexes, and the new parent-child
-    // relationship was recorded above. Only removed descendants can invalidate those indexes.
-    if needs_index_rebuild {
-        renderer.recompute_dom_indexes();
-    }
-    renderer.schedule_dom_update();
-    Ok(())
+) {
+    let state = JsRuntime::op_state_from(scope);
+    state
+        .borrow()
+        .borrow::<JsHostState>()
+        .renderer
+        .borrow_mut()
+        .set_text_content(node_idx, text);
+    mutation_observer::schedule(scope);
 }
+
 
 #[op2]
 #[string]
 fn op_get_text_content(state: &mut OpState, #[number] node_idx: usize) -> Result<String, JsError> {
     let host = state.borrow_mut::<JsHostState>();
-    let text = host
-        .renderer
-        .borrow_mut()
-        .get_element_text_content(node_idx);
+    let text = host.renderer.borrow().get_text_content(node_idx);
     Ok(text)
 }
 
@@ -6187,67 +6150,53 @@ fn op_get_parent_node(
 }
 
 #[op2]
-fn op_update_attributes<'s>(
-    state: &mut OpState,
+fn op_update_attributes(
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[serde] attributes: HashMap<String, String>,
     #[number] frame_id: Option<usize>,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    let attributes = Attributes::from_hash_map(attributes);
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
-                node_idx,
-                attributes,
-                reply,
-            })
-        })?
-        .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
-    } else {
-        renderer
-            .update_element_attributes(node_idx, attributes)
+    let result = {
+        let state = JsRuntime::op_state_from(scope);
+        let state = state.borrow();
+        let host = state.borrow::<JsHostState>();
+        let mut renderer = host.renderer.borrow_mut();
+        let attributes = Attributes::from_hash_map(attributes);
+        if let Some(frame_id) = frame_id {
+            js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+                FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
+                    node_idx,
+                    attributes,
+                    reply,
+                })
+            })?
             .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
-    }
+        } else {
+            renderer
+                .update_element_attributes(node_idx, attributes)
+                .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
+        }
+    };
+    mutation_observer::schedule(scope);
+    result
 }
 
-#[op2(fast)]
+#[op2(nofast)]
 fn op_remove_attribute(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] attribute: String,
-) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    let removed = match renderer.nodes.get_mut(node_idx).unwrap() {
-        Node::Element(element) => element.attributes.remove(&attribute),
-        _ => None,
-    };
-    let Some(removed) = removed else {
-        return Ok(());
-    };
-
-    if attribute == "id" {
-        renderer.dom_indexes.remove_id_node(&removed, node_idx);
-    } else if attribute == "class" {
-        let Renderer {
-            dom_indexes,
-            css_parser,
-            ..
-        } = &mut *renderer;
-        dom_indexes.remove_class_node(&removed, node_idx, &mut css_parser.class_definitions);
-    }
-    renderer
-        .dom_indexes
-        .remove_attribute_node(&attribute, node_idx);
-    renderer
-        .selector_changes
-        .attribute_changed(node_idx, attribute, Some(removed), None);
-    renderer.style_cache.mark_node_dirty(node_idx);
-    renderer.schedule_dom_update();
-    Ok(())
+) {
+    let state = JsRuntime::op_state_from(scope);
+    state
+        .borrow()
+        .borrow::<JsHostState>()
+        .renderer
+        .borrow_mut()
+        .remove_attribute(node_idx, attribute);
+    mutation_observer::schedule(scope);
 }
+
 
 fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
     match node {
@@ -6827,6 +6776,10 @@ extension!(
   browser,
   ops = [
     op_fetch_site,
+    op_mutation_observer_create,
+    op_mutation_observer_observe,
+    op_mutation_observer_disconnect,
+    op_mutation_observer_take_records,
     op_create_element,
     op_create_document_fragment,
     op_get_template_content,
@@ -7411,6 +7364,7 @@ impl Renderer {
             node_styles,
             style_cache,
             selector_changes: SelectorChanges::default(),
+            mutation_observers: mutation_observer::Observers::default(),
             layout_table,
             flex_measurements: HashMap::new(),
             node_layout_mapping,
@@ -7755,7 +7709,91 @@ impl Renderer {
             .collect()
     }
 
+    fn set_text_content(&mut self, node_idx: usize, text: String) {
+        let (needs_index_rebuild, child_list_changed) = match self.nodes.get_mut(node_idx).unwrap()
+        {
+            Node::Text(element) => {
+                let old_value = std::mem::replace(&mut element.text, text);
+                self.record_mutation(node_idx, None, Some(old_value));
+                (false, false)
+            }
+            Node::Comment(element) => {
+                let old_value = std::mem::replace(&mut element.comment, text);
+                self.record_mutation(node_idx, None, Some(old_value));
+                (false, false)
+            }
+            Node::Element(_) | Node::DocumentFragment => {
+                let children = self
+                    .dom_indexes
+                    .children_index
+                    .get(&node_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                let had_children = !children.is_empty();
+                for child in children {
+                    self.remove_node(child, true);
+                }
+                self.push_node(Node::Text(TextElement {
+                    text,
+                    parent: Some(node_idx),
+                }));
+                let text_idx = self.nodes.cursor;
+                self.dom_indexes
+                    .children_index
+                    .insert(node_idx, vec![text_idx]);
+                self.dom_indexes.children_index.insert(text_idx, vec![]);
+                (had_children, true)
+            }
+        };
+
+        if child_list_changed {
+            self.selector_changes.child_list_changed(node_idx);
+        }
+
+        // Text nodes are absent from the tag/class/id/attribute indexes, and the new parent-child
+        // relationship was recorded above. Only removed descendants can invalidate those indexes.
+        if needs_index_rebuild {
+            self.recompute_dom_indexes();
+        }
+        self.schedule_dom_update();
+    }
+
+    fn remove_attribute(&mut self, node_idx: usize, attribute: String) {
+        let removed = match self.nodes.get_mut(node_idx).unwrap() {
+            Node::Element(element) => element.attributes.remove(&attribute),
+            _ => None,
+        };
+        let Some(removed) = removed else {
+            return;
+        };
+
+        if attribute == "id" {
+            self.dom_indexes.remove_id_node(&removed, node_idx);
+        } else if attribute == "class" {
+            let Renderer {
+                dom_indexes,
+                css_parser,
+                ..
+            } = self;
+            dom_indexes.remove_class_node(&removed, node_idx, &mut css_parser.class_definitions);
+        }
+        self.dom_indexes.remove_attribute_node(&attribute, node_idx);
+        self.record_mutation(node_idx, Some(attribute.clone()), Some(removed.clone()));
+        self.selector_changes
+            .attribute_changed(node_idx, attribute, Some(removed), None);
+        self.style_cache.mark_node_dirty(node_idx);
+        self.schedule_dom_update();
+    }
+
     fn update_element_attributes(&mut self, node_idx: usize, attributes: Attributes) -> Result<()> {
+        if !self.mutation_observers.is_empty() {
+            for name in attributes.values.keys() {
+                if let Some(Node::Element(element)) = self.nodes.get(node_idx) {
+                    let old_value = element.attributes.values.get(name).cloned();
+                    self.record_mutation(node_idx, Some(name.clone()), old_value);
+                }
+            }
+        }
         let mut attribute_changes = vec![];
         match self
             .nodes
@@ -8698,14 +8736,6 @@ impl Renderer {
             let variable = self.variable_definitions.data.get(variable).unwrap();
             *str = str.replace(&format!("var({})", variable.property), value);
         }
-    }
-
-    fn get_element_text_content(&self, node_idx: usize) -> String {
-        let mut str = String::new();
-        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
-            str += &self.get_text_content(*child_idx);
-        }
-        str
     }
 
     fn get_element_inner_html(&self, node_idx: usize) -> String {
@@ -12530,6 +12560,7 @@ impl Frame {
 
     fn drain_microtasks(runtime: &mut JsRuntime) {
         deno_core::scope!(scope, runtime);
+        mutation_observer::schedule(scope);
         scope.perform_microtask_checkpoint();
     }
 
@@ -12552,6 +12583,7 @@ impl Frame {
         let _guard = tokio.enter();
 
         let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+        Self::drain_microtasks(&mut runtime);
         let value = runtime.execute_script(name, code)?;
         Self::drain_microtasks(&mut runtime);
         Ok(value)
@@ -12904,6 +12936,7 @@ impl Frame {
             .clone()
             .borrow_mut()
             .block_on(async {
+                Self::drain_microtasks(&mut runtime);
                 tokio::select! {
                     result = runtime.run_event_loop(Default::default()) => match result {
                         Ok(()) => Ok(false),
@@ -13278,6 +13311,15 @@ impl Frame {
 
     fn bind_js_host(&mut self, proxy: RendererProxy) {
         if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
+            self.renderer
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .mutation_observers = mutation_observer::Observers::default();
+            js_runtime
+                .op_state()
+                .borrow_mut()
+                .put(mutation_observer::Callbacks::default());
             js_runtime.op_state().borrow_mut().put(JsHostState {
                 renderer: self.renderer.as_mut().cloned().unwrap(),
                 proxy: proxy,
