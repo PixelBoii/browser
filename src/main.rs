@@ -5192,7 +5192,6 @@ fn op_post_message_to_frame(
     #[string] message: String,
     #[number] frame_id: usize,
 ) -> Result<(), JsErrorBox> {
-    println!("test");
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
     let Some(frame) = renderer.frames.get(&frame_id) else {
