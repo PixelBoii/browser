@@ -12525,9 +12525,9 @@ impl Frame {
                 self.paint_iframe(parent_proxy, bitmap_for_thread, !canvas_updated);
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
-                self.apply_hovering(&position);
-
-                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
+                if self.apply_hovering(&position) {
+                    self.paint_iframe(parent_proxy, bitmap_for_thread, true);
+                }
             }
             FrameCommand::UserEvent(UserEvent::Click) => {
                 if let Err(err) = self.on_click() {
@@ -13671,8 +13671,9 @@ impl Frame {
         style.background = StyleBackground::Hex(0x32_a8_52_FF);
     }
 
-    fn apply_hovering(&mut self, cursor: &Position) {
+    fn apply_hovering(&mut self, cursor: &Position) -> bool {
         self.last_hover_position = Some(*cursor);
+        let mut needs_repaint = false;
         let (should_re_render, hovering, iframe_hover) = {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             let old_value = renderer.hovering.clone();
@@ -13747,6 +13748,7 @@ impl Frame {
                 renderer.style_cache.next_style_revision != previous_revision
             };
             if styles_changed || self.hover_debugging {
+                needs_repaint = true;
                 self.layout_dirty = true;
                 if let Some(hovering) = hovering
                     && self.hover_debugging
@@ -13758,6 +13760,7 @@ impl Frame {
                 }
             }
         }
+        needs_repaint
     }
 
     pub fn pump_with_limit(&mut self, latest_end: Instant) -> Result<()> {
