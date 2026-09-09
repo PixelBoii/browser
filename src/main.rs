@@ -12560,7 +12560,7 @@ impl Frame {
                 let code = format!(
                     r#"
                 (() => {{
-                    const event = new MessageEvent("message", {{ data: {} }})
+                    const event = new MessageEvent("message", {{ data: {}, source: parent }})
                     window.dispatchEvent(event)
                 }})()
                 "#,
