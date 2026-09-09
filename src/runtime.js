@@ -1575,6 +1575,22 @@ class HTMLMediaElement extends HtmlElement {
     }
 }
 
+class HTMLBodyElement extends HtmlElement {
+    constructor() {
+        super("body")
+    }
+
+    get onload() { return this.ownerDocument.defaultView.onload }
+    set onload(handler) { this.ownerDocument.defaultView.onload = handler }
+}
+
+Object.defineProperty(globalThis, "HTMLBodyElement", {
+    value: HTMLBodyElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 class HTMLDivElement extends HtmlElement {
     constructor() {
         super("div")
@@ -2184,7 +2200,9 @@ Object.defineProperty(globalThis, "SVGElement", {
 })
 
 function tagToElement(tag) {
-    return tag === "svg" ?
+    return tag === "body" ?
+        HTMLBodyElement :
+        tag === "svg" ?
         SVGElement :
         tag === "template" ?
             HTMLTemplateElement :

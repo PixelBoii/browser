@@ -7506,11 +7506,13 @@ impl Renderer {
                     *phase == LoadPhase::IframeDone
                 } else if element.tag == "img" {
                     self.images_nodes_loaded.contains_key(&node_idx)
-                } else {
+                } else if element.tag == "link" || element.tag == "style" {
                     *phase == LoadPhase::JsDone
+                } else {
+                    false
                 }
             }
-            _ => *phase == LoadPhase::JsDone,
+            _ => false,
         }
     }
 
@@ -13012,8 +13014,8 @@ impl Frame {
             }
         };
 
-        // Run onload handlers
-        if let Some(node_idx) = js.node_idx {
+        // Only external scripts fire load after execution.
+        if let (ScriptContent::Link(_), Some(node_idx)) = (&js.content, js.node_idx) {
             let code = format!(
                 "__elementFromNodeIdx({}).dispatchEvent(new Event('load'))",
                 node_idx
