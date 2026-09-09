@@ -1362,6 +1362,8 @@ class HtmlCanvasElement extends HtmlElement {
     }
 }
 
+const windowProxies = new Map()
+
 class HTMLIFrameElement extends HtmlElement {
     constructor() {
         super("iframe")
@@ -1391,7 +1393,12 @@ class HTMLIFrameElement extends HtmlElement {
     get contentWindow() {
         // Frame idx is the node idx
         this.spawnFrame()
-        return new WindowProxy(this.__node_idx)
+        let proxy = windowProxies.get(this.__node_idx)
+        if (!proxy) {
+            proxy = new WindowProxy(this.__node_idx)
+            windowProxies.set(this.__node_idx, proxy)
+        }
+        return proxy
     }
 }
 
