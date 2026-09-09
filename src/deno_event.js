@@ -1245,8 +1245,10 @@ class CloseEvent extends Event {
 const CloseEventPrototype = CloseEvent.prototype;
 
 class MessageEvent extends Event {
+  #source;
+
   get source() {
-    return null;
+    return this.#source;
   }
 
   constructor(type, eventInitDict) {
@@ -1257,6 +1259,7 @@ class MessageEvent extends Event {
     });
 
     this.data = eventInitDict?.data ?? null;
+    this.#source = eventInitDict?.source ?? null;
     this.ports = eventInitDict?.ports ?? [];
     this.origin = eventInitDict?.origin ?? "";
     this.lastEventId = eventInitDict?.lastEventId ?? "";
