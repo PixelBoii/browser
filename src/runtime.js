@@ -1461,6 +1461,12 @@ class HTMLScriptElement extends HtmlElement {
     }
 }
 
+class HTMLLinkElement extends HtmlElement {
+    constructor() {
+        super("link")
+    }
+}
+
 class HTMLFormControlElement extends HtmlElement {
     constructor(tag) {
         super(tag)
@@ -1627,6 +1633,12 @@ Object.defineProperty(globalThis, "HTMLIFrameElement", {
 });
 Object.defineProperty(globalThis, "HTMLScriptElement", {
     value: HTMLScriptElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLLinkElement", {
+    value: HTMLLinkElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -2182,6 +2194,8 @@ function tagToElement(tag) {
                 HTMLIFrameElement :
                 tag === "script" ?
                     HTMLScriptElement :
+                    tag === "link" ?
+                        HTMLLinkElement :
                     tag === "input" ?
                         HTMLInputElement :
                     tag === "textarea" ?
