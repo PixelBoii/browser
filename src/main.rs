@@ -13215,14 +13215,6 @@ impl Frame {
                         continue;
                     };
                     self.execute_host_script("implicit event handler", code)?;
-                    let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
-                    let future = runtime.run_event_loop(Default::default());
-                    self.tokio
-                        .as_ref()
-                        .unwrap()
-                        .clone()
-                        .borrow_mut()
-                        .block_on(future)?;
                 }
             }
 
