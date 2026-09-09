@@ -3351,17 +3351,15 @@ Object.defineProperty(globalThis, "MessageEvent", {
     writable: true,
 })
 
-class FormData {
+class FormData extends formData.FormData {
     constructor(formElement = null) {
+        super()
         if (formElement instanceof Node) {
-            this.data = core.ops.op_collect_data_for_form(formElement.__node_idx)
-        } else {
-            this.data = {}
+            const data = core.ops.op_collect_data_for_form(formElement.__node_idx)
+            for (const [name, value] of Object.entries(data)) {
+                this.append(name, value)
+            }
         }
-    }
-
-    [Symbol.iterator]() {
-        return Object.entries(this.data)[Symbol.iterator]()
     }
 }
 
