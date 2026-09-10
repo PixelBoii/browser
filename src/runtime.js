@@ -456,6 +456,19 @@ Object.defineProperty(globalThis, "NodeFilter", {
     writable: true,
 })
 
+class Range {
+    constructor() {
+        // Expose the interface for type references; range operations are not implemented.
+        throw new TypeError("Range is not implemented")
+    }
+}
+
+Object.defineProperty(globalThis, "Range", {
+    value: Range,
+    configurable: true,
+    writable: true,
+})
+
 class CustomElementRegistry {
     constructor() {
         this.definitions = new Map()
