@@ -6739,7 +6739,7 @@ fn query_selector_all(
     if let Some(required_parent) = required_parent {
         node_idxs = node_idxs
             .into_iter()
-            .filter(|idx| has_parent(nodes_table, *idx, required_parent))
+            .filter(|idx| *idx != required_parent && has_parent(nodes_table, *idx, required_parent))
             .collect();
         node_idxs.sort();
     }
