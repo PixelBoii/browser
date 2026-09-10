@@ -1,4 +1,5 @@
 mod css;
+mod custom_elements;
 mod loader;
 mod mutation_observer;
 mod parser;
@@ -7,6 +8,10 @@ mod ui;
 
 use deno_core::serde::Deserialize;
 use deno_error::JsErrorBox;
+use custom_elements::{
+    op_custom_element_construct, op_custom_element_create, op_custom_element_define,
+    op_custom_element_get, op_custom_element_upgrade,
+};
 use mutation_observer::{
     op_mutation_observer_create, op_mutation_observer_disconnect, op_mutation_observer_observe,
     op_mutation_observer_take_records,
@@ -5268,16 +5273,21 @@ fn clone_node(
     Ok(new_node_idx)
 }
 
-#[op2(fast)]
+#[op2(nofast, reentrant)]
 fn op_clone_node(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     deep: bool,
 ) -> Result<u32, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    let new_node_idx = clone_node(&mut renderer, node_idx, None, deep)
-        .or_else(|err| Err(JsErrorBox::generic(err.root_cause().to_string())))?;
+    let new_node_idx = {
+        let state = JsRuntime::op_state_from(scope);
+        let state = state.borrow();
+        let host = state.borrow::<JsHostState>();
+        let mut renderer = host.renderer.borrow_mut();
+        clone_node(&mut renderer, node_idx, None, deep)
+            .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))?
+    };
+    custom_elements::upgrade_subtree(scope, Some(new_node_idx), None);
     Ok(new_node_idx as u32)
 }
 
@@ -5669,6 +5679,31 @@ fn op_remove_child(state: &mut OpState, #[number] child_idx: usize) -> Result<()
     let mut renderer = host.renderer.borrow_mut();
     renderer.detach_node(child_idx);
     renderer.schedule_dom_update();
+    Ok(())
+}
+
+fn node_index_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let name = v8::String::new(scope, "browser::Node::index").unwrap();
+    v8::Private::for_api(scope, Some(name))
+}
+
+fn native_node_index(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) -> Option<usize> {
+    let key = node_index_key(scope);
+    let value = object.get_private(scope, key)?;
+    Some(v8::Local::<v8::Number>::try_from(value).ok()?.value() as usize)
+}
+
+#[op2(fast)]
+fn op_bind_node_wrapper(
+    scope: &mut v8::PinScope,
+    object: v8::Local<v8::Object>,
+    #[number] idx: usize,
+) -> Result<(), JsErrorBox> {
+    let key = node_index_key(scope);
+    let value = v8::Number::new(scope, idx as f64);
+    if object.set_private(scope, key, value.into()) != Some(true) {
+        return Err(JsErrorBox::type_error("Could not bind node wrapper"));
+    }
     Ok(())
 }
 
@@ -6776,6 +6811,11 @@ extension!(
   browser,
   ops = [
     op_fetch_site,
+    op_custom_element_define,
+    op_custom_element_create,
+    op_custom_element_get,
+    op_custom_element_upgrade,
+    op_custom_element_construct,
     op_mutation_observer_create,
     op_mutation_observer_observe,
     op_mutation_observer_disconnect,
@@ -6821,6 +6861,7 @@ extension!(
     op_set_location_href,
     op_is_top,
     op_get_node,
+    op_bind_node_wrapper,
     op_get_closest,
     op_get_attribute,
     op_get_attributes,
@@ -13320,6 +13361,10 @@ impl Frame {
                 .op_state()
                 .borrow_mut()
                 .put(mutation_observer::Callbacks::default());
+            js_runtime
+                .op_state()
+                .borrow_mut()
+                .put(custom_elements::Registry::default());
             js_runtime.op_state().borrow_mut().put(JsHostState {
                 renderer: self.renderer.as_mut().cloned().unwrap(),
                 proxy: proxy,
@@ -14789,7 +14834,12 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://www.google.com".to_string(),
+        concat!(
+            "file://",
+            env!("CARGO_MANIFEST_DIR"),
+            "/pages/custom-elements.html"
+        )
+        .to_string(),
         hover_debugging,
         show_fps_counter,
     )?;

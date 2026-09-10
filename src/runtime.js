@@ -469,18 +469,30 @@ Object.defineProperty(globalThis, "Range", {
     writable: true,
 })
 
+const customElementRegistryToken = Symbol()
+
+for (const name of ["SyntaxError", "NotSupportedError", "InvalidStateError"]) {
+    core.registerErrorBuilder(`DOMException${name}`, message => new DOMException.DOMException(message, name))
+}
+
 class CustomElementRegistry {
-    constructor() {
-        this.definitions = new Map()
+    constructor(token) {
+        if (token !== customElementRegistryToken) throw new TypeError("Scoped custom element registries are not implemented")
     }
 
-    // TODO: Definition validation, element upgrades, lifecycle callbacks, and whenDefined().
-    define(name, constructor) {
-        this.definitions.set(name, constructor)
+    define(name, constructor, options = {}) {
+        if (options?.extends !== undefined) throw new Error("Customized built-in elements are not implemented")
+        core.ops.op_custom_element_define(String(name), constructor)
     }
 
     get(name) {
-        return this.definitions.get(name)
+        return core.ops.op_custom_element_get(String(name)) ?? undefined
+    }
+
+    upgrade(root) {
+        if (!(root instanceof BaseNode) && !(root instanceof Document)) throw new TypeError("Expected a Node")
+        if ((root.ownerDocument ?? root).__frameId != null) throw new Error("Cross-frame upgrades are not implemented")
+        core.ops.op_custom_element_upgrade(root.__node_idx ?? null)
     }
 }
 
@@ -492,7 +504,7 @@ Object.defineProperty(globalThis, "CustomElementRegistry", {
 })
 
 Object.defineProperty(globalThis, "customElements", {
-    value: new CustomElementRegistry(),
+    value: new CustomElementRegistry(customElementRegistryToken),
     enumerable: true,
     configurable: true,
     writable: true,
@@ -796,6 +808,12 @@ Object.defineProperty(globalThis, "DOMStringMap", {
 class HtmlElement extends BaseNode {
     constructor(tag) {
         super()
+        if (autoRegisterNode) {
+            const customElement = core.ops.op_custom_element_construct(new.target)
+            if (customElement) return customElement
+        }
+        // Internal element factories supply a tag; an unregistered custom constructor cannot.
+        if (tag === undefined) throw new TypeError("Custom element constructor is not registered")
         this.tag = tag
         this.namespaceURI = "http://www.w3.org/1999/xhtml"
         if (autoRegisterNode) {
@@ -2233,6 +2251,10 @@ function clearNodeMap() {
 
 function cacheNodeElement(nodeIdx, element) {
     if (nodeIdx != null) {
+        // Foreign-frame indices do not refer to nodes in this realm's renderer.
+        if (element.ownerDocument.__frameId == null) {
+            core.ops.op_bind_node_wrapper(element, nodeIdx)
+        }
         nodeMap.set(nodeMapKey(nodeIdx), element)
     }
 }
@@ -2264,7 +2286,7 @@ function nodeToElement(pair) {
         element = withoutAutoRegisterNode(() => new TextNode(node.text))
     }
     element.__node_idx = node_idx
-    nodeMap.set(key, element)
+    cacheNodeElement(node_idx, element)
     return element
 }
 
@@ -2435,6 +2457,10 @@ class Document extends EventTarget {
     }
     createElementNS(ns, tag) {
         tag = String(tag)
+        if (ns === "http://www.w3.org/1999/xhtml" && this.__frameId == null) {
+            const element = withDocument(this, () => core.ops.op_custom_element_create(tag))
+            if (element) return element
+        }
         const elementClass = tagToElement(tag)
         const element = withDocument(this, () => new elementClass(tag))
         element.namespaceURI = ns
@@ -2442,6 +2468,10 @@ class Document extends EventTarget {
     }
     createElement(tag, ...args) {
         tag = String(tag).replace(/[A-Z]/g, char => char.toLowerCase())
+        if (this.__frameId == null) {
+            const element = withDocument(this, () => core.ops.op_custom_element_create(tag))
+            if (element) return element
+        }
         const elementClass = tagToElement(tag)
         const element = withDocument(this, () => new elementClass(tag, ...args))
         return element
