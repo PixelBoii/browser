@@ -13983,25 +13983,6 @@ impl Frame {
         needs_repaint
     }
 
-    pub fn pump_with_limit(&mut self, latest_end: Instant) -> Result<()> {
-        match self.pump_js_event_loop_once() {
-            Ok(js_pending) => {
-                let dom_pending = self.renderer.as_ref().unwrap().borrow().pending_dom_update;
-
-                if dom_pending {
-                    self.execute_dom_update();
-                }
-
-                if js_pending && Instant::now().le(&latest_end) {
-                    self.pump_with_limit(latest_end)
-                } else {
-                    Ok(())
-                }
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     pub fn handle_main_event(&mut self, proxy: &RendererProxy, event: FrameCommand) {
         match event {
             FrameCommand::Render => {
@@ -15292,11 +15273,13 @@ mod tests {
     };
 
     impl Frame {
-        fn process_pending_navigation_events(
+        fn process_pending_snapshot_events(
             &mut self,
             frame_rx: &Receiver<FrameCommand>,
-        ) -> Result<()> {
+        ) -> Result<bool> {
+            let mut had_commands = false;
             while let Ok(command) = frame_rx.try_recv() {
+                had_commands = true;
                 match command {
                     FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
                         self.perform_navigation(href, reload)?;
@@ -15309,8 +15292,37 @@ mod tests {
                             .finish_image_prefetch(entries);
                         self.layout_dirty = true;
                     }
+                    FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
+                        self.animation_frame_requested = true;
+                    }
                     // Headless tests apply DOM and rendering updates directly.
                     _ => {}
+                }
+            }
+            Ok(had_commands)
+        }
+
+        fn pump_with_limit(
+            &mut self,
+            frame_rx: &Receiver<FrameCommand>,
+            latest_end: Instant,
+        ) -> Result<()> {
+            while Instant::now() < latest_end {
+                self.process_pending_snapshot_events(frame_rx)?;
+                self.run_animation_frame_if_due()?;
+                let js_pending = self.pump_js_event_loop_once()?;
+                if self.renderer.as_ref().unwrap().borrow().pending_dom_update {
+                    self.execute_dom_update();
+                }
+                // JS can request a frame or navigate even when Deno reports idle.
+                let had_commands = self.process_pending_snapshot_events(frame_rx)?;
+                if !js_pending && !had_commands {
+                    let Some(delay) = self.animation_frame_delay() else {
+                        break;
+                    };
+                    std::thread::sleep(
+                        delay.min(latest_end.saturating_duration_since(Instant::now())),
+                    );
                 }
             }
             Ok(())
@@ -15394,13 +15406,13 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         frame.apply_hovering(&Position { x: 864, y: 770 });
         frame.on_click()?;
-        frame.process_pending_navigation_events(&rx)?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.process_pending_snapshot_events(&rx)?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "googlecom", 1920, 1080)
     }
@@ -15416,7 +15428,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         // The current baseline is blank because app startup fails; see NOTES.md.
@@ -15472,7 +15484,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         // Facebook can still capture an empty app shell before initialization; see NOTES.md.
@@ -15492,7 +15504,7 @@ mod tests {
         frame.run_js()?;
         let pump_limit = Duration::from_secs(10);
         let pump_start = Instant::now();
-        frame.pump_with_limit(Instant::now().add(pump_limit))?;
+        frame.pump_with_limit(&rx, Instant::now().add(pump_limit))?;
         println!(
             "renders_swapped_com pump={}ms limit={}ms",
             pump_start.elapsed().as_millis(),
@@ -15539,7 +15551,7 @@ mod tests {
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 4320];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 4320, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "vitedev", 1920, 4320)
@@ -15556,7 +15568,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "vitefeatures", 1920, 1080)
@@ -15573,7 +15585,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(2)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(2)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "marblematchio", 1920, 1080)
@@ -15589,7 +15601,7 @@ mod tests {
         );
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "pixeltimetracker", 1920, 1080)
@@ -15606,7 +15618,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 8640];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 8640, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "slackcom", 1920, 8640)
@@ -15623,7 +15635,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 6480];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 6480, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "discordcom", 1920, 6480)
@@ -15640,7 +15652,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 6480];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 6480, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "cloudflarecom", 1920, 6480)
@@ -15657,7 +15669,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "nodejsorg", 1920, 2160)
@@ -15674,13 +15686,13 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 2160];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         frame.apply_hovering(&Position { x: 1140, y: 1850 });
         frame.on_click()?;
-        frame.process_pending_navigation_events(&rx)?;
-        frame.pump_with_limit(Instant::now().add(Duration::from_secs(5)))?;
+        frame.process_pending_snapshot_events(&rx)?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
     }
