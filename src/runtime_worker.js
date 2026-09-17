@@ -4,6 +4,7 @@ import * as url from "ext:deno_web/00_url.js";
 import * as urlPattern from "ext:deno_web/01_urlpattern.js";
 import * as infra from "ext:deno_web/00_infra.js";
 import * as DOMException from "ext:deno_web/01_dom_exception.js";
+import { Console, setNoColorFns } from "ext:deno_web/01_console.js";
 import * as broadcastChannel from "ext:deno_web/01_broadcast_channel.js";
 import * as mimesniff from "ext:deno_web/01_mimesniff.js";
 import * as denoEvent from "ext:deno_web/02_event.js";
@@ -34,6 +35,10 @@ import { XMLHttpRequest } from "ext:browser_worker/xml_http_request.js";
 denoEvent.saveGlobalThisReference(globalThis)
 
 const { core } = Deno
+setNoColorFns(() => true, () => true)
+globalThis.console = new Console((message, level) => core.print(message, level >= 2))
+core.wrapConsole(globalThis.console, core.console)
+
 location.setLocationHref(core.ops.op_worker_get_location_href())
 Object.defineProperties(globalThis, {
     location: location.workerLocationDescriptor,

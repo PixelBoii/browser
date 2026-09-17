@@ -8032,6 +8032,11 @@ impl Renderer {
 
                 let script_type =
                     parse_script_type_attr(element.attributes.get_str("type").as_deref())?;
+                if script_type == ScriptType::Classic
+                    && element.attributes.get_str("nomodule").is_some()
+                {
+                    return None;
+                }
                 let src = element.attributes.get_str("src");
                 let has_src = src.is_some();
                 let is_async = has_src && element.attributes.get_str("async").is_some();
@@ -12443,6 +12448,7 @@ struct Frame {
     layout_booted: bool,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
     network_fetch: Rc<RefCell<NetworkFetch>>,
+    next_inline_module_id: u64,
     dom_content_loaded_dispatched: bool,
     load_dispatched: bool,
     is_top: bool,
@@ -12502,6 +12508,7 @@ impl Frame {
             html_parser: None,
             font_handler,
             executed_scripts: Rc::new(RefCell::new(ExecutedScripts::new())),
+            next_inline_module_id: 0,
             layout_dirty: true,
             layout_booted: false,
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
@@ -13045,6 +13052,26 @@ impl Frame {
         bodies
     }
 
+    async fn execute_js_module(runtime: &mut JsRuntime, url: &ReqwestUrl, code: String) {
+        // Modules do not expose a document.currentScript, including during imports.
+        if let Err(err) = Self::set_current_script(runtime, None) {
+            eprintln!("Failed to prepare JS module at {url}: {err}");
+            return;
+        }
+        match runtime.load_side_es_module_from_code(url, code).await {
+            Ok(module_id) => {
+                let result = runtime.mod_evaluate(module_id);
+                if let Err(err) = runtime
+                    .with_event_loop_promise(result, Default::default())
+                    .await
+                {
+                    eprintln!("Failed to execute JS module at {url}: {err}");
+                }
+            }
+            Err(err) => eprintln!("Failed to load JS module at {url}: {err}"),
+        }
+    }
+
     async fn execute_js_script(
         &mut self,
         js: &Script,
@@ -13055,6 +13082,22 @@ impl Frame {
         };
 
         match &js.content {
+            ScriptContent::Code(code) if js.script_type == ScriptType::Module => {
+                let mut url = ReqwestUrl::parse(&self.url)?;
+                // Deno keys modules by URL. Each inline script needs its own entry,
+                // while relative imports still resolve against the document URL.
+                url.set_fragment(Some(&format!(
+                    "inline-module-{}",
+                    self.next_inline_module_id
+                )));
+                self.next_inline_module_id += 1;
+                // Keep the synthetic module identity out of the page's import.meta.url.
+                let code = format!(
+                    "import.meta.url = {};\n{code}",
+                    js_string_literal(&self.url)
+                );
+                Self::execute_js_module(&mut runtime, &url, code).await;
+            }
             ScriptContent::Code(code) => {
                 let code_context: String = code.chars().take(40).collect();
                 Self::set_current_script(&mut runtime, js.node_idx)?;
@@ -13092,23 +13135,7 @@ impl Frame {
                     }
                     ScriptType::Module => {
                         if let Some(code) = prefetched.get(&url.to_string()) {
-                            let module_id = runtime
-                                .load_side_es_module_from_code(&url, code.clone())
-                                .await;
-                            if let Ok(module_id) = module_id.inspect_err(|err| {
-                                eprintln!("Failed to load JS module at {} with error: {}", url, err)
-                            }) {
-                                let result = runtime.mod_evaluate(module_id);
-                                let _ = runtime
-                                    .with_event_loop_promise(result, Default::default())
-                                    .await
-                                    .inspect_err(|err| {
-                                        eprintln!(
-                                            "Failed to execute JS at {} with error: {}",
-                                            url, err
-                                        )
-                                    });
-                            }
+                            Self::execute_js_module(&mut runtime, &url, code.clone()).await;
                         } else {
                             eprintln!(
                                 "Failed to load JS module at {} with error: prefetch failed",
