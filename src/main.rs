@@ -6118,13 +6118,22 @@ fn op_get_descendant_nodes(
 }
 
 #[op2]
-fn op_get_next_sibling(state: &mut OpState, #[number] node_idx: usize) -> Option<(usize, Node)> {
+fn op_get_sibling(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    previous: bool,
+) -> Option<(usize, Node)> {
     let host = state.borrow::<JsHostState>();
     let renderer = host.renderer.borrow();
     let parent = renderer.nodes.get(node_idx)?.get_parent()?;
     let children = renderer.dom_indexes.children_index.get(&parent)?;
     let position = children.iter().position(|idx| *idx == node_idx)?;
-    let sibling = *children.get(position + 1)?;
+    let sibling_position = if previous {
+        position.checked_sub(1)?
+    } else {
+        position + 1
+    };
+    let sibling = *children.get(sibling_position)?;
     Some((sibling, renderer.nodes.get(sibling)?.clone()))
 }
 
@@ -6810,7 +6819,7 @@ extension!(
     op_remove_child,
     op_get_child_nodes,
     op_get_descendant_nodes,
-    op_get_next_sibling,
+    op_get_sibling,
     op_get_edge_child,
     op_get_parent_node,
     op_get_document_element,
@@ -6861,7 +6870,7 @@ extension!(
     op_request_animation_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
-  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js"],
+  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js", "node_iterator.js"],
   state = |state| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,

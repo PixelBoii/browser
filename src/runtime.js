@@ -30,6 +30,7 @@ import * as response from "ext:deno_fetch/23_response.js";
 import * as fetch from "ext:browser/runtime_fetch.js";
 import * as crypto from "ext:deno_crypto/00_crypto.js";
 import { EventTarget } from "./event_target.js";
+import { NodeFilter, NodeIterator, createNodeIterator } from "./node_iterator.js";
 import { XMLHttpRequest } from "ext:browser/xml_http_request.js";
 
 denoEvent.saveGlobalThisReference(globalThis)
@@ -174,7 +175,12 @@ class BaseNode extends EventTarget {
     }
 
     get nextSibling() {
-        const sibling = core.ops.op_get_next_sibling(this.__node_idx)
+        const sibling = core.ops.op_get_sibling(this.__node_idx, false)
+        return sibling ? nodeToElement(sibling) : null
+    }
+
+    get previousSibling() {
+        const sibling = core.ops.op_get_sibling(this.__node_idx, true)
         return sibling ? nodeToElement(sibling) : null
     }
 
@@ -441,25 +447,6 @@ Object.defineProperty(globalThis, "Node", {
     writable: true,
 })
 
-const NodeFilter = {
-    FILTER_ACCEPT: 1,
-    FILTER_REJECT: 2,
-    FILTER_SKIP: 3,
-    SHOW_ALL: 0xFFFFFFFF,
-    SHOW_ELEMENT: 0x1,
-    SHOW_ATTRIBUTE: 0x2,
-    SHOW_TEXT: 0x4,
-    SHOW_CDATA_SECTION: 0x8,
-    SHOW_ENTITY_REFERENCE: 0x10,
-    SHOW_ENTITY: 0x20,
-    SHOW_PROCESSING_INSTRUCTION: 0x40,
-    SHOW_COMMENT: 0x80,
-    SHOW_DOCUMENT: 0x100,
-    SHOW_DOCUMENT_TYPE: 0x200,
-    SHOW_DOCUMENT_FRAGMENT: 0x400,
-    SHOW_NOTATION: 0x800,
-}
-
 Object.defineProperty(globalThis, "NodeFilter", {
     value: NodeFilter,
     enumerable: true,
@@ -584,6 +571,13 @@ class ShadowRoot extends DocumentFragment {
 
 Object.defineProperty(globalThis, "ShadowRoot", {
     value: ShadowRoot,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "NodeIterator", {
+    value: NodeIterator,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -2649,6 +2643,15 @@ class Document extends EventTarget {
     }
     createTreeWalker(root) {
         return new TreeWalker(root)
+    }
+    createNodeIterator(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+        if (!(root instanceof BaseNode) && !(root instanceof Document)) throw new TypeError("Expected a Node")
+        whatToShow = whatToShow >>> 0
+        if (filter !== null && typeof filter !== "function" && typeof filter !== "object") {
+            throw new TypeError("NodeFilter must be a function or an object")
+        }
+        if ((root.ownerDocument ?? root).__frameId != null) throw new Error("Cross-frame iteration is not implemented")
+        return createNodeIterator(root, whatToShow, filter)
     }
     hasFocus() {
         return true
