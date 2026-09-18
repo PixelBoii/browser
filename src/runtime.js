@@ -1533,6 +1533,29 @@ class HtmlCanvasElement extends HtmlElement {
 
 const windowProxies = new Map()
 
+function frameWindow(frameId) {
+    let proxy = windowProxies.get(frameId)
+    if (!proxy) {
+        proxy = new WindowProxy(frameId)
+        windowProxies.set(frameId, proxy)
+    }
+    return proxy
+}
+
+function windowMessageOptions(targetOrigin, transfer) {
+    if (typeof targetOrigin === "object") {
+        transfer = targetOrigin?.transfer
+        targetOrigin = targetOrigin?.targetOrigin
+    }
+    targetOrigin = targetOrigin === undefined ? "/" : String(targetOrigin)
+    if (targetOrigin !== "*" && targetOrigin !== "/") {
+        try { new URL(targetOrigin) } catch {
+            throw new DOMException.DOMException("Invalid postMessage target origin", "SyntaxError")
+        }
+    }
+    return { targetOrigin, transfer }
+}
+
 class HTMLIFrameElement extends HtmlElement {
     constructor() {
         super("iframe")
@@ -1565,12 +1588,7 @@ class HTMLIFrameElement extends HtmlElement {
     get contentWindow() {
         // Frame idx is the node idx
         this.spawnFrame()
-        let proxy = windowProxies.get(this.__node_idx)
-        if (!proxy) {
-            proxy = new WindowProxy(this.__node_idx)
-            windowProxies.set(this.__node_idx, proxy)
-        }
-        return proxy
+        return frameWindow(this.__node_idx)
     }
 }
 
@@ -1579,8 +1597,9 @@ class WindowProxy {
         this.__frame_id = frameId
     }
 
-    postMessage(message) {
-        core.ops.op_post_message_to_frame(serializeWorkerMessage(message), this.__frame_id)
+    postMessage(message, targetOrigin, transfer) {
+        const options = windowMessageOptions(targetOrigin, transfer)
+        core.ops.op_post_message_to_frame(serializeWorkerMessage(message, options), this.__frame_id, options.targetOrigin)
     }
 
     get document() {
@@ -1680,10 +1699,23 @@ class HTMLFormControlElement extends HtmlElement {
     }
 }
 
+const inputTypes = new Set([
+    "hidden", "text", "search", "tel", "url", "email", "password", "date", "month",
+    "week", "time", "datetime-local", "number", "range", "color", "checkbox", "radio",
+    "file", "submit", "image", "reset", "button",
+])
+
 class HTMLInputElement extends HTMLFormControlElement {
     constructor() {
         super("input")
     }
+
+    get type() {
+        const type = this.getAttribute("type")?.toLowerCase()
+        return inputTypes.has(type) ? type : "text"
+    }
+
+    set type(value) { this.setAttribute("type", value) }
 }
 
 class HTMLTextAreaElement extends HTMLFormControlElement {
@@ -1706,6 +1738,15 @@ class HTMLButtonElement extends HTMLFormControlElement {
     constructor() {
         super("button")
     }
+
+    get type() {
+        const type = this.getAttribute("type")?.toLowerCase()
+        if (["submit", "reset", "button"].includes(type)) return type
+        if (this.hasAttribute("command") || this.hasAttribute("commandfor") || this.parentElement?.localName === "select") return "button"
+        return "submit"
+    }
+
+    set type(value) { this.setAttribute("type", value) }
 }
 
 class HTMLFormElement extends HtmlElement {
@@ -3540,19 +3581,22 @@ Object.defineProperty(globalThis, "MutationObserver", {
 
 // Ideally this would be of the same structure as document, but that's a much larger change that will happen later on
 const parentStub = {
-    postMessage(message) {
-        core.ops.op_post_message_to_parent(serializeWorkerMessage(message))
+    postMessage(message, targetOrigin, transfer) {
+        const options = windowMessageOptions(targetOrigin, transfer)
+        core.ops.op_post_message_to_parent(serializeWorkerMessage(message, options), options.targetOrigin)
     }
 }
 
-function __dispatchWindowMessage(source) {
+function __dispatchWindowMessage(source, origin) {
     const message = deserializeWorkerMessage(core.ops.op_take_worker_message())
     const event = new denoEvent.MessageEvent("message", {
-        source,
+        source: source === "window" ? globalThis : source === "parent" ? parent : frameWindow(source),
+        origin,
         ports: message.ports,
     })
     event.data = message.data
-    globalThis.dispatchEvent(event)
+    denoEvent.setIsTrusted(event, true)
+    denoEvent.dispatch(globalThis, event)
 }
 
 Object.defineProperty(globalThis, "__dispatchWindowMessage", {
@@ -3578,8 +3622,9 @@ Object.defineProperty(globalThis, "top", {
     configurable: true,
 })
 
-function postMessage(message) {
-    globalThis.dispatchEvent(new denoEvent.MessageEvent("message", { data: message, source: globalThis }))
+function postMessage(message, targetOrigin, transfer) {
+    const options = windowMessageOptions(targetOrigin, transfer)
+    core.ops.op_post_message_to_frame(serializeWorkerMessage(message, options), null, options.targetOrigin)
 }
 
 Object.defineProperty(globalThis, "postMessage", {

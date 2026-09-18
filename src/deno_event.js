@@ -1,7 +1,7 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 // Vendored from deno_web 0.276.0, 02_event.js.
 // Local changes: DOM parent/root hooks, Window propagation, ancestor-only listeners,
-// and legacy initEvent. Preserve these when updating from upstream.
+// trusted native dispatch, and legacy initEvent. Preserve these when updating from upstream.
 
 // This module follows most of the WHATWG Living Standard for the DOM logic.
 // Many parts of the DOM are not implemented in Deno, but the logic for those
@@ -1075,12 +1075,6 @@ class EventTarget {
       globalThis_[SymbolFor("Deno.isUnloadDispatched")] = true;
     }
 
-    const { listeners } = self[eventTargetData];
-    if (!listeners[event.type] && !isNode(self)) {
-      setTarget(event, this);
-      return true;
-    }
-
     if (getDispatched(event)) {
       throw new DOMException("Invalid event state", "InvalidStateError");
     }
@@ -1089,6 +1083,12 @@ class EventTarget {
       throw new DOMException("Invalid event state", "InvalidStateError");
     }
 
+    setIsTrusted(event, false);
+    const { listeners } = self[eventTargetData];
+    if (!listeners[event.type] && !isNode(self)) {
+      setTarget(event, this);
+      return true;
+    }
     return dispatch(self, event);
   }
 

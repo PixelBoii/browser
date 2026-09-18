@@ -6,6 +6,7 @@ mod parser;
 mod shadow_dom;
 mod style;
 mod ui;
+mod window_messaging;
 
 use deno_core::serde::Deserialize;
 use deno_error::JsErrorBox;
@@ -30,6 +31,9 @@ use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
     StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility,
     get_base_style, parse_style,
+};
+use window_messaging::{
+    ParentWindow, WindowMessage, op_is_top, op_post_message_to_frame, op_post_message_to_parent,
 };
 
 use std::borrow::Cow;
@@ -1728,6 +1732,7 @@ impl SelectorChanges {
 #[derive(Debug)]
 struct Renderer {
     url: String,
+    origin: url::Origin,
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
     template_contents: HashMap<usize, usize>,
@@ -4999,8 +5004,7 @@ enum UserEvent {
     CanvasUpdated,
     TabUpdated { tab_idx: usize, buffer: Vec<u32> },
     TabUrlUpdated { tab_idx: usize, url: String },
-    ChildMessage(WorkerMessage),
-    ParentMessage(WorkerMessage),
+    WindowMessage(WindowMessage),
     WorkerMessage {
         worker_id: usize,
         message: WorkerMessage,
@@ -5019,7 +5023,7 @@ struct JsHostState {
     renderer: Rc<RefCell<Renderer>>,
     proxy: RendererProxy,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
-    is_top: bool,
+    parent_window: Option<ParentWindow>,
 }
 
 fn is_trustworthy_http_url(url: &ReqwestUrl) -> bool {
@@ -5282,43 +5286,6 @@ fn op_clone_node(
     };
     custom_elements::upgrade_subtree(scope, Some(new_node_idx), None);
     Ok(new_node_idx as u32)
-}
-
-#[op2]
-fn op_post_message_to_parent(
-    state: &mut OpState,
-    #[serde] message: deno_web::JsMessageData,
-) -> Result<(), JsErrorBox> {
-    let message = WorkerMessage::take(state, message)?;
-    let host = state.borrow::<JsHostState>();
-    host.proxy
-        .fire_user_event(UserEvent::ChildMessage(message))
-        .unwrap();
-    Ok(())
-}
-
-#[op2(fast)]
-fn op_is_top(state: &mut OpState) -> bool {
-    let host = state.borrow::<JsHostState>();
-    host.is_top
-}
-
-#[op2]
-fn op_post_message_to_frame(
-    state: &mut OpState,
-    #[serde] message: deno_web::JsMessageData,
-    #[number] frame_id: usize,
-) -> Result<(), JsErrorBox> {
-    let message = WorkerMessage::take(state, message)?;
-    let host = state.borrow::<JsHostState>();
-    let renderer = host.renderer.borrow();
-    let Some(frame) = renderer.frames.get(&frame_id) else {
-        return Err(JsErrorBox::generic("Failed to get frame by idx"));
-    };
-    let _ = frame
-        .tx
-        .send(FrameCommand::UserEvent(UserEvent::ParentMessage(message)));
-    Ok(())
 }
 
 fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_offset: i32) -> i32 {
@@ -7414,6 +7381,7 @@ impl Renderer {
             );
 
         Self {
+            origin: ReqwestUrl::parse(&url).unwrap().origin(),
             url,
             nodes_idxs,
             nodes: nodes_table,
@@ -7936,6 +7904,7 @@ impl Renderer {
     ) {
         self.workers.clear();
         self.frames.clear();
+        self.origin = ReqwestUrl::parse(&url).unwrap().origin();
         self.url = url;
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
@@ -9442,9 +9411,14 @@ impl Renderer {
             .unwrap_or_default();
         tx.send(FrameCommand::Render).unwrap();
         let tx_proxy = RendererProxy::FrameLoop(tx.clone());
+        let parent_window = ParentWindow {
+            proxy: parent_proxy.clone(),
+            node_idx,
+            origin: self.origin.clone(),
+        };
         std::thread::spawn(move || {
             let mut frame = Frame::new(frame_url.to_string(), false, size);
-            frame.is_top = false;
+            frame.parent_window = Some(parent_window);
             frame.window_name = window_name;
 
             let frame_result = frame.open();
@@ -12428,7 +12402,7 @@ struct Frame {
     next_inline_module_id: u64,
     dom_content_loaded_dispatched: bool,
     load_dispatched: bool,
-    is_top: bool,
+    parent_window: Option<ParentWindow>,
     window_name: String,
     hover_debugging: bool,
     render_size: PhysicalSize<u32>,
@@ -12491,7 +12465,7 @@ impl Frame {
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
             dom_content_loaded_dispatched: false,
             load_dispatched: false,
-            is_top: true,
+            parent_window: None,
             window_name: String::new(),
             hover_debugging,
             render_size,
@@ -12631,17 +12605,6 @@ impl Frame {
         let code = format!("__dispatchWorkerMessage({worker_id})");
         if let Err(err) = self.execute_host_script("worker message handler", code) {
             eprintln!("Failed to dispatch worker message: {err}");
-        }
-        state.borrow_mut().try_take::<WorkerMessage>();
-    }
-
-    fn dispatch_window_message(&mut self, message: WorkerMessage, source_is_parent: bool) {
-        let state = self.js_runtime.as_ref().unwrap().borrow().op_state();
-        state.borrow_mut().put(message);
-        let source = if source_is_parent { "parent" } else { "null" };
-        let code = format!("__dispatchWindowMessage({source})");
-        if let Err(err) = self.execute_host_script("window message handler", code) {
-            eprintln!("Failed to dispatch window message: {err}");
         }
         state.borrow_mut().try_take::<WorkerMessage>();
     }
@@ -12810,11 +12773,8 @@ impl Frame {
 
                 self.paint_iframe(parent_proxy, bitmap_for_thread, true);
             }
-            FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
-                let _ = parent_proxy.fire_user_event(UserEvent::ChildMessage(message));
-            }
-            FrameCommand::UserEvent(UserEvent::ParentMessage(message)) => {
-                self.dispatch_window_message(message, true);
+            FrameCommand::UserEvent(UserEvent::WindowMessage(message)) => {
+                self.dispatch_window_message(message);
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
                 self.dispatch_worker_message(worker_id, message);
@@ -13355,6 +13315,11 @@ impl Frame {
     }
 
     fn bind_js_host(&mut self, proxy: RendererProxy) {
+        if self.url == "about:blank"
+            && let Some(parent) = &self.parent_window
+        {
+            self.renderer.as_ref().unwrap().borrow_mut().origin = parent.origin.clone();
+        }
         if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
             self.renderer
                 .as_ref()
@@ -13373,7 +13338,7 @@ impl Frame {
                 renderer: self.renderer.as_mut().cloned().unwrap(),
                 proxy: proxy,
                 executed_scripts: self.executed_scripts.clone(),
-                is_top: self.is_top,
+                parent_window: self.parent_window.clone(),
             });
         }
     }
@@ -14081,8 +14046,8 @@ impl Frame {
                     self.execute_dom_update();
                 }
             }
-            FrameCommand::UserEvent(UserEvent::ChildMessage(message)) => {
-                self.dispatch_window_message(message, false);
+            FrameCommand::UserEvent(UserEvent::WindowMessage(message)) => {
+                self.dispatch_window_message(message);
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
                 self.dispatch_worker_message(worker_id, message);
