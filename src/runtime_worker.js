@@ -12,7 +12,7 @@ import * as structuredClone from "ext:deno_web/02_structured_clone.js";
 import * as abortSignal from "ext:deno_web/03_abort_signal.js";
 import * as globalInterfaces from "ext:deno_web/04_global_interfaces.js";
 import * as base64 from "ext:deno_web/05_base64.js";
-import * as streams from "ext:deno_web/06_streams.js";
+import "./streams.js";
 import * as encoding from "ext:deno_web/08_text_encoding.js";
 import * as file from "ext:deno_web/09_file.js";
 import * as fileReader from "ext:deno_web/10_filereader.js";

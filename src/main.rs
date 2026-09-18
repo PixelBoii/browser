@@ -1787,9 +1787,20 @@ struct Renderer {
     images_nodes_loaded: HashMap<usize, (u32, u32)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct WorkerHandle {
     tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
+    termination: tokio::sync::watch::Sender<bool>,
+    isolate: Arc<Mutex<Option<v8::IsolateHandle>>>,
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.termination.send_replace(true);
+        if let Some(isolate) = self.isolate.lock().unwrap().as_ref() {
+            isolate.terminate_execution();
+        }
+    }
 }
 
 // Resources are taken from the sending runtime and installed in the receiving runtime.
@@ -6622,6 +6633,16 @@ fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<u32, JsEr
     Ok(worker_id as u32)
 }
 
+#[op2(fast)]
+fn op_terminate_worker(state: &mut OpState, #[number] worker_id: usize) {
+    state
+        .borrow::<JsHostState>()
+        .renderer
+        .borrow_mut()
+        .workers
+        .remove(&worker_id);
+}
+
 #[op2]
 fn op_post_message_to_worker(
     state: &mut OpState,
@@ -6632,7 +6653,7 @@ fn op_post_message_to_worker(
     let host = state.borrow::<JsHostState>();
     let renderer = host.renderer.borrow();
     let Some(worker) = renderer.workers.get(&worker_id) else {
-        return Err(JsErrorBox::generic("Failed to get worker by idx"));
+        return Ok(());
     };
     // A worker whose thread has exited simply drops the message.
     let _ = worker.tx.send(message);
@@ -6781,7 +6802,7 @@ extension!(
     op_worker_fetch_script,
   ],
   esm_entry_point = "ext:browser_worker/runtime_worker.js",
-  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js"],
+  esm = [dir "src", "runtime_worker.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js", "streams.js"],
   options = {
     host: WorkerHostState,
   },
@@ -6863,6 +6884,7 @@ extension!(
     op_clone_node,
     op_spawn_frame,
     op_spawn_worker,
+    op_terminate_worker,
     op_post_message_to_worker,
     op_take_worker_message,
     op_track_intersection,
@@ -6870,7 +6892,7 @@ extension!(
     op_request_animation_frame,
   ],
   esm_entry_point = "ext:browser/runtime.js",
-  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js", "node_iterator.js"],
+  esm = [dir "src", "runtime.js", "runtime_fetch.js", "xml_http_request.js", "event_target.js", "worker_messaging.js", "node_iterator.js", "streams.js"],
   state = |state| {
     let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
       sys_traits::impls::RealSys,
@@ -8491,13 +8513,21 @@ impl Renderer {
         let worker_id = self.next_worker_id;
         self.next_worker_id += 1;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (termination, mut terminated) = tokio::sync::watch::channel(false);
+        let isolate = Arc::new(Mutex::new(None));
+        let worker_isolate = Arc::clone(&isolate);
+        let blob_store = Arc::clone(&self.blob_store);
+        // Retain the entry blob before returning to JS, which may revoke its URL immediately.
+        let entry_blob = blob_store.get_object_url(url.clone());
         let proxy = self
             .event_loop_proxy
             .clone()
             .context("Renderer event loop proxy is not configured")?;
         let network = NetworkFetch::new();
         std::thread::spawn(move || {
-            let blob_store = Arc::new(BlobStore::default());
+            if *terminated.borrow() {
+                return;
+            }
             let broadcast_channel = InMemoryBroadcastChannel::default();
             let host = WorkerHostState {
                 worker_id,
@@ -8527,41 +8557,49 @@ impl Renderer {
                 ],
                 ..Default::default()
             });
-            let fetch = async || -> Result<String> {
-                if let Some(stripped) = url.as_str().strip_prefix("file://") {
-                    let contents = fs::read_to_string(stripped)?;
-                    Ok(contents)
-                } else {
-                    let code = network.client.get(url.clone()).send().await?.text().await?;
-                    Ok(code)
-                }
-            };
-            let code = match tokio.block_on(fetch()) {
-                Ok(code) => code,
-                Err(err) => {
-                    eprintln!("Failed to fetch JS in worker thread: {}", err);
-                    return;
-                }
-            };
-            match runtime.execute_script(url, code) {
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("Failed to execute JS in worker thread: {}", err);
-                    return;
-                }
-            };
-            if let Err(err) =
-                runtime.execute_script("<worker-messaging>", "__startWorkerMessageLoop()")
             {
-                eprintln!("Failed to start worker message loop: {}", err);
-                return;
+                // Serialize registration with termination so a stop during startup cannot be lost.
+                let mut isolate = worker_isolate.lock().unwrap();
+                if *terminated.borrow() {
+                    return;
+                }
+                *isolate = Some(runtime.v8_isolate().thread_safe_handle());
             }
-            let future = runtime.run_event_loop(Default::default());
-            let _ = tokio.block_on(future).inspect_err(|err| {
-                eprintln!("Failed to run worker thread: {}", err);
+            let run = async {
+                let code = if url.scheme() == "blob" {
+                    let blob = entry_blob.context("Worker blob URL was revoked or not found")?;
+                    String::from_utf8_lossy(&blob.read_all().await).into_owned()
+                } else if let Some(stripped) = url.as_str().strip_prefix("file://") {
+                    fs::read_to_string(stripped)?
+                } else {
+                    network.client.get(url.clone()).send().await?.text().await?
+                };
+                runtime.execute_script(url, code)?;
+                runtime.execute_script("<worker-messaging>", "__startWorkerMessageLoop()")?;
+                runtime.run_event_loop(Default::default()).await?;
+                Ok::<(), anyhow::Error>(())
+            };
+            let result = tokio.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = terminated.changed() => Ok(()),
+                    result = run => result,
+                }
             });
+            if let Err(err) = result
+                && !*terminated.borrow()
+            {
+                eprintln!("Failed to run worker thread: {err:#}");
+            }
         });
-        self.workers.insert(worker_id, WorkerHandle { tx });
+        self.workers.insert(
+            worker_id,
+            WorkerHandle {
+                tx,
+                termination,
+                isolate,
+            },
+        );
         Ok(worker_id)
     }
 
@@ -12598,7 +12636,7 @@ impl Frame {
     }
 
     fn dispatch_worker_message(&mut self, worker_id: usize, message: WorkerMessage) {
-        // Navigation drops old workers. Do not install their resources in the new document.
+        // Termination and navigation remove workers. Discard their queued messages and resources.
         if !self
             .renderer
             .as_ref()
