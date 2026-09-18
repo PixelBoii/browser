@@ -43,7 +43,7 @@ impl Options {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
     #[serde(rename = "type")]
@@ -51,6 +51,10 @@ pub struct Record {
     target: usize,
     attribute_name: Option<String>,
     old_value: Option<String>,
+    added_nodes: Vec<usize>,
+    removed_nodes: Vec<usize>,
+    previous_sibling: Option<usize>,
+    next_sibling: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -118,23 +122,23 @@ impl Observers {
                 if depth != 0 && !options.subtree {
                     continue;
                 }
-                let old_value = if record.kind == "attributes" {
-                    if options.attributes != Some(true)
-                        || options.attribute_filter.as_ref().is_some_and(|filter| {
+                let old_value = match record.kind {
+                    "attributes" if options.attributes == Some(true) => {
+                        if options.attribute_filter.as_ref().is_some_and(|filter| {
                             record
                                 .attribute_name
                                 .as_ref()
                                 .is_none_or(|name| !filter.contains(name))
-                        })
-                    {
-                        continue;
+                        }) {
+                            continue;
+                        }
+                        options.attribute_old_value == Some(true)
                     }
-                    options.attribute_old_value == Some(true)
-                } else {
-                    if options.character_data != Some(true) {
-                        continue;
+                    "characterData" if options.character_data == Some(true) => {
+                        options.character_data_old_value == Some(true)
                     }
-                    options.character_data_old_value == Some(true)
+                    "childList" if options.child_list => false,
+                    _ => continue,
                 };
                 if let Some((_, include_old)) = interested
                     .iter_mut()
@@ -166,11 +170,47 @@ impl Renderer {
         attribute_name: Option<String>,
         old_value: Option<String>,
     ) {
+        self.queue_mutation(Record {
+            kind: if attribute_name.is_some() {
+                "attributes"
+            } else {
+                "characterData"
+            },
+            target,
+            attribute_name,
+            old_value,
+            ..Record::default()
+        });
+    }
+
+    pub fn record_child_list_mutation(
+        &mut self,
+        target: usize,
+        added_nodes: Vec<usize>,
+        removed_nodes: Vec<usize>,
+        previous_sibling: Option<usize>,
+        next_sibling: Option<usize>,
+    ) {
+        if added_nodes.is_empty() && removed_nodes.is_empty() {
+            return;
+        }
+        self.queue_mutation(Record {
+            kind: "childList",
+            target,
+            added_nodes,
+            removed_nodes,
+            previous_sibling,
+            next_sibling,
+            ..Record::default()
+        });
+    }
+
+    fn queue_mutation(&mut self, record: Record) {
         if self.mutation_observers.registrations.is_empty() {
             return;
         }
-        let mut ancestors = vec![Some(target)];
-        let mut current = target;
+        let mut ancestors = vec![Some(record.target)];
+        let mut current = record.target;
         while let Some(parent) = self.nodes.get(current).and_then(Node::get_parent) {
             ancestors.push(Some(parent));
             current = parent;
@@ -178,19 +218,7 @@ impl Renderer {
         if current == self.dom_indexes.root_indice {
             ancestors.push(None);
         }
-        self.mutation_observers.queue(
-            &ancestors,
-            Record {
-                kind: if attribute_name.is_some() {
-                    "attributes"
-                } else {
-                    "characterData"
-                },
-                target,
-                attribute_name,
-                old_value,
-            },
-        );
+        self.mutation_observers.queue(&ancestors, record);
     }
 }
 

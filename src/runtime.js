@@ -889,6 +889,10 @@ class HtmlElement extends BaseNode {
         core.ops.op_update_attributes(this.__node_idx, { [String(attr)]: String(value) }, this.ownerDocument.__frameId)
     }
 
+    setAttributeNS(namespace, qualifiedName, value) {
+        // Intentionally a no-op until namespace-aware attributes are supported.
+    }
+
     removeAttribute(attr) {
         core.ops.op_remove_attribute(this.__node_idx, String(attr))
     }
@@ -3422,7 +3426,10 @@ Object.defineProperty(globalThis, "XMLHttpRequest", {
 function mutationRecordsFromBackend(records) {
     return records.map(record => ({
         ...record, target: elementFromNodeIdx(record.target),
-        addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null,
+        addedNodes: record.addedNodes.map(elementFromNodeIdx),
+        removedNodes: record.removedNodes.map(elementFromNodeIdx),
+        previousSibling: record.previousSibling == null ? null : elementFromNodeIdx(record.previousSibling),
+        nextSibling: record.nextSibling == null ? null : elementFromNodeIdx(record.nextSibling),
         attributeNamespace: null,
     }))
 }

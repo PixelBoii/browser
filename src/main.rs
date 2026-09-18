@@ -381,22 +381,6 @@ impl DomIndexes {
         }
     }
 
-    fn remove_nodes(&mut self, removed: &FixedBitSet) {
-        for elements in &mut self.class_elements {
-            elements.difference_with(removed);
-        }
-        for index in [
-            &mut self.tag_elements,
-            &mut self.id_elements,
-            &mut self.attribute_elements,
-        ] {
-            index.retain(|_, elements| {
-                elements.difference_with(removed);
-                !elements.is_clear()
-            });
-        }
-    }
-
     pub fn recompute_class_elements(
         &mut self,
         html_nodes: &NodesTable,
@@ -1561,10 +1545,6 @@ impl NodesTable {
             .iter()
             .enumerate()
             .filter_map(|(idx, e)| e.as_ref().and_then(|e| Some((idx, e))))
-    }
-
-    pub fn remove(&mut self, idx: usize) {
-        self.data[idx] = None;
     }
 
     pub fn insert(&mut self, idx: usize, value: Node) {
@@ -5563,11 +5543,7 @@ fn op_append_child<'s>(
         if before_reference_idx.is_some_and(|idx| idx == node_idx) {
             return Ok(());
         }
-        if let Some(old_parent_idx) = renderer.nodes.get(node_idx).unwrap().get_parent() {
-            if let Some(children) = renderer.dom_indexes.children_index.get_mut(&old_parent_idx) {
-                children.retain(|idx| *idx != node_idx);
-            }
-        }
+        renderer.detach_node(node_idx);
         renderer
             .nodes
             .get_mut(node_idx)
@@ -5580,7 +5556,16 @@ fn op_append_child<'s>(
         let insert_pos = before_reference_idx
             .and_then(|before_idx| children.iter().position(|idx| *idx == before_idx))
             .unwrap_or(children.len());
+        let previous_sibling = insert_pos.checked_sub(1).map(|idx| children[idx]);
+        let next_sibling = children.get(insert_pos).copied();
         children.insert(insert_pos, node_idx);
+        renderer.record_child_list_mutation(
+            parent_idx,
+            vec![node_idx],
+            vec![],
+            previous_sibling,
+            next_sibling,
+        );
         renderer
             .dom_indexes
             .children_index
@@ -5634,6 +5619,7 @@ fn op_append_child<'s>(
         }
     };
 
+    mutation_observer::schedule(scope);
     if let Some(code) = script_to_run {
         run_v8_source(
             scope,
@@ -5673,12 +5659,17 @@ fn op_get_inner_html(
     Ok(html)
 }
 
-#[op2(fast)]
-fn op_remove_child(state: &mut OpState, #[number] child_idx: usize) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    renderer.detach_node(child_idx);
-    renderer.schedule_dom_update();
+#[op2(nofast)]
+fn op_remove_child(scope: &mut v8::PinScope, #[number] child_idx: usize) -> Result<(), JsError> {
+    {
+        let state = JsRuntime::op_state_from(scope);
+        let state = state.borrow();
+        let host = state.borrow::<JsHostState>();
+        let mut renderer = host.renderer.borrow_mut();
+        renderer.detach_node(child_idx);
+        renderer.schedule_dom_update();
+    }
+    mutation_observer::schedule(scope);
     Ok(())
 }
 
@@ -5935,25 +5926,31 @@ fn js_send_onetime_to_frame<T>(
 
 #[op2]
 fn op_set_inner_html(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] html: String,
     #[number] frame_id: Option<usize>,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
-                node_idx,
-                html,
-                reply,
+    let result = {
+        let state = JsRuntime::op_state_from(scope);
+        let state = state.borrow();
+        let host = state.borrow::<JsHostState>();
+        let mut renderer = host.renderer.borrow_mut();
+        if let Some(frame_id) = frame_id {
+            js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+                FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
+                    node_idx,
+                    html,
+                    reply,
+                })
             })
-        })
-    } else {
-        renderer.replace_inner_html(node_idx, html);
-        Ok(())
-    }
+        } else {
+            renderer.replace_inner_html(node_idx, html);
+            Ok(())
+        }
+    };
+    mutation_observer::schedule(scope);
+    result
 }
 
 #[op2(nofast)]
@@ -7594,9 +7591,20 @@ impl Renderer {
     }
 
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
-        let node_idx = self.template_contents.get(&node_idx).copied().unwrap_or(node_idx);
-        self.remove_children(node_idx);
+        let node_idx = self
+            .template_contents
+            .get(&node_idx)
+            .copied()
+            .unwrap_or(node_idx);
+        let removed = self.detach_children(node_idx);
         self.create_children_from_html(node_idx, html);
+        let added = self
+            .dom_indexes
+            .children_index
+            .get(&node_idx)
+            .unwrap()
+            .clone();
+        self.record_child_list_mutation(node_idx, added, removed, None, None);
         self.schedule_dom_update();
     }
 
@@ -7751,51 +7759,33 @@ impl Renderer {
     }
 
     fn set_text_content(&mut self, node_idx: usize, text: String) {
-        let (needs_index_rebuild, child_list_changed) = match self.nodes.get_mut(node_idx).unwrap()
-        {
+        match self.nodes.get_mut(node_idx).unwrap() {
             Node::Text(element) => {
                 let old_value = std::mem::replace(&mut element.text, text);
                 self.record_mutation(node_idx, None, Some(old_value));
-                (false, false)
             }
             Node::Comment(element) => {
                 let old_value = std::mem::replace(&mut element.comment, text);
                 self.record_mutation(node_idx, None, Some(old_value));
-                (false, false)
             }
             Node::Element(_) | Node::DocumentFragment => {
-                let children = self
-                    .dom_indexes
-                    .children_index
-                    .get(&node_idx)
-                    .cloned()
-                    .unwrap_or_default();
-                let had_children = !children.is_empty();
-                for child in children {
-                    self.remove_node(child, true);
+                let removed = self.detach_children(node_idx);
+                let mut added = vec![];
+                if !text.is_empty() {
+                    self.push_node(Node::Text(TextElement {
+                        text,
+                        parent: Some(node_idx),
+                    }));
+                    let text_idx = self.nodes.cursor;
+                    self.dom_indexes.children_index.insert(text_idx, vec![]);
+                    added.push(text_idx);
                 }
-                self.push_node(Node::Text(TextElement {
-                    text,
-                    parent: Some(node_idx),
-                }));
-                let text_idx = self.nodes.cursor;
                 self.dom_indexes
                     .children_index
-                    .insert(node_idx, vec![text_idx]);
-                self.dom_indexes.children_index.insert(text_idx, vec![]);
-                (had_children, true)
+                    .insert(node_idx, added.clone());
+                self.record_child_list_mutation(node_idx, added, removed, None, None);
             }
         };
-
-        if child_list_changed {
-            self.selector_changes.child_list_changed(node_idx);
-        }
-
-        // Text nodes are absent from the tag/class/id/attribute indexes, and the new parent-child
-        // relationship was recorded above. Only removed descendants can invalidate those indexes.
-        if needs_index_rebuild {
-            self.recompute_dom_indexes();
-        }
         self.schedule_dom_update();
     }
 
@@ -11960,73 +11950,19 @@ impl Renderer {
         self.insert_node_at_idx(self.nodes.cursor, node);
     }
 
-    pub fn remove_node(&mut self, node_idx: usize, remove_from_parent: bool) {
-        if remove_from_parent {
-            self.selector_changes.child_list_changed(node_idx);
-        }
-        // Remove children
-        for child in self
-            .dom_indexes
-            .children_index
-            .get(&node_idx)
-            .unwrap()
-            .clone()
-        {
-            self.remove_node(child, false);
-        }
-
-        // Remove from parent
-        if remove_from_parent {
-            if let Some(parent) = self.nodes.get(node_idx).unwrap().get_parent() {
-                let children = self.dom_indexes.children_index.get(&parent).unwrap();
-                let filtered: Vec<usize> = children
-                    .into_iter()
-                    .filter(|idx| **idx != node_idx)
-                    .cloned()
-                    .collect();
-                self.dom_indexes.children_index.insert(parent, filtered);
-            }
-        }
-
-        // Remove node itself
-        self.nodes_idxs = self
-            .nodes_idxs
-            .iter()
-            .filter(|idx| **idx != node_idx)
-            .cloned()
-            .collect();
-        self.nodes.remove(node_idx);
-        self.node_layout_mapping.remove(&node_idx);
-        self.dom_indexes.children_index.remove(&node_idx);
-    }
-
-    fn remove_children(&mut self, parent_idx: usize) {
+    // Leave recording to the replacement so it can report old and new children together.
+    fn detach_children(&mut self, parent_idx: usize) -> Vec<usize> {
         self.selector_changes.child_list_changed(parent_idx);
-        let mut pending = self
-            .dom_indexes
-            .children_index
-            .get(&parent_idx)
-            .cloned()
-            .unwrap_or_default();
-        let mut removed = FixedBitSet::with_capacity(self.nodes.data.len());
-        while let Some(node_idx) = pending.pop() {
-            if removed.contains(node_idx) {
-                continue;
-            }
-            removed.insert(node_idx);
-            if let Some(children) = self.dom_indexes.children_index.get(&node_idx) {
-                pending.extend(children);
-            }
-        }
-
-        self.dom_indexes.remove_nodes(&removed);
-        self.nodes_idxs.retain(|idx| !removed.contains(*idx));
-        for node_idx in removed.ones() {
-            self.nodes.remove(node_idx);
+        let children = std::mem::take(
+            self.dom_indexes
+                .children_index
+                .get_or_insert_default(parent_idx),
+        );
+        for &node_idx in &children {
+            self.nodes.get_mut(node_idx).unwrap().set_parent(None);
             self.node_layout_mapping.remove(&node_idx);
-            self.dom_indexes.children_index.remove(&node_idx);
         }
-        self.dom_indexes.children_index.insert(parent_idx, vec![]);
+        children
     }
 
     pub fn detach_node(&mut self, node_idx: usize) {
@@ -12036,14 +11972,23 @@ impl Renderer {
 
         self.selector_changes.child_list_changed(node_idx);
 
-        if let Some(children) = self.dom_indexes.children_index.get_mut(&parent) {
-            children.retain(|idx| *idx != node_idx);
-        }
+        let children = self.dom_indexes.children_index.get_mut(&parent).unwrap();
+        let index = children.iter().position(|idx| *idx == node_idx).unwrap();
+        let previous_sibling = index.checked_sub(1).map(|idx| children[idx]);
+        let next_sibling = children.get(index + 1).copied();
+        children.remove(index);
 
         if let Some(node) = self.nodes.get_mut(node_idx) {
             node.set_parent(None);
         }
         self.node_layout_mapping.remove(&node_idx);
+        self.record_child_list_mutation(
+            parent,
+            vec![],
+            vec![node_idx],
+            previous_sibling,
+            next_sibling,
+        );
     }
 
     pub fn recompute_dom_indexes(&mut self) {
@@ -14861,12 +14806,7 @@ fn main() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        concat!(
-            "file://",
-            env!("CARGO_MANIFEST_DIR"),
-            "/pages/custom-elements.html"
-        )
-        .to_string(),
+        "https://2captcha.com/demo/cloudflare-turnstile".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
