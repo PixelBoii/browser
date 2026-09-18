@@ -3,6 +3,7 @@ mod custom_elements;
 mod loader;
 mod mutation_observer;
 mod parser;
+mod shadow_dom;
 mod style;
 mod ui;
 
@@ -24,6 +25,7 @@ use reqwest::cookie::{CookieStore, Jar};
 use resvg::tiny_skia::{IntSize, Pixmap};
 use resvg::usvg::Tree;
 use serde::Serialize;
+use shadow_dom::{op_attach_shadow, op_get_shadow_root};
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
     StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility,
@@ -1729,6 +1731,7 @@ struct Renderer {
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
     template_contents: HashMap<usize, usize>,
+    shadow_roots: HashMap<usize, usize>,
     node_styles: NodeMap<Style>,
     style_cache: StyleCache,
     selector_changes: SelectorChanges,
@@ -2890,7 +2893,7 @@ fn get_expandable_css_nodes_walk(
                 println!("Got element when expecting CSS text {:?}", element);
                 return;
             }
-            Node::Comment(_) | Node::DocumentFragment => {
+            Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
                 return;
             }
             Node::Text(text) => text,
@@ -2938,6 +2941,7 @@ fn compute_node_style(
     nodes: &NodesTable,
     node_idx: usize,
     children_index: &NodeMap<Vec<usize>>,
+    shadow_roots: &HashMap<usize, usize>,
     css_nodes: &Vec<CssNode>,
     parent_style: Option<usize>,
     parent_variables: &Rc<StyleVariables>,
@@ -3049,7 +3053,10 @@ fn compute_node_style(
     let subtree_hidden = ancestor_hidden || style.display == StyleDisplay::None;
     let resolved_variables = Rc::clone(&style.variables);
 
-    for child_idx in children_index.get(&node_idx).unwrap().iter() {
+    // Until scoped stylesheets and slots are supported, render the shadow children
+    // with host inheritance and their inline styles. Document rules stay outside.
+    let children_root = shadow_roots.get(&node_idx).copied().unwrap_or(node_idx);
+    for child_idx in children_index.get(&children_root).unwrap().iter() {
         compute_node_style(
             node_styles,
             resolved_font_sizes,
@@ -3057,6 +3064,7 @@ fn compute_node_style(
             nodes,
             *child_idx,
             children_index,
+            shadow_roots,
             css_nodes,
             Some(node_idx),
             &resolved_variables,
@@ -4753,6 +4761,7 @@ fn compute_node_styles(
     network_fetch: &Rc<RefCell<NetworkFetch>>,
     nodes: &NodesTable,
     nodes_idxs: &Vec<usize>,
+    shadow_roots: &HashMap<usize, usize>,
     root_indice: usize,
     window_size: &PhysicalSize<u32>,
     dom_indexes: &mut DomIndexes,
@@ -4931,6 +4940,7 @@ fn compute_node_styles(
         nodes,
         dom_indexes.root_indice,
         &dom_indexes.children_index,
+        shadow_roots,
         &parsed_css_nodes,
         None,
         &StyleVariables::from_values(default_variables),
@@ -5232,6 +5242,9 @@ fn clone_node(
         .get(node_idx)
         .with_context(|| "Could not find node by idx")?
         .clone();
+    if matches!(node, Node::ShadowRoot { .. }) {
+        return Err(anyhow!("Shadow roots cannot be cloned"));
+    }
     node.set_parent(new_parent);
     renderer.push_node(node);
     let new_node_idx = renderer.nodes.cursor;
@@ -5313,11 +5326,7 @@ fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_o
         parent_offset += scroll_y;
     }
 
-    if let Some(parent) = renderer
-        .nodes
-        .get(node_idx)
-        .and_then(|node| node.get_parent())
-    {
+    if let Some(parent) = renderer.layout_parent(node_idx) {
         get_offset_y_walk(renderer, parent, parent_offset)
     } else {
         parent_offset
@@ -5517,7 +5526,7 @@ fn op_would_create_cycle(
             Some(Node::DocumentFragment) => renderer.template_contents.iter().find_map(
                 |(template, content)| (*content == idx).then_some(*template),
             ),
-            Some(node) => node.get_parent(),
+            Some(node) => node.shadow_including_parent(),
             None => None,
         };
     }
@@ -5731,14 +5740,19 @@ fn op_get_document_element(
 fn op_get_element_by_id(
     state: &mut OpState,
     #[string] id: String,
+    #[number] root_idx: Option<usize>,
 ) -> Result<Option<(usize, Node)>, JsError> {
     let host = state.borrow_mut::<JsHostState>();
     let renderer = host.renderer.borrow();
-    let node_idx = renderer
-        .dom_indexes
-        .id_elements
-        .get(&id)
-        .and_then(|v| v.ones().find(|idx| renderer.node_is_connected(*idx)));
+    let node_idx = renderer.dom_indexes.id_elements.get(&id).and_then(|v| {
+        v.ones().find(|idx| {
+            has_parent(
+                &renderer.nodes,
+                *idx,
+                root_idx.unwrap_or(renderer.dom_indexes.root_indice),
+            )
+        })
+    });
     let node = node_idx.and_then(|idx| Some((idx, renderer.nodes.get(idx).unwrap().clone())));
     Ok(node)
 }
@@ -6819,6 +6833,8 @@ extension!(
     op_mutation_observer_take_records,
     op_create_element,
     op_create_document_fragment,
+    op_attach_shadow,
+    op_get_shadow_root,
     op_get_template_content,
     op_create_text_element,
     op_create_comment_element,
@@ -7107,7 +7123,7 @@ fn get_dom_indexes(
         .filter_map(|(idx, node)| node.get_parent().is_none().then_some(idx))
         .filter(|idx| match html_nodes.get(*idx).unwrap() {
             Node::Element(_) | Node::Text(_) => true,
-            Node::Comment(_) | Node::DocumentFragment => false,
+            Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => false,
         })
         .collect();
     root_indices.sort_unstable();
@@ -7115,7 +7131,9 @@ fn get_dom_indexes(
         .iter()
         .find(|idx| match html_nodes.get(**idx).unwrap() {
             Node::Element(element) => element.tag == "html",
-            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => false,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
+                false
+            }
         })
         .or(root_indices.first())
         .copied()
@@ -7381,6 +7399,7 @@ impl Renderer {
                 &network_fetch,
                 &nodes_table,
                 &nodes_idxs,
+                &HashMap::new(),
                 dom_indexes.root_indice,
                 &window_size,
                 &mut dom_indexes,
@@ -7399,6 +7418,7 @@ impl Renderer {
             nodes_idxs,
             nodes: nodes_table,
             template_contents,
+            shadow_roots: HashMap::new(),
             node_styles,
             style_cache,
             selector_changes: SelectorChanges::default(),
@@ -7551,7 +7571,7 @@ impl Renderer {
         matches.sort_unstable();
         matches.dedup();
         if required_parent.is_none() {
-            matches.retain(|idx| self.node_is_connected(*idx));
+            matches.retain(|idx| has_parent(&self.nodes, *idx, self.dom_indexes.root_indice));
         }
         matches
     }
@@ -7672,7 +7692,7 @@ impl Renderer {
                 .filter(|(idx, _)| has_parent(&self.nodes, *idx, required_parent))
                 .collect();
         } else {
-            nodes.retain(|(idx, _)| self.node_is_connected(*idx));
+            nodes.retain(|(idx, _)| has_parent(&self.nodes, *idx, self.dom_indexes.root_indice));
         }
         nodes
     }
@@ -7709,7 +7729,7 @@ impl Renderer {
                 .filter(|(idx, _)| has_parent(&self.nodes, *idx, required_parent))
                 .collect();
         } else {
-            nodes.retain(|(idx, _)| self.node_is_connected(*idx));
+            nodes.retain(|(idx, _)| has_parent(&self.nodes, *idx, self.dom_indexes.root_indice));
         }
         nodes
     }
@@ -7768,7 +7788,7 @@ impl Renderer {
                 let old_value = std::mem::replace(&mut element.comment, text);
                 self.record_mutation(node_idx, None, Some(old_value));
             }
-            Node::Element(_) | Node::DocumentFragment => {
+            Node::Element(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
                 let removed = self.detach_children(node_idx);
                 let mut added = vec![];
                 if !text.is_empty() {
@@ -7920,6 +7940,7 @@ impl Renderer {
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
         self.template_contents = template_contents;
+        self.shadow_roots.clear();
         self.hovering = None;
         self.pending_dom_update = false;
         self.scroll_y.clear();
@@ -7998,7 +8019,7 @@ impl Renderer {
         };
         if style.is_some_and(|style| style.overflow_y.allows_user_scroll()) && allow_scroll {
             Some(node_idx)
-        } else if let Some(parent) = self.nodes.get(node_idx).and_then(|n| n.get_parent()) {
+        } else if let Some(parent) = self.layout_parent(node_idx) {
             self.get_scrollable_node_idx_inner(parent)
         } else {
             None
@@ -8061,14 +8082,16 @@ impl Renderer {
                         defer,
                         is_async,
                     }),
-                    Node::Comment(_) | Node::DocumentFragment => {
+                    Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
                         return None;
                     }
                 };
 
                 text
             }
-            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => None,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
+                None
+            }
         }
     }
 
@@ -8077,7 +8100,11 @@ impl Renderer {
             return true;
         }
 
-        let Some(parent) = self.nodes.get(idx).and_then(|node| node.get_parent()) else {
+        let Some(parent) = self
+            .nodes
+            .get(idx)
+            .and_then(|node| node.shadow_including_parent())
+        else {
             return false;
         };
 
@@ -8790,7 +8817,7 @@ impl Renderer {
             Node::Text(element) => {
                 str += &element.text;
             }
-            Node::Element(_) | Node::DocumentFragment => {
+            Node::Element(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
                 for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
                     str += &self.get_text_content(*child_idx);
                 }
@@ -8826,7 +8853,9 @@ impl Renderer {
             Node::Comment(element) => {
                 str += &format!("<!--{}-->", element.comment);
             }
-            Node::DocumentFragment => str += &self.get_element_inner_html(node_idx),
+            Node::DocumentFragment | Node::ShadowRoot { .. } => {
+                str += &self.get_element_inner_html(node_idx)
+            }
         }
         str
     }
@@ -8855,14 +8884,7 @@ impl Renderer {
     fn get_parent_font_size(&self, node_idx: usize) -> u32 {
         let resolved_parent_font_size = self
             .resolved_font_sizes
-            .get(
-                &self
-                    .nodes
-                    .get(node_idx)
-                    .unwrap()
-                    .get_parent()
-                    .unwrap_or(node_idx),
-            )
+            .get(&self.layout_parent(node_idx).unwrap_or(node_idx))
             .unwrap_or(&16);
         *resolved_parent_font_size
     }
@@ -8941,7 +8963,7 @@ impl Renderer {
             Element(String),
         }
         let node_kind = match self.nodes.get(node_idx).unwrap() {
-            Node::Comment(_) | Node::DocumentFragment => return None,
+            Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => return None,
             Node::Text(text) => LayoutNodeKind::Text(text.text.clone()),
             Node::Element(element) => LayoutNodeKind::Element(element.tag.clone()),
         };
@@ -10284,6 +10306,11 @@ impl Renderer {
 
     // Contents wrappers stay in the DOM for inheritance, but generate no layout box.
     fn layout_children(&self, node_idx: usize) -> Vec<usize> {
+        let node_idx = self
+            .shadow_roots
+            .get(&node_idx)
+            .copied()
+            .unwrap_or(node_idx);
         let mut children = Vec::new();
         for child in self
             .dom_indexes
@@ -10313,14 +10340,14 @@ impl Renderer {
         let containing_block = match style.position {
             StylePosition::Absolute | StylePosition::Fixed => Some(containing_node_idx),
             StylePosition::Relative | StylePosition::Static | StylePosition::Sticky => {
-                let mut parent = self.nodes.get(node_idx).unwrap().get_parent();
+                let mut parent = self.layout_parent(node_idx);
                 while let Some(idx) = parent {
                     if !self.node_styles.get(&idx)
                         .is_some_and(|s| s.display == StyleDisplay::Contents)
                     {
                         break;
                     }
-                    parent = self.nodes.get(idx).unwrap().get_parent();
+                    parent = self.layout_parent(idx);
                 }
                 parent
             }
@@ -10619,7 +10646,9 @@ impl Renderer {
 
         let input_value = match &self.nodes.get(node_idx).unwrap() {
             Node::Element(element) => element.attributes.get_str("value"),
-            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => None,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
+                None
+            }
         };
         if immediate_children.len() == 0
             && let Some(input_value) = input_value
@@ -10926,7 +10955,9 @@ impl Renderer {
 
         let input_value = match &self.nodes.get(node_idx).unwrap() {
             Node::Element(element) => element.attributes.get_str("value"),
-            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment => None,
+            Node::Text(_) | Node::Comment(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
+                None
+            }
         };
         if immediate_children.len() == 0
             && let Some(input_value) = input_value
@@ -11914,7 +11945,7 @@ impl Renderer {
     fn walk_parent_tree(&self, buffer: &mut Vec<usize>, idx: usize) {
         buffer.push(idx);
         if let Some(node) = self.nodes.get(idx) {
-            if let Some(parent) = node.get_parent() {
+            if let Some(parent) = node.shadow_including_parent() {
                 self.walk_parent_tree(buffer, parent);
             }
         }
@@ -12023,6 +12054,7 @@ impl Renderer {
             &self.network_fetch,
             &self.nodes,
             &self.nodes_idxs,
+            &self.shadow_roots,
             self.dom_indexes.root_indice,
             &self.window_size,
             &mut self.dom_indexes,
@@ -14243,6 +14275,7 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
             &frame.network_fetch,
             &params.nodes,
             &params.nodes_idxs,
+            &HashMap::new(),
             params.dom_indexes.root_indice,
             &window_size,
             &mut params.dom_indexes,
@@ -14847,6 +14880,7 @@ fn get_node_text_representation(
         },
         Node::Comment(element) => format!("Node::Comment \"{}\"", element.comment),
         Node::DocumentFragment => "Node::DocumentFragment".to_string(),
+        Node::ShadowRoot { host, mode } => format!("Node::ShadowRoot {mode:?} [host={host}]"),
     };
     label.push_str(&format!(" [idx={}]", node_idx));
     match layout_node_mapping

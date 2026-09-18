@@ -97,11 +97,18 @@ pub struct CommentElement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ShadowRootMode {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Element(Element),
     Text(TextElement),
     Comment(CommentElement),
     DocumentFragment,
+    ShadowRoot { host: usize, mode: ShadowRootMode },
 }
 
 impl Node {
@@ -110,7 +117,14 @@ impl Node {
             Node::Element(element) => element.parent,
             Node::Text(element) => element.parent,
             Node::Comment(element) => element.parent,
-            Node::DocumentFragment => None,
+            Node::DocumentFragment | Node::ShadowRoot { .. } => None,
+        }
+    }
+
+    pub fn shadow_including_parent(&self) -> Option<usize> {
+        match self {
+            Node::ShadowRoot { host, .. } => Some(*host),
+            _ => self.get_parent(),
         }
     }
 
@@ -119,7 +133,7 @@ impl Node {
             Node::Element(element) => element.parent = parent,
             Node::Text(element) => element.parent = parent,
             Node::Comment(element) => element.parent = parent,
-            Node::DocumentFragment => {}
+            Node::DocumentFragment | Node::ShadowRoot { .. } => {}
         }
     }
 }
@@ -212,6 +226,21 @@ impl<'a> ToV8<'a> for Node {
             Node::DocumentFragment => {
                 let object = v8::Object::new(scope);
                 set_object_prop(scope, object, "kind", "fragment");
+                Ok(object.into())
+            }
+            Node::ShadowRoot { host, mode } => {
+                let object = v8::Object::new(scope);
+                set_object_prop(scope, object, "kind", "shadow-root");
+                set_object_prop(scope, object, "host", host);
+                set_object_prop(
+                    scope,
+                    object,
+                    "mode",
+                    match mode {
+                        ShadowRootMode::Open => "open",
+                        ShadowRootMode::Closed => "closed",
+                    },
+                );
                 Ok(object.into())
             }
         }

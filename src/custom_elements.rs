@@ -56,7 +56,7 @@ pub struct Registry {
     attempted: HashSet<usize>,
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     name.starts_with(|c: char| c.is_ascii_lowercase())
         && name.contains('-')
         && name.chars().all(|c| {

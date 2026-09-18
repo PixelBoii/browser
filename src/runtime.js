@@ -160,7 +160,7 @@ class BaseNode extends EventTarget {
     }
 
     get isConnected() {
-        return this.__node_idx != null && this.getRootNode() === this.ownerDocument
+        return this.__node_idx != null && this.getRootNode({ composed: true }) === this.ownerDocument
     }
 
     get parentNode() {
@@ -183,10 +183,13 @@ class BaseNode extends EventTarget {
         return child ? nodeToElement(child) : null
     }
 
-    getRootNode() {
+    getRootNode(options = {}) {
         let node = this
         while (node.parentNode) {
             node = node.parentNode
+        }
+        if (options?.composed && node instanceof ShadowRoot) {
+            return node.host.getRootNode(options)
         }
         return node === this.ownerDocument.documentElement ? this.ownerDocument : node
     }
@@ -274,6 +277,9 @@ class BaseNode extends EventTarget {
     insertBefore(newNode, referenceNode) {
         if (!newNode) {
             throw new TypeError("insertBefore called without newNode")
+        }
+        if (newNode instanceof ShadowRoot) {
+            throw new DOMException.DOMException("A shadow root cannot be inserted", "HierarchyRequestError")
         }
         if (referenceNode && newNode.__node_idx === referenceNode.__node_idx) {
             return newNode
@@ -531,10 +537,53 @@ class DocumentFragment extends BaseNode {
     get nodeType() { return Node.DOCUMENT_FRAGMENT_NODE }
     get nodeName() { return "#document-fragment" }
     get nodeValue() { return null }
+
+    getElementById(id) {
+        const node = core.ops.op_get_element_by_id(String(id), this.__node_idx)
+        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
+    }
 }
 
 Object.defineProperty(globalThis, "DocumentFragment", {
     value: DocumentFragment,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+const shadowRootToken = Symbol("ShadowRoot")
+
+class ShadowRoot extends DocumentFragment {
+    constructor(token, host, mode) {
+        if (token !== shadowRootToken) throw new TypeError("Illegal constructor")
+        super()
+        // Reuse the event implementation's shadow-boundary and retargeting hooks.
+        this[denoEvent.eventTargetData].host = host
+        this[denoEvent.eventTargetData].mode = mode
+    }
+
+    get host() { return this[denoEvent.eventTargetData].host }
+    get mode() { return this[denoEvent.eventTargetData].mode }
+
+    getParent(event) {
+        return event && !event.composed ? null : this.host
+    }
+
+    get innerHTML() {
+        return core.ops.op_get_inner_html(this.__node_idx)
+    }
+
+    set innerHTML(value) {
+        core.ops.op_set_inner_html(this.__node_idx, String(value))
+    }
+
+    cloneNode() {
+        throw new DOMException.DOMException("Shadow roots cannot be cloned", "NotSupportedError")
+    }
+}
+
+Object.defineProperty(globalThis, "ShadowRoot", {
+    value: ShadowRoot,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -829,6 +878,23 @@ class HtmlElement extends BaseNode {
     registerInBackend() {
         this.__node_idx = core.ops.op_create_element(this.tag, this.ownerDocument.__frameId)
         cacheNodeElement(this.__node_idx, this)
+    }
+
+    attachShadow(init) {
+        if (this.ownerDocument.__frameId != null) {
+            throw new Error("Cross-frame attachShadow is not implemented")
+        }
+        if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+            throw new DOMException.DOMException("Shadow hosts must be HTML elements", "NotSupportedError")
+        }
+        const root = core.ops.op_attach_shadow(this.__node_idx, String(init?.mode))
+        return withDocument(this.ownerDocument, () => elementFromNodeIdx(root))
+    }
+
+    get shadowRoot() {
+        if (this.ownerDocument.__frameId != null) return null
+        const root = core.ops.op_get_shadow_root(this.__node_idx)
+        return root == null ? null : withDocument(this.ownerDocument, () => elementFromNodeIdx(root))
     }
 
     click() {
@@ -2289,6 +2355,10 @@ function nodeToElement(pair) {
         element = withoutAutoRegisterNode(() => new elementClass(node.tag))
     } else if (node.kind === "fragment") {
         element = withoutAutoRegisterNode(() => new DocumentFragment())
+    } else if (node.kind === "shadow-root") {
+        element = withoutAutoRegisterNode(() => new ShadowRoot(
+            shadowRootToken, elementFromNodeIdx(node.host), node.mode,
+        ))
     } else if (node.kind === "comment") {
         element = withoutAutoRegisterNode(() => new CommentNode(node.comment))
     } else if (node.kind === "text") {

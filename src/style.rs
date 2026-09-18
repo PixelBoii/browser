@@ -628,7 +628,10 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                     StyleBackground::Transparent
                 }
             }
-            HtmlNode::Text(_) | HtmlNode::Comment(_) | HtmlNode::DocumentFragment => StyleBackground::Transparent,
+            HtmlNode::Text(_)
+            | HtmlNode::Comment(_)
+            | HtmlNode::DocumentFragment
+            | HtmlNode::ShadowRoot { .. } => StyleBackground::Transparent,
         },
         display: match node {
             HtmlNode::Element(element) => {
@@ -655,7 +658,9 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                 }
             }
             HtmlNode::Text(_) => StyleDisplay::Inline,
-            HtmlNode::Comment(_) | HtmlNode::DocumentFragment => StyleDisplay::None,
+            HtmlNode::Comment(_) | HtmlNode::DocumentFragment | HtmlNode::ShadowRoot { .. } => {
+                StyleDisplay::None
+            }
         },
         flex_shrink: 1,
         flex_grow: 0,
@@ -697,7 +702,9 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                     }
                 })
                 .unwrap_or(StyleBackground::Hex(0x00_00_00_FF)),
-            HtmlNode::Comment(_) | HtmlNode::DocumentFragment => StyleBackground::Transparent,
+            HtmlNode::Comment(_) | HtmlNode::DocumentFragment | HtmlNode::ShadowRoot { .. } => {
+                StyleBackground::Transparent
+            }
         },
         min_height: StyleSize::Auto,
         max_height: StyleSize::Auto,
@@ -712,7 +719,10 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                     implied_text_align
                 }
             }
-            HtmlNode::Text(_) | HtmlNode::Comment(_) | HtmlNode::DocumentFragment => implied_text_align,
+            HtmlNode::Text(_)
+            | HtmlNode::Comment(_)
+            | HtmlNode::DocumentFragment
+            | HtmlNode::ShadowRoot { .. } => implied_text_align,
         },
         variables: Rc::new(StyleVariables::default()),
         font_size: parent_style
