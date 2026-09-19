@@ -1,4 +1,5 @@
-import { EventTarget, Event, defineEventHandler } from "ext:deno_web/02_event.js";
+import { core } from "ext:core/mod.js";
+const { EventTarget, Event, defineEventHandler } = core.loadExtScript("ext:deno_web/02_event.js");
 
 function resolveBrowserUrl(value) {
     return new URL(value, globalThis.location?.href ?? "about:blank").href

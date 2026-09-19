@@ -1,7 +1,8 @@
-import * as webidl from "ext:deno_webidl/00_webidl.js";
-import { DOMException } from "ext:deno_web/01_dom_exception.js";
-import { MessageEvent } from "ext:deno_web/02_event.js";
-import * as messagePort from "ext:deno_web/13_message_port.js";
+import { core } from "ext:core/mod.js";
+const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+const { MessageEvent } = core.loadExtScript("ext:deno_web/02_event.js");
+const messagePort = core.loadExtScript("ext:deno_web/13_message_port.js");
 
 export function serializeWorkerMessage(message, transferOrOptions) {
     const options = transferOrOptions?.[Symbol.iterator] !== undefined

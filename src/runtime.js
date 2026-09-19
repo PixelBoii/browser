@@ -1,41 +1,41 @@
+import { core } from "ext:core/mod.js";
 import { serializeWorkerMessage, deserializeWorkerMessage } from "./worker_messaging.js";
-import * as webidl from "ext:deno_webidl/00_webidl.js";
-import * as url from "ext:deno_web/00_url.js";
-import * as urlPattern from "ext:deno_web/01_urlpattern.js";
-import * as infra from "ext:deno_web/00_infra.js";
-import * as DOMException from "ext:deno_web/01_dom_exception.js";
-import { Console, setNoColorFns } from "ext:deno_web/01_console.js";
-import * as broadcastChannel from "ext:deno_web/01_broadcast_channel.js";
-import * as mimesniff from "ext:deno_web/01_mimesniff.js";
-import * as denoEvent from "ext:deno_web/02_event.js";
-import * as structuredClone from "ext:deno_web/02_structured_clone.js";
-import * as abortSignal from "ext:deno_web/03_abort_signal.js";
-import * as globalInterfaces from "ext:deno_web/04_global_interfaces.js";
-import * as base64 from "ext:deno_web/05_base64.js";
+const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const url = core.loadExtScript("ext:deno_web/00_url.js");
+const urlPattern = core.loadExtScript("ext:deno_web/01_urlpattern.js");
+const infra = core.loadExtScript("ext:deno_web/00_infra.js");
+const DOMException = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+const { Console, setNoColorFns } = core.loadExtScript("ext:deno_web/01_console.js");
+const broadcastChannel = core.loadExtScript("ext:deno_web/01_broadcast_channel.js");
+const mimesniff = core.loadExtScript("ext:deno_web/01_mimesniff.js");
+const denoEvent = core.loadExtScript("ext:deno_web/02_event.js");
+const structuredClone = core.loadExtScript("ext:deno_web/02_structured_clone.js");
+const abortSignal = core.loadExtScript("ext:deno_web/03_abort_signal.js");
+const globalInterfaces = core.loadExtScript("ext:deno_web/04_global_interfaces.js");
+const base64 = core.loadExtScript("ext:deno_web/05_base64.js");
 import "./streams.js";
-import * as encoding from "ext:deno_web/08_text_encoding.js";
-import * as file from "ext:deno_web/09_file.js";
-import * as fileReader from "ext:deno_web/10_filereader.js";
+const encoding = core.loadExtScript("ext:deno_web/08_text_encoding.js");
+const file = core.loadExtScript("ext:deno_web/09_file.js");
+const fileReader = core.loadExtScript("ext:deno_web/10_filereader.js");
 // import * as location from "ext:deno_web/12_location.js";
-import * as messagePort from "ext:deno_web/13_message_port.js";
-import * as compression from "ext:deno_web/14_compression.js";
-import * as performance from "ext:deno_web/15_performance.js";
-import * as imageData from "ext:deno_web/16_image_data.js";
-import * as net from "ext:deno_net/01_net.js";
-import * as tls from "ext:deno_net/02_tls.js";
-import * as headers from "ext:deno_fetch/20_headers.js";
-import * as formData from "ext:deno_fetch/21_formdata.js";
-import * as request from "ext:deno_fetch/23_request.js";
-import * as response from "ext:deno_fetch/23_response.js";
+const messagePort = core.loadExtScript("ext:deno_web/13_message_port.js");
+const compression = core.loadExtScript("ext:deno_web/14_compression.js");
+const performance = core.loadExtScript("ext:deno_web/15_performance.js");
+const imageData = core.loadExtScript("ext:deno_web/16_image_data.js");
+const net = core.loadExtScript("ext:deno_net/01_net.js");
+const tls = core.loadExtScript("ext:deno_net/02_tls.js");
+const headers = core.loadExtScript("ext:deno_fetch/20_headers.js");
+const formData = core.loadExtScript("ext:deno_fetch/21_formdata.js");
+const request = core.loadExtScript("ext:deno_fetch/23_request.js");
+const response = core.loadExtScript("ext:deno_fetch/23_response.js");
 import * as fetch from "ext:browser/runtime_fetch.js";
-import * as crypto from "ext:deno_crypto/00_crypto.js";
+const crypto = core.loadExtScript("ext:deno_crypto/00_crypto.js");
 import { EventTarget } from "./event_target.js";
 import { NodeFilter, NodeIterator, createNodeIterator } from "./node_iterator.js";
 import { XMLHttpRequest } from "ext:browser/xml_http_request.js";
 
 denoEvent.saveGlobalThisReference(globalThis)
 
-const { core } = Deno
 setNoColorFns(() => true, () => true)
 globalThis.console = new Console((message, level) => core.print(message, level >= 2))
 core.wrapConsole(globalThis.console, core.console)

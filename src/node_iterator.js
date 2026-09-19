@@ -1,4 +1,5 @@
-import { DOMException } from "ext:deno_web/01_dom_exception.js";
+import { core } from "ext:core/mod.js";
+const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
 
 export const NodeFilter = {
     FILTER_ACCEPT: 1,

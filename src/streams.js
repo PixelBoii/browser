@@ -1,4 +1,5 @@
-import * as streams from "ext:deno_web/06_streams.js";
+import { core } from "ext:core/mod.js";
+const streams = core.loadExtScript("ext:deno_web/06_streams.js");
 
 // Windows and workers expose the same stream interfaces.
 for (const name of [

@@ -2,13 +2,16 @@
 // Vendored from deno_web 0.276.0, 02_event.js.
 // Local changes: DOM parent/root hooks, Window propagation, ancestor-only listeners,
 // trusted native dispatch, and legacy initEvent. Preserve these when updating from upstream.
+// Wrapped for Deno's lazy script loader; event behavior remains based on 0.276.0.
 
 // This module follows most of the WHATWG Living Standard for the DOM logic.
 // Many parts of the DOM are not implemented in Deno, but the logic for those
 // parts still exists.  This means you will observe a lot of strange structures
 // and impossible logic branches based on what Deno currently supports.
 
-import { core, primordials } from "ext:core/mod.js";
+(function () {
+"use strict";
+const { core, primordials } = __bootstrap;
 const {
   ArrayPrototypeIncludes,
   ArrayPrototypeIndexOf,
@@ -36,9 +39,14 @@ const {
   TypeError,
 } = primordials;
 
-import * as webidl from "ext:deno_webidl/00_webidl.js";
-import { DOMException } from "./01_dom_exception.js";
-import { createFilteredInspectProxy } from "./01_console.js";
+const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+
+// Console can load event-related modules, so resolve it only when inspecting.
+function createFilteredInspectProxy(options) {
+  return core.loadExtScript("ext:deno_web/01_console.js")
+    .createFilteredInspectProxy(options);
+}
 
 // This should be set via setGlobalThis this is required so that if even
 // user deletes globalThis it is still usable
@@ -889,8 +897,8 @@ function retarget(a, b) {
 
 // Accessors for non-public data
 
-export const eventTargetData = Symbol();
-export const kResistStopImmediatePropagation = Symbol(
+const eventTargetData = Symbol();
+const kResistStopImmediatePropagation = Symbol(
   "kResistStopImmediatePropagation",
 );
 
@@ -1566,7 +1574,7 @@ function reportError(error) {
   reportException(error);
 }
 
-export {
+return {
   CloseEvent,
   CustomEvent,
   defineEventHandler,
@@ -1575,6 +1583,8 @@ export {
   Event,
   EventTarget,
   EventTargetPrototype,
+  eventTargetData,
+  kResistStopImmediatePropagation,
   listenerCount,
   MessageEvent,
   ProgressEvent,
@@ -1586,3 +1596,4 @@ export {
   setIsTrusted,
   setTarget,
 };
+})();
