@@ -1413,6 +1413,9 @@ enum FrameDomCommand {
 enum FrameCommand {
     Close,
     Render,
+    TakeScreenshot {
+        reply: Sender<Result<Pixmap>>,
+    },
     UserEvent(UserEvent),
     Dom(FrameDomCommand),
     Resized(PhysicalSize<u32>),
@@ -12461,6 +12464,27 @@ pub struct HeadlessFrame {
     tx: Sender<FrameCommand>,
 }
 
+impl HeadlessFrame {
+    /// Render the current viewport and save it as a PNG, overwriting `path`.
+    ///
+    /// Rendering happens on the frame thread. PNG encoding and file IO happen
+    /// on the calling thread so the frame can continue processing events.
+    /// This does not wait for pending network requests or page animations.
+    pub fn take_screenshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let (reply, response) = std::sync::mpsc::channel();
+        self.tx
+            .send(FrameCommand::TakeScreenshot { reply })
+            .map_err(|_| anyhow!("Headless frame thread has stopped"))?;
+        let pixmap = response
+            .recv()
+            .context("Headless frame thread stopped before capturing the screenshot")??;
+        pixmap
+            .save_png(path)
+            .with_context(|| format!("Failed to save screenshot to {}", path.display()))
+    }
+}
+
 impl Drop for HeadlessFrame {
     fn drop(&mut self) {
         let _ = self.tx.send(FrameCommand::Close);
@@ -13928,6 +13952,14 @@ impl Frame {
         buffer
     }
 
+    fn capture_screenshot(&mut self) -> Result<Pixmap> {
+        let buffer = self.render_loop();
+        let size = IntSize::from_wh(self.render_size.width, self.render_size.height)
+            .context("Invalid screenshot dimensions")?;
+        Pixmap::from_vec(rgb_buffer_to_premul_bytes(&buffer), size)
+            .context("Failed to create screenshot pixmap")
+    }
+
     fn render(&mut self, buffer: &mut Vec<u32>) -> bool {
         if self
             .renderer
@@ -14105,6 +14137,9 @@ impl Frame {
             FrameCommand::Render => {
                 let buffer = self.render_loop();
                 let _ = proxy.fire_tab_updated(buffer);
+            }
+            FrameCommand::TakeScreenshot { reply } => {
+                let _ = reply.send(self.capture_screenshot());
             }
             FrameCommand::Resized(new_size) => {
                 self.render_size = new_size;
