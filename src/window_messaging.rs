@@ -22,7 +22,7 @@ enum MessageSource {
 }
 
 #[derive(Debug)]
-pub(crate) struct WindowMessage {
+pub struct WindowMessage {
     data: WorkerMessage,
     origin: String,
     target_origin: Option<Origin>,

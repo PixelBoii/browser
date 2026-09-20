@@ -21,9 +21,11 @@ use mutation_observer::{
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use fixedbitset::FixedBitSet;
 use image::{DynamicImage, ImageReader};
-use parser::{Element, HtmlParser, Node};
+use parser::HtmlParser;
+pub use parser::{Attributes, CommentElement, Element, Node, ShadowRootMode, TextElement};
 use reqwest::cookie::{CookieStore, Jar};
-use resvg::tiny_skia::{IntSize, Pixmap};
+use resvg::tiny_skia::IntSize;
+pub use resvg::tiny_skia::Pixmap;
 use resvg::usvg::Tree;
 use serde::Serialize;
 use shadow_dom::{op_attach_shadow, op_get_shadow_root};
@@ -33,8 +35,9 @@ use style::{
     get_base_style, parse_style,
 };
 use window_messaging::{
-    ParentWindow, WindowMessage, op_is_top, op_post_message_to_frame, op_post_message_to_parent,
+    ParentWindow, op_is_top, op_post_message_to_frame, op_post_message_to_parent,
 };
+pub use window_messaging::WindowMessage;
 
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
@@ -70,7 +73,6 @@ use crate::css::{
     selector_to_parts,
 };
 use crate::loader::HttpModuleLoader;
-use crate::parser::{Attributes, CommentElement, TextElement};
 use crate::style::{
     CalcExpression, CssCascadeMetadata, GridColumnSize, GridTemplateColumns,
     GridTemplateColumnsValue, StyleAlign, StyleBorderStyle, StyleCalcOperator, StylePointerEvents,
@@ -314,7 +316,7 @@ struct LayoutBox {
 }
 
 #[derive(Debug, Clone)]
-enum RequestCacheEntry {
+pub enum RequestCacheEntry {
     PngData(Bytes),
     SvgData(String),
     CssData(String),
@@ -1356,7 +1358,7 @@ impl Animation {
 }
 
 #[derive(Debug)]
-enum FrameDomCommand {
+pub enum FrameDomCommand {
     GetDocumentElement {
         reply: std::sync::mpsc::Sender<Option<(usize, Node)>>,
     },
@@ -1410,9 +1412,19 @@ enum FrameDomCommand {
 }
 
 #[derive(Debug)]
-enum FrameCommand {
+pub enum FrameCommand {
     Close,
     Render,
+    /// Return the native node and its descendant text together on the frame thread.
+    QuerySelector {
+        selector: String,
+        reply: Sender<Option<(Node, String)>>,
+    },
+    /// Return matching native nodes and their descendant text.
+    QuerySelectorAll {
+        selector: String,
+        reply: Sender<Vec<(Node, String)>>,
+    },
     TakeScreenshot {
         reply: Sender<Result<Pixmap>>,
     },
@@ -1461,7 +1473,7 @@ impl Drop for FrameHandle {
 }
 
 #[derive(Debug, Clone)]
-enum RendererProxy {
+pub enum RendererProxy {
     WindowLoop {
         proxy: EventLoopProxy<UserEvent>,
         tab_idx: usize,
@@ -1807,7 +1819,7 @@ impl Drop for WorkerHandle {
 }
 
 // Resources are taken from the sending runtime and installed in the receiving runtime.
-struct WorkerMessage {
+pub struct WorkerMessage {
     data: deno_core::DetachedBuffer,
     transferables: Vec<deno_web::Transferable>,
 }
@@ -1881,7 +1893,7 @@ struct OptionalSize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Position {
+pub struct Position {
     x: i32,
     y: i32,
 }
@@ -4991,7 +5003,7 @@ fn compute_node_styles(
 }
 
 #[derive(Debug, Clone)]
-enum UserNavigateUrl {
+pub enum UserNavigateUrl {
     Raw(String),
     Form(FormNavigation),
 }
@@ -5003,14 +5015,14 @@ enum FormMethod {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct FormNavigation {
+pub struct FormNavigation {
     url: ReqwestUrl,
     method: FormMethod,
     body: Option<String>,
 }
 
 #[derive(Debug)]
-enum UserEvent {
+pub enum UserEvent {
     DomUpdated,
     ImagesPrefetched(Vec<(ReqwestUrl, RequestCacheEntry)>),
     Navigate((UserNavigateUrl, bool)),
@@ -12430,7 +12442,7 @@ impl ExecutedScripts {
     }
 }
 
-/// A document frame. Use [`Frame::open_headless`] to run one on its own thread.
+/// A document frame. [`Frame::open_headless`] initializes one on the calling thread.
 pub struct Frame {
     url: String,
     renderer: Option<Rc<RefCell<Renderer>>>,
@@ -12456,39 +12468,6 @@ pub struct Frame {
     animation_frame_requested: bool,
     last_animation_frame: Instant,
     blob_store: Arc<BlobStore>,
-}
-
-/// Owns a headless frame running on a dedicated Rust thread.
-/// Dropping the handle requests shutdown without blocking the caller.
-pub struct HeadlessFrame {
-    tx: Sender<FrameCommand>,
-}
-
-impl HeadlessFrame {
-    /// Render the current viewport and save it as a PNG, overwriting `path`.
-    ///
-    /// Rendering happens on the frame thread. PNG encoding and file IO happen
-    /// on the calling thread so the frame can continue processing events.
-    /// This does not wait for pending network requests or page animations.
-    pub fn take_screenshot(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let (reply, response) = std::sync::mpsc::channel();
-        self.tx
-            .send(FrameCommand::TakeScreenshot { reply })
-            .map_err(|_| anyhow!("Headless frame thread has stopped"))?;
-        let pixmap = response
-            .recv()
-            .context("Headless frame thread stopped before capturing the screenshot")??;
-        pixmap
-            .save_png(path)
-            .with_context(|| format!("Failed to save screenshot to {}", path.display()))
-    }
-}
-
-impl Drop for HeadlessFrame {
-    fn drop(&mut self) {
-        let _ = self.tx.send(FrameCommand::Close);
-    }
 }
 
 struct BootParams {
@@ -12522,47 +12501,42 @@ impl std::fmt::Debug for Frame {
 }
 
 impl Frame {
-    /// Start a headless frame and wait for its initial document to initialize.
+    /// Initialize a windowless frame on the calling thread.
     ///
-    /// The frame, JavaScript runtime, and event loop stay on their owning thread.
-    /// This creates no Winit event loop or window. Keep the returned handle alive
-    /// for as long as the frame should run.
-    pub fn open_headless(url: String) -> Result<HeadlessFrame> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let frame_tx = tx.clone();
+    /// Run [`Frame::start_main_loop`] on this thread after initialization.
+    /// This creates no Winit event loop or window.
+    pub fn open_headless(url: String, proxy: RendererProxy) -> Result<Self> {
+        let mut frame = Self::new(url, false, PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, proxy)?;
+        frame.run_js()?;
+        frame.render_loop();
+        Ok(frame)
+    }
 
-        std::thread::Builder::new()
-            .name("browser-frame".into())
-            .spawn(move || {
-                let proxy = RendererProxy::FrameLoop(frame_tx);
-                let initialize = || -> Result<Frame> {
-                    let mut frame =
-                        Frame::new(url, false, PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
-                    let params = frame.open()?;
-                    frame.set_up_without_event_loop(params, proxy.clone())?;
-                    frame.run_js()?;
-                    frame.render_loop();
-                    Ok(frame)
-                };
+    /// Return the first matching node, with its document-local ID.
+    pub fn query_selector(&mut self, selector: &str) -> Option<(usize, Node)> {
+        self.renderer
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .query_selector_node(selector.to_owned(), None)
+    }
 
-                match initialize() {
-                    Ok(mut frame) => {
-                        if started_tx.send(Ok(())).is_ok() {
-                            frame.start_main_loop(proxy, rx);
-                        }
-                    }
-                    Err(error) => {
-                        let _ = started_tx.send(Err(error));
-                    }
-                }
-            })
-            .context("Failed to start headless frame thread")?;
+    /// Return matching nodes without duplicates.
+    pub fn query_selector_all(&mut self, selector: &str) -> Vec<(usize, Node)> {
+        self.renderer
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .query_selector_all_nodes(selector.to_owned(), None)
+    }
 
-        started_rx
-            .recv()
-            .context("Headless frame thread stopped during initialization")??;
-        Ok(HeadlessFrame { tx })
+    /// Read a node's descendant text, or None if the node ID does not exist.
+    pub fn text_content(&self, node_idx: usize) -> Option<String> {
+        let renderer = self.renderer.as_ref()?.borrow();
+        renderer.nodes.get(node_idx)?;
+        Some(renderer.get_text_content(node_idx))
     }
 
     fn new(url: String, hover_debugging: bool, render_size: PhysicalSize<u32>) -> Self {
@@ -13463,7 +13437,8 @@ impl Frame {
         }
     }
 
-    fn start_main_loop(&mut self, proxy: RendererProxy, rx: Receiver<FrameCommand>) {
+    /// Run the frame's main loop on its owning thread until `Close` is received.
+    pub fn start_main_loop(&mut self, proxy: RendererProxy, rx: Receiver<FrameCommand>) {
         let mut js_pending = true;
         loop {
             let cmd = if let Some(timeout) = self.command_wait_timeout(js_pending) {
@@ -13952,7 +13927,8 @@ impl Frame {
         buffer
     }
 
-    fn capture_screenshot(&mut self) -> Result<Pixmap> {
+    /// Render the current viewport to an owned bitmap without encoding or saving it.
+    pub fn render_to_pixmap(&mut self) -> Result<Pixmap> {
         let buffer = self.render_loop();
         let size = IntSize::from_wh(self.render_size.width, self.render_size.height)
             .context("Invalid screenshot dimensions")?;
@@ -14138,8 +14114,22 @@ impl Frame {
                 let buffer = self.render_loop();
                 let _ = proxy.fire_tab_updated(buffer);
             }
+            FrameCommand::QuerySelector { selector, reply } => {
+                let result = self.query_selector(&selector).map(|(node_idx, node)| {
+                    (node, self.text_content(node_idx).unwrap())
+                });
+                let _ = reply.send(result);
+            }
+            FrameCommand::QuerySelectorAll { selector, reply } => {
+                let result = self
+                    .query_selector_all(&selector)
+                    .into_iter()
+                    .map(|(node_idx, node)| (node, self.text_content(node_idx).unwrap()))
+                    .collect();
+                let _ = reply.send(result);
+            }
             FrameCommand::TakeScreenshot { reply } => {
-                let _ = reply.send(self.capture_screenshot());
+                let _ = reply.send(self.render_to_pixmap());
             }
             FrameCommand::Resized(new_size) => {
                 self.render_size = new_size;
