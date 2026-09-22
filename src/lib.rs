@@ -307,6 +307,7 @@ enum LayoutKind {
 
 #[derive(Debug, Clone)]
 struct LayoutBox {
+    parent: Option<usize>,
     rect: Rect,
     kind: LayoutKind,
     children: Vec<usize>,
@@ -8326,65 +8327,52 @@ impl Renderer {
 
     // Measurements assume the normal rendering pass has already updated layout.
     fn measure_element(&self, node_idx: usize) -> ElementGeometry {
-        self.layout_roots
-            .iter()
-            .find_map(|&root| self.measure_layout_box(root, node_idx, 0, 0))
-            .unwrap_or_default()
-    }
-
-    fn measure_layout_box(
-        &self,
-        layout_idx: usize,
-        node_idx: usize,
-        mut offset_x: i32,
-        mut offset_y: i32,
-    ) -> Option<ElementGeometry> {
-        let layout = &self.layout_table[layout_idx];
-        let style = self.node_styles.get(&layout.node_idx);
-        if let Some(style) = style {
-            if style.position == StylePosition::Fixed {
-                offset_x = 0;
-                offset_y = 0;
+        let Some(&layout_idx) = self.node_layout_mapping.get(&node_idx) else {
+            return ElementGeometry::default();
+        };
+        let rect = &self.layout_table[layout_idx].rect;
+        let style = self.node_styles.get(&node_idx);
+        let (client_width, client_height) =
+            if style.is_some_and(|s| s.display == StyleDisplay::Inline) {
+                (0, 0)
+            } else if node_idx == self.dom_indexes.root_indice {
+                (self.window_size.width, self.window_size.height)
+            } else {
+                (
+                    rect.width
+                        .saturating_sub(rect.border.left.as_ref().map_or(0, |b| b.size))
+                        .saturating_sub(rect.border.right.as_ref().map_or(0, |b| b.size)),
+                    rect.height
+                        .saturating_sub(rect.border.top.as_ref().map_or(0, |b| b.size))
+                        .saturating_sub(rect.border.bottom.as_ref().map_or(0, |b| b.size)),
+                )
+            };
+        let mut geometry = ElementGeometry {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            client_width,
+            client_height,
+        };
+        // Follow layout parents: positioned boxes can skip DOM ancestors.
+        let mut current = Some(layout_idx);
+        while let Some(idx) = current {
+            let layout = &self.layout_table[idx];
+            if idx != layout_idx || layout.node_idx == self.dom_indexes.root_indice {
+                geometry.y += self.scroll_y.get(&layout.node_idx).copied().unwrap_or(0);
             }
-            let (x, y) = self.resolve_transform_offset(style, layout);
-            offset_x += x;
-            offset_y += y;
-        }
-        if layout.node_idx == node_idx {
-            if node_idx == self.dom_indexes.root_indice {
-                offset_y += self.scroll_y.get(&node_idx).copied().unwrap_or(0);
+            if let Some(style) = self.node_styles.get(&layout.node_idx) {
+                let (x, y) = self.resolve_transform_offset(style, layout);
+                geometry.x += x;
+                geometry.y += y;
+                if style.position == StylePosition::Fixed {
+                    break;
+                }
             }
-            let rect = &layout.rect;
-            let (client_width, client_height) =
-                if style.is_some_and(|s| s.display == StyleDisplay::Inline) {
-                    (0, 0)
-                } else if node_idx == self.dom_indexes.root_indice {
-                    (self.window_size.width, self.window_size.height)
-                } else {
-                    (
-                        rect.width
-                            .saturating_sub(rect.border.left.as_ref().map_or(0, |b| b.size))
-                            .saturating_sub(rect.border.right.as_ref().map_or(0, |b| b.size)),
-                        rect.height
-                            .saturating_sub(rect.border.top.as_ref().map_or(0, |b| b.size))
-                            .saturating_sub(rect.border.bottom.as_ref().map_or(0, |b| b.size)),
-                    )
-                };
-            return Some(ElementGeometry {
-                x: rect.x + offset_x,
-                y: rect.y + offset_y,
-                width: rect.width,
-                height: rect.height,
-                client_width,
-                client_height,
-            });
+            current = layout.parent;
         }
-        // Follow layout ancestry: positioned boxes can have a different DOM parent.
-        offset_y += self.scroll_y.get(&layout.node_idx).copied().unwrap_or(0);
-        layout
-            .children
-            .iter()
-            .find_map(|&child| self.measure_layout_box(child, node_idx, offset_x, offset_y))
+        geometry
     }
 
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
@@ -9006,9 +8994,13 @@ impl Renderer {
     fn register_layout_box(&mut self, layout_box: LayoutBox, save_as_final: bool) -> usize {
         let node_idx = layout_box.node_idx;
         let idx = self.layout_table.len();
+        for &child in &layout_box.children {
+            self.layout_table[child].parent = Some(idx);
+        }
         self.layout_table.push(layout_box);
-        // Only store first team as that'll be the highest parent
-        if save_as_final && !self.node_layout_mapping.contains_key(&node_idx) {
+        // Parents are registered last, replacing synthetic input text boxes
+        // that share the element's node index.
+        if save_as_final {
             self.node_layout_mapping.insert(node_idx, idx);
         }
         idx
@@ -9140,6 +9132,7 @@ impl Renderer {
 
                 Some(self.register_layout_box(
                     LayoutBox {
+                        parent: None,
                         rect: Rect {
                             x: cursor.x,
                             y: cursor.y,
@@ -9290,6 +9283,7 @@ impl Renderer {
 
                     Some(self.register_layout_box(
                         LayoutBox {
+                            parent: None,
                             rect: Rect {
                                 x: cursor.x,
                                 y: cursor.y,
@@ -9348,6 +9342,7 @@ impl Renderer {
                     }
                     Some(self.register_layout_box(
                         LayoutBox {
+                            parent: None,
                             rect: Rect {
                                 x: cursor.x,
                                 y: cursor.y,
@@ -9523,6 +9518,7 @@ impl Renderer {
 
                         Some(self.register_layout_box(
                             LayoutBox {
+                                parent: None,
                                 rect: Rect {
                                     x: cursor.x,
                                     y: cursor.y,
@@ -9937,6 +9933,7 @@ impl Renderer {
 
         let layout_box = self.register_layout_box(
             LayoutBox {
+                parent: None,
                 rect: Rect {
                     x: cursor.x,
                     y: cursor.y,
