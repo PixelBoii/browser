@@ -194,6 +194,14 @@ impl Renderer {
         if added_nodes.is_empty() && removed_nodes.is_empty() {
             return;
         }
+        if self.node_is_connected(target) {
+            for &idx in &removed_nodes {
+                self.custom_element_connection_changed(idx, false);
+            }
+            for &idx in &added_nodes {
+                self.custom_element_connection_changed(idx, true);
+            }
+        }
         self.queue_mutation(Record {
             kind: "childList",
             target,

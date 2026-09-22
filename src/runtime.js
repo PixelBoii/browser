@@ -1059,10 +1059,7 @@ class HtmlElement extends BaseNode {
     }
 
     set style(value) {
-        if (!(value instanceof CSSStyleDeclaration)) {
-            throw new TypeError("Unsupported style value (for now)")
-        }
-        this.setAttribute('style', value)
+        this.style.cssText = String(value ?? "")
     }
 
     get href() {
@@ -2288,8 +2285,8 @@ class ClassList {
     }
 
     sync() {
-        this.element.class = Array.from(this.list).join(" ")
-        core.ops.op_update_attributes(this.element.__node_idx, { class: this.element.class }, this.element.ownerDocument.__frameId)
+        const value = Array.from(this.list).join(" ")
+        core.ops.op_update_attributes(this.element.__node_idx, { class: value }, this.element.ownerDocument.__frameId)
     }
 
     add(...tokens) {

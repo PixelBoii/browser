@@ -1,16 +1,18 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
 };
 
 use deno_core::{JsRuntime, OpState, op2, v8};
 use deno_error::JsErrorBox;
 
-use crate::{JsHostState, Node, native_node_index};
+use crate::{JsHostState, Node, Renderer, native_node_index};
 
 struct Definition {
     constructor: v8::Global<v8::Function>,
+    connected_callback: Option<v8::Global<v8::Function>>,
+    disconnected_callback: Option<v8::Global<v8::Function>>,
     // Existing wrappers awaiting super(); None means super() already consumed the wrapper.
     upgrade_stack: RefCell<Vec<Option<v8::Global<v8::Object>>>>,
 }
@@ -45,7 +47,19 @@ impl Definition {
             return Ok(Some(v8::Local::new(scope, existing)));
         }
 
-        Ok(create_element(scope, name))
+        let element = create_element(scope, name);
+        if let Some(element) = element {
+            let idx = native_node_index(scope, element).unwrap();
+            JsRuntime::op_state_from(scope)
+                .borrow()
+                .borrow::<JsHostState>()
+                .renderer
+                .borrow_mut()
+                .custom_element_reactions
+                .custom
+                .insert(idx);
+        }
+        Ok(element)
     }
 }
 
@@ -54,6 +68,133 @@ pub struct Registry {
     definitions: HashMap<String, Rc<Definition>>,
     // A failed upgrade must not be attempted again either.
     attempted: HashSet<usize>,
+}
+
+#[derive(Debug)]
+enum Reaction {
+    Upgrade,
+    Connected,
+    Disconnected,
+}
+
+// DOM mutations enqueue reactions; the calling op delivers them after releasing its borrows.
+#[derive(Debug, Default)]
+pub struct Reactions {
+    custom: HashSet<usize>,
+    pending: Vec<usize>,
+    queues: HashMap<usize, VecDeque<Reaction>>,
+}
+
+impl Reactions {
+    fn enqueue(&mut self, idx: usize, reaction: Reaction) {
+        self.queues.entry(idx).or_default().push_back(reaction);
+        self.pending.push(idx);
+    }
+}
+
+impl Renderer {
+    fn custom_element_candidates(&self, root: usize) -> Vec<usize> {
+        let mut pending = vec![root];
+        let mut candidates = Vec::new();
+        while let Some(idx) = pending.pop() {
+            if matches!(self.nodes.get(idx), Some(Node::Element(element)) if element.tag.contains('-'))
+            {
+                candidates.push(idx);
+            }
+            // Template contents stay inert; shadow trees participate in upgrades and connection.
+            if let Some(children) = self.dom_indexes.children_index.get(&idx) {
+                pending.extend(children.iter().rev().copied());
+            }
+            if let Some(root) = self.shadow_roots.get(&idx) {
+                pending.push(*root);
+            }
+        }
+        candidates
+    }
+
+    pub fn enqueue_custom_element_upgrades(&mut self, root: usize, name: Option<&str>) {
+        for idx in self.custom_element_candidates(root) {
+            if matches!(self.nodes.get(idx), Some(Node::Element(element)) if name.is_none_or(|name| element.tag == name))
+            {
+                self.custom_element_reactions
+                    .enqueue(idx, Reaction::Upgrade);
+            }
+        }
+    }
+
+    pub fn custom_element_connection_changed(&mut self, root: usize, connected: bool) {
+        for idx in self.custom_element_candidates(root) {
+            let reaction = if self.custom_element_reactions.custom.contains(&idx) {
+                if connected {
+                    Reaction::Connected
+                } else {
+                    Reaction::Disconnected
+                }
+            } else if connected {
+                Reaction::Upgrade
+            } else {
+                continue;
+            };
+            self.custom_element_reactions.enqueue(idx, reaction);
+        }
+    }
+}
+
+pub fn deliver_reactions(scope: &mut v8::PinScope) {
+    let state = JsRuntime::op_state_from(scope);
+    let renderer = state.borrow().borrow::<JsHostState>().renderer.clone();
+    let pending = std::mem::take(&mut renderer.borrow_mut().custom_element_reactions.pending);
+    for idx in pending {
+        loop {
+            // Keep each element's queue accessible to reentrant DOM operations.
+            let reaction = renderer
+                .borrow_mut()
+                .custom_element_reactions
+                .queues
+                .get_mut(&idx)
+                .and_then(VecDeque::pop_front);
+            let Some(reaction) = reaction else { break };
+            if matches!(reaction, Reaction::Upgrade) {
+                upgrade_element(scope, idx);
+                continue;
+            }
+            let callback = {
+                let renderer = renderer.borrow();
+                let Some(Node::Element(element)) = renderer.nodes.get(idx) else {
+                    continue;
+                };
+                let state = state.borrow();
+                let Some(definition) = state.borrow::<Registry>().definitions.get(&element.tag)
+                else {
+                    continue;
+                };
+                match reaction {
+                    Reaction::Connected => definition.connected_callback.clone(),
+                    Reaction::Disconnected => definition.disconnected_callback.clone(),
+                    Reaction::Upgrade => unreachable!(),
+                }
+            };
+            let Some(callback) = callback else { continue };
+            v8::tc_scope!(let scope, scope);
+            let Some(element) = node_wrapper(scope, idx) else {
+                continue;
+            };
+            let callback = v8::Local::new(scope, callback);
+            if callback.call(scope, element.into(), &[]).is_none()
+                && let Some(exception) = scope.exception()
+            {
+                eprintln!(
+                    "Custom element callback failed: {}",
+                    exception.to_rust_string_lossy(scope)
+                );
+            }
+        }
+        renderer
+            .borrow_mut()
+            .custom_element_reactions
+            .queues
+            .remove(&idx);
+    }
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -157,7 +298,7 @@ pub fn op_custom_element_create<'s>(
 
 fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
     let state = JsRuntime::op_state_from(scope);
-    let definition = {
+    let (name, definition, connected) = {
         let state = state.borrow();
         let registry = state.borrow::<Registry>();
         if registry.attempted.contains(&idx) {
@@ -170,9 +311,12 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
         let Some(definition) = registry.definitions.get(&element.tag) else {
             return;
         };
-        (element.tag.clone(), definition.clone())
+        (
+            element.tag.clone(),
+            definition.clone(),
+            renderer.node_is_connected(idx),
+        )
     };
-    let (name, definition) = definition;
     state
         .borrow_mut()
         .borrow_mut::<Registry>()
@@ -198,6 +342,13 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
             scope.throw_exception(error);
             return None;
         }
+        let renderer = state.borrow().borrow::<JsHostState>().renderer.clone();
+        let mut renderer = renderer.borrow_mut();
+        let reactions = &mut renderer.custom_element_reactions;
+        reactions.custom.insert(idx);
+        if connected {
+            reactions.enqueue(idx, Reaction::Connected);
+        }
         Some(())
     })();
     if result.is_none() {
@@ -214,27 +365,13 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
 
 pub fn upgrade_subtree(scope: &mut v8::PinScope, root: Option<usize>, name: Option<&str>) {
     let state = JsRuntime::op_state_from(scope);
-    let candidates = {
+    {
         let state = state.borrow();
-        let renderer = state.borrow::<JsHostState>().renderer.borrow();
-        let mut pending = vec![root.unwrap_or(renderer.dom_indexes.root_indice)];
-        let mut candidates = Vec::new();
-        while let Some(idx) = pending.pop() {
-            if let Some(Node::Element(element)) = renderer.nodes.get(idx)
-                && name.is_none_or(|name| element.tag == name)
-            {
-                candidates.push(idx);
-            }
-            // Template contents live in a separate fragment and stay inert.
-            if let Some(children) = renderer.dom_indexes.children_index.get(&idx) {
-                pending.extend(children.iter().rev().copied());
-            }
-        }
-        candidates
-    };
-    for idx in candidates {
-        upgrade_element(scope, idx);
+        let mut renderer = state.borrow::<JsHostState>().renderer.borrow_mut();
+        let root = root.unwrap_or(renderer.dom_indexes.root_indice);
+        renderer.enqueue_custom_element_upgrades(root, name);
     }
+    deliver_reactions(scope);
 }
 
 #[op2(nofast, reentrant)]
@@ -255,10 +392,27 @@ pub fn op_custom_element_define(
         // Preserve a JavaScript exception thrown by a prototype getter.
         return Ok(());
     };
-    if !prototype.is_object() {
+    let Ok(prototype) = v8::Local::<v8::Object>::try_from(prototype) else {
         return Err(JsErrorBox::type_error(
             "Custom element prototype must be an object",
         ));
+    };
+    let mut connected_callback = None;
+    let mut disconnected_callback = None;
+    for (name, slot) in [
+        ("connectedCallback", &mut connected_callback),
+        ("disconnectedCallback", &mut disconnected_callback),
+    ] {
+        let key = v8::String::new(scope, name).unwrap();
+        let Some(callback) = prototype.get(scope, key.into()) else {
+            return Ok(());
+        };
+        if callback.is_undefined() {
+            continue;
+        }
+        let callback = v8::Local::<v8::Function>::try_from(callback)
+            .map_err(|_| JsErrorBox::type_error(format!("{name} must be a function")))?;
+        *slot = Some(v8::Global::new(scope, callback));
     }
     {
         let mut state = state.borrow_mut();
@@ -278,6 +432,8 @@ pub fn op_custom_element_define(
             name.clone(),
             Rc::new(Definition {
                 constructor: v8::Global::new(scope, constructor),
+                connected_callback,
+                disconnected_callback,
                 upgrade_stack: RefCell::default(),
             }),
         );

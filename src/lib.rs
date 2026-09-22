@@ -1756,6 +1756,7 @@ struct Renderer {
     style_cache: StyleCache,
     selector_changes: SelectorChanges,
     mutation_observers: mutation_observer::Observers,
+    custom_element_reactions: custom_elements::Reactions,
     layout_table: Vec<LayoutBox>,
     flex_measurements: HashMap<FlexMeasurementKey, Option<Size>>,
     node_layout_mapping: NodeMap<usize>,
@@ -5621,6 +5622,7 @@ fn op_append_child<'s>(
         }
     };
 
+    custom_elements::deliver_reactions(scope);
     mutation_observer::schedule(scope);
     if let Some(code) = script_to_run {
         run_v8_source(
@@ -5661,7 +5663,7 @@ fn op_get_inner_html(
     Ok(html)
 }
 
-#[op2(nofast)]
+#[op2(nofast, reentrant)]
 fn op_remove_child(scope: &mut v8::PinScope, #[number] child_idx: usize) -> Result<(), JsError> {
     {
         let state = JsRuntime::op_state_from(scope);
@@ -5671,6 +5673,7 @@ fn op_remove_child(scope: &mut v8::PinScope, #[number] child_idx: usize) -> Resu
         renderer.detach_node(child_idx);
         renderer.schedule_dom_update();
     }
+    custom_elements::deliver_reactions(scope);
     mutation_observer::schedule(scope);
     Ok(())
 }
@@ -5931,7 +5934,7 @@ fn js_send_onetime_to_frame<T>(
         .map_err(|err| JsErrorBox::generic(format!("Frame query timed out: {err}")))
 }
 
-#[op2]
+#[op2(reentrant)]
 fn op_set_inner_html(
     scope: &mut v8::PinScope,
     #[number] node_idx: usize,
@@ -5956,11 +5959,12 @@ fn op_set_inner_html(
             Ok(())
         }
     };
+    custom_elements::deliver_reactions(scope);
     mutation_observer::schedule(scope);
     result
 }
 
-#[op2(nofast)]
+#[op2(nofast, reentrant)]
 fn op_set_text_content(
     scope: &mut v8::PinScope,
     #[number] node_idx: usize,
@@ -5973,6 +5977,7 @@ fn op_set_text_content(
         .renderer
         .borrow_mut()
         .set_text_content(node_idx, text);
+    custom_elements::deliver_reactions(scope);
     mutation_observer::schedule(scope);
 }
 
@@ -7430,6 +7435,7 @@ impl Renderer {
             style_cache,
             selector_changes: SelectorChanges::default(),
             mutation_observers: mutation_observer::Observers::default(),
+            custom_element_reactions: custom_elements::Reactions::default(),
             layout_table,
             flex_measurements: HashMap::new(),
             node_layout_mapping,
@@ -7618,6 +7624,7 @@ impl Renderer {
     }
 
     fn replace_inner_html(&mut self, node_idx: usize, html: String) {
+        let is_template = self.template_contents.contains_key(&node_idx);
         let node_idx = self
             .template_contents
             .get(&node_idx)
@@ -7631,6 +7638,11 @@ impl Renderer {
             .get(&node_idx)
             .unwrap()
             .clone();
+        if !is_template && !self.node_is_connected(node_idx) {
+            for &idx in &added {
+                self.enqueue_custom_element_upgrades(idx, None);
+            }
+        }
         self.record_child_list_mutation(node_idx, added, removed, None, None);
         self.schedule_dom_update();
     }
@@ -7949,6 +7961,7 @@ impl Renderer {
         self.nodes_idxs = nodes_idxs;
         self.template_contents = template_contents;
         self.shadow_roots.clear();
+        self.custom_element_reactions = custom_elements::Reactions::default();
         self.hovering = None;
         self.pending_dom_update = false;
         self.scroll_y.clear();
@@ -12653,6 +12666,7 @@ impl Frame {
 
     fn drain_microtasks(runtime: &mut JsRuntime) {
         deno_core::scope!(scope, runtime);
+        custom_elements::deliver_reactions(scope);
         mutation_observer::schedule(scope);
         scope.perform_microtask_checkpoint();
     }
@@ -15576,7 +15590,7 @@ mod tests {
         frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
-        // The current baseline is blank because app startup fails; see NOTES.md.
+        // Remaining YouTube rendering gaps are tracked in NOTES.md.
         ensure_snapshot_matches(&buffer, "youtubecom", 1920, 1080)
     }
 
