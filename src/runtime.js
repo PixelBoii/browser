@@ -1188,19 +1188,19 @@ class HtmlElement extends BaseNode {
     }
 
     get clientWidth() {
-        return Number.parseFloat(this.getAttribute("width")) || globalThis.innerWidth || 0
+        return measureElement(this).clientWidth
     }
 
     get clientHeight() {
-        return Number.parseFloat(this.getAttribute("height")) || globalThis.innerHeight || 0
+        return measureElement(this).clientHeight
     }
 
     get offsetWidth() {
-        return this.clientWidth
+        return measureElement(this).width
     }
 
     get offsetHeight() {
-        return this.clientHeight
+        return measureElement(this).height
     }
 
     get scrollWidth() {
@@ -1216,17 +1216,16 @@ class HtmlElement extends BaseNode {
     }
 
     getBoundingClientRect() {
-        const width = this.clientWidth
-        const height = this.clientHeight
+        const { x, y, width, height } = measureElement(this)
         return {
-            x: 0,
-            y: 0,
-            left: 0,
-            top: 0,
+            x,
+            y,
+            left: x,
+            top: y,
             width,
             height,
-            right: width,
-            bottom: height,
+            right: x + width,
+            bottom: y + height,
         }
     }
 
@@ -1241,6 +1240,10 @@ class HtmlElement extends BaseNode {
             .map(([key, value]) => [camelize(key.replace('data-', '')).replaceAll('-', ''), value])
         return Object.setPrototypeOf(Object.fromEntries(data), DOMStringMap.prototype)
     }
+}
+
+function measureElement(element) {
+    return core.ops.op_measure_element(element.__node_idx, element.ownerDocument.__frameId)
 }
 
 function camelize(str) {

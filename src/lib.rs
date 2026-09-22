@@ -315,6 +315,17 @@ struct LayoutBox {
     z_index: i32,
 }
 
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElementGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    client_width: u32,
+    client_height: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum RequestCacheEntry {
     PngData(Bytes),
@@ -1384,6 +1395,10 @@ pub enum FrameDomCommand {
     GetComputedStyle {
         node_idx: usize,
         reply: std::sync::mpsc::Sender<HashMap<String, String>>,
+    },
+    MeasureElement {
+        node_idx: usize,
+        reply: std::sync::mpsc::Sender<ElementGeometry>,
     },
     CreateElement {
         tag: String,
@@ -5486,6 +5501,24 @@ fn op_get_computed_style(
     }
 }
 
+#[op2]
+#[serde]
+fn op_measure_element(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[number] frame_id: Option<usize>,
+) -> Result<ElementGeometry, JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply })
+        })
+    } else {
+        Ok(renderer.measure_element(node_idx))
+    }
+}
+
 #[op2(fast)]
 fn op_create_comment_element(
     state: &mut OpState,
@@ -6896,6 +6929,7 @@ extension!(
     op_get_attribute,
     op_get_attributes,
     op_get_computed_style,
+    op_measure_element,
     op_post_message_to_parent,
     op_post_message_to_frame,
     op_get_offset_y,
@@ -8288,6 +8322,77 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    // Match layout's ancestry: skip boxless nodes and attach absolute elements
+    // to their containing block. Fixed elements use viewport coordinates.
+    fn geometry_parent(&self, node_idx: usize) -> Option<usize> {
+        let position = self.node_styles.get(&node_idx)?.position;
+        if position == StylePosition::Fixed {
+            return None;
+        }
+        let mut parent = self.layout_parent(node_idx);
+        while let Some(idx) = parent {
+            if self.node_layout_mapping.contains_key(&idx)
+                && (position != StylePosition::Absolute
+                    || idx == self.dom_indexes.root_indice
+                    || self
+                        .node_styles
+                        .get(&idx)
+                        .is_some_and(|style| style.position != StylePosition::Static))
+            {
+                return Some(idx);
+            }
+            parent = self.layout_parent(idx);
+        }
+        None
+    }
+
+    // Measurements assume the normal rendering pass has already updated layout.
+    fn measure_element(&self, node_idx: usize) -> ElementGeometry {
+        let Some(&layout_idx) = self.node_layout_mapping.get(&node_idx) else {
+            return ElementGeometry::default();
+        };
+        let rect = &self.layout_table[layout_idx].rect;
+        let style = self.node_styles.get(&node_idx);
+        let (client_width, client_height) =
+            if style.is_some_and(|s| s.display == StyleDisplay::Inline) {
+                (0, 0)
+            } else if node_idx == self.dom_indexes.root_indice {
+                (self.window_size.width, self.window_size.height)
+            } else {
+                (
+                    rect.width
+                        .saturating_sub(rect.border.left.as_ref().map_or(0, |b| b.size))
+                        .saturating_sub(rect.border.right.as_ref().map_or(0, |b| b.size)),
+                    rect.height
+                        .saturating_sub(rect.border.top.as_ref().map_or(0, |b| b.size))
+                        .saturating_sub(rect.border.bottom.as_ref().map_or(0, |b| b.size)),
+                )
+            };
+        let mut geometry = ElementGeometry {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            client_width,
+            client_height,
+        };
+        let mut current = Some(node_idx);
+        while let Some(idx) = current {
+            let layout_idx = self.node_layout_mapping.get(&idx).unwrap();
+            let layout = &self.layout_table[*layout_idx];
+            if idx != node_idx || idx == self.dom_indexes.root_indice {
+                geometry.y += self.scroll_y.get(&idx).copied().unwrap_or(0);
+            }
+            if let Some(style) = self.node_styles.get(&idx) {
+                let (x, y) = self.resolve_transform_offset(style, layout);
+                geometry.x += x;
+                geometry.y += y;
+            }
+            current = self.geometry_parent(idx);
+        }
+        geometry
     }
 
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
@@ -9814,7 +9919,6 @@ impl Renderer {
         input_value: String,
         cursor: &mut Position,
         font_size: u32,
-        save_as_final: bool,
     ) -> Result<usize> {
         let style = &self.node_styles.get(&node_idx).unwrap();
         let text = collapse_whitespace(&input_value).unwrap();
@@ -9838,6 +9942,7 @@ impl Renderer {
                 .with_context(|| "Failed to build pixmap for input text")?
         };
 
+        // Synthetic text shares the input's node index; only the outer box is mapped.
         let layout_box = self.register_layout_box(
             LayoutBox {
                 rect: Rect {
@@ -9855,7 +9960,7 @@ impl Renderer {
                 content_height: *height,
                 z_index: 0,
             },
-            save_as_final,
+            false,
         );
         Ok(layout_box)
     }
@@ -10702,7 +10807,6 @@ impl Renderer {
                     input_value.into_owned(),
                     &mut content_position,
                     font_size,
-                    save_as_final,
                 )
                 .unwrap();
             max_child_width = self.layout_table.get(layout_box).unwrap().rect.width;
@@ -11010,7 +11114,6 @@ impl Renderer {
                 input_value.into_owned(),
                 &mut content_position,
                 font_size,
-                save_as_final,
             ) {
                 children.push(layout_box_idx);
             }
@@ -12926,6 +13029,10 @@ impl Frame {
             FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply }) => {
                 let renderer = self.renderer.as_ref().unwrap().borrow();
                 let _ = reply.send(computed_style_properties(&renderer, node_idx));
+            }
+            FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let _ = reply.send(renderer.measure_element(node_idx));
             }
             FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply }) => {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
