@@ -307,7 +307,6 @@ enum LayoutKind {
 
 #[derive(Debug, Clone)]
 struct LayoutBox {
-    parent: Option<usize>,
     rect: Rect,
     kind: LayoutKind,
     children: Vec<usize>,
@@ -8325,6 +8324,30 @@ impl Renderer {
         }
     }
 
+    // Match layout's ancestry: skip boxless nodes and attach absolute elements
+    // to their containing block. Fixed elements use viewport coordinates.
+    fn geometry_parent(&self, node_idx: usize) -> Option<usize> {
+        let position = self.node_styles.get(&node_idx)?.position;
+        if position == StylePosition::Fixed {
+            return None;
+        }
+        let mut parent = self.layout_parent(node_idx);
+        while let Some(idx) = parent {
+            if self.node_layout_mapping.contains_key(&idx)
+                && (position != StylePosition::Absolute
+                    || idx == self.dom_indexes.root_indice
+                    || self
+                        .node_styles
+                        .get(&idx)
+                        .is_some_and(|style| style.position != StylePosition::Static))
+            {
+                return Some(idx);
+            }
+            parent = self.layout_parent(idx);
+        }
+        None
+    }
+
     // Measurements assume the normal rendering pass has already updated layout.
     fn measure_element(&self, node_idx: usize) -> ElementGeometry {
         let Some(&layout_idx) = self.node_layout_mapping.get(&node_idx) else {
@@ -8355,22 +8378,19 @@ impl Renderer {
             client_width,
             client_height,
         };
-        // Follow layout parents: positioned boxes can skip DOM ancestors.
-        let mut current = Some(layout_idx);
+        let mut current = Some(node_idx);
         while let Some(idx) = current {
-            let layout = &self.layout_table[idx];
-            if idx != layout_idx || layout.node_idx == self.dom_indexes.root_indice {
-                geometry.y += self.scroll_y.get(&layout.node_idx).copied().unwrap_or(0);
+            let layout_idx = self.node_layout_mapping.get(&idx).unwrap();
+            let layout = &self.layout_table[*layout_idx];
+            if idx != node_idx || idx == self.dom_indexes.root_indice {
+                geometry.y += self.scroll_y.get(&idx).copied().unwrap_or(0);
             }
-            if let Some(style) = self.node_styles.get(&layout.node_idx) {
+            if let Some(style) = self.node_styles.get(&idx) {
                 let (x, y) = self.resolve_transform_offset(style, layout);
                 geometry.x += x;
                 geometry.y += y;
-                if style.position == StylePosition::Fixed {
-                    break;
-                }
             }
-            current = layout.parent;
+            current = self.geometry_parent(idx);
         }
         geometry
     }
@@ -8994,9 +9014,6 @@ impl Renderer {
     fn register_layout_box(&mut self, layout_box: LayoutBox, save_as_final: bool) -> usize {
         let node_idx = layout_box.node_idx;
         let idx = self.layout_table.len();
-        for &child in &layout_box.children {
-            self.layout_table[child].parent = Some(idx);
-        }
         self.layout_table.push(layout_box);
         // Parents are registered last, replacing synthetic input text boxes
         // that share the element's node index.
@@ -9132,7 +9149,6 @@ impl Renderer {
 
                 Some(self.register_layout_box(
                     LayoutBox {
-                        parent: None,
                         rect: Rect {
                             x: cursor.x,
                             y: cursor.y,
@@ -9283,7 +9299,6 @@ impl Renderer {
 
                     Some(self.register_layout_box(
                         LayoutBox {
-                            parent: None,
                             rect: Rect {
                                 x: cursor.x,
                                 y: cursor.y,
@@ -9342,7 +9357,6 @@ impl Renderer {
                     }
                     Some(self.register_layout_box(
                         LayoutBox {
-                            parent: None,
                             rect: Rect {
                                 x: cursor.x,
                                 y: cursor.y,
@@ -9518,7 +9532,6 @@ impl Renderer {
 
                         Some(self.register_layout_box(
                             LayoutBox {
-                                parent: None,
                                 rect: Rect {
                                     x: cursor.x,
                                     y: cursor.y,
@@ -9933,7 +9946,6 @@ impl Renderer {
 
         let layout_box = self.register_layout_box(
             LayoutBox {
-                parent: None,
                 rect: Rect {
                     x: cursor.x,
                     y: cursor.y,
