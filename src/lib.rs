@@ -315,6 +315,17 @@ struct LayoutBox {
     z_index: i32,
 }
 
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElementGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    client_width: u32,
+    client_height: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum RequestCacheEntry {
     PngData(Bytes),
@@ -1384,6 +1395,10 @@ pub enum FrameDomCommand {
     GetComputedStyle {
         node_idx: usize,
         reply: std::sync::mpsc::Sender<HashMap<String, String>>,
+    },
+    MeasureElement {
+        node_idx: usize,
+        reply: std::sync::mpsc::Sender<ElementGeometry>,
     },
     CreateElement {
         tag: String,
@@ -5486,6 +5501,24 @@ fn op_get_computed_style(
     }
 }
 
+#[op2]
+#[serde]
+fn op_measure_element(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[number] frame_id: Option<usize>,
+) -> Result<ElementGeometry, JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply })
+        })
+    } else {
+        Ok(renderer.measure_element(node_idx))
+    }
+}
+
 #[op2(fast)]
 fn op_create_comment_element(
     state: &mut OpState,
@@ -6896,6 +6929,7 @@ extension!(
     op_get_attribute,
     op_get_attributes,
     op_get_computed_style,
+    op_measure_element,
     op_post_message_to_parent,
     op_post_message_to_frame,
     op_get_offset_y,
@@ -8288,6 +8322,69 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    // Measurements assume the normal rendering pass has already updated layout.
+    fn measure_element(&self, node_idx: usize) -> ElementGeometry {
+        self.layout_roots
+            .iter()
+            .find_map(|&root| self.measure_layout_box(root, node_idx, 0, 0))
+            .unwrap_or_default()
+    }
+
+    fn measure_layout_box(
+        &self,
+        layout_idx: usize,
+        node_idx: usize,
+        mut offset_x: i32,
+        mut offset_y: i32,
+    ) -> Option<ElementGeometry> {
+        let layout = &self.layout_table[layout_idx];
+        let style = self.node_styles.get(&layout.node_idx);
+        if let Some(style) = style {
+            if style.position == StylePosition::Fixed {
+                offset_x = 0;
+                offset_y = 0;
+            }
+            let (x, y) = self.resolve_transform_offset(style, layout);
+            offset_x += x;
+            offset_y += y;
+        }
+        if layout.node_idx == node_idx {
+            if node_idx == self.dom_indexes.root_indice {
+                offset_y += self.scroll_y.get(&node_idx).copied().unwrap_or(0);
+            }
+            let rect = &layout.rect;
+            let (client_width, client_height) =
+                if style.is_some_and(|s| s.display == StyleDisplay::Inline) {
+                    (0, 0)
+                } else if node_idx == self.dom_indexes.root_indice {
+                    (self.window_size.width, self.window_size.height)
+                } else {
+                    (
+                        rect.width
+                            .saturating_sub(rect.border.left.as_ref().map_or(0, |b| b.size))
+                            .saturating_sub(rect.border.right.as_ref().map_or(0, |b| b.size)),
+                        rect.height
+                            .saturating_sub(rect.border.top.as_ref().map_or(0, |b| b.size))
+                            .saturating_sub(rect.border.bottom.as_ref().map_or(0, |b| b.size)),
+                    )
+                };
+            return Some(ElementGeometry {
+                x: rect.x + offset_x,
+                y: rect.y + offset_y,
+                width: rect.width,
+                height: rect.height,
+                client_width,
+                client_height,
+            });
+        }
+        // Follow layout ancestry: positioned boxes can have a different DOM parent.
+        offset_y += self.scroll_y.get(&layout.node_idx).copied().unwrap_or(0);
+        layout
+            .children
+            .iter()
+            .find_map(|&child| self.measure_layout_box(child, node_idx, offset_x, offset_y))
     }
 
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
@@ -12926,6 +13023,10 @@ impl Frame {
             FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply }) => {
                 let renderer = self.renderer.as_ref().unwrap().borrow();
                 let _ = reply.send(computed_style_properties(&renderer, node_idx));
+            }
+            FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply }) => {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let _ = reply.send(renderer.measure_element(node_idx));
             }
             FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply }) => {
                 let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
