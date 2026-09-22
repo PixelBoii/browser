@@ -9015,9 +9015,8 @@ impl Renderer {
         let node_idx = layout_box.node_idx;
         let idx = self.layout_table.len();
         self.layout_table.push(layout_box);
-        // Parents are registered last, replacing synthetic input text boxes
-        // that share the element's node index.
-        if save_as_final {
+        // Only store first team as that'll be the highest parent
+        if save_as_final && !self.node_layout_mapping.contains_key(&node_idx) {
             self.node_layout_mapping.insert(node_idx, idx);
         }
         idx
@@ -9920,7 +9919,6 @@ impl Renderer {
         input_value: String,
         cursor: &mut Position,
         font_size: u32,
-        save_as_final: bool,
     ) -> Result<usize> {
         let style = &self.node_styles.get(&node_idx).unwrap();
         let text = collapse_whitespace(&input_value).unwrap();
@@ -9944,6 +9942,7 @@ impl Renderer {
                 .with_context(|| "Failed to build pixmap for input text")?
         };
 
+        // Synthetic text shares the input's node index; only the outer box is mapped.
         let layout_box = self.register_layout_box(
             LayoutBox {
                 rect: Rect {
@@ -9961,7 +9960,7 @@ impl Renderer {
                 content_height: *height,
                 z_index: 0,
             },
-            save_as_final,
+            false,
         );
         Ok(layout_box)
     }
@@ -10808,7 +10807,6 @@ impl Renderer {
                     input_value.into_owned(),
                     &mut content_position,
                     font_size,
-                    save_as_final,
                 )
                 .unwrap();
             max_child_width = self.layout_table.get(layout_box).unwrap().rect.width;
@@ -11116,7 +11114,6 @@ impl Renderer {
                 input_value.into_owned(),
                 &mut content_position,
                 font_size,
-                save_as_final,
             ) {
                 children.push(layout_box_idx);
             }
