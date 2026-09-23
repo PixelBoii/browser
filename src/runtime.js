@@ -1171,6 +1171,18 @@ class HtmlElement extends BaseNode {
         }
     }
 
+    get hidden() {
+        return this.hasAttribute('hidden')
+    }
+
+    set hidden(value) {
+        if (value) {
+            this.setAttribute('hidden', '')
+        } else {
+            this.removeAttribute('hidden')
+        }
+    }
+
     get height() {
         return Number.parseFloat(this.getAttribute('height')) || 0
     }
