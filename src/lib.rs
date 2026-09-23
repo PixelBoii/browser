@@ -15862,54 +15862,9 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        let started = Instant::now();
-        let deadline = started + Duration::from_secs(30);
-        let mut buffer = frame.render_loop();
-        let mut last_paint_change = Instant::now();
-        loop {
-            if Instant::now() >= deadline {
-                bail!("Timed out waiting for YouTube's consent dialog to finish rendering");
-            }
-            let cycle_end = (Instant::now() + Duration::from_millis(100)).min(deadline);
-            frame.pump_with_limit(&rx, cycle_end)?;
-            // Continue normal post-paint work while the page initializes its dialog.
-            let next_buffer = frame.render_loop();
-            if next_buffer != buffer {
-                last_paint_change = Instant::now();
-            }
-            buffer = next_buffer;
-
-            let dialog_visible = frame
-                .query_selector("ytd-consent-bump-v2-lightbox tp-yt-paper-dialog")
-                .is_some_and(|(node_idx, _)| {
-                    let renderer = frame.renderer.as_ref().unwrap().borrow();
-                    let Some(layout_idx) = renderer.node_layout_mapping.get(&node_idx) else {
-                        return false;
-                    };
-                    let layout = &renderer.layout_table[*layout_idx];
-                    let style = &renderer.node_styles[&node_idx];
-                    layout.rect.width > 0
-                        && layout.rect.height > 0
-                        && style.visibility.is_visible()
-                        && style.opacity > 0.0
-                        && renderer.layout_inside_viewport(layout, *layout_idx)
-                });
-            let ready = {
-                let renderer = frame.renderer.as_ref().unwrap().borrow();
-                dialog_visible
-                    && renderer.pending_image_fetches.is_empty()
-                    && !renderer.pending_dom_update
-                    && !renderer.layout_dirty
-            };
-            if ready && last_paint_change.elapsed() >= Duration::from_secs(1) {
-                println!(
-                    "YouTube consent snapshot ready after {}ms",
-                    started.elapsed().as_millis()
-                );
-                break;
-            }
-            std::thread::sleep(cycle_end.saturating_duration_since(Instant::now()));
-        }
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(30)))?;
+        let mut buffer = vec![0; 1920 * 1080];
+        frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         // Remaining YouTube rendering gaps are tracked in NOTES.md.
         ensure_snapshot_matches(&buffer, "youtubecom", 1920, 1080)
     }
