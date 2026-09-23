@@ -2391,14 +2391,16 @@ fn solve_calc(
         }
     }
 
-    let mut value = if calc.len() == 1
-        && let CalcExpression::Solved(value) = calc[0]
-    {
-        Some(value as i32)
-    } else if calc.len() == 1
-        && let CalcExpression::Size(StyleSize::Px(size)) = calc[0]
-    {
-        Some(size as i32)
+    let mut value = if calc.len() == 1 {
+        get_calc_exp_value(
+            &calc[0],
+            font_size,
+            root_font_size,
+            available_size,
+            auto_size,
+            window_size,
+            default_unit,
+        )
     } else {
         None
     };
