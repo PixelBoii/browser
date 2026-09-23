@@ -133,6 +133,7 @@ impl RectBorderSide {
         style: &StyleSizeAndColor,
         node_style: &Style,
         font_size: u32,
+        root_font_size: u32,
         available_size: &Size,
         window_size: &PhysicalSize<u32>,
     ) -> Option<RectBorderSide> {
@@ -140,6 +141,7 @@ impl RectBorderSide {
             StyleBorderStyle::Solid => Some(Self {
                 size: get_specified_size(
                     font_size,
+                    root_font_size,
                     &style.size,
                     Some(available_size.width),
                     None,
@@ -1666,6 +1668,7 @@ struct CachedNodeStyle {
     matched_css_rules: Vec<MatchedCssRule>,
     local_revision: u64,
     parent_style_revision: Option<u64>,
+    root_font_size: Option<u32>,
     style_revision: u64,
 }
 
@@ -2022,6 +2025,7 @@ impl Renderer {
             let resolved_parent_font_size = self.get_parent_font_size(waiter.node_idx);
             let font_size = get_specified_size(
                 resolved_parent_font_size,
+                self.get_root_font_size(),
                 &style.font_size,
                 Some(resolved_parent_font_size),
                 None,
@@ -2033,6 +2037,7 @@ impl Renderer {
                 .insert(waiter.node_idx, font_size as u32);
             let top = get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.top,
                 Some(positioning_height),
                 None,
@@ -2041,6 +2046,7 @@ impl Renderer {
             );
             let right = get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.right,
                 Some(positioning_width),
                 None,
@@ -2049,6 +2055,7 @@ impl Renderer {
             );
             let bottom = get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.bottom,
                 Some(positioning_height),
                 None,
@@ -2057,6 +2064,7 @@ impl Renderer {
             );
             let left = get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.left,
                 Some(positioning_width),
                 None,
@@ -2082,6 +2090,7 @@ impl Renderer {
 
             let margin_right = get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.margin_right,
                 Some(positioning_width),
                 None,
@@ -2090,6 +2099,7 @@ impl Renderer {
             );
             let margin_left = get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.margin_left,
                 Some(positioning_width),
                 None,
@@ -2205,6 +2215,7 @@ enum SizeUnit {
 
 fn get_specified_size(
     font_size: u32,
+    root_font_size: u32,
     value: &StyleSize,
     available_size: Option<u32>,
     auto_size: Option<i32>,
@@ -2228,6 +2239,7 @@ fn get_specified_size(
         StyleSize::Clamp { min, value, max } => {
             let min = get_specified_size(
                 font_size,
+                root_font_size,
                 min,
                 available_size,
                 auto_size,
@@ -2236,6 +2248,7 @@ fn get_specified_size(
             )?;
             let value = get_specified_size(
                 font_size,
+                root_font_size,
                 value,
                 available_size,
                 auto_size,
@@ -2244,6 +2257,7 @@ fn get_specified_size(
             )?;
             let max = get_specified_size(
                 font_size,
+                root_font_size,
                 max,
                 available_size,
                 auto_size,
@@ -2255,14 +2269,14 @@ fn get_specified_size(
         StyleSize::Calc(calc) => solve_calc(
             calc,
             font_size,
+            root_font_size,
             available_size,
             auto_size,
             window_size,
             default_unit,
         ),
         StyleSize::Em(em) => Some(unit_to_px(*em, &SizeUnit::Em, font_size) as i32),
-        // TODO: This should actually be the font-size of the root element, so figure that out
-        StyleSize::Rem(rem) => Some((*rem * 16 as f32) as i32),
+        StyleSize::Rem(rem) => Some((*rem * root_font_size as f32) as i32),
         StyleSize::FitContent | StyleSize::MinContent | StyleSize::MaxContent => None,
     }
 }
@@ -2270,6 +2284,7 @@ fn get_specified_size(
 fn get_calc_exp_value(
     exp: &CalcExpression,
     font_size: u32,
+    root_font_size: u32,
     available_size: Option<u32>,
     auto_size: Option<i32>,
     window_size: &PhysicalSize<u32>,
@@ -2278,6 +2293,7 @@ fn get_calc_exp_value(
     match exp {
         CalcExpression::Size(size) => get_specified_size(
             font_size,
+            root_font_size,
             &size,
             available_size,
             auto_size,
@@ -2287,6 +2303,7 @@ fn get_calc_exp_value(
         CalcExpression::Nesting(nesting) => solve_calc(
             nesting,
             font_size,
+            root_font_size,
             available_size,
             auto_size,
             window_size,
@@ -2300,6 +2317,7 @@ fn get_calc_exp_value(
 fn solve_calc(
     calc: &Vec<CalcExpression>,
     font_size: u32,
+    root_font_size: u32,
     available_size: Option<u32>,
     auto_size: Option<i32>,
     window_size: &PhysicalSize<u32>,
@@ -2340,6 +2358,7 @@ fn solve_calc(
             let prev_value = get_calc_exp_value(
                 prev,
                 font_size,
+                root_font_size,
                 available_size,
                 auto_size,
                 window_size,
@@ -2348,6 +2367,7 @@ fn solve_calc(
             let next_value = get_calc_exp_value(
                 next,
                 font_size,
+                root_font_size,
                 available_size,
                 auto_size,
                 window_size,
@@ -2992,6 +3012,7 @@ fn compute_node_style(
     parent_style: Option<usize>,
     parent_variables: &Rc<StyleVariables>,
     parent_font_size: Option<u32>,
+    root_font_size: Option<u32>,
     collected_class_nodes: &[Vec<MatchedCssRule>],
     css_children_index: &HashMap<usize, Vec<usize>>,
     css_cascade_metadata: &[Option<CssCascadeMetadata>],
@@ -3016,6 +3037,7 @@ fn compute_node_style(
         cached.matched_css_rules.as_slice() == matched_css_rules
             && cached.local_revision == local_revision
             && cached.parent_style_revision == parent_style_revision
+            && cached.root_font_size == root_font_size
             && node_styles.contains_key(&node_idx)
             && resolved_font_sizes.contains_key(&node_idx)
     });
@@ -3046,6 +3068,7 @@ fn compute_node_style(
 
         let resolved_font_size = get_specified_size(
             parent_font_size.unwrap_or(16),
+            root_font_size.unwrap_or(16),
             &style.font_size,
             Some(parent_font_size.unwrap_or(16)),
             None,
@@ -3079,6 +3102,7 @@ fn compute_node_style(
                 matched_css_rules: matched_css_rules.to_vec(),
                 local_revision,
                 parent_style_revision,
+                root_font_size,
                 style_revision,
             },
         );
@@ -3090,6 +3114,8 @@ fn compute_node_style(
 
     let style_revision = style_cache.nodes[&node_idx].style_revision;
     let resolved_font_size = resolved_font_sizes[&node_idx];
+    // The root's own font size uses the initial size; descendants use its computed size.
+    let root_font_size = root_font_size.unwrap_or(resolved_font_size);
     let style = &node_styles[&node_idx];
     let resolved_variables = Rc::clone(&style.variables);
 
@@ -3109,6 +3135,7 @@ fn compute_node_style(
             Some(node_idx),
             &resolved_variables,
             Some(resolved_font_size),
+            Some(root_font_size),
             collected_class_nodes,
             css_children_index,
             css_cascade_metadata,
@@ -5000,6 +5027,7 @@ fn compute_node_styles(
         &parsed_css_nodes,
         None,
         &StyleVariables::from_values(default_variables),
+        None,
         None,
         &collected_class_nodes,
         &css_children_index,
@@ -7252,6 +7280,7 @@ fn resolve_auto_fit(
     size: u32,
     gap: u32,
     item_count: usize,
+    root_font_size: u32,
 ) -> GridTemplateColumns {
     let GridTemplateColumns::Values(columns) = template else {
         return GridTemplateColumns::None;
@@ -7269,6 +7298,10 @@ fn resolve_auto_fit(
     let px = |column: &GridTemplateColumnsValue| match column {
         GridTemplateColumnsValue::MinMax((GridColumnSize::Px(px), _))
         | GridTemplateColumnsValue::Size(GridColumnSize::Px(px)) => *px as u32,
+        GridTemplateColumnsValue::MinMax((GridColumnSize::Rem(rem), _))
+        | GridTemplateColumnsValue::Size(GridColumnSize::Rem(rem)) => {
+            (rem * root_font_size as f32) as u32
+        }
         _ => 0,
     };
     let fixed_width = columns.iter().map(px).sum::<u32>();
@@ -9124,9 +9157,17 @@ impl Renderer {
         *resolved_parent_font_size
     }
 
+    fn get_root_font_size(&self) -> u32 {
+        self.resolved_font_sizes
+            .get(&self.dom_indexes.root_indice)
+            .copied()
+            .unwrap_or(16)
+    }
+
     fn get_line_height(&self, style: &Style, font_size: u32) -> Option<u32> {
         get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.line_height,
             Some(font_size),
             None,
@@ -9153,6 +9194,7 @@ impl Renderer {
                 StyleTransformOperation::Translate { x, y } => {
                     offset_x += get_specified_size(
                         font_size,
+                        self.get_root_font_size(),
                         x,
                         Some(layout_box.rect.width),
                         Some(0),
@@ -9162,6 +9204,7 @@ impl Renderer {
                     .unwrap_or(0);
                     offset_y += get_specified_size(
                         font_size,
+                        self.get_root_font_size(),
                         y,
                         Some(layout_box.rect.height),
                         Some(0),
@@ -9279,6 +9322,7 @@ impl Renderer {
                         self.get_containing_block_size(containing_node_idx, node_idx, &style);
                     let max_h = get_specified_size(
                         resolved_font_size as u32,
+                        self.get_root_font_size(),
                         &style.max_height,
                         containing_block_height,
                         None,
@@ -9293,6 +9337,7 @@ impl Renderer {
                     );
                     let max_w = get_specified_size(
                         resolved_font_size as u32,
+                        self.get_root_font_size(),
                         &style.max_width,
                         containing_block_width,
                         None,
@@ -9516,6 +9561,7 @@ impl Renderer {
                                 &style.border_left,
                                 &style,
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &available_size,
                                 &self.window_size,
                             ),
@@ -9523,6 +9569,7 @@ impl Renderer {
                                 &style.border_top,
                                 &style,
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &available_size,
                                 &self.window_size,
                             ),
@@ -9530,6 +9577,7 @@ impl Renderer {
                                 &style.border_right,
                                 &style,
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &available_size,
                                 &self.window_size,
                             ),
@@ -9537,6 +9585,7 @@ impl Renderer {
                                 &style.border_bottom,
                                 &style,
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &available_size,
                                 &self.window_size,
                             ),
@@ -9549,6 +9598,7 @@ impl Renderer {
                         let border_radius = BorderRadius {
                             top_left: get_specified_size(
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &style.border_radius_top_left,
                                 Some(available_size.width),
                                 None,
@@ -9559,6 +9609,7 @@ impl Renderer {
                             .max(0) as u32,
                             top_right: get_specified_size(
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &style.border_radius_top_right,
                                 Some(available_size.width),
                                 None,
@@ -9569,6 +9620,7 @@ impl Renderer {
                             .max(0) as u32,
                             bottom_right: get_specified_size(
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &style.border_radius_bottom_right,
                                 Some(available_size.width),
                                 None,
@@ -9579,6 +9631,7 @@ impl Renderer {
                             .max(0) as u32,
                             bottom_left: get_specified_size(
                                 resolved_font_size,
+                                self.get_root_font_size(),
                                 &style.border_radius_bottom_left,
                                 Some(available_size.width),
                                 None,
@@ -9911,6 +9964,7 @@ impl Renderer {
 
         let min_height = get_specified_size(
             *resolved_font_size,
+            self.get_root_font_size(),
             &style.min_height,
             containing_block_height,
             None,
@@ -9920,6 +9974,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32);
         let max_height = get_specified_size(
             *resolved_font_size,
+            self.get_root_font_size(),
             &style.max_height,
             containing_block_height,
             None,
@@ -9929,6 +9984,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32);
         let min_width = get_specified_size(
             *resolved_font_size,
+            self.get_root_font_size(),
             &style.min_width,
             containing_block_width,
             None,
@@ -9938,6 +9994,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32);
         let max_width = get_specified_size(
             *resolved_font_size,
+            self.get_root_font_size(),
             &style.max_width,
             containing_block_width,
             None,
@@ -9948,6 +10005,7 @@ impl Renderer {
 
         let specified_width = forced_size.width.or(get_specified_size(
             *resolved_font_size,
+            self.get_root_font_size(),
             &style.width,
             containing_block_width,
             None,
@@ -9957,6 +10015,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32));
         let specified_height = forced_size.height.or(get_specified_size(
             *resolved_font_size,
+            self.get_root_font_size(),
             &style.height,
             containing_block_height,
             None,
@@ -10085,7 +10144,7 @@ impl Renderer {
             GridTemplateColumnsValue::AutoFit(_) => unreachable!(),
             GridTemplateColumnsValue::Size(size) => match size {
                 GridColumnSize::Px(px) => *px,
-                GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                GridColumnSize::Rem(rem) => (rem * self.get_root_font_size() as f32) as i32,
                 GridColumnSize::Percent(percent) => {
                     (to_distribute as f32 * (*percent / 100.)) as i32
                 }
@@ -10103,7 +10162,7 @@ impl Renderer {
             GridTemplateColumnsValue::MinMax((min, max)) => {
                 let min_parsed = match min {
                     GridColumnSize::Px(px) => *px,
-                    GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                    GridColumnSize::Rem(rem) => (rem * self.get_root_font_size() as f32) as i32,
                     GridColumnSize::Percent(percent) => {
                         (to_distribute as f32 * (*percent / 100.)) as i32
                     }
@@ -10113,7 +10172,7 @@ impl Renderer {
                 };
                 let max_parsed = match max {
                     GridColumnSize::Px(px) => *px,
-                    GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                    GridColumnSize::Rem(rem) => (rem * self.get_root_font_size() as f32) as i32,
                     GridColumnSize::Percent(percent) => {
                         (to_distribute as f32 * (*percent / 100.)) as i32
                     }
@@ -10169,6 +10228,7 @@ impl Renderer {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let grid_gap = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.gap,
             Some(container_sizes.inner_width),
             None,
@@ -10180,6 +10240,7 @@ impl Renderer {
             self.get_containing_block_size(containing_node_idx, node_idx, style);
         let specified_height = forced_size.height.or(get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.height,
             containing_block_height,
             None,
@@ -10189,6 +10250,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32));
         let specified_width = forced_size.width.or(get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.width,
             containing_block_width,
             None,
@@ -10237,12 +10299,14 @@ impl Renderer {
             container_sizes.inner_width,
             grid_gap,
             immediate_children.len(),
+            self.get_root_font_size(),
         );
         let grid_template_rows = resolve_auto_fit(
             &style.grid_template_rows,
             container_sizes.inner_height,
             grid_gap,
             immediate_children.len(),
+            self.get_root_font_size(),
         );
         let mut current_column = 0;
         let mut definitely_used_width = 0;
@@ -10260,7 +10324,7 @@ impl Renderer {
                     GridTemplateColumnsValue::Size(size) => {
                         definitely_used_width += match size {
                             GridColumnSize::Px(px) => *px,
-                            GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                            GridColumnSize::Rem(rem) => (rem * self.get_root_font_size() as f32) as i32,
                             GridColumnSize::Percent(percent) => {
                                 (container_sizes.inner_width as f32 * (*percent / 100.)) as i32
                             }
@@ -10289,7 +10353,7 @@ impl Renderer {
                     GridTemplateColumnsValue::Size(size) => {
                         definitely_used_height += match size {
                             GridColumnSize::Px(px) => *px,
-                            GridColumnSize::Rem(rem) => (rem * 16.) as i32,
+                            GridColumnSize::Rem(rem) => (rem * self.get_root_font_size() as f32) as i32,
                             GridColumnSize::Percent(percent) => {
                                 (container_sizes.inner_height as f32 * (*percent / 100.)) as i32
                             }
@@ -10691,6 +10755,7 @@ impl Renderer {
 
         let specified_width = forced_size.width.or(get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.width,
             containing_block_width,
             None,
@@ -10700,6 +10765,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32));
         let specified_height = forced_size.height.or(get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.height,
             containing_block_height,
             None,
@@ -11046,6 +11112,7 @@ impl Renderer {
 
         get_specified_size(
             font_size,
+            self.get_root_font_size(),
             size,
             available_size,
             None,
@@ -11144,6 +11211,7 @@ impl Renderer {
 
         let specified_height = forced_size.height.or(get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.height,
             containing_block_height,
             None,
@@ -11153,6 +11221,7 @@ impl Renderer {
         .map(|v| v.max(0) as u32));
         let specified_width = forced_size.width.or(get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.width,
             containing_block_width,
             None,
@@ -11262,6 +11331,7 @@ impl Renderer {
                 );
                 let max_width = get_specified_size(
                     font_size,
+                    self.get_root_font_size(),
                     &child_style.max_width,
                     Some(container_sizes.inner_width),
                     None,
@@ -11271,6 +11341,7 @@ impl Renderer {
                 .unwrap_or(i32::MAX);
                 let max_height = get_specified_size(
                     font_size,
+                    self.get_root_font_size(),
                     &child_style.max_height,
                     Some(container_sizes.inner_height),
                     None,
@@ -11424,6 +11495,7 @@ impl Renderer {
         // Justify-content
         let authored_gap = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.gap,
             Some(flex_available_size),
             None,
@@ -12377,6 +12449,7 @@ impl Renderer {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let padding_left_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.padding_left,
             containing_block_width,
             None,
@@ -12386,6 +12459,7 @@ impl Renderer {
         .unwrap_or(0);
         let padding_right_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.padding_right,
             containing_block_width,
             None,
@@ -12395,6 +12469,7 @@ impl Renderer {
         .unwrap_or(0);
         let padding_top_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.padding_top,
             containing_block_width,
             None,
@@ -12404,6 +12479,7 @@ impl Renderer {
         .unwrap_or(0);
         let padding_bottom_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.padding_bottom,
             containing_block_width,
             None,
@@ -12432,6 +12508,7 @@ impl Renderer {
         let left_size = if style.border_left.style == StyleBorderStyle::Solid {
             get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.border_left.size,
                 containing_block_width,
                 None,
@@ -12445,6 +12522,7 @@ impl Renderer {
         let right_size = if style.border_right.style == StyleBorderStyle::Solid {
             get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.border_right.size,
                 containing_block_width,
                 None,
@@ -12458,6 +12536,7 @@ impl Renderer {
         let top_size = if style.border_top.style == StyleBorderStyle::Solid {
             get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.border_top.size,
                 containing_block_height,
                 None,
@@ -12471,6 +12550,7 @@ impl Renderer {
         let bottom_size = if style.border_bottom.style == StyleBorderStyle::Solid {
             get_specified_size(
                 font_size,
+                self.get_root_font_size(),
                 &style.border_bottom.size,
                 containing_block_height,
                 None,
@@ -12494,6 +12574,7 @@ impl Renderer {
         let font_size = self.resolved_font_sizes.get(&node_idx).cloned().unwrap();
         let margin_left_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.margin_left,
             Some(available_size.width),
             None,
@@ -12503,6 +12584,7 @@ impl Renderer {
         .unwrap_or(0);
         let margin_right_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.margin_right,
             Some(available_size.width),
             None,
@@ -12512,6 +12594,7 @@ impl Renderer {
         .unwrap_or(0);
         let margin_top_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.margin_top,
             Some(available_size.height),
             None,
@@ -12521,6 +12604,7 @@ impl Renderer {
         .unwrap_or(0);
         let margin_bottom_size = get_specified_size(
             font_size,
+            self.get_root_font_size(),
             &style.margin_bottom,
             Some(available_size.height),
             None,
@@ -16131,6 +16215,7 @@ mod tests {
             super::solve_calc(
                 &calc,
                 16,
+                16,
                 None,
                 None,
                 &PhysicalSize::new(100, 100),
@@ -16150,6 +16235,7 @@ mod tests {
         assert_eq!(
             super::solve_calc(
                 &calc,
+                16,
                 16,
                 None,
                 None,
