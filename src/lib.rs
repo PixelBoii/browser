@@ -2006,16 +2006,12 @@ impl Renderer {
                 height: None,
                 width: None,
             };
-            let positioning_width = if style.position == StylePosition::Fixed {
-                self.window_size.width
-            } else {
-                width
-            };
-            let positioning_height = if style.position == StylePosition::Fixed {
-                self.window_size.height
-            } else {
-                height
-            };
+            let (positioning_width, positioning_height) =
+                if self.is_initial_containing_block(containing_node_idx, style.position) {
+                    (self.window_size.width, self.window_size.height)
+                } else {
+                    (width, height)
+                };
             let available_size = Size {
                 width: positioning_width,
                 height: positioning_height,
@@ -8395,12 +8391,57 @@ impl Renderer {
         geometry
     }
 
+    // Return the source node and canvas color. The source's own background must
+    // not be painted again (CSS Backgrounds 3 §2.11).
+    fn canvas_background(&self) -> Option<(usize, u32)> {
+        let root_idx = self.dom_indexes.root_indice;
+        let root_style = self.node_styles.get(&root_idx)?;
+        if root_style.display == StyleDisplay::None {
+            return None;
+        }
+
+        let transparent_root = matches!(root_style.background, StyleBackground::Transparent)
+            || matches!(root_style.background, StyleBackground::Hex(color) if color & 0xFF == 0);
+        let (node_idx, style) = if transparent_root {
+            if !self
+                .dom_indexes
+                .tag_elements
+                .get("html")?
+                .contains(root_idx)
+            {
+                return None;
+            }
+            let body_elements = self.dom_indexes.tag_elements.get("body")?;
+            let body_idx = *self
+                .dom_indexes
+                .children_index
+                .get(&root_idx)?
+                .iter()
+                .find(|idx| body_elements.contains(**idx))?;
+            (body_idx, self.node_styles.get(&body_idx)?)
+        } else {
+            (root_idx, root_style)
+        };
+        if style.display == StyleDisplay::None {
+            return None;
+        }
+        match style.background {
+            StyleBackground::Hex(color) if color & 0xFF != 0 => Some((node_idx, color)),
+            _ => None,
+        }
+    }
+
     fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
         if width == 0 || height == 0 {
             return;
         }
 
-        clear_buffer(buffer, 0xFF_FF_FF_FF);
+        let canvas_background = self.canvas_background();
+        let canvas_color = canvas_background
+            .map(|(_, color)| blend_rgb_with_rgba(0xFF_FF_FF, rgba_to_premul_tuple(color)))
+            .unwrap_or(0xFF_FF_FF_FF);
+        let propagated_background_node = canvas_background.map(|(node_idx, _)| node_idx);
+        clear_buffer(buffer, canvas_color);
 
         if rebuild_layout {
             self.clear_layout_state();
@@ -8419,6 +8460,7 @@ impl Renderer {
                 0,
                 0,
                 viewport_clip,
+                propagated_background_node,
                 &mut new_rendered_nodes_ordered,
                 &mut deferred_z_index,
                 true,
@@ -8429,6 +8471,7 @@ impl Renderer {
             buffer,
             width,
             height,
+            propagated_background_node,
             &mut new_rendered_nodes_ordered,
         );
         self.rendered_nodes_ordered = new_rendered_nodes_ordered;
@@ -10477,6 +10520,22 @@ impl Renderer {
         children
     }
 
+    // Fixed elements, and absolute elements with no positioned ancestor, are
+    // sized against the initial containing block (the viewport), which is
+    // tracked as the root node here.
+    fn is_initial_containing_block(
+        &self,
+        containing_node_idx: usize,
+        position: StylePosition,
+    ) -> bool {
+        containing_node_idx == self.dom_indexes.root_indice
+            && (position == StylePosition::Fixed
+                || self
+                    .node_styles
+                    .get(&containing_node_idx)
+                    .is_none_or(|style| style.position == StylePosition::Static))
+    }
+
     fn get_containing_block_size(
         &self,
         containing_node_idx: usize,
@@ -10519,6 +10578,11 @@ impl Renderer {
 
             (containing_block_height, containing_block_width)
         } else {
+            if containing_block
+                .is_some_and(|idx| self.is_initial_containing_block(idx, style.position))
+            {
+                return (Some(self.window_size.height), Some(self.window_size.width));
+            }
             let containing_block_height = containing_block
                 .and_then(|idx| {
                     self.resolved_heights
@@ -11779,6 +11843,7 @@ impl Renderer {
         parent_offset_x: i32,
         parent_offset_y: i32,
         clip: PaintClip,
+        propagated_background_node: Option<usize>,
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
         deferred_z_index: &mut Vec<DeferredPaint>,
         defer_positive_z_index: bool,
@@ -11856,7 +11921,9 @@ impl Renderer {
         match &layout_box.kind {
             LayoutKind::Element => {
                 match &layout_box.rect.background {
-                    StyleBackground::Hex(code) => {
+                    StyleBackground::Hex(code)
+                        if propagated_background_node != Some(layout_box.node_idx) =>
+                    {
                         draw_rect_filled_clipped(
                             buffer,
                             false,
@@ -12032,6 +12099,7 @@ impl Renderer {
                 offset_x,
                 child_offset_y,
                 child_clip,
+                propagated_background_node,
                 rendered_nodes_ordered,
                 child_deferred_z_index,
                 true,
@@ -12043,6 +12111,7 @@ impl Renderer {
                 buffer,
                 width,
                 height,
+                propagated_background_node,
                 rendered_nodes_ordered,
             );
         }
@@ -12062,6 +12131,7 @@ impl Renderer {
         buffer: &mut [u32],
         width: u32,
         height: u32,
+        propagated_background_node: Option<usize>,
         rendered_nodes_ordered: &mut Vec<RenderedNode>,
     ) {
         deferred_z_index.sort_by(|(a, ..), (b, ..)| {
@@ -12080,6 +12150,7 @@ impl Renderer {
                 child_parent_offset_x,
                 child_parent_offset_y,
                 clip,
+                propagated_background_node,
                 rendered_nodes_ordered,
                 deferred_z_index,
                 false,
