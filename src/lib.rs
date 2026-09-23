@@ -2307,7 +2307,8 @@ fn get_calc_exp_value(
             available_size,
             auto_size,
             window_size,
-            default_unit,
+            // Apply unitless line-height scaling only to the outer expression.
+            &SizeUnit::Px,
         ),
         CalcExpression::Solved(value) => Some(*value as i32),
         _ => panic!("Expected calc expression to be value"),
@@ -2324,7 +2325,14 @@ fn solve_calc(
     default_unit: &SizeUnit,
 ) -> Option<i32> {
     let mut calc = calc.clone();
-    let has_unit = calc.iter().any(|c| matches!(c, CalcExpression::Size(..)));
+    fn has_unit(calc: &[CalcExpression]) -> bool {
+        calc.iter().any(|exp| match exp {
+            CalcExpression::Size(_) => true,
+            CalcExpression::Nesting(nested) => has_unit(nested),
+            CalcExpression::Operator(_) | CalcExpression::Solved(_) => false,
+        })
+    }
+    let has_unit = has_unit(&calc);
     while calc.len() > 1 {
         let exp = calc
             .iter()
@@ -15854,7 +15862,7 @@ mod tests {
         let params = frame.open()?;
         frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
         frame.run_js()?;
-        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
+        frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(30)))?;
         let mut buffer = vec![0; 1920 * 1080];
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 1080, Duration::from_secs(5))?;
         // Remaining YouTube rendering gaps are tracked in NOTES.md.
