@@ -1769,10 +1769,13 @@ struct Renderer {
     shadow_roots: HashMap<usize, usize>,
     node_styles: NodeMap<Style>,
     style_cache: StyleCache,
+    // Also remains dirty when a synchronous pass leaves stylesheets to fetch.
+    styles_dirty: bool,
     selector_changes: SelectorChanges,
     mutation_observers: mutation_observer::Observers,
     custom_element_reactions: custom_elements::Reactions,
     layout_table: Vec<LayoutBox>,
+    layout_dirty: bool,
     flex_measurements: HashMap<FlexMeasurementKey, Option<Size>>,
     node_layout_mapping: NodeMap<usize>,
     containing_nodes: HashMap<usize, ContainingNode>,
@@ -2994,17 +2997,12 @@ fn compute_node_style(
     css_cascade_metadata: &[Option<CssCascadeMetadata>],
     window_size: &PhysicalSize<u32>,
     variable_definitions: &VariableDefinitions,
-    ancestor_hidden: bool,
     parent_style_revision: Option<u64>,
     stats: &mut StyleRecomputeStats,
     variable_cache: &mut style::VariableCache,
 ) {
     stats.visited += 1;
-    // Keep cached descendants until their hidden ancestor can render again.
-    if ancestor_hidden && node_styles.contains_key(&node_idx) {
-        return;
-    }
-
+    // Hidden elements still need current computed styles for CSSOM reads.
     let matched_css_rules = collected_class_nodes
         .get(node_idx)
         .map(Vec::as_slice)
@@ -3093,7 +3091,6 @@ fn compute_node_style(
     let style_revision = style_cache.nodes[&node_idx].style_revision;
     let resolved_font_size = resolved_font_sizes[&node_idx];
     let style = &node_styles[&node_idx];
-    let subtree_hidden = ancestor_hidden || style.display == StyleDisplay::None;
     let resolved_variables = Rc::clone(&style.variables);
 
     // Until scoped stylesheets and slots are supported, render the shadow children
@@ -3117,7 +3114,6 @@ fn compute_node_style(
             css_cascade_metadata,
             window_size,
             variable_definitions,
-            subtree_hidden,
             Some(style_revision),
             stats,
             variable_cache,
@@ -4529,6 +4525,12 @@ fn fetch_expandable_css(
     Ok(fetched_nodes)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StylesheetLoad {
+    AvailableOnly,
+    AllowFetch,
+}
+
 fn get_css_nodes(
     base_url: &String,
     tokio: &Rc<RefCell<tokio::runtime::Runtime>>,
@@ -4539,13 +4541,14 @@ fn get_css_nodes(
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
     flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     css_parser: &mut CssParser,
-) -> (Vec<CssNode>, bool) {
+    load: StylesheetLoad,
+) -> (Vec<CssNode>, bool, bool) {
     let expandable = get_expandable_css_nodes(nodes, root_indice, &dom_indexes.children_index);
     if let Some((cached_base_url, cached_expandable, cached_nodes)) = flattened_css_cache
         && cached_base_url == base_url
         && cached_expandable == &expandable
     {
-        return (cached_nodes.clone(), true);
+        return (cached_nodes.clone(), true, false);
     }
     let mut parsed_css_chunks = vec![];
     let mut needs_fetching = vec![];
@@ -4564,7 +4567,8 @@ fn get_css_nodes(
             };
         }
     }
-    if needs_fetching.len() > 0 {
+    let pending_fetches = !needs_fetching.is_empty() && load == StylesheetLoad::AvailableOnly;
+    if !needs_fetching.is_empty() && load == StylesheetLoad::AllowFetch {
         let fetched =
             fetch_expandable_css(base_url, tokio, network_fetch, &needs_fetching).unwrap();
         for (str, (idx, _, exp)) in fetched.into_iter().zip(needs_fetching) {
@@ -4575,8 +4579,14 @@ fn get_css_nodes(
         }
     }
     let parsed_css_nodes = flatten_css_chunks(parsed_css_chunks);
-    *flattened_css_cache = Some((base_url.clone(), expandable, parsed_css_nodes.clone()));
-    (parsed_css_nodes, false)
+    // An incomplete collection must be revisited when normal DOM processing
+    // can fetch the missing sheets, including rematching their selectors.
+    *flattened_css_cache = if pending_fetches {
+        None
+    } else {
+        Some((base_url.clone(), expandable, parsed_css_nodes.clone()))
+    };
+    (parsed_css_nodes, false, pending_fetches)
 }
 
 #[derive(Debug)]
@@ -4816,11 +4826,13 @@ fn compute_node_styles(
     mut resolved_font_sizes: NodeMap<u32>,
     style_cache: &mut StyleCache,
     selector_changes: &SelectorChanges,
+    load: StylesheetLoad,
 ) -> (
     NodeMap<Style>,
     NodeMap<u32>,
     VariableDefinitions,
     HashSet<usize>,
+    bool,
 ) {
     node_styles.retain(|idx, _| nodes.contains_key(*idx));
     resolved_font_sizes.retain(|idx, _| nodes.contains_key(*idx));
@@ -4829,7 +4841,7 @@ fn compute_node_styles(
         .local_revisions
         .retain(|idx, _| nodes.contains_key(*idx));
     let start = Instant::now();
-    let (mut parsed_css_nodes, stylesheet_unchanged) = get_css_nodes(
+    let (mut parsed_css_nodes, stylesheet_unchanged, pending_fetches) = get_css_nodes(
         base_url,
         tokio,
         network_fetch,
@@ -4839,6 +4851,7 @@ fn compute_node_styles(
         css_parse_cache,
         flattened_css_cache,
         css_parser,
+        load,
     );
     println!(
         "Retrieved parsed css nodes in {}ms",
@@ -4993,7 +5006,6 @@ fn compute_node_styles(
         &css_cascade_metadata,
         window_size,
         &definitions_map,
-        false,
         None,
         &mut stats,
         &mut style::VariableCache::default(),
@@ -5011,6 +5023,7 @@ fn compute_node_styles(
         resolved_font_sizes,
         definitions_map,
         style_cache.selector_hovering_impact.clone(),
+        pending_fetches,
     )
 }
 
@@ -5374,7 +5387,8 @@ fn style_border_to_properties(
     properties.insert(format!("border-{side}-style"), border.style.to_string());
 }
 
-fn computed_style_properties(renderer: &Renderer, node_idx: usize) -> HashMap<String, String> {
+fn computed_style_properties(renderer: &mut Renderer, node_idx: usize) -> HashMap<String, String> {
+    renderer.ensure_styles(StylesheetLoad::AvailableOnly);
     let Some(style) = renderer.node_styles.get(&node_idx) else {
         return HashMap::new();
     };
@@ -5487,13 +5501,13 @@ fn op_get_computed_style(
     #[number] frame_id: Option<usize>,
 ) -> Result<HashMap<String, String>, JsErrorBox> {
     let host = state.borrow::<JsHostState>();
-    let renderer = host.renderer.borrow();
+    let mut renderer = host.renderer.borrow_mut();
     if let Some(frame_id) = frame_id {
         js_send_onetime_to_frame(&renderer, frame_id, |reply| {
             FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply })
         })
     } else {
-        Ok(computed_style_properties(&renderer, node_idx))
+        Ok(computed_style_properties(&mut renderer, node_idx))
     }
 }
 
@@ -5505,7 +5519,7 @@ fn op_measure_element(
     #[number] frame_id: Option<usize>,
 ) -> Result<ElementGeometry, JsErrorBox> {
     let host = state.borrow::<JsHostState>();
-    let renderer = host.renderer.borrow();
+    let mut renderer = host.renderer.borrow_mut();
     if let Some(frame_id) = frame_id {
         js_send_onetime_to_frame(&renderer, frame_id, |reply| {
             FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply })
@@ -7433,7 +7447,7 @@ impl Renderer {
         let mut css_parser = CssParser::new();
         let mut style_cache = StyleCache::default();
 
-        let (node_styles, resolved_font_sizes, variable_definitions, hovering_impact) =
+        let (node_styles, resolved_font_sizes, variable_definitions, hovering_impact, styles_dirty) =
             compute_node_styles(
                 &url,
                 &tokio,
@@ -7452,6 +7466,7 @@ impl Renderer {
                 NodeMap::default(),
                 &mut style_cache,
                 &SelectorChanges::default(),
+                StylesheetLoad::AllowFetch,
             );
 
         Self {
@@ -7463,10 +7478,12 @@ impl Renderer {
             shadow_roots: HashMap::new(),
             node_styles,
             style_cache,
+            styles_dirty,
             selector_changes: SelectorChanges::default(),
             mutation_observers: mutation_observer::Observers::default(),
             custom_element_reactions: custom_elements::Reactions::default(),
             layout_table,
+            layout_dirty: true,
             flex_measurements: HashMap::new(),
             node_layout_mapping,
             containing_nodes,
@@ -7962,6 +7979,7 @@ impl Renderer {
     }
 
     fn clear_layout_state(&mut self) {
+        self.layout_dirty = true;
         self.layout_table.clear();
         self.flex_measurements.clear();
         self.node_layout_mapping.clear();
@@ -8006,7 +8024,8 @@ impl Renderer {
         self.selector_changes = SelectorChanges::default();
         self.selector_changes.force_full_rematch();
         self.clear_layout_state();
-        self.recompute_nodes();
+        self.styles_dirty = true;
+        self.ensure_styles(StylesheetLoad::AllowFetch);
     }
 
     fn get_implicit_click_events(&self, node_idx: usize) -> Vec<(usize, HtmlEvent)> {
@@ -8344,8 +8363,38 @@ impl Renderer {
         None
     }
 
-    // Measurements assume the normal rendering pass has already updated layout.
-    fn measure_element(&self, node_idx: usize) -> ElementGeometry {
+    fn set_window_size(&mut self, size: PhysicalSize<u32>) {
+        if self.window_size != size {
+            self.window_size = size;
+            self.styles_dirty = true;
+            self.layout_dirty = true;
+        }
+    }
+
+    fn ensure_layout(&mut self) {
+        self.ensure_styles(StylesheetLoad::AvailableOnly);
+        if !self.layout_dirty {
+            return;
+        }
+
+        // Hover stores a layout-table index; preserve its node across the rebuild.
+        let hovered_node = self.hovering.map(|idx| self.layout_table[idx].node_idx);
+        self.hovering = None;
+        self.clear_layout_state();
+        self.layout_roots = self.build_layout(self.window_size.width, self.window_size.height);
+        self.hovering = hovered_node.and_then(|idx| self.node_layout_mapping.get(&idx).copied());
+        self.layout_dirty = false;
+        if hovered_node.is_some() && self.hovering.is_none() {
+            // Resolve the end of hover before returning geometry. This retry
+            // starts with no hover target, so it cannot trigger another retry.
+            self.selector_changes.state_changed();
+            self.styles_dirty = true;
+            self.ensure_layout();
+        }
+    }
+
+    fn measure_element(&mut self, node_idx: usize) -> ElementGeometry {
+        self.ensure_layout();
         let Some(&layout_idx) = self.node_layout_mapping.get(&node_idx) else {
             return ElementGeometry::default();
         };
@@ -8431,11 +8480,13 @@ impl Renderer {
         }
     }
 
-    fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32, rebuild_layout: bool) {
+    fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
 
+        self.set_window_size(PhysicalSize::new(width, height));
+        self.ensure_layout();
         let canvas_background = self.canvas_background();
         let canvas_color = canvas_background
             .map(|(_, color)| blend_rgb_with_rgba(0xFF_FF_FF, rgba_to_premul_tuple(color)))
@@ -8443,10 +8494,6 @@ impl Renderer {
         let propagated_background_node = canvas_background.map(|(node_idx, _)| node_idx);
         clear_buffer(buffer, canvas_color);
 
-        if rebuild_layout {
-            self.clear_layout_state();
-            self.layout_roots = self.build_layout(width, height);
-        }
         self.resolve_pending_canvas_images();
         let mut new_rendered_nodes_ordered = vec![];
         let mut deferred_z_index = vec![];
@@ -8667,6 +8714,7 @@ impl Renderer {
     }
 
     fn finish_image_prefetch(&mut self, entries: Vec<(ReqwestUrl, RequestCacheEntry)>) {
+        self.layout_dirty = true;
         for (url, entry) in entries {
             self.pending_image_fetches.remove(&url);
             self.request_cache.insert(url, entry);
@@ -8847,7 +8895,9 @@ impl Renderer {
         } else if src.starts_with("blob") {
             let url = url::Url::parse(&src).ok()?;
             let blob = self.blob_store.get_object_url(url)?;
-            let bytes = self.tokio.borrow_mut().block_on(blob.read_all());
+            // BlobStore uses in-memory parts. A read during JS must not enter
+            // the Tokio runtime that is already executing that script.
+            let bytes = deno_core::futures::FutureExt::now_or_never(blob.read_all())?;
             sniff_image_data(bytes)
         } else {
             self.get_img_src_data(&src)
@@ -12254,7 +12304,7 @@ impl Renderer {
         }
     }
 
-    pub fn recompute_styles(&mut self) {
+    fn recompute_styles(&mut self, load: StylesheetLoad) {
         let hover_chain = self.get_hover_chain();
         let node_styles = std::mem::take(&mut self.node_styles);
         let resolved_font_sizes = std::mem::take(&mut self.resolved_font_sizes);
@@ -12264,6 +12314,7 @@ impl Renderer {
             self.resolved_font_sizes,
             self.variable_definitions,
             self.hovering_impact,
+            self.styles_dirty,
         ) = compute_node_styles(
             &self.url,
             &self.tokio,
@@ -12282,12 +12333,16 @@ impl Renderer {
             resolved_font_sizes,
             &mut self.style_cache,
             &selector_changes,
+            load,
         );
+        self.layout_dirty = true;
     }
 
-    pub fn recompute_nodes(&mut self) {
-        self.recompute_dom_indexes();
-        self.recompute_styles();
+    fn ensure_styles(&mut self, load: StylesheetLoad) {
+        if self.styles_dirty {
+            self.recompute_dom_indexes();
+            self.recompute_styles(load);
+        }
     }
 
     fn queue_free_child_for_layout(
@@ -12509,6 +12564,10 @@ impl Renderer {
     }
 
     pub fn schedule_dom_update(&mut self) {
+        // A read may have flushed the previous mutation while its notification
+        // is still queued. Every new mutation must invalidate the result again.
+        self.styles_dirty = true;
+        self.layout_dirty = true;
         if !self.pending_dom_update
             && let Some(proxy) = &self.event_loop_proxy
         {
@@ -12638,7 +12697,6 @@ pub struct Frame {
     tokio: Option<Rc<RefCell<tokio::runtime::Runtime>>>,
     html_parser: Option<HtmlParser>,
     font_handler: Rc<FontHandler>,
-    layout_dirty: bool,
     layout_booted: bool,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
     network_fetch: Rc<RefCell<NetworkFetch>>,
@@ -12674,7 +12732,6 @@ impl std::fmt::Debug for Frame {
             .field("tokio", &self.tokio)
             .field("html_parser", &self.html_parser)
             .field("font_handler", &self.font_handler)
-            .field("layout_dirty", &self.layout_dirty)
             .field("layout_booted", &self.layout_booted)
             .field("executed_scripts", &self.executed_scripts)
             .field("network_fetch", &self.network_fetch)
@@ -12741,7 +12798,6 @@ impl Frame {
             font_handler,
             executed_scripts: Rc::new(RefCell::new(ExecutedScripts::new())),
             next_inline_module_id: 0,
-            layout_dirty: true,
             layout_booted: false,
             network_fetch: Rc::new(RefCell::new(NetworkFetch::new())),
             dom_content_loaded_dispatched: false,
@@ -12759,19 +12815,12 @@ impl Frame {
         }
     }
 
-    fn render_into(
-        &mut self,
-        buffer: &mut [u32],
-        width: u32,
-        height: u32,
-        rebuild_layout: bool,
-    ) {
-        self.renderer.as_ref().unwrap().borrow_mut().render_into(
-            buffer,
-            width,
-            height,
-            rebuild_layout,
-        );
+    fn render_into(&mut self, buffer: &mut [u32], width: u32, height: u32) {
+        self.renderer
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .render_into(buffer, width, height);
     }
 
     async fn get_html_for_navigation(&self, request: FormNavigation) -> Result<(String, String)> {
@@ -12946,21 +12995,16 @@ impl Frame {
         Ok(())
     }
 
-    fn paint_iframe(
-        &mut self,
-        parent_proxy: &RendererProxy,
-        surface: &Arc<Mutex<FrameSurface>>,
-        rebuild_layout: bool,
-    ) {
+    fn paint_iframe(&mut self, parent_proxy: &RendererProxy, surface: &Arc<Mutex<FrameSurface>>) {
         let size = self.render_size;
         let mut pixels = vec![0; (size.width * size.height) as usize];
         self.renderer.as_ref().unwrap().borrow_mut().render_into(
             &mut pixels,
             size.width,
             size.height,
-            rebuild_layout,
         );
         *surface.lock().unwrap() = FrameSurface { size, pixels };
+        self.update_newly_loaded_images();
         let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
     }
 
@@ -13004,11 +13048,11 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread, !canvas_updated);
+                self.paint_iframe(parent_proxy, bitmap_for_thread);
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
                 if self.apply_hovering(&position) {
-                    self.paint_iframe(parent_proxy, bitmap_for_thread, true);
+                    self.paint_iframe(parent_proxy, bitmap_for_thread);
                 }
             }
             FrameCommand::UserEvent(UserEvent::Click) => {
@@ -13024,7 +13068,7 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
+                self.paint_iframe(parent_proxy, bitmap_for_thread);
             }
             FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
                 if let Err(err) = self.perform_navigation(href, reload) {
@@ -13032,7 +13076,7 @@ impl Frame {
                     return;
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
+                self.paint_iframe(parent_proxy, bitmap_for_thread);
             }
             FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
                 self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
@@ -13041,8 +13085,7 @@ impl Frame {
                 self.render_size = new_size;
                 {
                     let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                    renderer.window_size = new_size;
-                    renderer.recompute_styles();
+                    renderer.set_window_size(new_size);
                 }
 
                 let code = format!(
@@ -13053,7 +13096,7 @@ impl Frame {
                     eprintln!("Failed to dispatch iframe resize: {err}");
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread, true);
+                self.paint_iframe(parent_proxy, bitmap_for_thread);
             }
             FrameCommand::UserEvent(UserEvent::WindowMessage(message)) => {
                 self.dispatch_window_message(message);
@@ -13098,11 +13141,11 @@ impl Frame {
                 let _ = reply.send(html);
             }
             FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow();
-                let _ = reply.send(computed_style_properties(&renderer, node_idx));
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let _ = reply.send(computed_style_properties(&mut renderer, node_idx));
             }
             FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
                 let _ = reply.send(renderer.measure_element(node_idx));
             }
             FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply }) => {
@@ -13561,7 +13604,6 @@ impl Frame {
             );
         }
         if let Some(window) = self.window.as_mut() {
-            self.layout_dirty = true;
             window.request_redraw();
         }
         Ok(())
@@ -13952,7 +13994,7 @@ impl Frame {
     }
 
     fn fire_load_phase(&mut self, phase: &LoadPhase, idxs: Option<&Vec<usize>>) {
-        let nodes_idxs = {
+        let nodes_to_fire = {
             let renderer = self.renderer.as_ref().unwrap().borrow();
             let candidates = idxs.unwrap_or(&renderer.nodes_idxs);
             let idxs_to_fire: Vec<usize> = candidates
@@ -13969,26 +14011,29 @@ impl Frame {
 
             idxs_to_fire
                 .iter()
-                .map(usize::to_string)
-                .collect::<Vec<String>>()
-                .join(",")
+                .map(|idx| (*idx, renderer.images_nodes_loaded.get(idx).copied()))
+                .collect::<Vec<_>>()
         };
-        if nodes_idxs.is_empty() {
+        if nodes_to_fire.is_empty() {
             return;
         }
         let load_code = format!(
             r#"
         (() => {{
-            const idxs = [{}]
-            for (let idx of idxs) {{
-                __elementFromNodeIdx(idx).dispatchEvent(new Event("load", {{
+            const nodes = {}
+            for (const [idx, imageSize] of nodes) {{
+                const node = __elementFromNodeIdx(idx)
+                if (imageSize) {{
+                    [node.naturalHeight, node.naturalWidth] = imageSize
+                }}
+                node.dispatchEvent(new Event("load", {{
                     bubbles: false,
                     cancelable: false,
                 }}))
             }}
         }})()
         "#,
-            nodes_idxs
+            deno_core::serde_json::to_string(&nodes_to_fire).unwrap()
         );
         let _ = self
             .execute_host_script("load", load_code)
@@ -14037,53 +14082,10 @@ impl Frame {
         }
     }
 
-    fn update_newly_loaded_images(&mut self, prev_state: &HashSet<usize>) {
-        let newly_loaded: Vec<(usize, u32, u32)> = {
-            let renderer = self.renderer.as_ref().unwrap().borrow();
-            renderer
-                .images_nodes_loaded
-                .iter()
-                .filter(|(idx, _)| !prev_state.contains(idx))
-                .map(|(&idx, &(height, width))| (idx, height, width))
-                .collect()
-        };
-
-        if newly_loaded.is_empty() {
-            return;
-        }
-
-        let images = newly_loaded
-            .iter()
-            .map(|(idx, height, width)| format!("[{idx}, {height}, {width}]"))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        self.execute_host_script(
-            "update newly loaded images",
-            format!(
-                r#"
-        for (const [idx, height, width] of [{}]) {{
-            const node = __elementFromNodeIdx(idx)
-            if (!node) continue
-
-            node.naturalHeight = height
-            node.naturalWidth = width
-        }}
-        "#,
-                images
-            ),
-        )
-        .unwrap();
-
-        // Decoding happens after the DOM-update load pass. Notify these images now
-        // so consumers do not wait for an unrelated DOM mutation to finish loading.
-        let loaded_images = newly_loaded.iter().map(|(idx, _, _)| *idx).collect();
-        self.fire_load_phase(&LoadPhase::JsDone, Some(&loaded_images));
-    }
-
-    fn render_loop(&mut self) -> Vec<u32> {
-        let animation_redraw = self.tick_animations();
-        let prev_loaded_images: HashSet<usize> = self
+    fn update_newly_loaded_images(&mut self) {
+        // Measurements can decode images before a paint. The load phase tracks
+        // delivery and publishes dimensions before invoking each handler.
+        let image_nodes = self
             .renderer
             .as_ref()
             .unwrap()
@@ -14092,6 +14094,11 @@ impl Frame {
             .keys()
             .copied()
             .collect();
+        self.fire_load_phase(&LoadPhase::JsDone, Some(&image_nodes));
+    }
+
+    fn render_loop(&mut self) -> Vec<u32> {
+        let animation_redraw = self.tick_animations();
         let first_boot = !self.layout_booted;
         if first_boot {
             let start = Instant::now();
@@ -14109,7 +14116,7 @@ impl Frame {
         self.refresh_hover_after_render();
         let _ = self.refresh_intersections();
         self.decode_detached_images();
-        self.update_newly_loaded_images(&prev_loaded_images);
+        self.update_newly_loaded_images();
 
         // If there are animations, continue re-rendering until there aren't
         if animation_redraw && let Some(window) = &self.window {
@@ -14143,9 +14150,7 @@ impl Frame {
             buffer,
             self.render_size.width,
             self.render_size.height,
-            self.layout_dirty,
         );
-        self.layout_dirty = false;
 
         println!(
             "Render took {} microseconds",
@@ -14165,13 +14170,8 @@ impl Frame {
         {
             let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
             renderer.pending_dom_update = false;
-            if renderer.hovering.take().is_some() {
-                renderer.selector_changes.state_changed();
-            }
-            renderer.clear_layout_state();
-            renderer.recompute_nodes();
+            renderer.ensure_styles(StylesheetLoad::AllowFetch);
         }
-        self.layout_dirty = true;
         let start = Instant::now();
         let js_result = self.run_js();
         println!(
@@ -14281,12 +14281,13 @@ impl Frame {
                 let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
                 let previous_revision = renderer.style_cache.next_style_revision;
                 renderer.selector_changes.state_changed();
-                renderer.recompute_nodes();
+                renderer.styles_dirty = true;
+                renderer.ensure_styles(StylesheetLoad::AllowFetch);
                 renderer.style_cache.next_style_revision != previous_revision
             };
             if styles_changed || self.hover_debugging {
                 needs_repaint = true;
-                self.layout_dirty = true;
+                self.renderer.as_ref().unwrap().borrow_mut().layout_dirty = true;
                 if let Some(hovering) = hovering
                     && self.hover_debugging
                 {
@@ -14325,7 +14326,11 @@ impl Frame {
             }
             FrameCommand::Resized(new_size) => {
                 self.render_size = new_size;
-                self.layout_dirty = true;
+                self.renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .set_window_size(new_size);
                 let buffer = self.render_loop();
                 let _ = proxy.fire_tab_updated(buffer);
             }
@@ -14344,7 +14349,6 @@ impl Frame {
                         if let Some(renderer) = self.renderer.as_ref() {
                             renderer.borrow_mut().finish_image_prefetch(urls);
                         }
-                        self.layout_dirty = true;
                     }
                     UserEvent::FrameUpdated => {}
                     _ => unreachable!(),
@@ -14572,6 +14576,7 @@ fn profile_compute_node_styles(args: &[String]) -> Result<()> {
             std::mem::take(&mut resolved_font_sizes),
             &mut style_cache,
             &SelectorChanges::default(),
+            StylesheetLoad::AllowFetch,
         );
         node_styles = result.0;
         resolved_font_sizes = result.1;
@@ -15627,7 +15632,6 @@ mod tests {
                             .unwrap()
                             .borrow_mut()
                             .finish_image_prefetch(entries);
-                        self.layout_dirty = true;
                     }
                     FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
                         self.animation_frame_requested = true;
@@ -15697,7 +15701,6 @@ mod tests {
                             .unwrap()
                             .borrow_mut()
                             .finish_image_prefetch(entries);
-                        self.layout_dirty = true;
                     }
                     // The headless tests drive JS and DOM updates directly, so their queued
                     // notifications have already been applied and must not be replayed here.
@@ -15725,9 +15728,9 @@ mod tests {
             timeout: Duration,
         ) -> Result<()> {
             // The initial layout discovers image URLs and starts their asynchronous fetches.
-            self.render_into(buffer, width, height, true);
+            self.render_into(buffer, width, height);
             self.wait_for_images_to_load(frame_rx, timeout)?;
-            self.render_into(buffer, width, height, true);
+            self.render_into(buffer, width, height);
             Ok(())
         }
     }
@@ -15799,7 +15802,7 @@ mod tests {
             )?;
             frame.process_dom_update();
             let mut buffer = vec![0; 800 * 600];
-            frame.render_into(&mut buffer, 800, 600, true);
+            frame.render_into(&mut buffer, 800, 600);
             let renderer = frame.renderer.as_ref().unwrap().borrow();
             let leaf = renderer.layout_table.iter().find(|layout| {
                 matches!(renderer.nodes.get(layout.node_idx), Some(super::Node::Element(element))
@@ -15849,7 +15852,7 @@ mod tests {
         );
         let mut buffer = vec![0; 1920 * 1080];
         let render_start = Instant::now();
-        frame.render_into(&mut buffer, 1920, 1080, true);
+        frame.render_into(&mut buffer, 1920, 1080);
         println!(
             "renders_swapped_com render_into_cold={}us",
             render_start.elapsed().as_micros()
@@ -15860,7 +15863,7 @@ mod tests {
         let mut hot_render_times = Vec::with_capacity(HOT_RENDER_RUNS);
         for _ in 0..HOT_RENDER_RUNS {
             let render_start = Instant::now();
-            frame.render_into(&mut buffer, 1920, 1080, true);
+            frame.render_into(&mut buffer, 1920, 1080);
             let elapsed = render_start.elapsed().as_micros();
             hot_render_times.push(elapsed);
         }
