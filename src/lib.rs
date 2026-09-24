@@ -1956,7 +1956,7 @@ struct ContainerSizes {
     max_height: Option<u32>,
     min_width: Option<u32>,
     max_width: Option<u32>,
-    padding_x: u32,
+    padding_and_border_x: u32,
     has_specified_height: bool,
 }
 
@@ -1969,7 +1969,7 @@ impl ContainerSizes {
 
     pub fn compute_actual_container_width(&self, used_width: u32) -> u32 {
         self.container_width_non_filling
-            .unwrap_or(self.clamp_width(used_width) + self.padding_x)
+            .unwrap_or(self.clamp_width(used_width) + self.padding_and_border_x)
     }
 
     pub fn image_placeholder_size(&self, max_width: u32, max_height: u32) -> (u32, u32) {
@@ -10045,9 +10045,9 @@ impl Renderer {
             .unwrap_or(available_size.width)
             .min(max_width.unwrap_or(u32::MAX))
             .max(min_width.unwrap_or(u32::MIN));
-        let inner_width = container_width.saturating_sub(
-            (padding_left_size + padding_right_size + border_left_size + border_right_size) as u32,
-        );
+        let padding_and_border_x =
+            (padding_left_size + padding_right_size + border_left_size + border_right_size) as u32;
+        let inner_width = container_width.saturating_sub(padding_and_border_x);
         let container_height_non_filling = specified_height.map(|v| {
             v.min(max_height.unwrap_or(u32::MAX))
                 .max(min_height.unwrap_or(u32::MIN))
@@ -10072,7 +10072,7 @@ impl Renderer {
             max_height,
             min_width,
             max_width,
-            padding_x: (padding_left_size + padding_right_size) as u32,
+            padding_and_border_x,
             has_specified_height: specified_height.is_some(),
         }
     }
