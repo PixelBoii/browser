@@ -1439,15 +1439,20 @@ pub struct ElementHandle {
 pub enum FrameCommand {
     Close,
     Render,
-    /// Return an element handle, native node, and descendant text on the frame thread.
+    /// Return an element handle and native node on the frame thread.
     QuerySelector {
         selector: String,
-        reply: Sender<Option<(ElementHandle, Node, String)>>,
+        reply: Sender<Option<(ElementHandle, Node)>>,
     },
-    /// Return handles, native nodes, and descendant text for matching elements.
+    /// Return handles and native nodes for matching elements.
     QuerySelectorAll {
         selector: String,
-        reply: Sender<Vec<(ElementHandle, Node, String)>>,
+        reply: Sender<Vec<(ElementHandle, Node)>>,
+    },
+    /// Read the current descendant text of an attached element.
+    GetTextContent {
+        element: ElementHandle,
+        reply: Sender<Result<String>>,
     },
     /// Dispatch a click to an attached element in the current document.
     ClickElement {
@@ -12893,11 +12898,11 @@ impl Frame {
             .query_selector_all_nodes(selector.to_owned(), None)
     }
 
-    /// Read a node's descendant text, or None if the node ID does not exist.
-    pub fn text_content(&self, node_idx: usize) -> Option<String> {
-        let renderer = self.renderer.as_ref()?.borrow();
-        renderer.nodes.get(node_idx)?;
-        Some(renderer.get_text_content(node_idx))
+    /// Read the current descendant text, rejecting detached or stale element handles.
+    pub fn text_content(&self, element: ElementHandle) -> Result<String> {
+        let node_idx = self.resolve_element(element)?;
+        let renderer = self.renderer.as_ref().unwrap().borrow();
+        Ok(renderer.get_text_content(node_idx))
     }
 
     fn new(url: String, hover_debugging: bool, render_size: PhysicalSize<u32>) -> Self {
@@ -13901,23 +13906,26 @@ impl Frame {
         Ok(())
     }
 
-    fn click_element(&mut self, element: ElementHandle) -> Result<()> {
+    fn resolve_element(&self, element: ElementHandle) -> Result<usize> {
         if element.document_generation != self.document_generation {
             return Err(anyhow!("Element belongs to a previous document"));
         }
+        let renderer = self
+            .renderer
+            .as_ref()
+            .context("Frame has no document")?
+            .borrow();
+        if !matches!(renderer.nodes.get(element.node_idx), Some(Node::Element(_)))
+            || !renderer.node_is_connected(element.node_idx)
         {
-            let renderer = self
-                .renderer
-                .as_ref()
-                .context("Frame has no document")?
-                .borrow();
-            if !matches!(renderer.nodes.get(element.node_idx), Some(Node::Element(_)))
-                || !renderer.node_is_connected(element.node_idx)
-            {
-                return Err(anyhow!("Element is no longer attached to the document"));
-            }
+            return Err(anyhow!("Element is no longer attached to the document"));
         }
-        self.dispatch_click(element.node_idx)
+        Ok(element.node_idx)
+    }
+
+    fn click_element(&mut self, element: ElementHandle) -> Result<()> {
+        let node_idx = self.resolve_element(element)?;
+        self.dispatch_click(node_idx)
     }
 
     fn dispatch_click(&mut self, node_idx: usize) -> Result<()> {
@@ -14462,7 +14470,6 @@ impl Frame {
                             document_generation: self.document_generation,
                         },
                         node,
-                        self.text_content(node_idx).unwrap(),
                     )
                 });
                 let _ = reply.send(result);
@@ -14478,11 +14485,13 @@ impl Frame {
                                 document_generation: self.document_generation,
                             },
                             node,
-                            self.text_content(node_idx).unwrap(),
                         )
                     })
                     .collect();
                 let _ = reply.send(result);
+            }
+            FrameCommand::GetTextContent { element, reply } => {
+                let _ = reply.send(self.text_content(element));
             }
             FrameCommand::ClickElement { element, reply } => {
                 let _ = reply.send(self.click_element(element));
