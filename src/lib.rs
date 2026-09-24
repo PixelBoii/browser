@@ -11414,12 +11414,30 @@ impl Renderer {
             }
         }
 
-        // Flex free space is based on each item's outer size, including fixed main-axis margins.
+        let authored_gap = get_specified_size(
+            font_size,
+            self.get_root_font_size(),
+            &style.gap,
+            Some(match style.flex_direction {
+                StyleFlexDirection::Row => container_sizes.inner_width,
+                StyleFlexDirection::Column if has_definite_height => container_sizes.inner_height,
+                // Percentage gaps cannot depend on a height that includes the gap itself.
+                StyleFlexDirection::Column => 0,
+            }),
+            None,
+            &self.window_size,
+            &SizeUnit::Px,
+        )
+        .unwrap_or(0);
+        let gap_total = authored_gap.saturating_mul(base_items.len().saturating_sub(1) as i32);
+
+        // Include fixed margins and gaps before growing or shrinking the items.
         // Auto margins resolve to zero here and receive their share during final alignment.
-        let total_outer_base: f32 = base_items
+        let total_outer_base = base_items
             .iter()
             .map(|item| item.base_size + item.main_margin as f32)
-            .sum();
+            .sum::<f32>()
+            + gap_total as f32;
         let flex_available_size = match style.flex_direction {
             StyleFlexDirection::Row => container_sizes.inner_width,
             StyleFlexDirection::Column if has_definite_height => container_sizes.inner_height,
@@ -11507,18 +11525,6 @@ impl Renderer {
         }
 
         // Justify-content
-        let authored_gap = get_specified_size(
-            font_size,
-            self.get_root_font_size(),
-            &style.gap,
-            Some(flex_available_size),
-            None,
-            &self.window_size,
-            &SizeUnit::Px,
-        )
-        .unwrap_or(0);
-        let gap_total = authored_gap.saturating_mul(base_items.len().saturating_sub(1) as i32);
-
         let used_main: u32 = base_items
             .iter()
             .map(|item| (item.target_size + item.main_margin as f32).max(0.).round() as u32)
