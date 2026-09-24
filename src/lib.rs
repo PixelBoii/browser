@@ -1428,19 +1428,31 @@ pub enum FrameDomCommand {
     },
 }
 
+/// An element identity tied to the document in its originating frame.
+#[derive(Debug, Clone, Copy)]
+pub struct ElementHandle {
+    node_idx: usize,
+    document_generation: u64,
+}
+
 #[derive(Debug)]
 pub enum FrameCommand {
     Close,
     Render,
-    /// Return the native node and its descendant text together on the frame thread.
+    /// Return an element handle, native node, and descendant text on the frame thread.
     QuerySelector {
         selector: String,
-        reply: Sender<Option<(Node, String)>>,
+        reply: Sender<Option<(ElementHandle, Node, String)>>,
     },
-    /// Return matching native nodes and their descendant text.
+    /// Return handles, native nodes, and descendant text for matching elements.
     QuerySelectorAll {
         selector: String,
-        reply: Sender<Vec<(Node, String)>>,
+        reply: Sender<Vec<(ElementHandle, Node, String)>>,
+    },
+    /// Dispatch a click to an attached element in the current document.
+    ClickElement {
+        element: ElementHandle,
+        reply: Sender<Result<()>>,
     },
     TakeScreenshot {
         reply: Sender<Result<Pixmap>>,
@@ -12795,6 +12807,7 @@ impl ExecutedScripts {
 /// A document frame. [`Frame::open_headless`] initializes one on the calling thread.
 pub struct Frame {
     url: String,
+    document_generation: u64,
     renderer: Option<Rc<RefCell<Renderer>>>,
     window: Option<Arc<Window>>,
     js_runtime: Option<Rc<RefCell<JsRuntime>>>,
@@ -12894,6 +12907,7 @@ impl Frame {
 
         Self {
             url,
+            document_generation: 0,
             renderer: None,
             window: None,
             js_runtime: None,
@@ -13684,6 +13698,7 @@ impl Frame {
             let nodes_table =
                 NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
             let nodes_idxs = sorted_node_idxs(&nodes_table);
+            self.document_generation += 1;
             renderer.borrow_mut().replace_document(
                 self.url.clone(),
                 nodes_table,
@@ -13877,161 +13892,189 @@ impl Frame {
                 }
                 return Ok(());
             }
-            let parents = self
+            self.dispatch_click(hovering_node_idx)?;
+        } else {
+            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+            renderer.focusable = None;
+        }
+
+        Ok(())
+    }
+
+    fn click_element(&mut self, element: ElementHandle) -> Result<()> {
+        if element.document_generation != self.document_generation {
+            return Err(anyhow!("Element belongs to a previous document"));
+        }
+        {
+            let renderer = self
+                .renderer
+                .as_ref()
+                .context("Frame has no document")?
+                .borrow();
+            if !matches!(renderer.nodes.get(element.node_idx), Some(Node::Element(_)))
+                || !renderer.node_is_connected(element.node_idx)
+            {
+                return Err(anyhow!("Element is no longer attached to the document"));
+            }
+        }
+        self.dispatch_click(element.node_idx)
+    }
+
+    fn dispatch_click(&mut self, node_idx: usize) -> Result<()> {
+        let parents = self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .get_parents(node_idx);
+        let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
+        let code = format!(
+            "__dispatchClickFromNodeIdx({}, [{}])",
+            node_idx,
+            parents_strs.join(", ")
+        );
+
+        let default_prevented = {
+            let value = self.execute_host_script("click handler", code)?;
+            let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+
+            deno_core::scope!(scope, &mut *runtime);
+            let value = deno_core::v8::Local::new(scope, value);
+            value.boolean_value(scope)
+        };
+
+        for p in parents.iter() {
+            let implicit_events = self
                 .renderer
                 .as_ref()
                 .unwrap()
                 .borrow()
-                .get_parents(hovering_node_idx);
-            let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
-            let code = format!(
-                "__dispatchClickFromNodeIdx({}, [{}])",
-                hovering_node_idx,
-                parents_strs.join(", ")
-            );
-
-            let default_prevented = {
-                let value = self.execute_host_script("click handler", code)?;
-                let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
-
-                deno_core::scope!(scope, &mut *runtime);
-                let value = deno_core::v8::Local::new(scope, value);
-                value.boolean_value(scope)
-            };
-
-            for p in parents.iter() {
-                let implicit_events = self
-                    .renderer
-                    .as_ref()
-                    .unwrap()
-                    .borrow()
-                    .get_implicit_click_events(*p);
-                for (implicit, event) in implicit_events {
-                    let Some(code) = (match event {
-                        HtmlEvent::Change => Some(format!(
-                            r#"
-                                (() => {{
-                                    const event = new Event("change", {{ bubbles: true }})
-                                    __elementFromNodeIdx({}).dispatchEvent(event)
-                                    return event.defaultPrevented
-                                }})()
-                            "#,
-                            implicit.to_string()
-                        )),
-                        _ => None,
-                    }) else {
-                        continue;
-                    };
-                    self.execute_host_script("implicit event handler", code)?;
-                }
+                .get_implicit_click_events(*p);
+            for (implicit, event) in implicit_events {
+                let Some(code) = (match event {
+                    HtmlEvent::Change => Some(format!(
+                        r#"
+                            (() => {{
+                                const event = new Event("change", {{ bubbles: true }})
+                                __elementFromNodeIdx({}).dispatchEvent(event)
+                                return event.defaultPrevented
+                            }})()
+                        "#,
+                        implicit.to_string()
+                    )),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                self.execute_host_script("implicit event handler", code)?;
             }
+        }
 
-            {
-                let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-                let focusable = renderer.walk_node_upwards(hovering_node_idx, |node| {
-                    let Node::Element(element) = node else {
-                        return false;
-                    };
-                    FOCUSABLE_ELEMENTS.contains(&element.tag.as_str())
-                        && element
-                            .attributes
-                            .get_str("type")
-                            .is_none_or(|v| FOCUSABLE_INPUT_TYPES.contains(&v.as_ref()))
-                });
-                renderer.focusable = focusable;
-            }
+        {
+            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
+            let focusable = renderer.walk_node_upwards(node_idx, |node| {
+                let Node::Element(element) = node else {
+                    return false;
+                };
+                FOCUSABLE_ELEMENTS.contains(&element.tag.as_str())
+                    && element
+                        .attributes
+                        .get_str("type")
+                        .is_none_or(|v| FOCUSABLE_INPUT_TYPES.contains(&v.as_ref()))
+            });
+            renderer.focusable = focusable;
+        }
 
-            let submittable_input = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(
-                hovering_node_idx,
-                |node| {
+        let submittable_input =
+            self.renderer
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .walk_node_upwards(node_idx, |node| {
                     let Node::Element(element) = node else {
                         return false;
                     };
                     is_submit_button(element)
-                },
-            );
-            if let Some(submittable_input) = submittable_input {
-                let form = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(
-                    submittable_input,
-                    |node| {
-                        let Node::Element(element) = node else {
-                            return false;
-                        };
-                        element.tag == "form"
-                    },
-                );
-
-                if let Some(form) = form {
-                    let default_prevented = {
-                        let value = self.execute_host_script(
-                            "submit event handler",
-                            format!(
-                                r#"
-                        (() => {{
-                            const event = new Event("submit", {{
-                                bubbles: false,
-                            }})
-                            __elementFromNodeIdx({}).dispatchEvent(event)
-                            return event.defaultPrevented
-                        }})()
-                        "#,
-                                form
-                            ),
-                        )?;
-                        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
-
-                        deno_core::scope!(scope, &mut *runtime);
-                        let value = deno_core::v8::Local::new(scope, value);
-                        value.boolean_value(scope)
-                    };
-                    if !default_prevented {
-                        self.renderer
-                            .as_mut()
-                            .unwrap()
-                            .borrow_mut()
-                            .submit_form(form, Some(submittable_input))?;
-                    }
-                }
-            }
-
-            let parent_link = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(
-                hovering_node_idx,
+                });
+        if let Some(submittable_input) = submittable_input {
+            let form = self.renderer.as_ref().unwrap().borrow().walk_node_upwards(
+                submittable_input,
                 |node| {
                     let Node::Element(element) = node else {
                         return false;
                     };
-                    element.tag == "a"
+                    element.tag == "form"
                 },
             );
-            if let Some(parent) = parent_link {
-                let parent_href = {
-                    let renderer = self.renderer.as_ref().unwrap().borrow();
-                    match renderer.nodes.get(parent) {
-                        Some(Node::Element(element)) => {
-                            element.attributes.get_str("href").map(|v| v.into_owned())
-                        }
-                        _ => None,
-                    }
+
+            if let Some(form) = form {
+                let default_prevented = {
+                    let value = self.execute_host_script(
+                        "submit event handler",
+                        format!(
+                            r#"
+                    (() => {{
+                        const event = new Event("submit", {{
+                            bubbles: false,
+                        }})
+                        __elementFromNodeIdx({}).dispatchEvent(event)
+                        return event.defaultPrevented
+                    }})()
+                    "#,
+                            form
+                        ),
+                    )?;
+                    let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+
+                    deno_core::scope!(scope, &mut *runtime);
+                    let value = deno_core::v8::Local::new(scope, value);
+                    value.boolean_value(scope)
                 };
-                if let Some(href) = parent_href
-                    && !default_prevented
-                {
-                    let proxy = self
-                        .renderer
-                        .as_ref()
+                if !default_prevented {
+                    self.renderer
+                        .as_mut()
                         .unwrap()
-                        .borrow()
-                        .event_loop_proxy
-                        .as_ref()
-                        .cloned()
-                        .context("Renderer event loop proxy is not configured")?;
-                    proxy
-                        .fire_user_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), true)))?;
+                        .borrow_mut()
+                        .submit_form(form, Some(submittable_input))?;
                 }
             }
-        } else {
-            let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-            renderer.focusable = None;
+        }
+
+        let parent_link =
+            self.renderer
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .walk_node_upwards(node_idx, |node| {
+                    let Node::Element(element) = node else {
+                        return false;
+                    };
+                    element.tag == "a"
+                });
+        if let Some(parent) = parent_link {
+            let parent_href = {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                match renderer.nodes.get(parent) {
+                    Some(Node::Element(element)) => {
+                        element.attributes.get_str("href").map(|v| v.into_owned())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(href) = parent_href
+                && !default_prevented
+            {
+                let proxy = self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .event_loop_proxy
+                    .as_ref()
+                    .cloned()
+                    .context("Renderer event loop proxy is not configured")?;
+                proxy.fire_user_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), true)))?;
+            }
         }
 
         Ok(())
@@ -14413,7 +14456,14 @@ impl Frame {
             }
             FrameCommand::QuerySelector { selector, reply } => {
                 let result = self.query_selector(&selector).map(|(node_idx, node)| {
-                    (node, self.text_content(node_idx).unwrap())
+                    (
+                        ElementHandle {
+                            node_idx,
+                            document_generation: self.document_generation,
+                        },
+                        node,
+                        self.text_content(node_idx).unwrap(),
+                    )
                 });
                 let _ = reply.send(result);
             }
@@ -14421,9 +14471,21 @@ impl Frame {
                 let result = self
                     .query_selector_all(&selector)
                     .into_iter()
-                    .map(|(node_idx, node)| (node, self.text_content(node_idx).unwrap()))
+                    .map(|(node_idx, node)| {
+                        (
+                            ElementHandle {
+                                node_idx,
+                                document_generation: self.document_generation,
+                            },
+                            node,
+                            self.text_content(node_idx).unwrap(),
+                        )
+                    })
                     .collect();
                 let _ = reply.send(result);
+            }
+            FrameCommand::ClickElement { element, reply } => {
+                let _ = reply.send(self.click_element(element));
             }
             FrameCommand::TakeScreenshot { reply } => {
                 let _ = reply.send(self.render_to_pixmap());
