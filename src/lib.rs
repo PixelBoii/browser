@@ -31,7 +31,7 @@ use serde::Serialize;
 use shadow_dom::{op_attach_shadow, op_get_shadow_root};
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
-    StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility,
+    StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility, StyleWhiteSpace,
     get_base_style, parse_style,
 };
 use window_messaging::{
@@ -5481,6 +5481,7 @@ fn computed_style_properties(renderer: &mut Renderer, node_idx: usize) -> HashMa
         ("top".to_string(), style.top.to_string()),
         ("bottom".to_string(), style.bottom.to_string()),
         ("text-align".to_string(), style.text_align.to_string()),
+        ("white-space".to_string(), style.white_space.to_string()),
         ("font-size".to_string(), style.font_size.to_string()),
         (
             "line-height".to_string(),
@@ -9264,7 +9265,8 @@ impl Renderer {
                     StyleBackground::Hex(code) => Some(code),
                     _ => None,
                 }?;
-                let max_width = Some(available_size.width);
+                let max_width = (style.white_space == StyleWhiteSpace::Normal)
+                    .then_some(available_size.width);
                 let line_height = self.get_line_height(style, resolved_font_size);
                 let cache_key = (
                     text.clone(),
@@ -10856,6 +10858,7 @@ impl Renderer {
         let mut children_rows = MarginRows::new();
 
         let text_align = style.text_align;
+        let white_space = style.white_space;
         // By default block elements fill their available width, but if it's a child of a flex, it only uses what it needs
         let shrink_to_content_width = matches!(
             &style.width,
@@ -10934,7 +10937,8 @@ impl Renderer {
                     && next_child_display.is_none_or(|v| v.is_inline())
                 {
                     let child_width_with_margin = child_width as i32 + margin_right_size;
-                    if child_width_buffer > 0
+                    if white_space == StyleWhiteSpace::Normal
+                        && child_width_buffer > 0
                         && child_width_buffer + child_width_with_margin
                             > container_sizes.inner_width as i32
                     {

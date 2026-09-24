@@ -193,6 +193,12 @@ pub enum StyleAlign {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StyleWhiteSpace {
+    Normal,
+    NoWrap,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StyleBorderStyle {
     None,
@@ -411,6 +417,11 @@ impl_css_keyword!(
     StyleAlign::Right => "right",
 );
 impl_css_keyword!(
+    StyleWhiteSpace,
+    StyleWhiteSpace::Normal => "normal",
+    StyleWhiteSpace::NoWrap => "nowrap",
+);
+impl_css_keyword!(
     StyleBorderStyle,
     StyleBorderStyle::None => "none",
     StyleBorderStyle::Solid => "solid",
@@ -497,6 +508,7 @@ pub struct Style {
     pub top: StyleSize,
     pub bottom: StyleSize,
     pub text_align: StyleAlign,
+    pub white_space: StyleWhiteSpace,
     pub variables: Rc<StyleVariables>,
     pub font_size: StyleSize,
     pub line_height: StyleSize,
@@ -556,6 +568,7 @@ impl Style {
             top: self.top.clone(),
             bottom: self.bottom.clone(),
             text_align: self.text_align,
+            white_space: self.white_space,
             variables: Rc::new(StyleVariables::default()),
             font_size: self.font_size.clone(),
             line_height: self.line_height.clone(),
@@ -724,6 +737,9 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             | HtmlNode::DocumentFragment
             | HtmlNode::ShadowRoot { .. } => implied_text_align,
         },
+        white_space: parent_style
+            .map(|style| style.white_space)
+            .unwrap_or(StyleWhiteSpace::Normal),
         variables: Rc::new(StyleVariables::default()),
         font_size: parent_style
             .clone()
@@ -2151,6 +2167,14 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                 }
                 .with_context(|| "Failed to parse text-align")?,
             ),
+            "white-space" => PropertyValue::WhiteSpace(
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "normal" => Some(StyleWhiteSpace::Normal),
+                    "nowrap" => Some(StyleWhiteSpace::NoWrap),
+                    _ => None,
+                }
+                .with_context(|| "Failed to parse white-space")?,
+            ),
             "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
             "order" => PropertyValue::SignedInt(value.parse::<i32>()?),
             "flex-basis" => PropertyValue::Size(parse_style_size(value)?),
@@ -2434,6 +2458,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("text-align", PropertyValue::Align(value)) => {
             style.text_align = value;
+        }
+        ("white-space", PropertyValue::WhiteSpace(value)) => {
+            style.white_space = value;
         }
         ("flex-shrink", PropertyValue::Int(value)) => {
             style.flex_shrink = value;
