@@ -1385,6 +1385,11 @@ pub enum FrameDomCommand {
         required_parent: Option<usize>,
         reply: std::sync::mpsc::Sender<Result<Vec<(usize, Node)>, String>>,
     },
+    ElementFromPoint {
+        x: f64,
+        y: f64,
+        reply: std::sync::mpsc::Sender<Option<(usize, Node)>>,
+    },
     ReplaceInnerHtml {
         node_idx: usize,
         html: String,
@@ -5919,6 +5924,24 @@ fn op_get_elements_by_class_name(
 }
 
 #[op2]
+fn op_element_from_point(
+    state: &mut OpState,
+    x: f64,
+    y: f64,
+    #[number] frame_id: Option<usize>,
+) -> Result<Option<(usize, Node)>, JsErrorBox> {
+    let host = state.borrow::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    if let Some(frame_id) = frame_id {
+        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
+            FrameCommand::Dom(FrameDomCommand::ElementFromPoint { x, y, reply })
+        })
+    } else {
+        Ok(renderer.element_from_point(x, y))
+    }
+}
+
+#[op2]
 fn op_query_selector(
     state: &mut OpState,
     #[string] selector: String,
@@ -6969,6 +6992,7 @@ extension!(
     op_get_elements_by_class_name,
     op_query_selector,
     op_query_selector_all,
+    op_element_from_point,
     op_set_inner_html,
     op_set_text_content,
     op_media_query_matches,
@@ -11838,8 +11862,35 @@ impl Renderer {
     }
 
     fn compute_hovering(&mut self, position: Position) {
-        let hovering = self
-            .rendered_nodes_ordered
+        self.hovering = self.hit_test(position.x as f64, position.y as f64);
+    }
+
+    fn element_from_point(&mut self, x: f64, y: f64) -> Option<(usize, Node)> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x >= self.window_size.width as f64
+            || y >= self.window_size.height as f64
+        {
+            return None;
+        }
+        self.ensure_layout();
+        // A layout rebuild clears the paint-order data used for hit testing.
+        // TODO: Handle this by filling in rendered_nodes_ordered properly
+        if self.rendered_nodes_ordered.is_empty() {
+            return None;
+        }
+        let Some(layout_idx) = self.hit_test(x, y) else {
+            return self.document_element();
+        };
+        let node_idx = self.layout_to_node_idx(&layout_idx);
+        let element_idx = self.walk_node_upwards(node_idx, |node| matches!(node, Node::Element(_)))?;
+        Some((element_idx, self.nodes.get(element_idx)?.clone()))
+    }
+
+    fn hit_test(&self, x: f64, y: f64) -> Option<usize> {
+        self.rendered_nodes_ordered
             .iter()
             .rev()
             .find(|renderer_node| {
@@ -11865,12 +11916,12 @@ impl Renderer {
                     (layout_box.rect.y + renderer_node.offset_y + layout_box.rect.height as i32)
                         .min(renderer_node.clip.end_y);
 
-                position.x > start_x
-                    && position.x < end_x
-                    && position.y > start_y
-                    && position.y < end_y
-            });
-        self.hovering = hovering.and_then(|v| Some(v.layout_box_idx));
+                x >= start_x as f64
+                    && x < end_x as f64
+                    && y >= start_y as f64
+                    && y < end_y as f64
+            })
+            .map(|node| node.layout_box_idx)
     }
 
     fn paint_borders(
@@ -13249,6 +13300,10 @@ impl Frame {
                     renderer.query_selector_all_nodes(selector, required_parent)
                 ));
             }
+            FrameCommand::Dom(FrameDomCommand::ElementFromPoint { x, y, reply }) => {
+                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
+                let _ = reply.send(renderer.element_from_point(x, y));
+            }
             FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
                 html,
                 node_idx,
@@ -13897,7 +13952,7 @@ impl Frame {
                 }
                 return Ok(());
             }
-            self.dispatch_click(hovering_node_idx)?;
+            self.dispatch_click(hovering_node_idx, self.last_hover_position)?;
         } else {
             let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
             renderer.focusable = None;
@@ -13925,10 +13980,22 @@ impl Frame {
 
     fn click_element(&mut self, element: ElementHandle) -> Result<()> {
         let node_idx = self.resolve_element(element)?;
-        self.dispatch_click(node_idx)
+        self.dispatch_click(node_idx, None)
     }
 
-    fn dispatch_click(&mut self, node_idx: usize) -> Result<()> {
+    fn dispatch_click(&mut self, node_idx: usize, position: Option<Position>) -> Result<()> {
+        let position = position.unwrap_or_else(|| {
+            let rect = self
+                .renderer
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .measure_element(node_idx);
+            Position {
+                x: rect.x + (rect.width / 2) as i32,
+                y: rect.y + (rect.height / 2) as i32,
+            }
+        });
         let parents = self
             .renderer
             .as_ref()
@@ -13937,9 +14004,11 @@ impl Frame {
             .get_parents(node_idx);
         let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
         let code = format!(
-            "__dispatchClickFromNodeIdx({}, [{}])",
+            "__dispatchClickFromNodeIdx({}, [{}], {}, {})",
             node_idx,
-            parents_strs.join(", ")
+            parents_strs.join(", "),
+            position.x,
+            position.y
         );
 
         let default_prevented = {

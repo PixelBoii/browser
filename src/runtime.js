@@ -1603,6 +1603,10 @@ class WindowProxy {
         this.__frame_id = frameId
     }
 
+    get Promise() {
+        return Promise
+    }
+
     postMessage(message, targetOrigin, transfer) {
         const options = windowMessageOptions(targetOrigin, transfer)
         core.ops.op_post_message_to_frame(serializeWorkerMessage(message, options), this.__frame_id, options.targetOrigin)
@@ -2622,6 +2626,10 @@ class Document extends EventTarget {
         const nodes = core.ops.op_get_elements_by_class_name(String(classNames), null, this.__frameId)
         return withDocument(this, () => nodes.map(nodeToElement))
     }
+    elementFromPoint(x, y) {
+        const node = core.ops.op_element_from_point(Number(x), Number(y), this.__frameId)
+        return withDocument(this, () => node ? nodeToElement(node) : null)
+    }
     querySelector(selector) {
         const node = core.ops.op_query_selector(selector, null, this.__frameId)
         return withDocument(this, () => node ? nodeToElement(node) : null)
@@ -3167,7 +3175,7 @@ Object.defineProperty(globalThis, "navigator", {
     writable: true,
 })
 
-function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
+function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0) {
     const path = pathNodeIdxs
         .map(idx => __elementFromNodeIdx(idx))
         .filter(Boolean)
@@ -3179,6 +3187,9 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs) {
             bubbles: true,
             cancelable: true,
             composed: true,
+            view: globalThis,
+            clientX,
+            clientY,
             detail: eventType === "click" ? 1 : 0,
             button: 0,
             buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
@@ -3711,7 +3722,8 @@ function __dispatchWorkerMessage(workerId) {
         return
     }
     const event = deserializeWorkerMessage(core.ops.op_take_worker_message())
-    worker.dispatchEvent(event)
+    denoEvent.setIsTrusted(event, true)
+    denoEvent.dispatch(worker, event)
 }
 
 Object.defineProperty(globalThis, "__dispatchWorkerMessage", {

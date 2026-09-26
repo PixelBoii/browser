@@ -41,6 +41,8 @@ core.wrapConsole(globalThis.console, core.console)
 
 location.setLocationHref(core.ops.op_worker_get_location_href())
 Object.defineProperties(globalThis, {
+    URL: { value: url.URL, configurable: true, writable: true },
+    URLSearchParams: { value: url.URLSearchParams, configurable: true, writable: true },
     location: location.workerLocationDescriptor,
     WorkerLocation: location.workerLocationConstructorDescriptor,
 })
@@ -584,7 +586,8 @@ async function startWorkerMessageLoop() {
             break
         }
         const event = deserializeWorkerMessage(serializedMessage)
-        globalThis.dispatchEvent(event)
+        denoEvent.setIsTrusted(event, true)
+        denoEvent.dispatch(globalThis, event)
     }
 }
 
