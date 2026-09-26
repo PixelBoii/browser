@@ -6694,6 +6694,68 @@ fn op_canvas_path_clip(
 }
 
 #[op2(fast)]
+fn op_canvas_get_image_data(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    sx: i32,
+    sy: i32,
+    sw: i32,
+    sh: i32,
+    #[arraybuffer] output: &mut [u8],
+) -> Result<(), JsErrorBox> {
+    let width = sw.unsigned_abs() as usize;
+    let height = sh.unsigned_abs() as usize;
+    let byte_length = width
+        .checked_mul(height)
+        .and_then(|size| size.checked_mul(4));
+    if byte_length != Some(output.len()) {
+        return Err(JsErrorBox::range_error("Invalid image data buffer length"));
+    }
+
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let dimensions = renderer.nodes.get(node_idx).map(get_canvas_wh);
+    let Some((Some(canvas_width), Some(canvas_height))) = dimensions else {
+        return Err(JsErrorBox::type_error("Missing canvas"));
+    };
+    let Some(canvas) = renderer.canvas_buffers.get_mut(&node_idx) else {
+        // The caller supplies a new, zero-initialized ImageData buffer.
+        return Ok(());
+    };
+    canvas.resize_if_needed(canvas_width, canvas_height);
+    renderer.resolve_pending_canvas_images(Some(node_idx));
+    let canvas = renderer.canvas_buffers.get_mut(&node_idx).unwrap();
+    canvas.update_if_needed();
+
+    // Widen before normalizing: a negative extent can move the origin below i32::MIN.
+    let left = i64::from(sx) + i64::from(sw.min(0));
+    let top = i64::from(sy) + i64::from(sh.min(0));
+    let right = (left + width as i64).min(i64::from(canvas.width));
+    let bottom = (top + height as i64).min(i64::from(canvas.height));
+    for y in top.max(0)..bottom {
+        for x in left.max(0)..right {
+            let pixel = canvas.buffer[y as usize * canvas.width as usize + x as usize];
+            let [r, g, b, a] = pixel.to_be_bytes();
+            let unpremultiply = |channel: u8| {
+                if a == 0 {
+                    0
+                } else {
+                    ((u32::from(channel) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
+                }
+            };
+            let offset = ((y - top) as usize * width + (x - left) as usize) * 4;
+            output[offset..offset + 4].copy_from_slice(&[
+                unpremultiply(r),
+                unpremultiply(g),
+                unpremultiply(b),
+                a,
+            ]);
+        }
+    }
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_canvas_paint(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
     let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
@@ -7009,6 +7071,7 @@ extension!(
     op_canvas_path_fill,
     op_canvas_path_clip,
     op_canvas_paint,
+    op_canvas_get_image_data,
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
@@ -8367,11 +8430,13 @@ impl Renderer {
         Ok(())
     }
 
-    fn resolve_pending_canvas_images(&mut self) {
+    fn resolve_pending_canvas_images(&mut self, target: Option<usize>) {
         let dirty_canvas_idxs = self
             .canvas_buffers
             .iter()
-            .filter_map(|(idx, canvas)| canvas.dirty.then_some(*idx))
+            .filter_map(|(idx, canvas)| {
+                (canvas.dirty && target.is_none_or(|target| target == *idx)).then_some(*idx)
+            })
             .collect::<Vec<_>>();
 
         for canvas_idx in dirty_canvas_idxs {
@@ -8579,7 +8644,7 @@ impl Renderer {
         let propagated_background_node = canvas_background.map(|(node_idx, _)| node_idx);
         clear_buffer(buffer, canvas_color);
 
-        self.resolve_pending_canvas_images();
+        self.resolve_pending_canvas_images(None);
         let mut new_rendered_nodes_ordered = vec![];
         let mut deferred_z_index = vec![];
         let viewport_clip = PaintClip::viewport(width, height);

@@ -1278,6 +1278,12 @@ const CANVAS_COMMAND_RESTORE = "restore"
 const CANVAS_COMMAND_CLEAR_RECT = "clearRect"
 const CANVAS_COMMAND_BEGIN_PATH = "beginPath"
 
+Object.defineProperty(globalThis, "ImageData", {
+    value: imageData.ImageData,
+    configurable: true,
+    writable: true,
+})
+
 class CanvasGradient {
     constructor() {
         this.colorStops = []
@@ -1294,6 +1300,33 @@ class CanvasRenderingContext2D {
         this.lineWidth = 1
         this.fillStyle = "#000000"
         this.strokeStyle = "#000000"
+    }
+
+    getImageData(sx, sy, sw, sh, settings = {}) {
+        const prefix = "Failed to execute 'getImageData' on 'CanvasRenderingContext2D'"
+        webidl.requiredArguments(arguments.length, 4, prefix)
+        const options = { enforceRange: true }
+        sx = webidl.converters.long(sx, prefix, "Argument 1", options)
+        sy = webidl.converters.long(sy, prefix, "Argument 2", options)
+        sw = webidl.converters.long(sw, prefix, "Argument 3", options)
+        sh = webidl.converters.long(sh, prefix, "Argument 4", options)
+        if (sw === 0 || sh === 0) {
+            throw new DOMException.DOMException("Image dimensions must be nonzero", "IndexSizeError")
+        }
+
+        const width = Math.abs(sw)
+        const height = Math.abs(sh)
+        const byteLength = width * height * 4
+        if (!Number.isSafeInteger(byteLength) || byteLength > 0x7fffffff) {
+            throw new RangeError("Requested image data is too large")
+        }
+        const data = new Uint8ClampedArray(byteLength)
+        const result = new imageData.ImageData(data, width, height, settings)
+        if (result.colorSpace !== "srgb" || result.pixelFormat !== "rgba-unorm8") {
+            throw new DOMException.DOMException("Only 8-bit sRGB image data is supported", "NotSupportedError")
+        }
+        core.ops.op_canvas_get_image_data(this.canvas.__node_idx, sx, sy, sw, sh, data.buffer)
+        return result
     }
 
     fillRect(x, y, width, height) {
