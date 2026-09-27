@@ -283,6 +283,8 @@ pub struct CssParser {
     stage: CssBuildPhase,
     label: String,
     pub nodes: Vec<Node>,
+    // End byte offsets of complete top-level rules in the original UTF-8 source.
+    pub rule_ends: Vec<usize>,
     node: Option<usize>,
     in_url: bool,
     pub class_definitions: ClassIndexes,
@@ -648,6 +650,7 @@ impl CssParser {
             stage: CssBuildPhase::Start,
             label: String::new(),
             nodes: vec![],
+            rule_ends: vec![],
             node: None,
             in_url: false,
             class_definitions: ClassIndexes::new(),
@@ -659,6 +662,7 @@ impl CssParser {
             stage: CssBuildPhase::Specifier,
             label: String::new(),
             nodes: vec![],
+            rule_ends: vec![],
             node: None,
             in_url: false,
             class_definitions: ClassIndexes::new(),
@@ -786,6 +790,7 @@ impl CssParser {
 
     pub fn drain_result(&mut self) -> Vec<Node> {
         let nodes = self.nodes.drain(..).collect();
+        self.rule_ends.clear();
         self.node = None;
         self.in_url = false;
         self.label.clear();
@@ -798,8 +803,8 @@ impl CssParser {
                 "CssParser.parse called with stale results in parser!"
             ));
         }
-        let chars = input.trim().chars();
-        for char in chars {
+        let leading_bytes = input.len() - input.trim_start().len();
+        for (offset, char) in input.trim().char_indices() {
             match char {
                 '@' => match self.stage {
                     CssBuildPhase::Specifier if self.in_url => {
@@ -846,6 +851,7 @@ impl CssParser {
                     };
                 }
                 '}' => {
+                    let previous_node = self.node;
                     match self.stage {
                         CssBuildPhase::Specifier => {
                             self.create_specifier_from_state();
@@ -858,6 +864,9 @@ impl CssParser {
                         }
                         _ => {}
                     };
+                    if previous_node.is_some() && self.node.is_none() {
+                        self.rule_ends.push(leading_bytes + offset + 1);
+                    }
                 }
                 // TODO: Handle hover and other states here
                 ':' => {
@@ -874,7 +883,7 @@ impl CssParser {
                 ';' => {
                     match self.stage {
                         CssBuildPhase::Specifier if !self.in_url => {
-                            self.create_property_from_state();
+                            self.create_specifier_from_state();
                         }
                         CssBuildPhase::MediaQuery => {
                             self.label.push(char);

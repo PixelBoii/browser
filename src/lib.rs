@@ -6217,6 +6217,57 @@ fn op_get_stylesheet(
     Ok(Some(StyleSheetData { href, selectors }))
 }
 
+#[op2(nofast, reentrant)]
+fn op_insert_css_rule(
+    scope: &mut v8::PinScope,
+    #[number] node_idx: usize,
+    #[string] rule: String,
+    index: u32,
+) -> Result<u32, JsErrorBox> {
+    {
+        let state = JsRuntime::op_state_from(scope);
+        let state = state.borrow();
+        let host = state.borrow::<JsHostState>();
+        let mut renderer = host.renderer.borrow_mut();
+        if !matches!(renderer.nodes.get(node_idx), Some(Node::Element(element)) if element.tag == "style")
+        {
+            return Err(JsErrorBox::new(
+                "DOMExceptionNotSupportedError",
+                "Only inline stylesheets can be edited",
+            ));
+        }
+        let mut text = renderer.get_text_content(node_idx);
+        let syntax_error =
+            |err: anyhow::Error| JsErrorBox::new("DOMExceptionSyntaxError", err.to_string());
+        let offset = if index == 0 {
+            0
+        } else {
+            let mut parser = CssParser::new();
+            parser.parse(&text).map_err(syntax_error)?;
+            *parser.rule_ends.get(index as usize - 1).ok_or_else(|| {
+                JsErrorBox::new(
+                    "DOMExceptionIndexSizeError",
+                    "Rule index exceeds stylesheet length",
+                )
+            })?
+        };
+        let mut parser = CssParser::new();
+        parser.parse(&rule).map_err(syntax_error)?;
+        if parser.rule_ends.len() != 1 {
+            return Err(JsErrorBox::new(
+                "DOMExceptionSyntaxError",
+                "Expected a single complete CSS rule",
+            ));
+        }
+        text.insert_str(offset, &format!("\n{rule}\n"));
+        // Updating DOM text also schedules a restyle under the new source-text cache key.
+        renderer.set_text_content(node_idx, text);
+    }
+    custom_elements::deliver_reactions(scope);
+    mutation_observer::schedule(scope);
+    Ok(index)
+}
+
 #[op2(fast)]
 fn op_media_query_matches(state: &mut OpState, #[string] query: String) -> Result<bool, JsError> {
     let host = state.borrow_mut::<JsHostState>();
@@ -7136,6 +7187,7 @@ extension!(
     op_media_query_matches,
     op_get_stylesheet,
     op_get_stylesheet_nodes,
+    op_insert_css_rule,
     op_update_attributes,
     op_remove_attribute,
     op_get_inner_html,

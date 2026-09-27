@@ -469,7 +469,7 @@ Object.defineProperty(globalThis, "Range", {
 
 const customElementRegistryToken = Symbol()
 
-for (const name of ["SyntaxError", "NotSupportedError", "InvalidStateError"]) {
+for (const name of ["SyntaxError", "NotSupportedError", "InvalidStateError", "IndexSizeError"]) {
     core.registerErrorBuilder(`DOMException${name}`, message => new DOMException.DOMException(message, name))
 }
 
@@ -2114,8 +2114,8 @@ Object.defineProperty(globalThis, "ResizeObserver", {
 
 const styleSheets = new WeakMap()
 
-// Read-only CSSOM subset. Rule declarations, nested rules and stylesheet editing
-// are not exposed yet; selectors come from the same parser used for rendering.
+// Basic CSSOM subset. Rule declarations and nested rules are not exposed yet;
+// selectors come from the same parser used for rendering.
 class CSSRule {
     constructor(parentStyleSheet) {
         this.parentStyleSheet = parentStyleSheet
@@ -2157,6 +2157,14 @@ class CSSStyleSheet {
     }
 
     get rules() { return this.cssRules }
+
+    insertRule(rule, index = 0) {
+        const prefix = "Failed to execute 'insertRule' on 'CSSStyleSheet'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        rule = webidl.converters.DOMString(rule, prefix, "Argument 1")
+        index = webidl.converters["unsigned long"](index, prefix, "Argument 2")
+        return core.ops.op_insert_css_rule(this.ownerNode.__node_idx, rule, index)
+    }
 }
 
 for (const type of [CSSRule, CSSStyleRule, CSSStyleSheet]) {
