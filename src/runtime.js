@@ -1530,6 +1530,10 @@ class CanvasRenderingContext2D {
         })
     }
 
+    scale(x, y) {
+        this.transform(x, 0, 0, y, 0, 0)
+    }
+
     resetTransform() {
         core.ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_RESET_TRANSFORM,
