@@ -743,17 +743,21 @@ impl CanvasBuffer {
                 } => {
                     self.clear_rect(x, y, width, height);
                 }
-                CanvasPathCommand::DrawImage {
-                    image_node_idx,
-                    image_width,
-                    image_height,
-                    x,
-                    y,
-                } => {
-                    if let Some(image) =
-                        self.images
-                            .get(&(image_node_idx, image_width, image_height))
-                    {
+                CanvasPathCommand::DrawImage { x, y, .. }
+                | CanvasPathCommand::FillText { x, y, .. } => {
+                    let image = match &cmd {
+                        CanvasPathCommand::DrawImage {
+                            image_node_idx,
+                            image_width,
+                            image_height,
+                            ..
+                        } => self
+                            .images
+                            .get(&(*image_node_idx, *image_width, *image_height)),
+                        CanvasPathCommand::FillText { image, .. } => Some(image),
+                        _ => unreachable!(),
+                    };
+                    if let Some(image) = image {
                         let image_width = image.width() as usize;
                         let image_height = image.height() as usize;
                         let canvas_width = self.width as usize;
@@ -6495,6 +6499,12 @@ enum CanvasPathCommand {
         x: i32,
         y: i32,
     },
+    #[serde(skip)]
+    FillText {
+        image: Pixmap,
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -6691,6 +6701,50 @@ fn op_canvas_path_clip(
     }
 
     Ok(())
+}
+
+#[op2(fast)]
+fn op_canvas_fill_text(
+    state: &mut OpState,
+    #[number] node_idx: usize,
+    #[string] text: String,
+    x: f64,
+    y: f64,
+    font_size: f64,
+    #[string] fill_style: String,
+) -> Result<bool, JsErrorBox> {
+    if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
+        return Ok(false);
+    }
+    let color =
+        match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
+            StyleBackground::Hex(color) => color,
+            StyleBackground::Transparent => 0,
+            _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
+        };
+    let host = state.borrow_mut::<JsHostState>();
+    let mut renderer = host.renderer.borrow_mut();
+    let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
+        return Ok(false);
+    };
+    let font = &renderer.font_handler.font;
+    let font_px = font_size as u32;
+    let baseline = font.as_scaled(font_px as f32).ascent();
+    let Some((image, _, _)) = text_to_buffer(&renderer.font_handler, color, &text, font_px, None)
+    else {
+        return Ok(false);
+    };
+    let canvas = renderer
+        .canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(width, height));
+    canvas.resize_if_needed(width, height);
+    canvas.commands.push(CanvasPathCommand::FillText {
+        image,
+        x: x.round() as i32,
+        y: (y - f64::from(baseline)).round() as i32,
+    });
+    Ok(true)
 }
 
 #[op2(fast)]
@@ -7072,6 +7126,7 @@ extension!(
     op_canvas_path_clip,
     op_canvas_paint,
     op_canvas_get_image_data,
+    op_canvas_fill_text,
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
