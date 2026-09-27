@@ -6704,6 +6704,28 @@ fn op_canvas_path_clip(
 }
 
 #[op2(fast)]
+fn op_canvas_measure_text(state: &mut OpState, #[string] text: String, font_size: f64) -> f64 {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return 0.0;
+    }
+    let host = state.borrow::<JsHostState>();
+    let renderer = host.renderer.borrow();
+    let font_px = font_size as u32;
+    let font = renderer.font_handler.font.as_scaled(font_px as f32);
+    let mut width = 0.0;
+    let mut previous = None;
+    for ch in text.chars() {
+        let glyph_id = font.glyph_id(ch);
+        if let Some(previous_id) = previous {
+            width += font.kern(previous_id, glyph_id);
+        }
+        width += font.h_advance(glyph_id);
+        previous = Some(glyph_id);
+    }
+    f64::from(width)
+}
+
+#[op2(fast)]
 fn op_canvas_fill_text(
     state: &mut OpState,
     #[number] node_idx: usize,
@@ -7127,6 +7149,7 @@ extension!(
     op_canvas_paint,
     op_canvas_get_image_data,
     op_canvas_fill_text,
+    op_canvas_measure_text,
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,

@@ -1303,6 +1303,14 @@ class CanvasRenderingContext2D {
         this.font = "10px sans-serif"
     }
 
+    measureText(text) {
+        const prefix = "Failed to execute 'measureText' on 'CanvasRenderingContext2D'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
+        const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
+        return { width: core.ops.op_canvas_measure_text(text, fontSize) }
+    }
+
     fillText(text, x, y) {
         const prefix = "Failed to execute 'fillText' on 'CanvasRenderingContext2D'"
         webidl.requiredArguments(arguments.length, 3, prefix)
