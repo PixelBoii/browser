@@ -1,5 +1,6 @@
 mod css;
 mod custom_elements;
+mod frame_context;
 mod loader;
 mod mutation_observer;
 mod parser;
