@@ -48,7 +48,7 @@ use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::ops::Mul;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
@@ -73,6 +73,7 @@ use crate::css::{
     MediaQuery, Node as CssNode, PropertyValue, PseudoClass, parse_media_query_parts,
     selector_to_parts,
 };
+use crate::frame_context::{create_frame_context, spawn_frame};
 use crate::loader::HttpModuleLoader;
 use crate::style::{
     CalcExpression, CssCascadeMetadata, GridColumnSize, GridTemplateColumns,
@@ -121,6 +122,32 @@ fn run_v8_source<'s>(
     }
 
     Ok(())
+}
+
+fn execute_context_script(
+    scope: &mut v8::PinScope,
+    context: &v8::Global<v8::Context>,
+    code: &str,
+) -> Result<v8::Global<v8::Value>> {
+    let context = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(let scope, scope);
+
+    let source = v8::String::new(scope, code).context("Failed to allocate JS source")?;
+    let value = v8::Script::compile(scope, source, None).and_then(|script| script.run(scope));
+
+    match value {
+        Some(value) => Ok(v8::Global::new(scope, value)),
+        None => {
+            let error = scope
+                .exception()
+                .map(|exception| {
+                    deno_core::exception_to_err(scope, exception, false, false).to_string()
+                })
+                .unwrap_or_else(|| "Script execution failed".into());
+            Err(anyhow!(error))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1508,6 +1535,8 @@ struct FrameHandle {
     surface: Arc<Mutex<FrameSurface>>,
     requested_size: PhysicalSize<u32>,
     tx: std::sync::mpsc::Sender<FrameCommand>,
+    frame: Option<Rc<RefCell<Frame>>>,
+    rx: Option<Receiver<FrameCommand>>,
 }
 
 impl Drop for FrameHandle {
@@ -5332,22 +5361,33 @@ fn op_get_attribute<'s>(
     Ok(value)
 }
 
-#[op2]
+#[op2(reentrant)]
 #[string]
 fn op_spawn_frame(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] url: Option<String>,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if renderer.frames.contains_key(&node_idx) {
-        return Ok(());
-    }
-    let handle = renderer
-        .spawn_frame(url, PhysicalSize::new(300, 150), node_idx)
+    let state = JsRuntime::op_state_from(scope);
+    let init = {
+        let host = state.borrow();
+        let host = host.borrow::<JsHostState>();
+        let renderer = host.renderer.borrow();
+        if renderer.frames.contains_key(&node_idx) {
+            return Ok(());
+        }
+        renderer.prepare_frame_creation(url, node_idx).map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?
+    };
+    let parent_context = scope.get_current_context();
+    let parent_context = v8::Global::new(scope, parent_context);
+    let handle = spawn_frame(scope, &parent_context, init)
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
-    renderer.frames.insert(node_idx, handle);
+    {
+        let mut host = state.borrow_mut();
+        let host = host.borrow_mut::<JsHostState>();
+        let mut renderer = host.renderer.borrow_mut();
+        renderer.frames.insert(node_idx, handle);
+    }
     Ok(())
 }
 
@@ -7699,6 +7739,15 @@ enum LoadPhase {
     IframeDone,
 }
 
+pub struct PreparedFrame {
+    url: url::Url,
+    window_name: String,
+    parent_proxy: RendererProxy,
+    origin: url::Origin,
+    size: PhysicalSize<u32>,
+    node_idx: usize,
+}
+
 impl Renderer {
     fn new(
         url: String,
@@ -8487,6 +8536,32 @@ impl Renderer {
         });
 
         scripts
+    }
+
+    pub fn prepare_frame_creation(&self, url: Option<String>, node_idx: usize) -> Result<PreparedFrame> {
+        let frame_url = match url.as_deref().filter(|url| !url.is_empty()) {
+            Some(url) => ReqwestUrl::parse(&self.url)?.join(url)?,
+            None => ReqwestUrl::parse("about:blank")?,
+        };
+        let window_name = self
+            .nodes
+            .get(node_idx)
+            .and_then(|node| match node {
+                Node::Element(element) => element.attributes.get_str("name"),
+                _ => None,
+            })
+            .map(Cow::into_owned)
+            .unwrap_or_default();
+        let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
+        let origin = self.origin.clone();
+        Ok(PreparedFrame {
+            url: frame_url,
+            window_name,
+            parent_proxy,
+            origin,
+            size: PhysicalSize::new(300, 150),
+            node_idx,
+        })
     }
 
     pub fn walk_node_upwards(&self, idx: usize, callback: impl Fn(&Node) -> bool) -> Option<usize> {
@@ -9949,107 +10024,6 @@ impl Renderer {
                 }
             }
         }
-    }
-
-    fn spawn_frame(
-        &mut self,
-        url: Option<String>,
-        size: PhysicalSize<u32>,
-        node_idx: usize,
-    ) -> Result<FrameHandle> {
-        let frame_url = match url.as_deref().filter(|url| !url.is_empty()) {
-            Some(url) => ReqwestUrl::parse(&self.url)?.join(url)?,
-            None => ReqwestUrl::parse("about:blank")?,
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let latest_bitmap = Arc::new(Mutex::new(FrameSurface {
-            size,
-            pixels: vec![0; (size.width * size.height) as usize],
-        }));
-        let bitmap_for_thread = Arc::clone(&latest_bitmap);
-        let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
-        let window_name = self
-            .nodes
-            .get(node_idx)
-            .and_then(|node| match node {
-                Node::Element(element) => element.attributes.get_str("name"),
-                _ => None,
-            })
-            .map(Cow::into_owned)
-            .unwrap_or_default();
-        tx.send(FrameCommand::Render).unwrap();
-        let tx_proxy = RendererProxy::FrameLoop(tx.clone());
-        let parent_window = ParentWindow {
-            proxy: parent_proxy.clone(),
-            node_idx,
-            origin: self.origin.clone(),
-        };
-        std::thread::spawn(move || {
-            let mut frame = Frame::new(frame_url.to_string(), false, size);
-            frame.parent_window = Some(parent_window);
-            frame.window_name = window_name;
-
-            let frame_result = frame.open();
-            match frame_result {
-                Ok(params) => {
-                    let _ = frame
-                        .set_up_without_event_loop(params, tx_proxy)
-                        .inspect_err(|err| eprintln!("Failed to start iframe renderer: {:?}", err));
-                }
-                Err(err) => {
-                    eprintln!("Failed to boot iframe frame: {:?}", err);
-                    return;
-                }
-            }
-
-            let start = Instant::now();
-            let js_result = frame.run_js();
-            println!(
-                "Finished running JS code in {}ms: {:?}",
-                Instant::now().duration_since(start).as_millis(),
-                js_result
-            );
-            let _ = parent_proxy.fire_user_event(UserEvent::FrameLoaded(node_idx));
-
-            let mut js_pending = true;
-            loop {
-                let cmd = if let Some(timeout) = frame.command_wait_timeout(js_pending) {
-                    match rx.recv_timeout(timeout) {
-                        Ok(cmd) => Some(cmd),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                } else {
-                    match rx.recv() {
-                        Ok(cmd) => Some(cmd),
-                        Err(_) => break,
-                    }
-                };
-                let had_command = cmd.is_some();
-                for cmd in collect_frame_commands(cmd, &rx) {
-                    if matches!(cmd, FrameCommand::Close) {
-                        return;
-                    }
-                    frame.handle_frame_command(cmd, &parent_proxy, &bitmap_for_thread);
-                }
-                if had_command || js_pending {
-                    js_pending = frame
-                        .pump_js_event_loop_once()
-                        .inspect_err(|err| {
-                            eprintln!("Error occurred while pumping JS loop: {}", err)
-                        })
-                        .unwrap_or(false);
-                }
-                let _ = frame.run_animation_frame_if_due().inspect_err(|err| {
-                    eprintln!("Error occurred while running animation frame: {}", err)
-                });
-            }
-        });
-        Ok(FrameHandle {
-            surface: latest_bitmap,
-            requested_size: size,
-            tx,
-        })
     }
 
     fn resolve_background_data_url(
@@ -13056,13 +13030,23 @@ impl ExecutedScripts {
     }
 }
 
+pub struct FrameJsShared {
+    context: v8::Global<v8::Context>,
+    owner_runtime: Weak<RefCell<JsRuntime>>,
+}
+
+pub enum FrameJs {
+    Owned(Rc<RefCell<JsRuntime>>),
+    Shared(FrameJsShared),
+}
+
 /// A document frame. [`Frame::open_headless`] initializes one on the calling thread.
 pub struct Frame {
     url: String,
     document_generation: u64,
     renderer: Option<Rc<RefCell<Renderer>>>,
     window: Option<Arc<Window>>,
-    js_runtime: Option<Rc<RefCell<JsRuntime>>>,
+    js_runtime: Option<FrameJs>,
     tokio: Option<Rc<RefCell<tokio::runtime::Runtime>>>,
     html_parser: Option<HtmlParser>,
     font_handler: Rc<FontHandler>,
@@ -13228,11 +13212,40 @@ impl Frame {
         }
     }
 
+    fn install_js_context(
+        &mut self,
+        scope: &mut v8::PinScope,
+        parent_context: &v8::Global<v8::Context>,
+        proxy: RendererProxy,
+    ) -> Result<()> {
+        let state = JsRuntime::op_state_from(scope);
+        let owner_runtime = state
+            .borrow()
+            .try_borrow::<Weak<RefCell<JsRuntime>>>()
+            .cloned()
+            .context("Owner JS runtime is not registered")?;
+        let host = JsHostState {
+            renderer: self.renderer.as_ref().cloned().unwrap(),
+            proxy,
+            executed_scripts: self.executed_scripts.clone(),
+            parent_window: self.parent_window.clone(),
+        };
+        let handle = create_frame_context(scope, parent_context, host, |_scope| {
+            // TODO: Install this frame's browser globals and DOM bindings.
+            Ok(())
+        })?;
+        self.js_runtime = Some(FrameJs::Shared(FrameJsShared {
+            context: handle,
+            owner_runtime,
+        }));
+        Ok(())
+    }
+
     fn install_js_host(&mut self) {
         let buffer_store = deno_core::SharedArrayBufferStore::default();
         let broadcast_channel = InMemoryBroadcastChannel::default();
         let client = self.network_fetch.borrow().client.clone();
-        self.js_runtime = Some(Rc::new(RefCell::new(deno_core::JsRuntime::new(
+        let runtime = deno_core::JsRuntime::new(
             deno_core::RuntimeOptions {
                 shared_array_buffer_store: Some(buffer_store.clone()),
                 module_loader: Some(Rc::new(HttpModuleLoader::new(client))),
@@ -13247,14 +13260,12 @@ impl Frame {
                 ],
                 ..Default::default()
             },
-        ))));
-        self.js_runtime
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .op_state()
-            .borrow_mut()
-            .put(buffer_store);
+        );
+        let state = runtime.op_state();
+        state.borrow_mut().put(buffer_store);
+        let runtime = Rc::new(RefCell::new(runtime));
+        state.borrow_mut().put(Rc::downgrade(&runtime));
+        self.js_runtime = Some(FrameJs::Owned(runtime));
     }
 
     fn drain_microtasks(runtime: &mut JsRuntime) {
@@ -13282,11 +13293,29 @@ impl Frame {
         let tokio = tokio.borrow();
         let _guard = tokio.enter();
 
-        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
-        Self::drain_microtasks(&mut runtime);
-        let value = runtime.execute_script(name, code)?;
-        Self::drain_microtasks(&mut runtime);
-        Ok(value)
+        match self.js_runtime.as_ref().unwrap() {
+            FrameJs::Owned(runtime) => {
+                let mut runtime = runtime.borrow_mut();
+                Self::drain_microtasks(&mut runtime);
+                let value = runtime.execute_script(name, code)?;
+                Self::drain_microtasks(&mut runtime);
+                Ok(value)
+            }
+            FrameJs::Shared(shared) => {
+                let owner_runtime = shared
+                    .owner_runtime
+                    .upgrade()
+                    .context("Owner JS runtime has been dropped")?;
+                let mut runtime = owner_runtime.borrow_mut();
+                Self::drain_microtasks(&mut runtime);
+                let value = {
+                    deno_core::scope!(scope, runtime);
+                    execute_context_script(scope, &shared.context, &code)?
+                };
+                Self::drain_microtasks(&mut runtime);
+                Ok(value)
+            }
+        }
     }
 
     fn dispatch_worker_message(&mut self, worker_id: usize, message: WorkerMessage) {
@@ -13576,8 +13605,30 @@ impl Frame {
         })
     }
 
+    fn event_loop_delay(&self) -> Option<Duration> {
+        let mut delay = self.animation_frame_delay();
+        if let Some(renderer) = &self.renderer {
+            for frame in renderer
+                .borrow()
+                .frames
+                .values()
+                .filter_map(|handle| handle.frame.as_ref())
+            {
+                // Child queues do not wake the owner yet, so check them periodically.
+                let poll_interval = Duration::from_millis(16);
+                let frame_delay = frame
+                    .borrow()
+                    .event_loop_delay()
+                    .unwrap_or(poll_interval)
+                    .min(poll_interval);
+                delay = Some(delay.map_or(frame_delay, |delay| delay.min(frame_delay)));
+            }
+        }
+        delay
+    }
+
     fn command_wait_timeout(&self, js_pending: bool) -> Option<Duration> {
-        match (js_pending, self.animation_frame_delay()) {
+        match (js_pending, self.event_loop_delay()) {
             (true, Some(animation_delay)) => Some(Duration::from_millis(16).min(animation_delay)),
             (true, None) => Some(Duration::from_millis(16)),
             (false, Some(animation_delay)) => Some(animation_delay),
@@ -13602,6 +13653,61 @@ impl Frame {
         Ok(true)
     }
 
+    fn poll_shared_frames(&mut self) -> bool {
+        let Some(renderer) = self.renderer.as_ref().cloned() else {
+            return false;
+        };
+        // Release the parent renderer borrow before child handlers enter JavaScript.
+        let frames = renderer
+            .borrow()
+            .frames
+            .iter()
+            .filter_map(|(node_idx, handle)| {
+                Some((
+                    *node_idx,
+                    handle.frame.as_ref()?.clone(),
+                    collect_frame_commands(None, handle.rx.as_ref()?),
+                    Arc::clone(&handle.surface),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let mut had_work = false;
+        for (node_idx, child, commands, surface) in frames {
+            let mut frame = child.borrow_mut();
+            let parent_proxy = frame.parent_window.as_ref().unwrap().proxy.clone();
+            let mut closed = false;
+            for command in commands {
+                had_work = true;
+                if matches!(command, FrameCommand::Close) {
+                    let mut renderer = renderer.borrow_mut();
+                    if renderer
+                        .frames
+                        .get(&node_idx)
+                        .and_then(|handle| handle.frame.as_ref())
+                        .is_some_and(|current| Rc::ptr_eq(current, &child))
+                    {
+                        renderer.frames.remove(&node_idx);
+                    }
+                    closed = true;
+                    break;
+                }
+                frame.handle_frame_command(command, &parent_proxy, &surface);
+            }
+            if closed {
+                continue;
+            }
+            had_work |= frame
+                .run_animation_frame_if_due()
+                .inspect_err(|err| {
+                    eprintln!("Error occurred while running iframe animation frame: {}", err)
+                })
+                .unwrap_or(false);
+            had_work |= frame.poll_shared_frames();
+        }
+        had_work
+    }
+
     fn pump_js_event_loop_once(&mut self) -> Result<bool> {
         let event_loop_notify = self
             .renderer
@@ -13611,10 +13717,12 @@ impl Frame {
             .event_loop_notify
             .clone();
         let event_loop_wait = self
-            .animation_frame_delay()
+            .event_loop_delay()
             .unwrap_or(Duration::from_millis(10))
             .min(Duration::from_millis(10));
-        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+        let FrameJs::Owned(js) = self.js_runtime.as_mut().unwrap() else {
+            return Ok(false);
+        };
 
         // The current-thread Tokio runtime only drives network/timer IO while block_on is active,
         // so keep this as a short cooperative slice rather than a pure Winit waker.
@@ -13624,6 +13732,7 @@ impl Frame {
             .clone()
             .borrow_mut()
             .block_on(async {
+                let mut runtime = js.borrow_mut();
                 Self::drain_microtasks(&mut runtime);
                 tokio::select! {
                     result = runtime.run_event_loop(Default::default()) => match result {
@@ -14012,7 +14121,9 @@ impl Frame {
             .event_loop_proxy = Some(proxy.clone());
 
         self.bind_js_host(proxy);
-        self.setup_js_dom()?;
+        if self.js_runtime.is_some() {
+            self.setup_js_dom()?;
+        }
 
         Ok(())
     }
@@ -14085,6 +14196,8 @@ impl Frame {
                 // Animation callbacks can start async work after the JS pump went idle.
                 js_pending = true;
             }
+            // Child commands and animation callbacks can also start async work.
+            js_pending |= self.poll_shared_frames();
         }
     }
 
@@ -14103,6 +14216,30 @@ impl Frame {
             nodes_idxs,
             dom_indexes,
         })
+    }
+
+    fn open_as_context(
+        &mut self,
+        scope: &mut v8::PinScope,
+        parent_context: &v8::Global<v8::Context>,
+        proxy: RendererProxy,
+    ) -> Result<()> {
+        self.register_tokio_runtime()?;
+        self.perform_navigation(UserNavigateUrl::Raw(self.url.clone()), true)?;
+        let nodes_table =
+            NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
+        let nodes_idxs = sorted_node_idxs(&nodes_table);
+        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &mut ClassIndexes::new());
+        self.detect_html_redirect(&dom_indexes);
+        let params = BootParams {
+            template_contents: self.html_parser.as_ref().unwrap().template_contents.clone(),
+            nodes: nodes_table,
+            nodes_idxs,
+            dom_indexes,
+        };
+        self.set_up_without_event_loop(params, proxy.clone())?;
+        self.install_js_context(scope, parent_context, proxy)?;
+        Ok(())
     }
 
     fn on_click(&mut self) -> Result<()> {
