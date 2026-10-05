@@ -3,4 +3,3 @@
 - This is a standalone browser, so do not parse or webkit specific CSS or similar.
 - Snapshot tests fetch live sites and may be nondeterministic. Treat a visually near-identical mismatch cautiously; do not churn snapshots unless the change is intentional and inspected.
 - When a fix changes a snapshot, inspect the generated `.invalid.png` before accepting it as the new baseline.
-- Keep NOTES.md as the place for known rendering gaps that are larger than a small targeted change.
