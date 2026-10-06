@@ -405,6 +405,21 @@ impl DomIndexes {
         }
     }
 
+    fn remove_node(&mut self, idx: usize) {
+        self.children_index.remove(&idx);
+        for elements in self
+            .class_elements
+            .iter_mut()
+            .chain(self.tag_elements.values_mut())
+            .chain(self.id_elements.values_mut())
+            .chain(self.attribute_elements.values_mut())
+        {
+            if idx < elements.len() {
+                elements.remove(idx);
+            }
+        }
+    }
+
     pub fn recompute_class_elements(
         &mut self,
         html_nodes: &NodesTable,
@@ -5374,6 +5389,84 @@ fn op_clone_node(
     Ok(new_node_idx as u32)
 }
 
+#[op2]
+fn op_adopt_node(
+    scope: &mut v8::PinScope,
+    source_document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> Result<Vec<(usize, usize)>, JsErrorBox> {
+    let context = source_document
+        .get_creation_context(scope)
+        .ok_or_else(|| JsErrorBox::type_error("Expected a document"))?;
+    let source_state = context
+        .get_slot::<RefCell<frame_context::FrameState>>()
+        .ok_or_else(|| JsErrorBox::type_error("Expected a document"))?;
+    let source_host = source_state.borrow().host.clone();
+    let host = frame_host(scope);
+    if Rc::ptr_eq(&source_host.renderer, &host.renderer) {
+        return Ok(vec![]);
+    }
+
+    let moved = {
+        let mut source = source_host.renderer.borrow_mut();
+        let destination = &mut *host.renderer.borrow_mut();
+        if !source.nodes.contains_key(node_idx) {
+            return Err(JsErrorBox::type_error("Could not find node by idx"));
+        }
+
+        source.detach_node(node_idx);
+        let source_scripts = source_host.executed_scripts.borrow();
+        let mut destination_scripts = host.executed_scripts.borrow_mut();
+        let mut indices = HashMap::new();
+        let mut moved = vec![];
+        let mut pending = vec![node_idx];
+        // Parents move first, so their new indices are available to their children.
+        while let Some(old_idx) = pending.pop() {
+            pending.extend(source.template_contents.get(&old_idx).copied());
+            pending.extend(source.shadow_roots.get(&old_idx).copied());
+            if let Some(children) = source.dom_indexes.children_index.get(&old_idx) {
+                pending.extend(children.iter().rev().copied());
+            }
+
+            let mut node = source.nodes.data[old_idx].take().unwrap();
+            node.set_parent(node.get_parent().map(|parent| indices[&parent]));
+            if let Node::ShadowRoot { host, .. } = &mut node {
+                *host = indices[host];
+            }
+            destination.push_node(node);
+            let new_idx = destination.nodes.cursor;
+            indices.insert(old_idx, new_idx);
+            moved.push((old_idx, new_idx));
+            destination.dom_indexes.add_node(
+                new_idx,
+                destination.nodes.get(new_idx).unwrap(),
+                &mut destination.css_parser.class_definitions,
+            );
+            source.dom_indexes.remove_node(old_idx);
+            if source_scripts.nodes.contains(&old_idx) {
+                destination_scripts.nodes.push(new_idx);
+            }
+        }
+        for &(old_idx, new_idx) in &moved {
+            if let Some(content) = source.template_contents.remove(&old_idx) {
+                destination
+                    .template_contents
+                    .insert(new_idx, indices[&content]);
+            }
+            if let Some(root) = source.shadow_roots.remove(&old_idx) {
+                destination.shadow_roots.insert(new_idx, indices[&root]);
+            }
+        }
+        source.nodes_idxs.retain(|idx| !indices.contains_key(idx));
+        source.schedule_dom_update();
+        destination.schedule_dom_update();
+        moved
+    };
+    let source_scope = &mut v8::ContextScope::new(scope, context);
+    mutation_observer::schedule(source_scope);
+    Ok(moved)
+}
+
 fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_offset: i32) -> i32 {
     if let Some(scroll_y) = renderer.scroll_y.get(&node_idx) {
         parent_offset += scroll_y;
@@ -7038,6 +7131,7 @@ extension!(
     op_collect_data_for_form,
     op_submit_form,
     op_clone_node,
+    op_adopt_node,
     op_spawn_frame,
     op_frame_window,
     op_spawn_worker,
