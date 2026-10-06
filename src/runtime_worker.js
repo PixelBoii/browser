@@ -37,7 +37,7 @@ denoEvent.saveGlobalThisReference(globalThis)
 
 setNoColorFns(() => true, () => true)
 globalThis.console = new Console((message, level) => core.print(message, level >= 2))
-core.wrapConsole(globalThis.console, core.console)
+core.wrapConsole(globalThis.console, core.v8Console)
 
 location.setLocationHref(core.ops.op_worker_get_location_href())
 Object.defineProperties(globalThis, {

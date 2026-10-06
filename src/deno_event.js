@@ -121,16 +121,16 @@ const isTrusted = ObjectGetOwnPropertyDescriptor({
   },
 }, "isTrusted").get;
 
-const _attributes = Symbol("[[attributes]]");
-const _canceledFlag = Symbol("[[canceledFlag]]");
-const _stopPropagationFlag = Symbol("[[stopPropagationFlag]]");
-const _stopImmediatePropagationFlag = Symbol(
-  "[[stopImmediatePropagationFlag]]",
+const _attributes = SymbolFor("browser.Event.[[attributes]]");
+const _canceledFlag = SymbolFor("browser.Event.[[canceledFlag]]");
+const _stopPropagationFlag = SymbolFor("browser.Event.[[stopPropagationFlag]]");
+const _stopImmediatePropagationFlag = SymbolFor(
+  "browser.Event.[[stopImmediatePropagationFlag]]",
 );
-const _inPassiveListener = Symbol("[[inPassiveListener]]");
-const _dispatched = Symbol("[[dispatched]]");
-const _isTrusted = Symbol("[[isTrusted]]");
-const _path = Symbol("[[path]]");
+const _inPassiveListener = SymbolFor("browser.Event.[[inPassiveListener]]");
+const _dispatched = SymbolFor("browser.Event.[[dispatched]]");
+const _isTrusted = SymbolFor("browser.Event.[[isTrusted]]");
+const _path = SymbolFor("browser.Event.[[path]]");
 
 class Event {
   constructor(type, eventInitDict = { __proto__: null }) {
@@ -562,6 +562,9 @@ function dispatch(
   eventImpl,
   targetOverride,
 ) {
+  // Native notifications must not call listeners in a retired document.
+  if (!core.ops.op_realm_is_active()) return true;
+
   let clearTargets = false;
   let activationTarget = null;
 
@@ -749,6 +752,7 @@ function innerInvokeEventListeners(
   }
 
   for (let i = 0; i < handlersLength; i++) {
+    if (!core.ops.op_realm_is_active()) break;
     const listener = handlers[i];
 
     if (
@@ -897,7 +901,7 @@ function retarget(a, b) {
 
 // Accessors for non-public data
 
-const eventTargetData = Symbol();
+const eventTargetData = SymbolFor("browser.EventTarget.data");
 const kResistStopImmediatePropagation = Symbol(
   "kResistStopImmediatePropagation",
 );
@@ -1431,7 +1435,7 @@ defineEnumerableProps(PromiseRejectionEvent, [
   "reason",
 ]);
 
-const _eventHandlers = Symbol("eventHandlers");
+const _eventHandlers = SymbolFor("browser.EventTarget.handlers");
 
 function makeWrappedHandler(handler, isSpecialErrorEventHandler) {
   function wrappedHandler(evt) {

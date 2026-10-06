@@ -4,10 +4,11 @@ use std::{
     rc::Rc,
 };
 
-use deno_core::{JsRuntime, OpState, op2, v8};
+use deno_core::{op2, v8};
 use deno_error::JsErrorBox;
 
-use crate::{JsHostState, Node, Renderer, native_node_index};
+use crate::frame_context::{frame_state, is_active};
+use crate::{Node, Renderer, native_node_index};
 
 struct Definition {
     constructor: v8::Global<v8::Function>,
@@ -50,9 +51,9 @@ impl Definition {
         let element = create_element(scope, name);
         if let Some(element) = element {
             let idx = native_node_index(scope, element).unwrap();
-            JsRuntime::op_state_from(scope)
+            frame_state(scope)
                 .borrow()
-                .borrow::<JsHostState>()
+                .host
                 .renderer
                 .borrow_mut()
                 .custom_element_reactions
@@ -141,11 +142,14 @@ impl Renderer {
 }
 
 pub fn deliver_reactions(scope: &mut v8::PinScope) {
-    let state = JsRuntime::op_state_from(scope);
-    let renderer = state.borrow().borrow::<JsHostState>().renderer.clone();
+    let state = frame_state(scope);
+    let renderer = state.borrow().host.renderer.clone();
     let pending = std::mem::take(&mut renderer.borrow_mut().custom_element_reactions.pending);
     for idx in pending {
         loop {
+            if !is_active(scope) {
+                return;
+            }
             // Keep each element's queue accessible to reentrant DOM operations.
             let reaction = renderer
                 .borrow_mut()
@@ -164,8 +168,7 @@ pub fn deliver_reactions(scope: &mut v8::PinScope) {
                     continue;
                 };
                 let state = state.borrow();
-                let Some(definition) = state.borrow::<Registry>().definitions.get(&element.tag)
-                else {
+                let Some(definition) = state.custom_elements.definitions.get(&element.tag) else {
                     continue;
                 };
                 match reaction {
@@ -239,14 +242,10 @@ fn create_element<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: String,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let state = JsRuntime::op_state_from(scope);
-    let renderer = state.borrow().borrow::<JsHostState>().renderer.clone();
+    let state = frame_state(scope);
+    let renderer = state.borrow().host.renderer.clone();
     let idx = renderer.borrow_mut().create_element(name);
-    state
-        .borrow_mut()
-        .borrow_mut::<Registry>()
-        .attempted
-        .insert(idx);
+    state.borrow_mut().custom_elements.attempted.insert(idx);
     node_wrapper(scope, idx)
 }
 
@@ -255,10 +254,10 @@ pub fn op_custom_element_create<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     #[string] name: String,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     let definition = state
         .borrow()
-        .borrow::<Registry>()
+        .custom_elements
         .definitions
         .get(&name)
         .cloned()?;
@@ -268,7 +267,7 @@ pub fn op_custom_element_create<'s>(
         let result = constructor.new_instance(scope, &[]).and_then(|element| {
             let idx = native_node_index(scope, element)?;
             let state = state.borrow();
-            let renderer = state.borrow::<JsHostState>().renderer.borrow();
+            let renderer = state.host.renderer.borrow();
             let valid = matches!(renderer.nodes.get(idx), Some(Node::Element(node))
                 if node.tag == name && node.parent.is_none() && node.attributes.values.is_empty())
                 && renderer
@@ -297,14 +296,14 @@ pub fn op_custom_element_create<'s>(
 }
 
 fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     let (name, definition, connected) = {
         let state = state.borrow();
-        let registry = state.borrow::<Registry>();
+        let registry = &state.custom_elements;
         if registry.attempted.contains(&idx) {
             return;
         }
-        let renderer = state.borrow::<JsHostState>().renderer.borrow();
+        let renderer = state.host.renderer.borrow();
         let Some(Node::Element(element)) = renderer.nodes.get(idx) else {
             return;
         };
@@ -317,11 +316,7 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
             renderer.node_is_connected(idx),
         )
     };
-    state
-        .borrow_mut()
-        .borrow_mut::<Registry>()
-        .attempted
-        .insert(idx);
+    state.borrow_mut().custom_elements.attempted.insert(idx);
     v8::tc_scope!(let scope, scope);
     let result = (|| {
         let element = node_wrapper(scope, idx)?;
@@ -342,7 +337,7 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
             scope.throw_exception(error);
             return None;
         }
-        let renderer = state.borrow().borrow::<JsHostState>().renderer.clone();
+        let renderer = state.borrow().host.renderer.clone();
         let mut renderer = renderer.borrow_mut();
         let reactions = &mut renderer.custom_element_reactions;
         reactions.custom.insert(idx);
@@ -364,10 +359,10 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
 }
 
 pub fn upgrade_subtree(scope: &mut v8::PinScope, root: Option<usize>, name: Option<&str>) {
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     {
         let state = state.borrow();
-        let mut renderer = state.borrow::<JsHostState>().renderer.borrow_mut();
+        let mut renderer = state.host.renderer.borrow_mut();
         let root = root.unwrap_or(renderer.dom_indexes.root_indice);
         renderer.enqueue_custom_element_upgrades(root, name);
     }
@@ -386,7 +381,7 @@ pub fn op_custom_element_define(
             "Invalid custom element name",
         ));
     }
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     let key = v8::String::new(scope, "prototype").unwrap();
     let Some(prototype) = constructor.get(scope, key.into()) else {
         // Preserve a JavaScript exception thrown by a prototype getter.
@@ -416,7 +411,7 @@ pub fn op_custom_element_define(
     }
     {
         let mut state = state.borrow_mut();
-        let registry = state.borrow_mut::<Registry>();
+        let registry = &mut state.custom_elements;
         if registry.definitions.contains_key(&name)
             || registry
                 .definitions
@@ -445,11 +440,12 @@ pub fn op_custom_element_define(
 #[op2]
 pub fn op_custom_element_get<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    state: &mut OpState,
     #[string] name: String,
 ) -> Option<v8::Local<'s, v8::Function>> {
+    let state = frame_state(scope);
+    let state = state.borrow();
     state
-        .borrow::<Registry>()
+        .custom_elements
         .definitions
         .get(&name)
         .map(|definition| v8::Local::new(scope, &definition.constructor))
@@ -465,10 +461,10 @@ pub fn op_custom_element_construct<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     constructor: v8::Local<v8::Function>,
 ) -> Result<Option<v8::Local<'s, v8::Object>>, JsErrorBox> {
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     let definition = state
         .borrow()
-        .borrow::<Registry>()
+        .custom_elements
         .definitions
         .iter()
         .find(|(_, definition)| v8::Local::new(scope, &definition.constructor) == constructor)
