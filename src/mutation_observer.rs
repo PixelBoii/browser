@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use deno_core::{JsRuntime, OpState, op2, serde_v8, v8};
+use deno_core::{op2, serde_v8, v8};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 
-use crate::{JsHostState, Node, Renderer};
+use crate::frame_context::{frame_state, is_active};
+use crate::{Node, Renderer};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -230,7 +231,7 @@ impl Renderer {
     }
 }
 
-// V8 handles belong to the realm's OpState, not the renderer's DOM state.
+// V8 handles belong to the context's browser state, not the renderer's DOM state.
 #[derive(Default)]
 pub struct Callbacks {
     functions: HashMap<usize, v8::Global<v8::Function>>,
@@ -238,15 +239,13 @@ pub struct Callbacks {
 }
 
 pub fn schedule(scope: &mut v8::PinScope) {
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     let mut state = state.borrow_mut();
-    let Some(host) = state.try_borrow::<JsHostState>() else {
-        return;
-    };
+    let host = &state.host;
     if host.renderer.borrow().mutation_observers.pending.is_empty() {
         return;
     }
-    let callbacks = state.borrow_mut::<Callbacks>();
+    let callbacks = &mut state.mutation_observers;
     if callbacks.queued {
         return;
     }
@@ -256,16 +255,19 @@ pub fn schedule(scope: &mut v8::PinScope) {
 }
 
 fn deliver(scope: &mut v8::PinScope, _: v8::FunctionCallbackArguments, _: v8::ReturnValue) {
-    let state = JsRuntime::op_state_from(scope);
-    let renderer = state.borrow().borrow::<JsHostState>().renderer.clone();
-    state.borrow_mut().borrow_mut::<Callbacks>().queued = false;
+    let state = frame_state(scope);
+    let renderer = state.borrow().host.renderer.clone();
+    state.borrow_mut().mutation_observers.queued = false;
     let pending = std::mem::take(&mut renderer.borrow_mut().mutation_observers.pending);
     for id in pending {
+        if !is_active(scope) {
+            return;
+        }
         let records = renderer.borrow_mut().mutation_observers.take_records(id);
         if records.is_empty() {
             continue;
         }
-        let callback = state.borrow().borrow::<Callbacks>().functions[&id].clone();
+        let callback = state.borrow().mutation_observers.functions[&id].clone();
         v8::tc_scope!(let scope, scope);
         let callback = v8::Local::new(scope, callback);
         let records = serde_v8::to_v8(scope, records).unwrap();
@@ -283,13 +285,10 @@ fn deliver(scope: &mut v8::PinScope, _: v8::FunctionCallbackArguments, _: v8::Re
 
 #[op2(fast)]
 #[number]
-pub fn op_mutation_observer_create(state: &mut OpState) -> usize {
-    state
-        .borrow::<JsHostState>()
-        .renderer
-        .borrow_mut()
-        .mutation_observers
-        .create()
+pub fn op_mutation_observer_create(scope: &mut v8::PinScope) -> usize {
+    let state = frame_state(scope);
+    let state = state.borrow();
+    state.host.renderer.borrow_mut().mutation_observers.create()
 }
 
 #[op2]
@@ -300,38 +299,42 @@ pub fn op_mutation_observer_observe(
     #[serde] options: Options,
     callback: v8::Local<v8::Function>,
 ) -> Result<(), JsErrorBox> {
-    let state = JsRuntime::op_state_from(scope);
+    let state = frame_state(scope);
     let mut state = state.borrow_mut();
     state
-        .borrow::<JsHostState>()
+        .host
         .renderer
         .borrow_mut()
         .mutation_observers
         .observe(id, target, options)?;
     let callback = v8::Global::new(scope, callback);
-    state
-        .borrow_mut::<Callbacks>()
-        .functions
-        .insert(id, callback);
+    state.mutation_observers.functions.insert(id, callback);
     Ok(())
 }
 
 #[op2(fast)]
-pub fn op_mutation_observer_disconnect(state: &mut OpState, #[number] id: usize) {
+pub fn op_mutation_observer_disconnect(scope: &mut v8::PinScope, #[number] id: usize) {
+    let state = frame_state(scope);
+    let mut state = state.borrow_mut();
     state
-        .borrow::<JsHostState>()
+        .host
         .renderer
         .borrow_mut()
         .mutation_observers
         .disconnect(id);
-    state.borrow_mut::<Callbacks>().functions.remove(&id);
+    state.mutation_observers.functions.remove(&id);
 }
 
 #[op2]
 #[serde]
-pub fn op_mutation_observer_take_records(state: &mut OpState, #[number] id: usize) -> Vec<Record> {
+pub fn op_mutation_observer_take_records(
+    scope: &mut v8::PinScope,
+    #[number] id: usize,
+) -> Vec<Record> {
+    let state = frame_state(scope);
+    let state = state.borrow();
     state
-        .borrow::<JsHostState>()
+        .host
         .renderer
         .borrow_mut()
         .mutation_observers

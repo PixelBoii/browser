@@ -1,5 +1,6 @@
 mod css;
 mod custom_elements;
+mod frame_context;
 mod loader;
 mod mutation_observer;
 mod parser;
@@ -34,20 +35,18 @@ use style::{
     StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility, StyleWhiteSpace,
     get_base_style, parse_style,
 };
-use window_messaging::{
-    ParentWindow, op_is_top, op_post_message_to_frame, op_post_message_to_parent,
-};
+use window_messaging::{ParentWindow, op_window_message_source, op_window_post_message};
 pub use window_messaging::WindowMessage;
 
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::ops::Mul;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
@@ -57,7 +56,7 @@ use ab_glyph::{Font, FontRef, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use deno_core::error::JsError;
-use deno_core::{JsRuntime, OpState, ToV8, extension, op2, v8};
+use deno_core::{JsRealm, JsRuntime, OpState, ToV8, extension, op2, v8};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use reqwest::Url as ReqwestUrl;
 use resvg::{tiny_skia, usvg};
@@ -71,6 +70,10 @@ use crate::css::{
     ClassIndexes, ClassName, ClassNamePart, ClassNamePartAttribute, CssParser, MatchedCssRule,
     MediaQuery, Node as CssNode, PropertyValue, PseudoClass, parse_media_query_parts,
     selector_to_parts,
+};
+use crate::frame_context::{
+    WindowSources, bind_frame_state, caller_origin, context_origin, deactivate_realm, frame_host,
+    is_active, op_realm_is_active, spawn_frame, window_for_origin,
 };
 use crate::loader::HttpModuleLoader;
 use crate::style::{
@@ -1374,69 +1377,6 @@ impl Animation {
     }
 }
 
-#[derive(Debug)]
-pub enum FrameDomCommand {
-    GetDocumentElement {
-        reply: std::sync::mpsc::Sender<Option<(usize, Node)>>,
-    },
-    QuerySelector {
-        selector: String,
-        required_parent: Option<usize>,
-        reply: std::sync::mpsc::Sender<Result<Option<(usize, Node)>, String>>,
-    },
-    QuerySelectorAll {
-        selector: String,
-        required_parent: Option<usize>,
-        reply: std::sync::mpsc::Sender<Result<Vec<(usize, Node)>, String>>,
-    },
-    ElementFromPoint {
-        x: f64,
-        y: f64,
-        reply: std::sync::mpsc::Sender<Option<(usize, Node)>>,
-    },
-    ReplaceInnerHtml {
-        node_idx: usize,
-        html: String,
-        reply: std::sync::mpsc::Sender<()>,
-    },
-    GetInnerHtml {
-        node_idx: usize,
-        reply: std::sync::mpsc::Sender<String>,
-    },
-    GetComputedStyle {
-        node_idx: usize,
-        reply: std::sync::mpsc::Sender<HashMap<String, String>>,
-    },
-    MeasureElement {
-        node_idx: usize,
-        reply: std::sync::mpsc::Sender<ElementGeometry>,
-    },
-    CreateElement {
-        tag: String,
-        reply: std::sync::mpsc::Sender<usize>,
-    },
-    GetElementsByTagName {
-        tag: String,
-        required_parent: Option<usize>,
-        reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
-    },
-    GetElementsByName {
-        name: String,
-        required_parent: Option<usize>,
-        reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
-    },
-    GetElementsByClassName {
-        class_names: String,
-        required_parent: Option<usize>,
-        reply: std::sync::mpsc::Sender<Vec<(usize, Node)>>,
-    },
-    UpdateElementAttributes {
-        node_idx: usize,
-        attributes: Attributes,
-        reply: std::sync::mpsc::Sender<Result<()>>,
-    },
-}
-
 /// An element identity tied to the document in its originating frame.
 #[derive(Debug, Clone, Copy)]
 pub struct ElementHandle {
@@ -1448,6 +1388,7 @@ pub struct ElementHandle {
 pub enum FrameCommand {
     Close,
     Render,
+    Initialize,
     /// Return an element handle and native node on the frame thread.
     QuerySelector {
         selector: String,
@@ -1472,7 +1413,6 @@ pub enum FrameCommand {
         reply: Sender<Result<Pixmap>>,
     },
     UserEvent(UserEvent),
-    Dom(FrameDomCommand),
     Resized(PhysicalSize<u32>),
 }
 
@@ -1502,16 +1442,28 @@ struct FrameSurface {
     pixels: Vec<u32>,
 }
 
-#[derive(Debug)]
 struct FrameHandle {
-    surface: Arc<Mutex<FrameSurface>>,
+    surface: Rc<RefCell<FrameSurface>>,
     requested_size: PhysicalSize<u32>,
+    requested_url: ReqwestUrl,
     tx: std::sync::mpsc::Sender<FrameCommand>,
+    // contentWindow can be read while the child Frame is executing JavaScript.
+    js: Rc<RefCell<FrameJsShared>>,
+    frame: Rc<RefCell<Frame>>,
+    rx: Receiver<FrameCommand>,
+}
+
+impl std::fmt::Debug for FrameHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameHandle")
+            .field("requested_size", &self.requested_size)
+            .finish()
+    }
 }
 
 impl Drop for FrameHandle {
     fn drop(&mut self) {
-        let _ = self.tx.send(FrameCommand::Close);
+        self.js.borrow().connected.set(false);
     }
 }
 
@@ -5138,7 +5090,6 @@ struct JsHostState {
     renderer: Rc<RefCell<Renderer>>,
     proxy: RendererProxy,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
-    parent_window: Option<ParentWindow>,
 }
 
 fn is_trustworthy_http_url(url: &ReqwestUrl) -> bool {
@@ -5158,15 +5109,16 @@ fn is_trustworthy_http_url(url: &ReqwestUrl) -> bool {
 #[op2]
 #[serde]
 fn op_fetch_site(
+    scope: &mut v8::PinScope,
     state: &mut OpState,
     #[string] initiator: Option<String>,
     #[serde] urls: Vec<String>,
 ) -> (String, Option<String>) {
     let initiator = initiator.unwrap_or_else(|| {
-        if let Some(host) = state.try_borrow::<JsHostState>() {
-            host.renderer.borrow().url.clone()
+        if let Some(host) = state.try_borrow::<WorkerHostState>() {
+            host.url.to_string()
         } else {
-            state.borrow::<WorkerHostState>().url.to_string()
+            frame_host(scope).renderer.borrow().url.clone()
         }
     });
     let site = |url: &ReqwestUrl| match url.origin() {
@@ -5210,11 +5162,11 @@ fn op_tls_peer_certificate<'s>(
 
 #[op2(fast)]
 fn op_set_location_href(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] href: String,
     reload: bool,
 ) -> Result<(), JsError> {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
 
     host.proxy
         .fire_user_event(UserEvent::Navigate((UserNavigateUrl::Raw(href), reload)))
@@ -5224,8 +5176,8 @@ fn op_set_location_href(
 }
 
 #[op2(fast)]
-fn op_request_animation_frame(state: &mut OpState) -> Result<(), JsError> {
-    let host = state.borrow::<JsHostState>();
+fn op_request_animation_frame(scope: &mut v8::PinScope) -> Result<(), JsError> {
+    let host = frame_host(scope);
     host.proxy
         .fire_user_event(UserEvent::AnimationFrameRequested)
         .unwrap();
@@ -5236,7 +5188,7 @@ fn op_request_animation_frame(state: &mut OpState) -> Result<(), JsError> {
 // TODO: Somehow hook this into fetch as well
 #[op2(fast)]
 fn op_set_cookie(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] url: String,
     #[string] cookie: String,
 ) -> Result<(), JsError> {
@@ -5244,7 +5196,7 @@ fn op_set_cookie(
         return Ok(());
     };
 
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let network_fetch = renderer.network_fetch.borrow();
     let jar = &network_fetch.cookie_jar;
@@ -5254,12 +5206,12 @@ fn op_set_cookie(
 
 #[op2]
 #[string]
-fn op_get_cookie(state: &mut OpState, #[string] url: String) -> Result<String, JsError> {
+fn op_get_cookie(scope: &mut v8::PinScope, #[string] url: String) -> Result<String, JsError> {
     let Ok(url) = ReqwestUrl::parse(&url) else {
         return Ok(String::new());
     };
 
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let network_fetch = renderer.network_fetch.borrow();
     let cookie = network_fetch
@@ -5271,39 +5223,27 @@ fn op_get_cookie(state: &mut OpState, #[string] url: String) -> Result<String, J
     Ok(cookie)
 }
 
-#[op2]
-fn op_create_element(
-    state: &mut OpState,
-    #[string] tag: String,
-    #[number] frame_id: Option<usize>,
-) -> Result<i32, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    let node_idx = if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply })
-        })?
-    } else {
-        renderer.create_element(tag)
-    };
-    Ok(node_idx as i32)
+#[op2(fast)]
+fn op_create_element(scope: &mut v8::PinScope, #[string] tag: String) -> i32 {
+    let host = frame_host(scope);
+    host.renderer.borrow_mut().create_element(tag) as i32
 }
 
 #[op2(fast)]
-fn op_create_document_fragment(state: &mut OpState) -> u32 {
-    let host = state.borrow::<JsHostState>();
+fn op_create_document_fragment(scope: &mut v8::PinScope) -> u32 {
+    let host = frame_host(scope);
     host.renderer.borrow_mut().create_document_fragment() as u32
 }
 
 #[op2(fast)]
-fn op_get_template_content(state: &mut OpState, #[number] node_idx: usize) -> u32 {
-    let host = state.borrow::<JsHostState>();
+fn op_get_template_content(scope: &mut v8::PinScope, #[number] node_idx: usize) -> u32 {
+    let host = frame_host(scope);
     host.renderer.borrow().template_content(node_idx) as u32
 }
 
 #[op2(fast)]
-fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result<i32, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+fn op_create_text_element(scope: &mut v8::PinScope, #[string] text: String) -> Result<i32, JsError> {
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Text(TextElement { text, parent: None }));
     let node_idx = renderer.nodes.cursor;
@@ -5314,11 +5254,10 @@ fn op_create_text_element(state: &mut OpState, #[string] text: String) -> Result
 #[op2]
 fn op_get_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    state: &mut OpState,
     #[number] node_idx: usize,
     #[string] attribute: String,
 ) -> Result<Option<v8::Local<'s, v8::Value>>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
@@ -5331,23 +5270,57 @@ fn op_get_attribute<'s>(
     Ok(value)
 }
 
-#[op2]
-#[string]
+#[op2(reentrant)]
 fn op_spawn_frame(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] url: Option<String>,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if renderer.frames.contains_key(&node_idx) {
-        return Ok(());
-    }
-    let handle = renderer
-        .spawn_frame(url, PhysicalSize::new(300, 150), node_idx)
+    let host = frame_host(scope);
+    let init = {
+        let mut renderer = host.renderer.borrow_mut();
+        let init = renderer
+            .prepare_frame_creation(url, node_idx)
+            .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
+        if let Some(handle) = renderer.frames.get_mut(&node_idx) {
+            if handle.requested_url != init.url {
+                handle
+                    .tx
+                    .send(FrameCommand::UserEvent(UserEvent::Navigate((
+                        UserNavigateUrl::Raw(init.url.to_string()),
+                        true,
+                    ))))
+                    .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+                handle.requested_url = init.url;
+            }
+            return Ok(());
+        }
+        init
+    };
+    let parent_context = scope.get_current_context();
+    let parent_context = v8::Global::new(scope, parent_context);
+    let handle = spawn_frame(scope, &parent_context, init)
         .map_err(|err| JsErrorBox::generic(format!("Failed to spawn frame: {err}")))?;
-    renderer.frames.insert(node_idx, handle);
+    host.renderer.borrow_mut().frames.insert(node_idx, handle);
     Ok(())
+}
+
+#[op2]
+fn op_frame_window<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[number] node_idx: usize,
+    same_origin_only: bool,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let origin = caller_origin(scope);
+    let host = frame_host(scope);
+    let renderer = host.renderer.borrow();
+    let handle = renderer.frames.get(&node_idx)?;
+    let js = handle.js.borrow();
+    let context = v8::Local::new(scope, js.realm.context());
+    if same_origin_only && context_origin(context) != origin {
+        return None;
+    }
+    Some(window_for_origin(scope, context, &origin))
 }
 
 fn clone_node(
@@ -5392,9 +5365,7 @@ fn op_clone_node(
     deep: bool,
 ) -> Result<u32, JsErrorBox> {
     let new_node_idx = {
-        let state = JsRuntime::op_state_from(scope);
-        let state = state.borrow();
-        let host = state.borrow::<JsHostState>();
+        let host = frame_host(scope);
         let mut renderer = host.renderer.borrow_mut();
         clone_node(&mut renderer, node_idx, None, deep)
             .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))?
@@ -5416,8 +5387,8 @@ fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_o
 }
 
 #[op2(fast)]
-fn op_get_offset_y(state: &mut OpState, #[number] node_idx: usize) -> Result<i32, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+fn op_get_offset_y(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Result<i32, JsError> {
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let offset_y = get_offset_y_walk(&renderer, node_idx, 0);
     Ok(offset_y)
@@ -5425,10 +5396,10 @@ fn op_get_offset_y(state: &mut OpState, #[number] node_idx: usize) -> Result<i32
 
 #[op2]
 fn op_get_attributes(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
 ) -> Result<Option<Attributes>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
@@ -5561,45 +5532,30 @@ fn computed_style_properties(renderer: &mut Renderer, node_idx: usize) -> HashMa
 #[op2]
 #[serde]
 fn op_get_computed_style(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
-    #[number] frame_id: Option<usize>,
-) -> Result<HashMap<String, String>, JsErrorBox> {
-    let host = state.borrow::<JsHostState>();
+) -> HashMap<String, String> {
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply })
-        })
-    } else {
-        Ok(computed_style_properties(&mut renderer, node_idx))
-    }
+    computed_style_properties(&mut renderer, node_idx)
 }
 
 #[op2]
 #[serde]
 fn op_measure_element(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
-    #[number] frame_id: Option<usize>,
-) -> Result<ElementGeometry, JsErrorBox> {
-    let host = state.borrow::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply })
-        })
-    } else {
-        Ok(renderer.measure_element(node_idx))
-    }
+) -> ElementGeometry {
+    let host = frame_host(scope);
+    host.renderer.borrow_mut().measure_element(node_idx)
 }
 
 #[op2(fast)]
 fn op_create_comment_element(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] comment: String,
 ) -> Result<i32, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Comment(CommentElement {
         comment,
@@ -5612,11 +5568,11 @@ fn op_create_comment_element(
 
 #[op2(fast)]
 fn op_would_create_cycle(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] parent_idx: usize,
     #[number] node_idx: usize,
 ) -> bool {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let mut current = Some(parent_idx);
     while let Some(idx) = current {
@@ -5638,16 +5594,13 @@ fn op_would_create_cycle(
 #[op2(reentrant)]
 fn op_append_child<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    state: Rc<RefCell<OpState>>,
     #[number] parent_idx: usize,
     #[number] node_idx: usize,
     #[number] before_reference_idx: Option<usize>,
 ) -> Result<(), JsErrorBox> {
-    let (renderer, executed_scripts) = {
-        let state = state.borrow();
-        let host = state.borrow::<JsHostState>();
-        (host.renderer.clone(), host.executed_scripts.clone())
-    };
+    let host = frame_host(scope);
+    let renderer = host.renderer.clone();
+    let executed_scripts = host.executed_scripts.clone();
 
     let script_to_run = {
         let mut renderer = renderer.borrow_mut();
@@ -5755,28 +5708,17 @@ fn op_append_child<'s>(
 #[op2]
 #[string]
 fn op_get_inner_html(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
-    #[number] frame_id: Option<usize>,
-) -> Result<String, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow_mut();
-    let html = if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetInnerHtml { node_idx, reply })
-        })?
-    } else {
-        renderer.get_element_inner_html(node_idx)
-    };
-    Ok(html)
+) -> String {
+    let host = frame_host(scope);
+    host.renderer.borrow().get_element_inner_html(node_idx)
 }
 
 #[op2(nofast, reentrant)]
 fn op_remove_child(scope: &mut v8::PinScope, #[number] child_idx: usize) -> Result<(), JsError> {
     {
-        let state = JsRuntime::op_state_from(scope);
-        let state = state.borrow();
-        let host = state.borrow::<JsHostState>();
+        let host = frame_host(scope);
         let mut renderer = host.renderer.borrow_mut();
         renderer.detach_node(child_idx);
         renderer.schedule_dom_update();
@@ -5813,10 +5755,10 @@ fn op_bind_node_wrapper(
 
 #[op2]
 fn op_get_node(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     Ok(renderer
         .nodes
@@ -5825,28 +5767,18 @@ fn op_get_node(
 }
 
 #[op2]
-fn op_get_document_element(
-    state: &mut OpState,
-    #[number] frame_id: Option<usize>,
-) -> Result<Option<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow::<JsHostState>();
-    let renderer = host.renderer.borrow();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetDocumentElement { reply })
-        })
-    } else {
-        Ok(renderer.document_element())
-    }
+fn op_get_document_element(scope: &mut v8::PinScope) -> Option<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer.borrow().document_element()
 }
 
 #[op2]
 fn op_get_element_by_id(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] id: String,
     #[number] root_idx: Option<usize>,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let node_idx = renderer.dom_indexes.id_elements.get(&id).and_then(|v| {
         v.ones().find(|idx| {
@@ -5863,109 +5795,56 @@ fn op_get_element_by_id(
 
 #[op2]
 fn op_get_elements_by_tag_name(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] tag: String,
     #[number] required_parent: Option<usize>,
-    #[number] frame_id: Option<usize>,
-) -> Result<Vec<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName {
-                tag,
-                reply,
-                required_parent,
-            })
-        })
-    } else {
-        Ok(renderer.get_elements_by_tag_name(&tag, required_parent))
-    }
+) -> Vec<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer
+        .borrow()
+        .get_elements_by_tag_name(&tag, required_parent)
 }
 
 #[op2]
 fn op_get_elements_by_name(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] name: String,
     #[number] required_parent: Option<usize>,
-    #[number] frame_id: Option<usize>,
-) -> Result<Vec<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetElementsByName {
-                name,
-                reply,
-                required_parent,
-            })
-        })
-    } else {
-        Ok(renderer.get_elements_by_name(&name, required_parent))
-    }
+) -> Vec<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer
+        .borrow()
+        .get_elements_by_name(&name, required_parent)
 }
 
 #[op2]
 fn op_get_elements_by_class_name(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] class_names: String,
     #[number] required_parent: Option<usize>,
-    #[number] frame_id: Option<usize>,
-) -> Result<Vec<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let renderer = host.renderer.borrow();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::GetElementsByClassName {
-                class_names,
-                reply,
-                required_parent,
-            })
-        })
-    } else {
-        Ok(renderer.get_elements_by_class_name(&class_names, required_parent))
-    }
+) -> Vec<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer
+        .borrow()
+        .get_elements_by_class_name(&class_names, required_parent)
 }
 
 #[op2]
-fn op_element_from_point(
-    state: &mut OpState,
-    x: f64,
-    y: f64,
-    #[number] frame_id: Option<usize>,
-) -> Result<Option<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::ElementFromPoint { x, y, reply })
-        })
-    } else {
-        Ok(renderer.element_from_point(x, y))
-    }
+fn op_element_from_point(scope: &mut v8::PinScope, x: f64, y: f64) -> Option<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer.borrow_mut().element_from_point(x, y)
 }
 
 #[op2]
 fn op_query_selector(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] selector: String,
     #[number] required_parent: Option<usize>,
-    #[number] frame_id: Option<usize>,
-) -> Result<Option<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::QuerySelector {
-                selector,
-                required_parent,
-                reply,
-            })
-        })?
-        .map_err(|err| JsErrorBox::generic(err))
-    } else {
-        Ok(renderer.query_selector_node(selector, required_parent))
-    }
+) -> Option<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer
+        .borrow_mut()
+        .query_selector_node(selector, required_parent)
 }
 
 fn walk_closest(buffer: &mut Vec<usize>, nodes: &NodesTable, node_idx: usize) {
@@ -5977,11 +5856,11 @@ fn walk_closest(buffer: &mut Vec<usize>, nodes: &NodesTable, node_idx: usize) {
 
 #[op2]
 fn op_get_closest(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] selector: String,
     #[number] node_idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let selector = selector_to_parts(&selector, &mut renderer.css_parser.class_definitions);
     let matched_idxs: Vec<usize> = query_selector_all(
@@ -6018,76 +5897,29 @@ fn has_parent(nodes_table: &NodesTable, node_idx: usize, target_parent: usize) -
 
 #[op2]
 fn op_query_selector_all(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[string] selector: String,
     #[number] required_parent: Option<usize>,
-    #[number] frame_id: Option<usize>,
-) -> Result<Vec<(usize, Node)>, JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
-    let mut renderer = host.renderer.borrow_mut();
-    if let Some(frame_id) = frame_id {
-        js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-            FrameCommand::Dom(FrameDomCommand::QuerySelectorAll {
-                selector,
-                required_parent,
-                reply,
-            })
-        })?
-        .map_err(|err| JsErrorBox::generic(err))
-    } else {
-        Ok(renderer.query_selector_all_nodes(selector, required_parent))
-    }
+) -> Vec<(usize, Node)> {
+    let host = frame_host(scope);
+    host.renderer
+        .borrow_mut()
+        .query_selector_all_nodes(selector, required_parent)
 }
 
-fn js_send_onetime_to_frame<T>(
-    renderer: &Renderer,
-    frame_id: usize,
-    build_command: impl FnOnce(std::sync::mpsc::Sender<T>) -> FrameCommand,
-) -> Result<T, JsErrorBox> {
-    let handle = renderer
-        .frames
-        .get(&frame_id)
-        .ok_or_else(|| JsErrorBox::generic("Failed to get frame"))?;
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-    handle
-        .tx
-        .send(build_command(reply_tx))
-        .map_err(|err| JsErrorBox::generic(format!("Failed to query frame: {err}")))?;
-
-    reply_rx
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|err| JsErrorBox::generic(format!("Frame query timed out: {err}")))
-}
-
-#[op2(reentrant)]
+#[op2(nofast, reentrant)]
 fn op_set_inner_html(
     scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] html: String,
-    #[number] frame_id: Option<usize>,
-) -> Result<(), JsErrorBox> {
-    let result = {
-        let state = JsRuntime::op_state_from(scope);
-        let state = state.borrow();
-        let host = state.borrow::<JsHostState>();
+) {
+    {
+        let host = frame_host(scope);
         let mut renderer = host.renderer.borrow_mut();
-        if let Some(frame_id) = frame_id {
-            js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-                FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
-                    node_idx,
-                    html,
-                    reply,
-                })
-            })
-        } else {
-            renderer.replace_inner_html(node_idx, html);
-            Ok(())
-        }
-    };
+        renderer.replace_inner_html(node_idx, html);
+    }
     custom_elements::deliver_reactions(scope);
     mutation_observer::schedule(scope);
-    result
 }
 
 #[op2(nofast, reentrant)]
@@ -6096,13 +5928,8 @@ fn op_set_text_content(
     #[number] node_idx: usize,
     #[string] text: String,
 ) {
-    let state = JsRuntime::op_state_from(scope);
-    state
-        .borrow()
-        .borrow::<JsHostState>()
-        .renderer
-        .borrow_mut()
-        .set_text_content(node_idx, text);
+    let host = frame_host(scope);
+    host.renderer.borrow_mut().set_text_content(node_idx, text);
     custom_elements::deliver_reactions(scope);
     mutation_observer::schedule(scope);
 }
@@ -6110,16 +5937,19 @@ fn op_set_text_content(
 
 #[op2]
 #[string]
-fn op_get_text_content(state: &mut OpState, #[number] node_idx: usize) -> Result<String, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+fn op_get_text_content(
+    scope: &mut v8::PinScope,
+    #[number] node_idx: usize,
+) -> Result<String, JsError> {
+    let host = frame_host(scope);
     let text = host.renderer.borrow().get_text_content(node_idx);
     Ok(text)
 }
 
 #[op2]
 #[serde]
-fn op_get_stylesheet_nodes(state: &mut OpState, #[number] root: usize) -> Vec<usize> {
-    let host = state.borrow::<JsHostState>();
+fn op_get_stylesheet_nodes(scope: &mut v8::PinScope, #[number] root: usize) -> Vec<usize> {
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let mut result = vec![];
     let mut pending = vec![root];
@@ -6145,11 +5975,11 @@ struct StyleSheetData {
 #[op2]
 #[serde]
 fn op_get_stylesheet(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     include_rules: bool,
 ) -> Result<Option<StyleSheetData>, JsErrorBox> {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let Some(Node::Element(element)) = renderer.nodes.get(node_idx) else {
         return Ok(None);
@@ -6225,9 +6055,7 @@ fn op_insert_css_rule(
     index: u32,
 ) -> Result<u32, JsErrorBox> {
     {
-        let state = JsRuntime::op_state_from(scope);
-        let state = state.borrow();
-        let host = state.borrow::<JsHostState>();
+        let host = frame_host(scope);
         let mut renderer = host.renderer.borrow_mut();
         if !matches!(renderer.nodes.get(node_idx), Some(Node::Element(element)) if element.tag == "style")
         {
@@ -6269,8 +6097,11 @@ fn op_insert_css_rule(
 }
 
 #[op2(fast)]
-fn op_media_query_matches(state: &mut OpState, #[string] query: String) -> Result<bool, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+fn op_media_query_matches(
+    scope: &mut v8::PinScope,
+    #[string] query: String,
+) -> Result<bool, JsError> {
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow_mut();
     let matches = media_query_matches(
         &MediaQuery {
@@ -6284,10 +6115,10 @@ fn op_media_query_matches(state: &mut OpState, #[string] query: String) -> Resul
 
 #[op2]
 fn op_get_child_nodes(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
 ) -> Result<Vec<(usize, Node)>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow_mut();
     let children: Vec<(usize, Node)> = renderer
         .dom_indexes
@@ -6302,10 +6133,10 @@ fn op_get_child_nodes(
 
 #[op2]
 fn op_get_descendant_nodes(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: Option<usize>,
 ) -> Vec<(usize, Node)> {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let mut pending = match node_idx {
         Some(idx) => match renderer.dom_indexes.children_index.get(&idx) {
@@ -6327,11 +6158,11 @@ fn op_get_descendant_nodes(
 
 #[op2]
 fn op_get_sibling(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     previous: bool,
 ) -> Option<(usize, Node)> {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let parent = renderer.nodes.get(node_idx)?.get_parent()?;
     let children = renderer.dom_indexes.children_index.get(&parent)?;
@@ -6347,11 +6178,11 @@ fn op_get_sibling(
 
 #[op2]
 fn op_get_edge_child(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     last: bool,
 ) -> Option<(usize, Node)> {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let children = renderer.dom_indexes.children_index.get(&node_idx)?;
     let child = *(if last {
@@ -6364,10 +6195,10 @@ fn op_get_edge_child(
 
 #[op2]
 fn op_get_parent_node(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow_mut();
     let parent_idx = if let Some(parent) = renderer.nodes.get(node_idx).and_then(|v| v.get_parent())
     {
@@ -6384,28 +6215,14 @@ fn op_update_attributes(
     scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[serde] attributes: HashMap<String, String>,
-    #[number] frame_id: Option<usize>,
 ) -> Result<(), JsErrorBox> {
     let result = {
-        let state = JsRuntime::op_state_from(scope);
-        let state = state.borrow();
-        let host = state.borrow::<JsHostState>();
+        let host = frame_host(scope);
         let mut renderer = host.renderer.borrow_mut();
         let attributes = Attributes::from_hash_map(attributes);
-        if let Some(frame_id) = frame_id {
-            js_send_onetime_to_frame(&renderer, frame_id, |reply| {
-                FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
-                    node_idx,
-                    attributes,
-                    reply,
-                })
-            })?
+        renderer
+            .update_element_attributes(node_idx, attributes)
             .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
-        } else {
-            renderer
-                .update_element_attributes(node_idx, attributes)
-                .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
-        }
     };
     mutation_observer::schedule(scope);
     result
@@ -6417,11 +6234,8 @@ fn op_remove_attribute(
     #[number] node_idx: usize,
     #[string] attribute: String,
 ) {
-    let state = JsRuntime::op_state_from(scope);
-    state
-        .borrow()
-        .borrow::<JsHostState>()
-        .renderer
+    let host = frame_host(scope);
+    host.renderer
         .borrow_mut()
         .remove_attribute(node_idx, attribute);
     mutation_observer::schedule(scope);
@@ -6448,11 +6262,11 @@ fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
 
 #[op2]
 fn op_canvas_record_command(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[serde] command: CanvasPathCommand,
 ) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6582,7 +6396,7 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 #[op2]
 fn op_canvas_draw_image(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] canvas_node_idx: usize,
     #[number] image_node_idx: usize,
     #[serde] request: CanvasDrawImageRequest,
@@ -6609,7 +6423,7 @@ fn op_canvas_draw_image(
         _ => return Ok(false),
     };
 
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     if !renderer.nodes.contains_key(image_node_idx) {
         return Ok(false);
@@ -6641,7 +6455,7 @@ fn op_canvas_draw_image(
 
 #[op2]
 fn op_canvas_path_stroke(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     line_width: f64,
@@ -6655,7 +6469,7 @@ fn op_canvas_path_stroke(
         _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
     };
 
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6684,7 +6498,7 @@ fn op_canvas_path_stroke(
 
 #[op2]
 fn op_canvas_path_fill(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[string] fill_style: String,
@@ -6697,7 +6511,7 @@ fn op_canvas_path_fill(
             _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
         };
 
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6726,12 +6540,12 @@ fn op_canvas_path_fill(
 
 #[op2]
 fn op_canvas_path_clip(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[serde] fill_rule: CanvasFillRule,
 ) -> Result<(), JsError> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6755,11 +6569,11 @@ fn op_canvas_path_clip(
 }
 
 #[op2(fast)]
-fn op_canvas_measure_text(state: &mut OpState, #[string] text: String, font_size: f64) -> f64 {
+fn op_canvas_measure_text(scope: &mut v8::PinScope, #[string] text: String, font_size: f64) -> f64 {
     if !font_size.is_finite() || font_size <= 0.0 {
         return 0.0;
     }
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let font_px = font_size as u32;
     let font = renderer.font_handler.font.as_scaled(font_px as f32);
@@ -6778,7 +6592,7 @@ fn op_canvas_measure_text(state: &mut OpState, #[string] text: String, font_size
 
 #[op2(fast)]
 fn op_canvas_fill_text(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     #[string] text: String,
     x: f64,
@@ -6795,7 +6609,7 @@ fn op_canvas_fill_text(
             StyleBackground::Transparent => 0,
             _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
         };
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
         return Ok(false);
@@ -6822,7 +6636,7 @@ fn op_canvas_fill_text(
 
 #[op2(fast)]
 fn op_canvas_get_image_data(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
     sx: i32,
     sy: i32,
@@ -6839,7 +6653,7 @@ fn op_canvas_get_image_data(
         return Err(JsErrorBox::range_error("Invalid image data buffer length"));
     }
 
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     let dimensions = renderer.nodes.get(node_idx).map(get_canvas_wh);
     let Some((Some(canvas_width), Some(canvas_height))) = dimensions else {
@@ -6883,8 +6697,8 @@ fn op_canvas_get_image_data(
 }
 
 #[op2(fast)]
-fn op_canvas_paint(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
+fn op_canvas_paint(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
 
     let canvas = renderer
@@ -6902,10 +6716,10 @@ fn op_canvas_paint(state: &mut OpState, #[number] node_idx: usize) -> Result<(),
 #[op2]
 #[serde]
 fn op_collect_data_for_form(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] form_node_idx: usize,
 ) -> HashMap<String, String> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let inputs = renderer.collect_inputs_in_form(form_node_idx, None);
     let mut data = HashMap::new();
@@ -6923,10 +6737,10 @@ fn op_collect_data_for_form(
 
 #[op2(fast)]
 fn op_submit_form(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] form_node_idx: usize,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<JsHostState>();
+    let host = frame_host(scope);
     let result = host
         .renderer
         .borrow_mut()
@@ -6935,8 +6749,11 @@ fn op_submit_form(
 }
 
 #[op2(fast)]
-fn op_track_intersection(state: &mut OpState, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
+fn op_track_intersection(
+    scope: &mut v8::PinScope,
+    #[number] node_idx: usize,
+) -> Result<(), JsErrorBox> {
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     renderer.track_intersection(node_idx);
     Ok(())
@@ -6944,19 +6761,23 @@ fn op_track_intersection(state: &mut OpState, #[number] node_idx: usize) -> Resu
 
 #[op2(fast)]
 fn op_untrack_intersection(
-    state: &mut OpState,
+    scope: &mut v8::PinScope,
     #[number] node_idx: usize,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow_mut::<JsHostState>();
+    let host = frame_host(scope);
     let mut renderer = host.renderer.borrow_mut();
     renderer.untrack_intersection(node_idx);
     Ok(())
 }
 
 #[op2(fast)]
-fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<u32, JsErrorBox> {
+fn op_spawn_worker(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    #[string] src: &str,
+) -> Result<u32, JsErrorBox> {
+    let host = frame_host(scope);
     let buffer_store = state.borrow::<deno_core::SharedArrayBufferStore>().clone();
-    let host = state.borrow_mut::<JsHostState>();
     let mut renderer = host.renderer.borrow_mut();
     let worker_id = renderer
         .spawn_worker(src, buffer_store)
@@ -6965,23 +6786,20 @@ fn op_spawn_worker(state: &mut OpState, #[string] src: &str) -> Result<u32, JsEr
 }
 
 #[op2(fast)]
-fn op_terminate_worker(state: &mut OpState, #[number] worker_id: usize) {
-    state
-        .borrow::<JsHostState>()
-        .renderer
-        .borrow_mut()
-        .workers
-        .remove(&worker_id);
+fn op_terminate_worker(scope: &mut v8::PinScope, #[number] worker_id: usize) {
+    let host = frame_host(scope);
+    host.renderer.borrow_mut().workers.remove(&worker_id);
 }
 
 #[op2]
 fn op_post_message_to_worker(
+    scope: &mut v8::PinScope,
     state: &mut OpState,
     #[number] worker_id: usize,
     #[serde] message: deno_web::JsMessageData,
 ) -> Result<(), JsErrorBox> {
+    let host = frame_host(scope);
     let message = WorkerMessage::take(state, message)?;
-    let host = state.borrow::<JsHostState>();
     let renderer = host.renderer.borrow();
     let Some(worker) = renderer.workers.get(&worker_id) else {
         return Ok(());
@@ -7124,6 +6942,7 @@ fn query_selector_all(
 extension!(
   browser_worker,
   ops = [
+    op_realm_is_active,
     op_fetch_site,
     op_tls_peer_certificate,
     op_worker_post_message,
@@ -7169,6 +6988,7 @@ extension!(
     op_would_create_cycle,
     op_append_child,
     op_remove_child,
+    op_realm_is_active,
     op_get_child_nodes,
     op_get_descendant_nodes,
     op_get_sibling,
@@ -7205,7 +7025,6 @@ extension!(
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
-    op_is_top,
     op_get_node,
     op_bind_node_wrapper,
     op_get_closest,
@@ -7213,13 +7032,14 @@ extension!(
     op_get_attributes,
     op_get_computed_style,
     op_measure_element,
-    op_post_message_to_parent,
-    op_post_message_to_frame,
+    op_window_post_message,
+    op_window_message_source,
     op_get_offset_y,
     op_collect_data_for_form,
     op_submit_form,
     op_clone_node,
     op_spawn_frame,
+    op_frame_window,
     op_spawn_worker,
     op_terminate_worker,
     op_post_message_to_worker,
@@ -7696,6 +7516,14 @@ fn blit_rgb_buffer(
 enum LoadPhase {
     JsDone,
     IframeDone,
+}
+
+pub struct PreparedFrame {
+    url: url::Url,
+    window_name: String,
+    parent_proxy: RendererProxy,
+    size: PhysicalSize<u32>,
+    node_idx: usize,
 }
 
 impl Renderer {
@@ -8486,6 +8314,30 @@ impl Renderer {
         });
 
         scripts
+    }
+
+    pub fn prepare_frame_creation(&self, url: Option<String>, node_idx: usize) -> Result<PreparedFrame> {
+        let frame_url = match url.as_deref().filter(|url| !url.is_empty()) {
+            Some(url) => ReqwestUrl::parse(&self.url)?.join(url)?,
+            None => ReqwestUrl::parse("about:blank")?,
+        };
+        let window_name = self
+            .nodes
+            .get(node_idx)
+            .and_then(|node| match node {
+                Node::Element(element) => element.attributes.get_str("name"),
+                _ => None,
+            })
+            .map(Cow::into_owned)
+            .unwrap_or_default();
+        let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
+        Ok(PreparedFrame {
+            url: frame_url,
+            window_name,
+            parent_proxy,
+            size: PhysicalSize::new(300, 150),
+            node_idx,
+        })
     }
 
     pub fn walk_node_upwards(&self, idx: usize, callback: impl Fn(&Node) -> bool) -> Option<usize> {
@@ -9706,7 +9558,7 @@ impl Renderer {
                     if style.display == StyleDisplay::None {
                         return None;
                     }
-                    let (height, width, url) = match self.nodes.get(node_idx).unwrap() {
+                    let (height, width) = match self.nodes.get(node_idx).unwrap() {
                         Node::Element(element) => (
                             element
                                 .attributes
@@ -9718,7 +9570,6 @@ impl Renderer {
                                 .get_str("width")
                                 .and_then(|v| v.parse::<f32>().ok())
                                 .unwrap_or(300.) as u32,
-                            element.attributes.get_str("src").map(Cow::into_owned),
                         ),
                         _ => unreachable!(),
                     };
@@ -9726,14 +9577,7 @@ impl Renderer {
                         StyleZIndex::Auto => 0,
                         StyleZIndex::Number(value) => value,
                     };
-                    if !self.frames.contains_key(&node_idx) {
-                        let handle = self
-                            .spawn_frame(url, PhysicalSize { width, height }, node_idx)
-                            .ok()?;
-                        self.frames.insert(node_idx, handle);
-                    }
-                    if save_as_final {
-                        let handle = self.frames.get_mut(&node_idx).unwrap();
+                    if save_as_final && let Some(handle) = self.frames.get_mut(&node_idx) {
                         let size = PhysicalSize::new(width, height);
                         if handle.requested_size != size {
                             let _ = handle.tx.send(FrameCommand::Resized(size));
@@ -9948,107 +9792,6 @@ impl Renderer {
                 }
             }
         }
-    }
-
-    fn spawn_frame(
-        &mut self,
-        url: Option<String>,
-        size: PhysicalSize<u32>,
-        node_idx: usize,
-    ) -> Result<FrameHandle> {
-        let frame_url = match url.as_deref().filter(|url| !url.is_empty()) {
-            Some(url) => ReqwestUrl::parse(&self.url)?.join(url)?,
-            None => ReqwestUrl::parse("about:blank")?,
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let latest_bitmap = Arc::new(Mutex::new(FrameSurface {
-            size,
-            pixels: vec![0; (size.width * size.height) as usize],
-        }));
-        let bitmap_for_thread = Arc::clone(&latest_bitmap);
-        let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
-        let window_name = self
-            .nodes
-            .get(node_idx)
-            .and_then(|node| match node {
-                Node::Element(element) => element.attributes.get_str("name"),
-                _ => None,
-            })
-            .map(Cow::into_owned)
-            .unwrap_or_default();
-        tx.send(FrameCommand::Render).unwrap();
-        let tx_proxy = RendererProxy::FrameLoop(tx.clone());
-        let parent_window = ParentWindow {
-            proxy: parent_proxy.clone(),
-            node_idx,
-            origin: self.origin.clone(),
-        };
-        std::thread::spawn(move || {
-            let mut frame = Frame::new(frame_url.to_string(), false, size);
-            frame.parent_window = Some(parent_window);
-            frame.window_name = window_name;
-
-            let frame_result = frame.open();
-            match frame_result {
-                Ok(params) => {
-                    let _ = frame
-                        .set_up_without_event_loop(params, tx_proxy)
-                        .inspect_err(|err| eprintln!("Failed to start iframe renderer: {:?}", err));
-                }
-                Err(err) => {
-                    eprintln!("Failed to boot iframe frame: {:?}", err);
-                    return;
-                }
-            }
-
-            let start = Instant::now();
-            let js_result = frame.run_js();
-            println!(
-                "Finished running JS code in {}ms: {:?}",
-                Instant::now().duration_since(start).as_millis(),
-                js_result
-            );
-            let _ = parent_proxy.fire_user_event(UserEvent::FrameLoaded(node_idx));
-
-            let mut js_pending = true;
-            loop {
-                let cmd = if let Some(timeout) = frame.command_wait_timeout(js_pending) {
-                    match rx.recv_timeout(timeout) {
-                        Ok(cmd) => Some(cmd),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                } else {
-                    match rx.recv() {
-                        Ok(cmd) => Some(cmd),
-                        Err(_) => break,
-                    }
-                };
-                let had_command = cmd.is_some();
-                for cmd in collect_frame_commands(cmd, &rx) {
-                    if matches!(cmd, FrameCommand::Close) {
-                        return;
-                    }
-                    frame.handle_frame_command(cmd, &parent_proxy, &bitmap_for_thread);
-                }
-                if had_command || js_pending {
-                    js_pending = frame
-                        .pump_js_event_loop_once()
-                        .inspect_err(|err| {
-                            eprintln!("Error occurred while pumping JS loop: {}", err)
-                        })
-                        .unwrap_or(false);
-                }
-                let _ = frame.run_animation_frame_if_due().inspect_err(|err| {
-                    eprintln!("Error occurred while running animation frame: {}", err)
-                });
-            }
-        });
-        Ok(FrameHandle {
-            surface: latest_bitmap,
-            requested_size: size,
-            tx,
-        })
     }
 
     fn resolve_background_data_url(
@@ -12442,7 +12185,7 @@ impl Renderer {
                     .frames
                     .get_mut(&self.layout_to_node_idx(&layout_box_idx))
                 {
-                    let surface = handle.surface.lock().unwrap();
+                    let surface = handle.surface.borrow();
                     let clip = clip
                         .intersect_x(
                             container_start_x,
@@ -12614,6 +12357,7 @@ impl Renderer {
             self.nodes.get_mut(node_idx).unwrap().set_parent(None);
             self.node_layout_mapping.remove(&node_idx);
         }
+        self.remove_disconnected_frames();
         children
     }
 
@@ -12634,6 +12378,7 @@ impl Renderer {
             node.set_parent(None);
         }
         self.node_layout_mapping.remove(&node_idx);
+        self.remove_disconnected_frames();
         self.record_child_list_mutation(
             parent,
             vec![],
@@ -12930,6 +12675,18 @@ impl Renderer {
         }
     }
 
+    fn remove_disconnected_frames(&mut self) {
+        let detached = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|idx| !self.node_is_connected(*idx))
+            .collect::<Vec<_>>();
+        for idx in detached {
+            self.frames.remove(&idx);
+        }
+    }
+
     pub fn schedule_dom_update(&mut self) {
         // A read may have flushed the previous mutation while its notification
         // is still queued. Every new mutation must invalidate the result again.
@@ -13055,13 +12812,50 @@ impl ExecutedScripts {
     }
 }
 
+pub struct FrameJsShared {
+    realm: JsRealm,
+    owner_runtime: Weak<RefCell<JsRuntime>>,
+    parent_context: v8::Global<v8::Context>,
+    connected: Rc<Cell<bool>>,
+}
+
+pub enum FrameJs {
+    Owned(Rc<RefCell<JsRuntime>>),
+    Shared(Rc<RefCell<FrameJsShared>>),
+}
+
+impl FrameJs {
+    fn runtime(&self) -> Rc<RefCell<JsRuntime>> {
+        match self {
+            Self::Owned(runtime) => runtime.clone(),
+            Self::Shared(shared) => shared
+                .borrow()
+                .owner_runtime
+                .upgrade()
+                .expect("Iframe outlived its JS runtime"),
+        }
+    }
+
+    fn realm(&self, runtime: &JsRuntime) -> JsRealm {
+        match self {
+            Self::Owned(_) => runtime.main_realm(),
+            Self::Shared(shared) => shared.borrow().realm.clone(),
+        }
+    }
+
+    fn op_state(&self) -> Rc<RefCell<OpState>> {
+        self.runtime().borrow().op_state()
+    }
+}
+
 /// A document frame. [`Frame::open_headless`] initializes one on the calling thread.
 pub struct Frame {
     url: String,
     document_generation: u64,
+    document_fetch: Option<tokio::task::JoinHandle<Result<(String, String)>>>,
     renderer: Option<Rc<RefCell<Renderer>>>,
     window: Option<Arc<Window>>,
-    js_runtime: Option<Rc<RefCell<JsRuntime>>>,
+    js_runtime: Option<FrameJs>,
     tokio: Option<Rc<RefCell<tokio::runtime::Runtime>>>,
     html_parser: Option<HtmlParser>,
     font_handler: Rc<FontHandler>,
@@ -13082,6 +12876,16 @@ pub struct Frame {
     last_animation_frame: Instant,
     blob_store: Arc<BlobStore>,
 }
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if let Some(fetch) = self.document_fetch.take() {
+            fetch.abort();
+        }
+    }
+}
+
+const BLANK_DOCUMENT: &str = "<html><head></head><body></body></html>";
 
 struct BootParams {
     template_contents: HashMap<usize, usize>,
@@ -13159,6 +12963,7 @@ impl Frame {
         Self {
             url,
             document_generation: 0,
+            document_fetch: None,
             renderer: None,
             window: None,
             js_runtime: None,
@@ -13192,27 +12997,22 @@ impl Frame {
             .render_into(buffer, width, height);
     }
 
-    async fn get_html_for_navigation(&self, request: FormNavigation) -> Result<(String, String)> {
+    async fn get_html_for_navigation(
+        client: reqwest::Client,
+        request: FormNavigation,
+    ) -> Result<(String, String)> {
         let url = request.url;
         if url.as_str() == "about:blank" {
-            return Ok((
-                r#"<html>
-  <head></head>
-  <body></body>
-</html>"#
-                    .to_string(),
-                url.to_string(),
-            ));
+            return Ok((BLANK_DOCUMENT.to_string(), url.to_string()));
         }
 
         if request.method == FormMethod::Get
             && let Some(stripped) = url.as_str().strip_prefix("file://")
         {
-            let contents = fs::read_to_string(stripped)?;
+            let contents = tokio::fs::read_to_string(stripped).await?;
             Ok((contents, url.to_string()))
         } else {
             println!("Fetching HTML for {:?}", url);
-            let client = &self.network_fetch.borrow_mut().client;
             let request = match request.method {
                 FormMethod::Get => client.get(url),
                 FormMethod::Post => client
@@ -13227,11 +13027,75 @@ impl Frame {
         }
     }
 
+    fn install_js_context(
+        &mut self,
+        scope: &mut v8::PinScope,
+        parent_context: &v8::Global<v8::Context>,
+        proxy: RendererProxy,
+    ) -> Result<()> {
+        if self.url == "about:blank" {
+            let parent = v8::Local::new(scope, parent_context);
+            self.renderer.as_ref().unwrap().borrow_mut().origin = context_origin(parent);
+        }
+        let state = JsRuntime::op_state_from(scope);
+        let owner_runtime = state.borrow().borrow::<Weak<RefCell<JsRuntime>>>().clone();
+        let host = JsHostState {
+            renderer: self.renderer.as_ref().cloned().unwrap(),
+            proxy,
+            executed_scripts: self.executed_scripts.clone(),
+        };
+        let realm = JsRuntime::new_realm_from_scope(
+            scope,
+            deno_core::CreateRealmOptions {
+                module_loader: Some(Rc::new(HttpModuleLoader::new(
+                    self.network_fetch.borrow().client.clone(),
+                ))),
+            },
+        )?;
+        let connected = match &self.js_runtime {
+            Some(FrameJs::Shared(shared)) => shared.borrow().connected.clone(),
+            _ => Rc::new(Cell::new(true)),
+        };
+        let context = v8::Local::new(scope, realm.context());
+        let child_scope = &mut v8::ContextScope::new(scope, context);
+        let origin = host.renderer.borrow().origin.clone();
+        bind_frame_state(child_scope, host, connected.clone(), Some(parent_context));
+        let parent = v8::Local::new(child_scope, parent_context);
+        if origin == context_origin(parent) {
+            context.set_security_token(parent.get_security_token(child_scope));
+        } else {
+            context.use_default_security_token();
+        }
+        let parent_window = window_for_origin(child_scope, parent, &origin);
+        let window = context.global(child_scope);
+        let key = v8::String::new(child_scope, "__parentWindow").unwrap();
+        window.set(child_scope, key.into(), parent_window);
+        run_v8_source(child_scope, "frame globals", &self.js_dom_code())?;
+        match &mut self.js_runtime {
+            Some(FrameJs::Shared(shared)) => {
+                shared.borrow_mut().realm = realm;
+            }
+            None => {
+                let shared = FrameJsShared {
+                    realm,
+                    owner_runtime,
+                    parent_context: parent_context.clone(),
+                    connected,
+                };
+                self.js_runtime = Some(FrameJs::Shared(Rc::new(RefCell::new(shared))));
+            }
+            Some(FrameJs::Owned(_)) => unreachable!(),
+        }
+        Ok(())
+    }
+
     fn install_js_host(&mut self) {
+        let tokio = self.tokio.as_ref().unwrap().borrow();
+        let _guard = tokio.enter();
         let buffer_store = deno_core::SharedArrayBufferStore::default();
         let broadcast_channel = InMemoryBroadcastChannel::default();
         let client = self.network_fetch.borrow().client.clone();
-        self.js_runtime = Some(Rc::new(RefCell::new(deno_core::JsRuntime::new(
+        let runtime = deno_core::JsRuntime::new(
             deno_core::RuntimeOptions {
                 shared_array_buffer_store: Some(buffer_store.clone()),
                 module_loader: Some(Rc::new(HttpModuleLoader::new(client))),
@@ -13246,29 +13110,45 @@ impl Frame {
                 ],
                 ..Default::default()
             },
-        ))));
-        self.js_runtime
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .op_state()
-            .borrow_mut()
-            .put(buffer_store);
+        );
+        let state = runtime.op_state();
+        state.borrow_mut().put(buffer_store);
+        state.borrow_mut().put(WindowSources::default());
+        let runtime = Rc::new(RefCell::new(runtime));
+        state.borrow_mut().put(Rc::downgrade(&runtime));
+        self.js_runtime = Some(FrameJs::Owned(runtime));
     }
 
     fn drain_microtasks(runtime: &mut JsRuntime) {
-        deno_core::scope!(scope, runtime);
-        custom_elements::deliver_reactions(scope);
-        mutation_observer::schedule(scope);
-        scope.perform_microtask_checkpoint();
+        // Deno also retains failed realms, which have no browser bindings.
+        let contexts = runtime
+            .op_state()
+            .borrow()
+            .borrow::<WindowSources>()
+            .0
+            .clone();
+        for context in &contexts {
+            v8::scope_with_context!(scope, runtime.v8_isolate(), context);
+            if is_active(scope) {
+                custom_elements::deliver_reactions(scope);
+                mutation_observer::schedule(scope);
+            } else {
+                deactivate_realm(scope);
+            }
+        }
+        runtime.v8_isolate().perform_microtask_checkpoint();
     }
 
-    fn set_current_script(runtime: &mut JsRuntime, node_idx: Option<usize>) -> Result<()> {
+    fn set_current_script(
+        runtime: &mut JsRuntime,
+        realm: &JsRealm,
+        node_idx: Option<usize>,
+    ) -> Result<()> {
         let code = match node_idx {
             Some(node_idx) => format!("__set_current_script_node_idx({node_idx})"),
             None => "__set_current_script_node_idx(null)".to_string(),
         };
-        runtime.execute_script("set current script", code)?;
+        realm.execute_script(runtime.v8_isolate(), "set current script", code)?;
         Ok(())
     }
 
@@ -13280,10 +13160,12 @@ impl Frame {
         let tokio = self.tokio.as_ref().unwrap().clone();
         let tokio = tokio.borrow();
         let _guard = tokio.enter();
-
-        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+        let js = self.js_runtime.as_ref().unwrap();
+        let owner = js.runtime();
+        let mut runtime = owner.borrow_mut();
+        let realm = js.realm(&runtime);
         Self::drain_microtasks(&mut runtime);
-        let value = runtime.execute_script(name, code)?;
+        let value = realm.execute_script(runtime.v8_isolate(), name, code)?;
         Self::drain_microtasks(&mut runtime);
         Ok(value)
     }
@@ -13300,7 +13182,7 @@ impl Frame {
         {
             return;
         }
-        let state = self.js_runtime.as_ref().unwrap().borrow().op_state();
+        let state = self.js_runtime.as_ref().unwrap().op_state();
         state.borrow_mut().put(message);
         let code = format!("__dispatchWorkerMessage({worker_id})");
         if let Err(err) = self.execute_host_script("worker message handler", code) {
@@ -13358,13 +13240,26 @@ impl Frame {
             .event_loop_proxy
             .clone()
             .context("Renderer event loop proxy is not configured")?;
-        self.js_runtime = None;
-        self.install_js_host();
-        self.bind_js_host(proxy);
+        if let Some(js @ FrameJs::Shared(shared)) = &self.js_runtime {
+            let owner = js.runtime();
+            let (parent, old_realm) = {
+                let shared = shared.borrow();
+                (shared.parent_context.clone(), shared.realm.clone())
+            };
+            let mut runtime = owner.borrow_mut();
+            v8::scope_with_context!(scope, runtime.v8_isolate(), old_realm.context());
+            deactivate_realm(scope);
+            self.install_js_context(scope, &parent, proxy)?;
+        } else {
+            self.js_runtime = None;
+            self.install_js_host();
+            self.bind_js_host(proxy);
+            self.setup_js_dom()?;
+        }
         Ok(())
     }
 
-    fn paint_iframe(&mut self, parent_proxy: &RendererProxy, surface: &Arc<Mutex<FrameSurface>>) {
+    fn paint_iframe(&mut self, parent_proxy: &RendererProxy, surface: &RefCell<FrameSurface>) {
         let size = self.render_size;
         let mut pixels = vec![0; (size.width * size.height) as usize];
         self.renderer.as_ref().unwrap().borrow_mut().render_into(
@@ -13372,7 +13267,7 @@ impl Frame {
             size.width,
             size.height,
         );
-        *surface.lock().unwrap() = FrameSurface { size, pixels };
+        *surface.borrow_mut() = FrameSurface { size, pixels };
         self.update_newly_loaded_images();
         let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
     }
@@ -13381,9 +13276,17 @@ impl Frame {
         &mut self,
         cmd: FrameCommand,
         parent_proxy: &RendererProxy,
-        bitmap_for_thread: &Arc<Mutex<FrameSurface>>,
+        surface: &RefCell<FrameSurface>,
     ) {
         match cmd {
+            FrameCommand::Initialize => {
+                if let Err(err) = self.run_js() {
+                    eprintln!("Failed to run iframe scripts: {err}");
+                }
+                let _ = parent_proxy.fire_user_event(UserEvent::FrameLoaded(
+                    self.parent_window.as_ref().unwrap().node_idx,
+                ));
+            }
             cmd @ (FrameCommand::Render
             | FrameCommand::UserEvent(UserEvent::FrameUpdated)
             | FrameCommand::UserEvent(UserEvent::DomUpdated)
@@ -13417,11 +13320,11 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread);
+                self.paint_iframe(parent_proxy, surface);
             }
             FrameCommand::UserEvent(UserEvent::Hover(position)) => {
                 if self.apply_hovering(&position) {
-                    self.paint_iframe(parent_proxy, bitmap_for_thread);
+                    self.paint_iframe(parent_proxy, surface);
                 }
             }
             FrameCommand::UserEvent(UserEvent::Click) => {
@@ -13437,15 +13340,16 @@ impl Frame {
                     self.process_dom_update();
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread);
+                self.paint_iframe(parent_proxy, surface);
             }
             FrameCommand::UserEvent(UserEvent::Navigate((href, reload))) => {
                 if let Err(err) = self.perform_navigation(href, reload) {
                     eprintln!("Iframe navigation failed: {err:?}");
                     return;
                 }
-
-                self.paint_iframe(parent_proxy, bitmap_for_thread);
+                if !reload {
+                    self.paint_iframe(parent_proxy, surface);
+                }
             }
             FrameCommand::UserEvent(UserEvent::FrameLoaded(node_idx)) => {
                 self.fire_load_phase(&LoadPhase::IframeDone, Some(&vec![node_idx]));
@@ -13465,99 +13369,13 @@ impl Frame {
                     eprintln!("Failed to dispatch iframe resize: {err}");
                 }
 
-                self.paint_iframe(parent_proxy, bitmap_for_thread);
+                self.paint_iframe(parent_proxy, surface);
             }
             FrameCommand::UserEvent(UserEvent::WindowMessage(message)) => {
                 self.dispatch_window_message(message);
             }
             FrameCommand::UserEvent(UserEvent::WorkerMessage { worker_id, message }) => {
                 self.dispatch_worker_message(worker_id, message);
-            }
-            FrameCommand::Dom(FrameDomCommand::GetDocumentElement { reply }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow();
-                let _ = reply.send(renderer.document_element());
-            }
-            FrameCommand::Dom(FrameDomCommand::QuerySelector {
-                selector,
-                required_parent,
-                reply,
-            }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(Ok(renderer.query_selector_node(selector, required_parent)));
-            }
-            FrameCommand::Dom(FrameDomCommand::QuerySelectorAll {
-                selector,
-                required_parent,
-                reply,
-            }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(Ok(
-                    renderer.query_selector_all_nodes(selector, required_parent)
-                ));
-            }
-            FrameCommand::Dom(FrameDomCommand::ElementFromPoint { x, y, reply }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(renderer.element_from_point(x, y));
-            }
-            FrameCommand::Dom(FrameDomCommand::ReplaceInnerHtml {
-                html,
-                node_idx,
-                reply,
-            }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                renderer.replace_inner_html(node_idx, html);
-                let _ = reply.send(());
-            }
-            FrameCommand::Dom(FrameDomCommand::GetInnerHtml { node_idx, reply }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow();
-                let html = renderer.get_element_inner_html(node_idx);
-                let _ = reply.send(html);
-            }
-            FrameCommand::Dom(FrameDomCommand::GetComputedStyle { node_idx, reply }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(computed_style_properties(&mut renderer, node_idx));
-            }
-            FrameCommand::Dom(FrameDomCommand::MeasureElement { node_idx, reply }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(renderer.measure_element(node_idx));
-            }
-            FrameCommand::Dom(FrameDomCommand::CreateElement { tag, reply }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let idx = renderer.create_element(tag);
-                let _ = reply.send(idx);
-            }
-            FrameCommand::Dom(FrameDomCommand::GetElementsByTagName {
-                tag,
-                reply,
-                required_parent,
-            }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(renderer.get_elements_by_tag_name(&tag, required_parent));
-            }
-            FrameCommand::Dom(FrameDomCommand::GetElementsByName {
-                name,
-                reply,
-                required_parent,
-            }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(renderer.get_elements_by_name(&name, required_parent));
-            }
-            FrameCommand::Dom(FrameDomCommand::GetElementsByClassName {
-                class_names,
-                reply,
-                required_parent,
-            }) => {
-                let renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ =
-                    reply.send(renderer.get_elements_by_class_name(&class_names, required_parent));
-            }
-            FrameCommand::Dom(FrameDomCommand::UpdateElementAttributes {
-                node_idx,
-                attributes,
-                reply,
-            }) => {
-                let mut renderer = self.renderer.as_ref().unwrap().borrow_mut();
-                let _ = reply.send(renderer.update_element_attributes(node_idx, attributes));
             }
             FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
                 self.animation_frame_requested = true;
@@ -13575,8 +13393,30 @@ impl Frame {
         })
     }
 
+    fn event_loop_delay(&self) -> Option<Duration> {
+        let mut delay = self.animation_frame_delay();
+        if let Some(renderer) = &self.renderer {
+            for frame in renderer
+                .borrow()
+                .frames
+                .values()
+                .map(|handle| &handle.frame)
+            {
+                // Child queues do not wake the owner yet, so check them periodically.
+                let poll_interval = Duration::from_millis(16);
+                let frame_delay = frame
+                    .borrow()
+                    .event_loop_delay()
+                    .unwrap_or(poll_interval)
+                    .min(poll_interval);
+                delay = Some(delay.map_or(frame_delay, |delay| delay.min(frame_delay)));
+            }
+        }
+        delay
+    }
+
     fn command_wait_timeout(&self, js_pending: bool) -> Option<Duration> {
-        match (js_pending, self.animation_frame_delay()) {
+        match (js_pending, self.event_loop_delay()) {
             (true, Some(animation_delay)) => Some(Duration::from_millis(16).min(animation_delay)),
             (true, None) => Some(Duration::from_millis(16)),
             (false, Some(animation_delay)) => Some(animation_delay),
@@ -13601,7 +13441,57 @@ impl Frame {
         Ok(true)
     }
 
+    fn poll_shared_frames(&mut self) -> bool {
+        let Some(renderer) = self.renderer.as_ref().cloned() else {
+            return false;
+        };
+        // Release the parent renderer borrow before child handlers enter JavaScript.
+        let frames = renderer
+            .borrow()
+            .frames
+            .values()
+            .map(|handle| {
+                (
+                    handle.frame.clone(),
+                    collect_frame_commands(None, &handle.rx),
+                    handle.surface.clone(),
+                    handle.js.borrow().connected.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut had_work = false;
+        for (child, commands, surface, connected) in frames {
+            let mut frame = child.borrow_mut();
+            let parent_proxy = frame.parent_window.as_ref().unwrap().proxy.clone();
+            for command in commands {
+                if !connected.get() {
+                    break;
+                }
+                had_work = true;
+                frame.handle_frame_command(command, &parent_proxy, &surface);
+            }
+            if !connected.get() {
+                continue;
+            }
+            had_work |= frame
+                .finish_navigation(&parent_proxy, &surface)
+                .inspect_err(|err| eprintln!("Iframe navigation failed: {err:?}"))
+                .unwrap_or(false);
+            had_work |= frame
+                .run_animation_frame_if_due()
+                .inspect_err(|err| {
+                    eprintln!("Error occurred while running iframe animation frame: {}", err)
+                })
+                .unwrap_or(false);
+            had_work |= frame.document_fetch.is_some();
+            had_work |= frame.poll_shared_frames();
+        }
+        had_work
+    }
+
     fn pump_js_event_loop_once(&mut self) -> Result<bool> {
+        let frame_work = self.poll_shared_frames();
         let event_loop_notify = self
             .renderer
             .as_ref()
@@ -13610,10 +13500,12 @@ impl Frame {
             .event_loop_notify
             .clone();
         let event_loop_wait = self
-            .animation_frame_delay()
+            .event_loop_delay()
             .unwrap_or(Duration::from_millis(10))
             .min(Duration::from_millis(10));
-        let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+        let FrameJs::Owned(js) = self.js_runtime.as_mut().unwrap() else {
+            return Ok(false);
+        };
 
         // The current-thread Tokio runtime only drives network/timer IO while block_on is active,
         // so keep this as a short cooperative slice rather than a pure Winit waker.
@@ -13623,10 +13515,17 @@ impl Frame {
             .clone()
             .borrow_mut()
             .block_on(async {
+                let mut runtime = js.borrow_mut();
                 Self::drain_microtasks(&mut runtime);
                 tokio::select! {
                     result = runtime.run_event_loop(Default::default()) => match result {
-                        Ok(()) => Ok(false),
+                        Ok(()) => {
+                            // Let Tokio drive document fetches even when JS is idle.
+                            if frame_work {
+                                tokio::time::sleep(event_loop_wait).await;
+                            }
+                            Ok(frame_work)
+                        },
                         Err(err) => {
                             eprintln!("Error occurred while pumping JS loop: {}", err);
                             Ok(true)
@@ -13691,15 +13590,23 @@ impl Frame {
         bodies
     }
 
-    async fn execute_js_module(runtime: &mut JsRuntime, url: &ReqwestUrl, code: String) {
+    async fn execute_js_module(
+        runtime: &mut JsRuntime,
+        realm: &JsRealm,
+        url: &ReqwestUrl,
+        code: String,
+    ) {
         // Modules do not expose a document.currentScript, including during imports.
-        if let Err(err) = Self::set_current_script(runtime, None) {
+        if let Err(err) = Self::set_current_script(runtime, realm, None) {
             eprintln!("Failed to prepare JS module at {url}: {err}");
             return;
         }
-        match runtime.load_side_es_module_from_code(url, code).await {
+        match realm
+            .load_side_es_module_from_code(runtime.v8_isolate(), url.to_string(), Some(code.into()))
+            .await
+        {
             Ok(module_id) => {
-                let result = runtime.mod_evaluate(module_id);
+                let result = realm.mod_evaluate(runtime.v8_isolate(), module_id);
                 if let Err(err) = runtime
                     .with_event_loop_promise(result, Default::default())
                     .await
@@ -13716,9 +13623,12 @@ impl Frame {
         js: &Script,
         prefetched: &HashMap<String, String>,
     ) -> Result<()> {
-        let Some(mut runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) else {
+        let Some(js_runtime) = &self.js_runtime else {
             return Ok(());
         };
+        let owner = js_runtime.runtime();
+        let mut runtime = owner.borrow_mut();
+        let realm = js_runtime.realm(&runtime);
 
         match &js.content {
             ScriptContent::Code(code) if js.script_type == ScriptType::Module => {
@@ -13735,14 +13645,17 @@ impl Frame {
                     "import.meta.url = {};\n{code}",
                     js_string_literal(&self.url)
                 );
-                Self::execute_js_module(&mut runtime, &url, code).await;
+                Self::execute_js_module(&mut runtime, &realm, &url, code).await;
             }
             ScriptContent::Code(code) => {
                 let code_context: String = code.chars().take(40).collect();
-                Self::set_current_script(&mut runtime, js.node_idx)?;
-                let result = runtime
-                    .execute_script(format!("injected code ({})", code_context), code.clone());
-                Self::set_current_script(&mut runtime, None)?;
+                Self::set_current_script(&mut runtime, &realm, js.node_idx)?;
+                let result = realm.execute_script(
+                    runtime.v8_isolate(),
+                    format!("injected code ({})", code_context),
+                    code.clone(),
+                );
+                Self::set_current_script(&mut runtime, &realm, None)?;
                 match result {
                     Ok(_) => Self::drain_microtasks(&mut runtime),
                     Err(err) => eprintln!("Failed to execute JS with error: {}", err),
@@ -13762,9 +13675,13 @@ impl Frame {
                         let Some(code) = prefetched.get(&url.to_string()) else {
                             return Err(anyhow!("Failed to fetch script {link}"));
                         };
-                        Self::set_current_script(&mut runtime, js.node_idx)?;
-                        let result = runtime.execute_script(url.to_string(), code.clone());
-                        Self::set_current_script(&mut runtime, None)?;
+                        Self::set_current_script(&mut runtime, &realm, js.node_idx)?;
+                        let result = realm.execute_script(
+                            runtime.v8_isolate(),
+                            url.to_string(),
+                            code.clone(),
+                        );
+                        Self::set_current_script(&mut runtime, &realm, None)?;
                         match result {
                             Ok(_) => Self::drain_microtasks(&mut runtime),
                             Err(err) => {
@@ -13774,7 +13691,7 @@ impl Frame {
                     }
                     ScriptType::Module => {
                         if let Some(code) = prefetched.get(&url.to_string()) {
-                            Self::execute_js_module(&mut runtime, &url, code.clone()).await;
+                            Self::execute_js_module(&mut runtime, &realm, &url, code.clone()).await;
                         } else {
                             eprintln!(
                                 "Failed to load JS module at {} with error: prefetch failed",
@@ -13792,7 +13709,7 @@ impl Frame {
                 "__elementFromNodeIdx({}).dispatchEvent(new Event('load'))",
                 node_idx
             );
-            runtime.execute_script("script onload", code.clone())?;
+            realm.execute_script(runtime.v8_isolate(), "script onload", code.clone())?;
             Self::drain_microtasks(&mut runtime);
         }
 
@@ -13809,6 +13726,20 @@ impl Frame {
     }
 
     fn run_js(&mut self) -> Result<()> {
+        let frames = {
+            let renderer = self.renderer.as_ref().unwrap().borrow();
+            renderer.nodes_idxs.iter().copied().filter(|idx| {
+                renderer.node_is_connected(*idx)
+                    && matches!(renderer.nodes.get(*idx), Some(Node::Element(element)) if element.tag == "iframe")
+            }).collect::<Vec<_>>()
+        };
+        self.execute_host_script(
+            "spawn document frames",
+            format!(
+                "{}.forEach(idx => __elementFromNodeIdx(idx).spawnFrame())",
+                deno_core::serde_json::to_string(&frames)?
+            ),
+        )?;
         let scripts: Vec<Script> = self
             .renderer
             .as_ref()
@@ -13934,12 +13865,59 @@ impl Frame {
     }
 
     fn navigate_with_request(&mut self, request: FormNavigation) -> Result<()> {
+        let client = self.network_fetch.borrow().client.clone();
+        if matches!(self.js_runtime, Some(FrameJs::Shared(_))) {
+            if let Some(fetch) = self.document_fetch.take() {
+                fetch.abort();
+            }
+            self.document_fetch = Some(
+                self.tokio
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .spawn(Self::get_html_for_navigation(client, request)),
+            );
+            return Ok(());
+        }
         let (input, final_url) = self
             .tokio
             .as_ref()
             .unwrap()
             .borrow_mut()
-            .block_on(self.get_html_for_navigation(request))?;
+            .block_on(Self::get_html_for_navigation(client, request))?;
+        self.install_navigation_document(input, final_url)
+    }
+
+    fn finish_navigation(
+        &mut self,
+        parent_proxy: &RendererProxy,
+        surface: &RefCell<FrameSurface>,
+    ) -> Result<bool> {
+        if self
+            .document_fetch
+            .as_ref()
+            .is_none_or(|fetch| !fetch.is_finished())
+        {
+            return Ok(false);
+        }
+        let fetch = self.document_fetch.take().unwrap();
+        let (input, final_url) = self
+            .tokio
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .block_on(fetch)??;
+        self.install_navigation_document(input, final_url)?;
+        if self.document_fetch.is_none() {
+            self.paint_iframe(parent_proxy, surface);
+            let _ = parent_proxy.fire_user_event(UserEvent::FrameLoaded(
+                self.parent_window.as_ref().unwrap().node_idx,
+            ));
+        }
+        Ok(true)
+    }
+
+    fn install_navigation_document(&mut self, input: String, final_url: String) -> Result<()> {
         println!("Changing url to {}", final_url);
         self.url = final_url;
 
@@ -13949,18 +13927,39 @@ impl Frame {
             self.html_parser.as_mut().unwrap().get_context()
         ));
 
-        if let Some(renderer) = &self.renderer {
+        if let Some(renderer) = self.renderer.clone() {
             let nodes_table =
                 NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
             let nodes_idxs = sorted_node_idxs(&nodes_table);
-            self.document_generation += 1;
-            renderer.borrow_mut().replace_document(
-                self.url.clone(),
-                nodes_table,
-                nodes_idxs,
-                self.html_parser.as_ref().unwrap().template_contents.clone(),
-            );
-            *self.executed_scripts.borrow_mut() = ExecutedScripts::new();
+            if matches!(self.js_runtime, Some(FrameJs::Shared(_))) {
+                let proxy = renderer.borrow().event_loop_proxy.clone();
+                let dom_indexes =
+                    get_dom_indexes(&nodes_table, &nodes_idxs, &mut ClassIndexes::new());
+                if let Some(result) = self.detect_html_redirect(&dom_indexes) {
+                    return result;
+                }
+                self.document_generation += 1;
+                self.refresh_renderer(
+                    nodes_table,
+                    dom_indexes,
+                    nodes_idxs,
+                    self.html_parser.as_ref().unwrap().template_contents.clone(),
+                );
+                self.renderer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .event_loop_proxy = proxy;
+            } else {
+                self.document_generation += 1;
+                renderer.borrow_mut().replace_document(
+                    self.url.clone(),
+                    nodes_table,
+                    nodes_idxs,
+                    self.html_parser.as_ref().unwrap().template_contents.clone(),
+                );
+            }
+            self.executed_scripts = Rc::new(RefCell::new(ExecutedScripts::new()));
             self.dom_content_loaded_dispatched = false;
             self.load_dispatched = false;
             self.loaded_nodes.clear();
@@ -13968,7 +13967,6 @@ impl Frame {
             self.animation_frame_requested = false;
             self.last_animation_frame = Instant::now();
             self.reset_js_document_state()?;
-            self.setup_js_dom()?;
             let start = Instant::now();
             let js_result = self.run_js();
             println!(
@@ -14011,37 +14009,32 @@ impl Frame {
             .event_loop_proxy = Some(proxy.clone());
 
         self.bind_js_host(proxy);
-        self.setup_js_dom()?;
+        if self.js_runtime.is_some() {
+            self.setup_js_dom()?;
+        }
 
         Ok(())
     }
 
     fn bind_js_host(&mut self, proxy: RendererProxy) {
-        if self.url == "about:blank"
-            && let Some(parent) = &self.parent_window
-        {
-            self.renderer.as_ref().unwrap().borrow_mut().origin = parent.origin.clone();
-        }
-        if let Some(js_runtime) = self.js_runtime.as_mut().and_then(|v| Some(v.borrow_mut())) {
+        if let Some(FrameJs::Owned(runtime)) = &self.js_runtime {
             self.renderer
                 .as_ref()
                 .unwrap()
                 .borrow_mut()
                 .mutation_observers = mutation_observer::Observers::default();
-            js_runtime
-                .op_state()
-                .borrow_mut()
-                .put(mutation_observer::Callbacks::default());
-            js_runtime
-                .op_state()
-                .borrow_mut()
-                .put(custom_elements::Registry::default());
-            js_runtime.op_state().borrow_mut().put(JsHostState {
-                renderer: self.renderer.as_mut().cloned().unwrap(),
-                proxy: proxy,
-                executed_scripts: self.executed_scripts.clone(),
-                parent_window: self.parent_window.clone(),
-            });
+            let mut runtime = runtime.borrow_mut();
+            deno_core::scope!(scope, runtime);
+            bind_frame_state(
+                scope,
+                JsHostState {
+                    renderer: self.renderer.as_ref().cloned().unwrap(),
+                    proxy,
+                    executed_scripts: self.executed_scripts.clone(),
+                },
+                Rc::new(Cell::new(true)),
+                None,
+            );
         }
     }
 
@@ -14084,6 +14077,8 @@ impl Frame {
                 // Animation callbacks can start async work after the JS pump went idle.
                 js_pending = true;
             }
+            // Child commands and animation callbacks can also start async work.
+            js_pending |= self.poll_shared_frames();
         }
     }
 
@@ -14102,6 +14097,34 @@ impl Frame {
             nodes_idxs,
             dom_indexes,
         })
+    }
+
+    fn open_as_context(
+        &mut self,
+        scope: &mut v8::PinScope,
+        parent_context: &v8::Global<v8::Context>,
+        proxy: RendererProxy,
+    ) -> Result<()> {
+        {
+            let host = frame_host(scope);
+            let renderer = host.renderer.borrow();
+            self.tokio = Some(renderer.tokio.clone());
+            self.blob_store = Arc::clone(&renderer.blob_store);
+        }
+        self.install_navigation_document(BLANK_DOCUMENT.to_string(), "about:blank".to_string())?;
+        let nodes_table =
+            NodesTable::new_from_nodes(self.html_parser.as_mut().unwrap().nodes.clone());
+        let nodes_idxs = sorted_node_idxs(&nodes_table);
+        let dom_indexes = get_dom_indexes(&nodes_table, &nodes_idxs, &mut ClassIndexes::new());
+        let params = BootParams {
+            template_contents: self.html_parser.as_ref().unwrap().template_contents.clone(),
+            nodes: nodes_table,
+            nodes_idxs,
+            dom_indexes,
+        };
+        self.set_up_without_event_loop(params, proxy.clone())?;
+        self.install_js_context(scope, parent_context, proxy)?;
+        Ok(())
     }
 
     fn on_click(&mut self) -> Result<()> {
@@ -14208,7 +14231,8 @@ impl Frame {
 
         let default_prevented = {
             let value = self.execute_host_script("click handler", code)?;
-            let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+            let owner = self.js_runtime.as_ref().unwrap().runtime();
+            let mut runtime = owner.borrow_mut();
 
             deno_core::scope!(scope, &mut *runtime);
             let value = deno_core::v8::Local::new(scope, value);
@@ -14296,7 +14320,8 @@ impl Frame {
                             form
                         ),
                     )?;
-                    let mut runtime = self.js_runtime.as_mut().unwrap().borrow_mut();
+                    let owner = self.js_runtime.as_ref().unwrap().runtime();
+                    let mut runtime = owner.borrow_mut();
 
                     deno_core::scope!(scope, &mut *runtime);
                     let value = deno_core::v8::Local::new(scope, value);
@@ -14352,37 +14377,25 @@ impl Frame {
         Ok(())
     }
 
-    fn setup_js_dom(&mut self) -> Result<()> {
-        let code = ScriptContent::Code(
-            format!(
-                r#"
-            navigator.userAgent = "{}";
+    fn js_dom_code(&self) -> String {
+        format!(
+            r#"
+                navigator.userAgent = {};
+                window.__init_location({});
+                window.name = {};
+                window.innerWidth = {};
+                window.innerHeight = {};
+            "#,
+            js_string_literal(USER_AGENT),
+            js_string_literal(&self.url),
+            js_string_literal(&self.window_name),
+            self.render_size.width,
+            self.render_size.height,
+        )
+    }
 
-            window.__init_location("{}");
-            window.name = {};
-            window.innerWidth = {};
-            window.innerHeight = {};
-        "#,
-                USER_AGENT,
-                self.url,
-                js_string_literal(&self.window_name),
-                self.render_size.width,
-                self.render_size.height
-            )
-            .to_string(),
-        );
-        self.tokio
-            .as_ref()
-            .unwrap()
-            .clone()
-            .borrow_mut()
-            .block_on(self.execute_js(vec![Script {
-                content: code,
-                script_type: ScriptType::Classic,
-                node_idx: None,
-                defer: false,
-                is_async: false,
-            }]))?;
+    fn setup_js_dom(&mut self) -> Result<()> {
+        self.execute_host_script("frame globals", self.js_dom_code())?;
         Ok(())
     }
 
@@ -14420,7 +14433,12 @@ impl Frame {
                 .iter()
                 .copied()
                 .filter(|idx| {
-                    !self.loaded_nodes.contains(idx) && renderer.element_has_loaded(*idx, phase)
+                    let should_fire = if *phase == LoadPhase::IframeDone {
+                        renderer.frames.contains_key(idx)
+                    } else {
+                        !self.loaded_nodes.contains(idx)
+                    };
+                    should_fire && renderer.element_has_loaded(*idx, phase)
                 })
                 .collect();
 
@@ -16047,7 +16065,8 @@ mod tests {
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent, ensure_snapshot_matches,
+        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent,
+        ensure_snapshot_matches,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
         },
@@ -16074,6 +16093,9 @@ mod tests {
                     }
                     FrameCommand::UserEvent(UserEvent::AnimationFrameRequested) => {
                         self.animation_frame_requested = true;
+                    }
+                    FrameCommand::UserEvent(UserEvent::WindowMessage(message)) => {
+                        self.dispatch_window_message(message);
                     }
                     // Headless tests apply DOM and rendering updates directly.
                     _ => {}

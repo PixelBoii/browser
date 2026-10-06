@@ -38,7 +38,7 @@ denoEvent.saveGlobalThisReference(globalThis)
 
 setNoColorFns(() => true, () => true)
 globalThis.console = new Console((message, level) => core.print(message, level >= 2))
-core.wrapConsole(globalThis.console, core.console)
+core.wrapConsole(globalThis.console, core.v8Console)
 
 let nextTimerId = 1
 const activeTimers = new Map()
@@ -53,6 +53,7 @@ function createTimer(callback, delay, args, repeat) {
 
     const timerId = nextTimerId++
     const timer = core.createTimer(() => {
+        if (!core.ops.op_realm_is_active()) return
         if (!repeat) {
             activeTimers.delete(timerId)
         }
@@ -114,6 +115,7 @@ function runAnimationFrame(timestamp) {
     const callbacks = Array.from(animationFrameCallbacks.values())
     animationFrameCallbacks.clear()
     for (const callback of callbacks) {
+        if (!core.ops.op_realm_is_active()) break
         try {
             callback(timestamp)
         } catch (err) {
@@ -153,7 +155,7 @@ class BaseNode extends EventTarget {
     constructor() {
         super()
         this.__node_idx = null
-        this.ownerDocument = currentDocument
+        this.ownerDocument = document
     }
 
     getParent() {
@@ -202,7 +204,7 @@ class BaseNode extends EventTarget {
 
     cloneNode(deep = false) {
         let newNodeIdx = core.ops.op_clone_node(this.__node_idx, deep)
-        return withDocument(this.ownerDocument, () => elementFromNodeIdx(newNodeIdx))
+        return elementFromNodeIdx(newNodeIdx)
     }
 
     registerInBackend() {
@@ -247,7 +249,7 @@ class BaseNode extends EventTarget {
     }
 
     get childNodes() {
-        return withDocument(this.ownerDocument, () => core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement))
+        return core.ops.op_get_child_nodes(this.__node_idx).map(nodeToElement)
     }
 
     get children() {
@@ -268,6 +270,9 @@ class BaseNode extends EventTarget {
             throw new TypeError("Element is not an object")
         }
 
+        if (element.ownerDocument !== this.ownerDocument) {
+            throw new DOMException.DOMException("The node belongs to another document", "NotFoundError")
+        }
         if (element.__node_idx != null) {
             core.ops.op_remove_child(element.__node_idx)
         }
@@ -283,6 +288,12 @@ class BaseNode extends EventTarget {
     insertBefore(newNode, referenceNode) {
         if (!newNode) {
             throw new TypeError("insertBefore called without newNode")
+        }
+        if (newNode.ownerDocument !== this.ownerDocument) {
+            throw new DOMException.DOMException("Moving nodes between documents is not supported", "NotSupportedError")
+        }
+        if (referenceNode && referenceNode.ownerDocument !== this.ownerDocument) {
+            throw new DOMException.DOMException("The reference node belongs to another document", "NotFoundError")
         }
         if (newNode instanceof ShadowRoot) {
             throw new DOMException.DOMException("A shadow root cannot be inserted", "HierarchyRequestError")
@@ -305,12 +316,12 @@ class BaseNode extends EventTarget {
 
     querySelector(selector) {
         const node = core.ops.op_query_selector(selector, this.__node_idx)
-        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
+        return node ? nodeToElement(node) : null
     }
 
     querySelectorAll(selector) {
         const nodes = core.ops.op_query_selector_all(selector, this.__node_idx)
-        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
+        return nodes.map(nodeToElement)
     }
 
     get textContent() {
@@ -322,8 +333,8 @@ class BaseNode extends EventTarget {
     }
 
     getElementsByTagName(tag) {
-        const nodes = core.ops.op_get_elements_by_tag_name(tag, this.__node_idx, this.ownerDocument.__frameId)
-        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
+        const nodes = core.ops.op_get_elements_by_tag_name(tag, this.__node_idx)
+        return nodes.map(nodeToElement)
     }
 }
 
@@ -489,7 +500,6 @@ class CustomElementRegistry {
 
     upgrade(root) {
         if (!(root instanceof BaseNode) && !(root instanceof Document)) throw new TypeError("Expected a Node")
-        if ((root.ownerDocument ?? root).__frameId != null) throw new Error("Cross-frame upgrades are not implemented")
         core.ops.op_custom_element_upgrade(root.__node_idx ?? null)
     }
 }
@@ -527,7 +537,7 @@ class DocumentFragment extends BaseNode {
 
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(String(id), this.__node_idx)
-        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
+        return node ? nodeToElement(node) : null
     }
 }
 
@@ -870,25 +880,21 @@ class HtmlElement extends BaseNode {
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_element(this.tag, this.ownerDocument.__frameId)
+        this.__node_idx = core.ops.op_create_element(this.tag)
         cacheNodeElement(this.__node_idx, this)
     }
 
     attachShadow(init) {
-        if (this.ownerDocument.__frameId != null) {
-            throw new Error("Cross-frame attachShadow is not implemented")
-        }
         if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") {
             throw new DOMException.DOMException("Shadow hosts must be HTML elements", "NotSupportedError")
         }
         const root = core.ops.op_attach_shadow(this.__node_idx, String(init?.mode))
-        return withDocument(this.ownerDocument, () => elementFromNodeIdx(root))
+        return elementFromNodeIdx(root)
     }
 
     get shadowRoot() {
-        if (this.ownerDocument.__frameId != null) return null
         const root = core.ops.op_get_shadow_root(this.__node_idx)
-        return root == null ? null : withDocument(this.ownerDocument, () => elementFromNodeIdx(root))
+        return root == null ? null : elementFromNodeIdx(root)
     }
 
     click() {
@@ -936,9 +942,8 @@ class HtmlElement extends BaseNode {
         const nodes = core.ops.op_get_elements_by_class_name(
             String(classNames),
             this.__node_idx,
-            this.ownerDocument.__frameId,
         )
-        return withDocument(this.ownerDocument, () => nodes.map(nodeToElement))
+        return nodes.map(nodeToElement)
     }
 
     getAttribute(attr) {
@@ -946,7 +951,7 @@ class HtmlElement extends BaseNode {
     }
 
     setAttribute(attr, value) {
-        core.ops.op_update_attributes(this.__node_idx, { [String(attr)]: String(value) }, this.ownerDocument.__frameId)
+        core.ops.op_update_attributes(this.__node_idx, { [String(attr)]: String(value) })
     }
 
     setAttributeNS(namespace, qualifiedName, value) {
@@ -989,7 +994,7 @@ class HtmlElement extends BaseNode {
 
     closest(selector) {
         const node = core.ops.op_get_closest(selector, this.__node_idx)
-        return withDocument(this.ownerDocument, () => node ? nodeToElement(node) : null)
+        return node ? nodeToElement(node) : null
     }
 
     matches(selector) {
@@ -1018,7 +1023,7 @@ class HtmlElement extends BaseNode {
     }
 
     get innerHTML() {
-        return core.ops.op_get_inner_html(this.__node_idx, this.ownerDocument.__frameId)
+        return core.ops.op_get_inner_html(this.__node_idx)
     }
 
     get outerHTML() {
@@ -1033,7 +1038,7 @@ class HtmlElement extends BaseNode {
     }
 
     set innerHTML(value) {
-        core.ops.op_set_inner_html(this.__node_idx, value, this.ownerDocument.__frameId);
+        core.ops.op_set_inner_html(this.__node_idx, value);
     }
 
     get classList() {
@@ -1255,7 +1260,7 @@ class HtmlElement extends BaseNode {
 }
 
 function measureElement(element) {
-    return core.ops.op_measure_element(element.__node_idx, element.ownerDocument.__frameId)
+    return core.ops.op_measure_element(element.__node_idx)
 }
 
 function camelize(str) {
@@ -1594,17 +1599,6 @@ class HtmlCanvasElement extends HtmlElement {
     }
 }
 
-const windowProxies = new Map()
-
-function frameWindow(frameId) {
-    let proxy = windowProxies.get(frameId)
-    if (!proxy) {
-        proxy = new WindowProxy(frameId)
-        windowProxies.set(frameId, proxy)
-    }
-    return proxy
-}
-
 function windowMessageOptions(targetOrigin, transfer) {
     if (typeof targetOrigin === "object") {
         transfer = targetOrigin?.transfer
@@ -1634,43 +1628,25 @@ class HTMLIFrameElement extends HtmlElement {
 
     set src(src) {
         this.setAttribute("src", src)
-        if (src) {
-            this.spawnFrame()
-        }
+    }
+
+    setAttribute(name, value) {
+        super.setAttribute(name, value)
+        if (String(name).toLowerCase() === "src") this.spawnFrame()
     }
 
     get name() { return this.getAttribute("name") ?? "" }
     set name(value) { this.setAttribute("name", String(value)) }
 
     get contentDocument() {
-        // Frame idx is the node idx
         this.spawnFrame()
-        return new Document(this.__node_idx)
+        return core.ops.op_frame_window(this.__node_idx, true)?.document ?? null
     }
 
     get contentWindow() {
-        // Frame idx is the node idx
+        // Navigation replaces the realm; retained globals keep their old document.
         this.spawnFrame()
-        return frameWindow(this.__node_idx)
-    }
-}
-
-class WindowProxy {
-    constructor(frameId) {
-        this.__frame_id = frameId
-    }
-
-    get Promise() {
-        return Promise
-    }
-
-    postMessage(message, targetOrigin, transfer) {
-        const options = windowMessageOptions(targetOrigin, transfer)
-        core.ops.op_post_message_to_frame(serializeWorkerMessage(message, options), this.__frame_id, options.targetOrigin)
-    }
-
-    get document() {
-        return new Document(this.__frame_id)
+        return core.ops.op_frame_window(this.__node_idx, false)
     }
 }
 
@@ -2248,7 +2224,7 @@ class CSSStyleDeclaration {
     sync() {
         const out = this.cssText
         this.__element.__style = out
-        core.ops.op_update_attributes(this.__element.__node_idx, { style: out }, this.__element.ownerDocument.__frameId)
+        core.ops.op_update_attributes(this.__element.__node_idx, { style: out })
     }
 }
 
@@ -2314,7 +2290,7 @@ Object.defineProperty(globalThis, "HTMLImageElement", {
 
 class HTMLTemplateElement extends HtmlElement {
     get content() {
-        return withDocument(this.ownerDocument, () => elementFromNodeIdx(core.ops.op_get_template_content(this.__node_idx)))
+        return elementFromNodeIdx(core.ops.op_get_template_content(this.__node_idx))
     }
 }
 
@@ -2370,7 +2346,7 @@ class ClassList {
 
     sync() {
         const value = Array.from(this.list).join(" ")
-        core.ops.op_update_attributes(this.element.__node_idx, { class: value }, this.element.ownerDocument.__frameId)
+        core.ops.op_update_attributes(this.element.__node_idx, { class: value })
     }
 
     add(...tokens) {
@@ -2432,36 +2408,17 @@ class ClassList {
 
 const nodeMap = new Map()
 
-function nodeMapKey(nodeIdx) {
-    return `${currentDocument?.__frameId ?? "main"}:${nodeIdx}`
-}
-
-function clearNodeMap() {
-    nodeMap.clear()
-}
-
 function cacheNodeElement(nodeIdx, element) {
     if (nodeIdx != null) {
-        // Foreign-frame indices do not refer to nodes in this realm's renderer.
-        if (element.ownerDocument.__frameId == null) {
-            core.ops.op_bind_node_wrapper(element, nodeIdx)
-        }
-        nodeMap.set(nodeMapKey(nodeIdx), element)
+        core.ops.op_bind_node_wrapper(element, nodeIdx)
+        nodeMap.set(nodeIdx, element)
     }
 }
-
-Object.defineProperty(globalThis, "__clear_node_map", {
-    value: clearNodeMap,
-    enumerable: false,
-    configurable: true,
-    writable: true,
-})
 
 function nodeToElement(pair) {
     const node_idx = pair[0]
     const node = pair[1]
-    const key = nodeMapKey(node_idx)
-    const existing = nodeMap.get(key)
+    const existing = nodeMap.get(node_idx)
     if (existing) {
         return existing
     }
@@ -2541,9 +2498,8 @@ function tagToElement(tag) {
 }
 
 class Document extends EventTarget {
-    constructor(frameId = null) {
+    constructor() {
         super()
-        this.__frameId = frameId
         this.__activeElement = null
         this.__currentScript = null
     }
@@ -2585,8 +2541,8 @@ class Document extends EventTarget {
     }
     get styleSheets() {
         const root = this.documentElement
-        const sheets = root ? withDocument(this, () => core.ops.op_get_stylesheet_nodes(root.__node_idx)
-            .map(idx => elementFromNodeIdx(idx).sheet).filter(Boolean)) : []
+        const sheets = root ? core.ops.op_get_stylesheet_nodes(root.__node_idx)
+            .map(idx => elementFromNodeIdx(idx).sheet).filter(Boolean) : []
         sheets.item = index => sheets[index] ?? null
         return sheets
     }
@@ -2641,8 +2597,8 @@ class Document extends EventTarget {
         }
     }
     get documentElement() {
-        const node = core.ops.op_get_document_element(this.__frameId)
-        return withDocument(this, () => node ? nodeToElement(node) : null)
+        const node = core.ops.op_get_document_element()
+        return node ? nodeToElement(node) : null
     }
     get head() {
         return this.querySelector("head")
@@ -2652,56 +2608,53 @@ class Document extends EventTarget {
     }
     createElementNS(ns, tag) {
         tag = String(tag)
-        if (ns === "http://www.w3.org/1999/xhtml" && this.__frameId == null) {
-            const element = withDocument(this, () => core.ops.op_custom_element_create(tag))
+        if (ns === "http://www.w3.org/1999/xhtml") {
+            const element = core.ops.op_custom_element_create(tag)
             if (element) return element
         }
         const elementClass = tagToElement(tag)
-        const element = withDocument(this, () => new elementClass(tag))
+        const element = new elementClass(tag)
         element.namespaceURI = ns
         return element
     }
     createElement(tag, ...args) {
         tag = String(tag).replace(/[A-Z]/g, char => char.toLowerCase())
-        if (this.__frameId == null) {
-            const element = withDocument(this, () => core.ops.op_custom_element_create(tag))
-            if (element) return element
-        }
+        const customElement = core.ops.op_custom_element_create(tag)
+        if (customElement) return customElement
         const elementClass = tagToElement(tag)
-        const element = withDocument(this, () => new elementClass(tag, ...args))
+        const element = new elementClass(tag, ...args)
         return element
     }
     createComment(data) {
-        const element = withDocument(this, () => new CommentNode(data))
-        return element
+        return new CommentNode(data)
     }
     getElementById(id) {
         const node = core.ops.op_get_element_by_id(id)
-        return withDocument(this, () => node ? nodeToElement(node) : null)
+        return node ? nodeToElement(node) : null
     }
     getElementsByName(name) {
-        const nodes = core.ops.op_get_elements_by_name(String(name), null, this.__frameId)
-        return withDocument(this, () => nodes.map(nodeToElement))
+        const nodes = core.ops.op_get_elements_by_name(String(name), null)
+        return nodes.map(nodeToElement)
     }
     getElementsByTagName(tag) {
-        const nodes = core.ops.op_get_elements_by_tag_name(tag, null, this.__frameId)
-        return withDocument(this, () => nodes.map(nodeToElement))
+        const nodes = core.ops.op_get_elements_by_tag_name(tag, null)
+        return nodes.map(nodeToElement)
     }
     getElementsByClassName(classNames) {
-        const nodes = core.ops.op_get_elements_by_class_name(String(classNames), null, this.__frameId)
-        return withDocument(this, () => nodes.map(nodeToElement))
+        const nodes = core.ops.op_get_elements_by_class_name(String(classNames), null)
+        return nodes.map(nodeToElement)
     }
     elementFromPoint(x, y) {
-        const node = core.ops.op_element_from_point(Number(x), Number(y), this.__frameId)
-        return withDocument(this, () => node ? nodeToElement(node) : null)
+        const node = core.ops.op_element_from_point(Number(x), Number(y))
+        return node ? nodeToElement(node) : null
     }
     querySelector(selector) {
-        const node = core.ops.op_query_selector(selector, null, this.__frameId)
-        return withDocument(this, () => node ? nodeToElement(node) : null)
+        const node = core.ops.op_query_selector(selector, null)
+        return node ? nodeToElement(node) : null
     }
     querySelectorAll(selector) {
-        const nodes = core.ops.op_query_selector_all(selector, null, this.__frameId)
-        return withDocument(this, () => nodes.map(nodeToElement))
+        const nodes = core.ops.op_query_selector_all(selector, null)
+        return nodes.map(nodeToElement)
     }
     getParent(event) {
         return event?.type === "load" ? null : this.defaultView
@@ -2724,7 +2677,7 @@ class Document extends EventTarget {
         return node.cloneNode(deep)
     }
     createDocumentFragment() {
-        return withDocument(this, () => new DocumentFragment())
+        return new DocumentFragment()
     }
     createTreeWalker(root) {
         return new TreeWalker(root)
@@ -2735,7 +2688,6 @@ class Document extends EventTarget {
         if (filter !== null && typeof filter !== "function" && typeof filter !== "object") {
             throw new TypeError("NodeFilter must be a function or an object")
         }
-        if ((root.ownerDocument ?? root).__frameId != null) throw new Error("Cross-frame iteration is not implemented")
         return createNodeIterator(root, whatToShow, filter)
     }
     hasFocus() {
@@ -2780,20 +2732,6 @@ Object.defineProperty(globalThis, "__set_current_script_node_idx", {
     configurable: true,
     writable: true,
 })
-
-let currentDocument = globalThis.document
-
-function withDocument(documentToUse, cb) {
-    let prev = currentDocument
-    currentDocument = documentToUse
-    let res = null
-    try {
-        res = cb()
-    } finally {
-        currentDocument = prev
-    }
-    return res
-}
 
 Object.defineProperty(globalThis, "setTimeout", {
   value: setTimeoutImpl,
@@ -2999,9 +2937,13 @@ function getComputedStyle(element) {
         throw new TypeError("getComputedStyle requires an Element")
     }
 
+    if (element.ownerDocument && element.ownerDocument !== document) {
+        return element.ownerDocument.defaultView.getComputedStyle(element)
+    }
+
     const properties = {
         "font-size": "16px",
-        ...core.ops.op_get_computed_style(element.__node_idx, element.ownerDocument?.__frameId),
+        ...core.ops.op_get_computed_style(element.__node_idx),
         "transition-duration": "0s",
         "transition-delay": "0s",
         "scroll-behavior": "auto",
@@ -3650,7 +3592,6 @@ class MutationObserver {
 
     observe(node, config = {}) {
         if (!(node instanceof BaseNode) && !(node instanceof Document)) throw new TypeError("Expected a Node")
-        if ((node.ownerDocument ?? node).__frameId != null) throw new Error("Cross-frame observation is not implemented")
         core.ops.op_mutation_observer_observe(this.#id, node.__node_idx ?? null, config, this.#deliver)
     }
 
@@ -3670,18 +3611,20 @@ Object.defineProperty(globalThis, "MutationObserver", {
     writable: true,
 })
 
-// Ideally this would be of the same structure as document, but that's a much larger change that will happen later on
-const parentStub = {
-    postMessage(message, targetOrigin, transfer) {
-        const options = windowMessageOptions(targetOrigin, transfer)
-        core.ops.op_post_message_to_parent(serializeWorkerMessage(message, options), options.targetOrigin)
-    }
-}
+// Same-origin windows are realm globals. Cross-origin windows expose messaging.
+Object.defineProperty(globalThis, "__crossOriginWindow", {
+    value: {
+        postMessage,
+        get document() {
+            throw new DOMException.DOMException("Cannot access a cross-origin window", "SecurityError")
+        },
+    },
+})
 
 function __dispatchWindowMessage(source, origin) {
     const message = deserializeWorkerMessage(core.ops.op_take_worker_message())
     const event = new denoEvent.MessageEvent("message", {
-        source: source === "window" ? globalThis : source === "parent" ? parent : frameWindow(source),
+        source: core.ops.op_window_message_source(source),
         origin,
         ports: message.ports,
     })
@@ -3699,7 +3642,7 @@ Object.defineProperty(globalThis, "__dispatchWindowMessage", {
 
 Object.defineProperty(globalThis, "parent", {
     get() {
-        return core.ops.op_is_top() ? globalThis : parentStub
+        return globalThis.__parentWindow ?? globalThis
     },
     enumerable: true,
     configurable: true,
@@ -3707,7 +3650,7 @@ Object.defineProperty(globalThis, "parent", {
 
 Object.defineProperty(globalThis, "top", {
     get() {
-        return core.ops.op_is_top() ? globalThis : parentStub
+        return globalThis.__parentWindow?.top ?? globalThis.parent
     },
     enumerable: true,
     configurable: true,
@@ -3715,7 +3658,7 @@ Object.defineProperty(globalThis, "top", {
 
 function postMessage(message, targetOrigin, transfer) {
     const options = windowMessageOptions(targetOrigin, transfer)
-    core.ops.op_post_message_to_frame(serializeWorkerMessage(message, options), null, options.targetOrigin)
+    core.ops.op_window_post_message(serializeWorkerMessage(message, options), options.targetOrigin)
 }
 
 Object.defineProperty(globalThis, "postMessage", {
