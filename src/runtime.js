@@ -163,6 +163,10 @@ class BaseNode extends EventTarget {
         return this.ownerDocument.__ops
     }
 
+    get baseURI() {
+        return this.ownerDocument.baseURI
+    }
+
     getParent() {
         return this.parentNode ?? (this === this.ownerDocument.documentElement ? this.ownerDocument : null)
     }
@@ -2560,6 +2564,17 @@ class Document extends EventTarget {
     }
     set location(value) {
         globalThis.location.href = value
+    }
+    get baseURI() {
+        const fallback = this.location?.href ?? "about:blank"
+        const href = this.querySelector("base[href]")?.getAttribute("href")
+        if (href != null) {
+            try {
+                const base = new URL(href, fallback)
+                if (base.protocol !== "data:" && base.protocol !== "javascript:") return base.href
+            } catch {}
+        }
+        return fallback
     }
     get cookie() {
         return core.ops.op_get_cookie(globalThis.location.href)
