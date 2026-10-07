@@ -22,7 +22,7 @@ use mutation_observer::{
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use fixedbitset::FixedBitSet;
 use image::{DynamicImage, ImageReader};
-use parser::HtmlParser;
+use parser::{HTML_NAMESPACE, HtmlParser};
 pub use parser::{Attributes, CommentElement, Element, Node, ShadowRootMode, TextElement};
 use reqwest::cookie::{CookieStore, Jar};
 use resvg::tiny_skia::IntSize;
@@ -5246,10 +5246,14 @@ fn op_get_cookie(scope: &mut v8::PinScope, #[string] url: String) -> Result<Stri
     Ok(cookie)
 }
 
-#[op2(fast)]
-fn op_create_element(scope: &mut v8::PinScope, #[string] tag: String) -> i32 {
+#[op2]
+fn op_create_element(
+    scope: &mut v8::PinScope,
+    #[string] tag: String,
+    #[string] namespace: Option<String>,
+) -> i32 {
     let host = frame_host(scope);
-    host.renderer.borrow_mut().create_element(tag) as i32
+    host.renderer.borrow_mut().create_element(tag, namespace) as i32
 }
 
 #[op2(fast)]
@@ -7954,10 +7958,11 @@ impl Renderer {
         self.schedule_dom_update();
     }
 
-    fn create_element(&mut self, tag: String) -> usize {
-        let is_template = tag == "template";
+    fn create_element(&mut self, tag: String, namespace: Option<String>) -> usize {
+        let is_template = tag == "template" && namespace.as_deref() == Some(HTML_NAMESPACE);
         self.push_node(Node::Element(Element {
             tag,
+            namespace,
             attributes: Attributes::new(),
             parent: None,
         }));
@@ -12810,7 +12815,11 @@ impl Renderer {
 
     pub fn create_children_from_html(&mut self, parent_idx: usize, html: String) {
         self.selector_changes.child_list_changed(parent_idx);
-        let mut parser = HtmlParser::new();
+        let context = match self.nodes.get(parent_idx) {
+            Some(Node::Element(element)) => Some(element),
+            _ => None,
+        };
+        let mut parser = HtmlParser::new(context);
         parser.parse(html).expect("Failed to parse inner html");
         let first_node_idx = self.reserve_node_idxs(parser.nodes.len());
         let mut idx_mapping = HashMap::new();
@@ -12839,7 +12848,7 @@ impl Renderer {
         // Keep the detached subtree and its IDs alive for existing JS references.
         self.dom_indexes.root_indice = self.create_document_fragment();
         self.document_stream = Some(DocumentStream {
-            parser: HtmlParser::new(),
+            parser: HtmlParser::new(None),
             idx_mapping: Vec::new(),
             parent_idx: None,
         });
@@ -12855,9 +12864,9 @@ impl Renderer {
     }
 
     fn populate_blank_document(&mut self) -> usize {
-        let html = self.create_element("html".to_string());
-        let head = self.create_element("head".to_string());
-        let body = self.create_element("body".to_string());
+        let html = self.create_element("html".to_string(), Some(HTML_NAMESPACE.to_string()));
+        let head = self.create_element("head".to_string(), Some(HTML_NAMESPACE.to_string()));
+        let body = self.create_element("body".to_string(), Some(HTML_NAMESPACE.to_string()));
         for idx in [head, body] {
             self.nodes.get_mut(idx).unwrap().set_parent(Some(html));
         }
@@ -14168,7 +14177,7 @@ impl Frame {
         println!("Changing url to {}", final_url);
         self.url = final_url;
 
-        let mut parser = HtmlParser::new();
+        let mut parser = HtmlParser::new(None);
         parser.parse(input).expect(&format!(
             "Failed to parse. Context: {}",
             parser.get_context()

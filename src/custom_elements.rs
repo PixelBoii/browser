@@ -8,7 +8,7 @@ use deno_core::{op2, v8};
 use deno_error::JsErrorBox;
 
 use crate::frame_context::{frame_state, is_active};
-use crate::{Node, Renderer, native_node_index};
+use crate::{HTML_NAMESPACE, Node, Renderer, native_node_index};
 
 struct Definition {
     constructor: v8::Global<v8::Function>,
@@ -244,7 +244,9 @@ fn create_element<'s>(
 ) -> Option<v8::Local<'s, v8::Object>> {
     let state = frame_state(scope);
     let renderer = state.borrow().host.renderer.clone();
-    let idx = renderer.borrow_mut().create_element(name);
+    let idx = renderer
+        .borrow_mut()
+        .create_element(name, Some(HTML_NAMESPACE.to_string()));
     state.borrow_mut().custom_elements.attempted.insert(idx);
     node_wrapper(scope, idx)
 }
@@ -307,6 +309,9 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
         let Some(Node::Element(element)) = renderer.nodes.get(idx) else {
             return;
         };
+        if element.namespace.as_deref() != Some(HTML_NAMESPACE) {
+            return;
+        }
         let Some(definition) = registry.definitions.get(&element.tag) else {
             return;
         };
@@ -320,12 +325,6 @@ fn upgrade_element(scope: &mut v8::PinScope, idx: usize) {
     v8::tc_scope!(let scope, scope);
     let result = (|| {
         let element = node_wrapper(scope, idx)?;
-        let key = v8::String::new(scope, "namespaceURI").unwrap();
-        let namespace = element.get(scope, key.into())?;
-        let html_namespace = v8::String::new(scope, "http://www.w3.org/1999/xhtml").unwrap();
-        if !namespace.strict_equals(html_namespace.into()) {
-            return Some(());
-        }
         let result = definition.upgrade(scope, element)?;
         if result != element {
             let message = v8::String::new(

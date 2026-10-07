@@ -874,29 +874,32 @@ Object.defineProperty(globalThis, "DOMStringMap", {
     writable: true,
 })
 
+const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+
 class HtmlElement extends BaseNode {
-    constructor(tag) {
+    constructor(tag, namespaceURI = HTML_NAMESPACE) {
         super()
-        if (autoRegisterNode) {
+        if (autoRegisterNode && namespaceURI === HTML_NAMESPACE) {
             const customElement = core.ops.op_custom_element_construct(new.target)
             if (customElement) return customElement
         }
         // Internal element factories supply a tag; an unregistered custom constructor cannot.
         if (tag === undefined) throw new TypeError("Custom element constructor is not registered")
         this.tag = tag
-        this.namespaceURI = "http://www.w3.org/1999/xhtml"
+        this.namespaceURI = namespaceURI
         if (autoRegisterNode) {
             this.registerInBackend()
         }
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_element(this.tag)
+        this.__node_idx = core.ops.op_create_element(this.tag, this.namespaceURI)
         cacheNodeElement(this.__node_idx, this)
     }
 
     attachShadow(init) {
-        if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+        if (this.namespaceURI !== HTML_NAMESPACE) {
             throw new DOMException.DOMException("Shadow hosts must be HTML elements", "NotSupportedError")
         }
         const root = this.__ops.op_attach_shadow(this.__node_idx, String(init?.mode))
@@ -1026,7 +1029,7 @@ class HtmlElement extends BaseNode {
     }
 
     get tagName() {
-        return this.tag.toUpperCase()
+        return this.namespaceURI === HTML_NAMESPACE ? this.tag.toUpperCase() : this.tag
     }
 
     get nodeName() {
@@ -2257,11 +2260,17 @@ function cssPropertyName(key) {
 
 class SVGElement extends HtmlElement {
     constructor(tag) {
-        super(tag)
-
-        this.namespaceURI = "http://www.w3.org/2000/svg"
+        super(tag, SVG_NAMESPACE)
     }
 }
+
+class SVGGraphicsElement extends SVGElement {}
+
+const svgGraphicsTags = new Set([
+    "a", "circle", "defs", "ellipse", "foreignObject", "g", "image", "line",
+    "path", "polygon", "polyline", "rect", "svg", "switch", "symbol", "text",
+    "textPath", "tspan", "use",
+])
 
 class Image extends HTMLElement {
     constructor() {
@@ -2435,8 +2444,8 @@ function nodeToElement(pair) {
     }
     let element;
     if (node.kind === "element") {
-        const elementClass = tagToElement(node.tag)
-        element = withoutAutoRegisterNode(() => new elementClass(node.tag))
+        const elementClass = tagToElement(node.tag, node.namespaceURI)
+        element = withoutAutoRegisterNode(() => new elementClass(node.tag, node.namespaceURI))
     } else if (node.kind === "fragment") {
         element = withoutAutoRegisterNode(() => new DocumentFragment())
     } else if (node.kind === "shadow-root") {
@@ -2474,13 +2483,22 @@ Object.defineProperty(globalThis, "SVGElement", {
     writable: true,
 })
 
-function tagToElement(tag) {
+Object.defineProperty(globalThis, "SVGGraphicsElement", {
+    value: SVGGraphicsElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+function tagToElement(tag, namespaceURI) {
+    if (namespaceURI === SVG_NAMESPACE) {
+        return svgGraphicsTags.has(tag) ? SVGGraphicsElement : SVGElement
+    }
+    if (namespaceURI !== HTML_NAMESPACE) return HtmlElement
     return tag === "a" ?
         HTMLAnchorElement :
         tag === "body" ?
         HTMLBodyElement :
-        tag === "svg" ?
-        SVGElement :
         tag === "template" ?
             HTMLTemplateElement :
         tag === "canvas" ?
@@ -2679,23 +2697,18 @@ class Document extends EventTarget {
         return this.querySelector("body")
     }
     createElementNS(ns, tag) {
+        ns = ns == null ? null : String(ns) || null
         tag = String(tag)
-        if (ns === "http://www.w3.org/1999/xhtml") {
+        if (ns === HTML_NAMESPACE) {
             const element = core.ops.op_custom_element_create(tag)
             if (element) return element
         }
-        const elementClass = tagToElement(tag)
-        const element = new elementClass(tag)
-        element.namespaceURI = ns
-        return element
+        const elementClass = tagToElement(tag, ns)
+        return new elementClass(tag, ns)
     }
-    createElement(tag, ...args) {
+    createElement(tag) {
         tag = String(tag).replace(/[A-Z]/g, char => char.toLowerCase())
-        const customElement = core.ops.op_custom_element_create(tag)
-        if (customElement) return customElement
-        const elementClass = tagToElement(tag)
-        const element = new elementClass(tag, ...args)
-        return element
+        return this.createElementNS(HTML_NAMESPACE, tag)
     }
     createComment(data) {
         return new CommentNode(data)

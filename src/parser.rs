@@ -5,9 +5,12 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::Hash;
 
-const SELF_CLOSING_TAGS: [&str; 15] = [
+pub const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+pub const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+
+const SELF_CLOSING_TAGS: [&str; 14] = [
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr", "path",
+    "track", "wbr",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,8 +83,23 @@ impl<'a> ToV8<'a> for Attributes {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Element {
     pub tag: String,
+    pub namespace: Option<String>,
     pub attributes: Attributes,
     pub parent: Option<usize>,
+}
+
+impl Element {
+    fn child_namespace(&self) -> Option<&str> {
+        if self.namespace.as_deref() == Some(SVG_NAMESPACE)
+            && ["foreignObject", "desc", "title"]
+                .iter()
+                .any(|tag| self.tag.eq_ignore_ascii_case(tag))
+        {
+            Some(HTML_NAMESPACE)
+        } else {
+            self.namespace.as_deref()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +181,7 @@ impl<'a> ToV8<'a> for Element {
 
         set_object_prop(scope, object, "kind", "element");
         set_object_prop(scope, object, "tag", self.tag);
+        set_object_prop(scope, object, "namespaceURI", self.namespace);
         set_object_prop(scope, object, "parent", self.parent);
 
         for (key, value) in self.attributes.values {
@@ -270,6 +289,8 @@ pub struct HtmlParser {
     pub nodes: Vec<Node>,
     pub template_contents: HashMap<usize, usize>,
     node: Option<usize>,
+    context_namespace: Option<String>,
+    self_closing: bool,
 }
 
 #[derive(Debug)]
@@ -337,7 +358,7 @@ fn decode_numeric_entity(input: &str) -> Option<(char, &str)> {
 }
 
 impl HtmlParser {
-    pub fn new() -> Self {
+    pub fn new(context: Option<&Element>) -> Self {
         Self {
             tag: "".to_string(),
             value: "".to_string(),
@@ -346,6 +367,12 @@ impl HtmlParser {
             nodes: vec![],
             template_contents: HashMap::new(),
             node: None,
+            context_namespace: match context {
+                Some(element) => element.child_namespace(),
+                None => Some(HTML_NAMESPACE),
+            }
+            .map(str::to_string),
+            self_closing: false,
         }
     }
 
@@ -391,12 +418,22 @@ impl HtmlParser {
             }),
             _ => Node::Element(Element {
                 tag: self.tag.trim().to_string(),
+                namespace: if self.tag.trim().eq_ignore_ascii_case("svg") {
+                    Some(SVG_NAMESPACE)
+                } else {
+                    match self.node.and_then(|idx| self.nodes.get(idx)) {
+                        Some(Node::Element(element)) => element.child_namespace(),
+                        _ => self.context_namespace.as_deref(),
+                    }
+                }
+                .map(str::to_string),
                 attributes: Attributes::new(),
                 parent,
             }),
         };
         let node_idx = self.nodes.len();
-        let is_template = matches!(&node, Node::Element(element) if element.tag == "template");
+        let is_template = matches!(&node, Node::Element(element)
+            if element.tag == "template" && element.namespace.as_deref() == Some(HTML_NAMESPACE));
         self.node = Some(node_idx);
         self.nodes.push(node);
         if is_template {
@@ -437,7 +474,16 @@ impl HtmlParser {
     }
 
     fn self_close_if_appropiate(&mut self) {
-        if matches!(self.curr_node(), Ok(Node::Element(element)) if SELF_CLOSING_TAGS.contains(&element.tag.as_str())) {
+        let self_closing = std::mem::take(&mut self.self_closing);
+        let Ok(Node::Element(element)) = self.curr_node() else {
+            return;
+        };
+        let should_close = match element.namespace.as_deref() {
+            Some(HTML_NAMESPACE) => SELF_CLOSING_TAGS.contains(&element.tag.as_str()),
+            Some(SVG_NAMESPACE) => self_closing,
+            _ => false,
+        };
+        if should_close {
             let _ = self.close_node();
         }
     }
@@ -527,10 +573,18 @@ impl HtmlParser {
                     _ => {}
                 },
                 '/' => match self.stage {
-                    BuildPhase::Tag => {
+                    BuildPhase::Tag if self.tag.is_empty() => {
                         self.stage = BuildPhase::TagClosing;
                     }
-                    BuildPhase::AttributeValueInside => {
+                    BuildPhase::Tag | BuildPhase::TagDone => {
+                        self.self_closing = true;
+                    }
+                    BuildPhase::AttributeName => {
+                        self.close_attribute()?;
+                        self.self_closing = true;
+                        self.stage = BuildPhase::TagDone;
+                    }
+                    BuildPhase::AttributeValue | BuildPhase::AttributeValueInside => {
                         self.value.push(char);
                     }
                     BuildPhase::Text => {
