@@ -1756,6 +1756,13 @@ impl SelectorChanges {
 }
 
 #[derive(Debug)]
+struct DocumentStream {
+    parser: HtmlParser,
+    idx_mapping: Vec<usize>,
+    parent_idx: Option<usize>,
+}
+
+#[derive(Debug)]
 struct Renderer {
     url: String,
     origin: url::Origin,
@@ -1795,6 +1802,7 @@ struct Renderer {
     resolved_heights: NodeMap<u32>,
     resolved_widths: NodeMap<u32>,
     dom_indexes: DomIndexes,
+    document_stream: Option<DocumentStream>,
     canvas_buffers: HashMap<usize, CanvasBuffer>,
     pending_canvas_update: bool,
     network_fetch: Rc<RefCell<NetworkFetch>>,
@@ -6016,6 +6024,54 @@ fn op_set_inner_html(
 }
 
 #[op2(nofast, reentrant)]
+fn op_document_open(scope: &mut v8::PinScope) {
+    let host = frame_host(scope);
+    host.renderer.borrow_mut().open_document();
+    *host.executed_scripts.borrow_mut() = ExecutedScripts::new();
+    custom_elements::deliver_reactions(scope);
+}
+
+#[op2(nofast, reentrant)]
+fn op_document_write(scope: &mut v8::PinScope, #[string] html: String) -> Result<(), JsErrorBox> {
+    let host = frame_host(scope);
+    {
+        let mut renderer = host.renderer.borrow_mut();
+        let stream = renderer.document_stream.as_mut().unwrap();
+        stream
+            .parser
+            .feed(html)
+            .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+        let mut stream = renderer.document_stream.take().unwrap();
+        renderer.adopt_document_stream(&mut stream);
+        renderer.document_stream = Some(stream);
+    }
+    custom_elements::deliver_reactions(scope);
+    mutation_observer::schedule(scope);
+    Ok(())
+}
+
+#[op2(nofast, reentrant)]
+fn op_document_close(scope: &mut v8::PinScope) -> Result<(), JsErrorBox> {
+    let host = frame_host(scope);
+    {
+        let mut renderer = host.renderer.borrow_mut();
+        let mut stream = renderer.document_stream.take().unwrap();
+        stream
+            .parser
+            .finish()
+            .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+        renderer.adopt_document_stream(&mut stream);
+        if renderer.document_element().is_none() {
+            renderer.populate_blank_document();
+            renderer.schedule_dom_update();
+        }
+    }
+    custom_elements::deliver_reactions(scope);
+    mutation_observer::schedule(scope);
+    Ok(())
+}
+
+#[op2(nofast, reentrant)]
 fn op_set_text_content(
     scope: &mut v8::PinScope,
     #[number] node_idx: usize,
@@ -7096,6 +7152,9 @@ extension!(
     op_query_selector_all,
     op_element_from_point,
     op_set_inner_html,
+    op_document_open,
+    op_document_write,
+    op_document_close,
     op_set_text_content,
     op_media_query_matches,
     op_get_stylesheet,
@@ -7706,6 +7765,7 @@ impl Renderer {
             resolved_heights: NodeMap::default(),
             resolved_widths: NodeMap::default(),
             dom_indexes,
+            document_stream: None,
             canvas_buffers: HashMap::new(),
             pending_canvas_update: false,
             network_fetch,
@@ -8207,6 +8267,7 @@ impl Renderer {
         self.url = url;
         self.nodes = nodes_table;
         self.nodes_idxs = nodes_idxs;
+        self.document_stream = None;
         self.template_contents = template_contents;
         self.shadow_roots.clear();
         self.custom_element_reactions = custom_elements::Reactions::default();
@@ -8224,8 +8285,8 @@ impl Renderer {
         self.selector_changes = SelectorChanges::default();
         self.selector_changes.force_full_rematch();
         self.clear_layout_state();
-        self.styles_dirty = true;
-        self.ensure_styles(StylesheetLoad::AllowFetch);
+        self.recompute_dom_indexes(None);
+        self.recompute_styles(StylesheetLoad::AllowFetch);
     }
 
     fn get_implicit_click_events(&self, node_idx: usize) -> Vec<(usize, HtmlEvent)> {
@@ -12482,12 +12543,15 @@ impl Renderer {
         );
     }
 
-    pub fn recompute_dom_indexes(&mut self) {
+    pub fn recompute_dom_indexes(&mut self, root_idx: Option<usize>) {
         self.dom_indexes = get_dom_indexes(
             &self.nodes,
             &self.nodes_idxs,
             &mut self.css_parser.class_definitions,
         );
+        if let Some(root_idx) = root_idx {
+            self.dom_indexes.root_indice = root_idx;
+        }
     }
 
     pub fn get_hover_chain(&self) -> Vec<usize> {
@@ -12534,7 +12598,8 @@ impl Renderer {
 
     fn ensure_styles(&mut self, load: StylesheetLoad) {
         if self.styles_dirty {
-            self.recompute_dom_indexes();
+            // document.open() leaves the previous root detached but still alive.
+            self.recompute_dom_indexes(Some(self.dom_indexes.root_indice));
             self.recompute_styles(load);
         }
     }
@@ -12745,8 +12810,8 @@ impl Renderer {
 
     pub fn create_children_from_html(&mut self, parent_idx: usize, html: String) {
         self.selector_changes.child_list_changed(parent_idx);
-        let mut parser = HtmlParser::new(html);
-        parser.parse().expect("Failed to parse inner html");
+        let mut parser = HtmlParser::new();
+        parser.parse(html).expect("Failed to parse inner html");
         let first_node_idx = self.reserve_node_idxs(parser.nodes.len());
         let mut idx_mapping = HashMap::new();
         for (node_internal_idx, _) in parser.nodes.iter().enumerate() {
@@ -12767,6 +12832,94 @@ impl Renderer {
         for (template, content) in parser.template_contents {
             self.template_contents.insert(idx_mapping[&template], idx_mapping[&content]);
         }
+    }
+
+    fn open_document(&mut self) {
+        self.custom_element_connection_changed(self.dom_indexes.root_indice, false);
+        // Keep the detached subtree and its IDs alive for existing JS references.
+        self.dom_indexes.root_indice = self.create_document_fragment();
+        self.document_stream = Some(DocumentStream {
+            parser: HtmlParser::new(),
+            idx_mapping: Vec::new(),
+            parent_idx: None,
+        });
+        self.remove_disconnected_frames();
+        self.hovering = None;
+        self.focusable = None;
+        self.scroll_y.clear();
+        self.animations.clear();
+        self.style_cache.clear();
+        self.selector_changes.force_full_rematch();
+        self.clear_layout_state();
+        self.schedule_dom_update();
+    }
+
+    fn populate_blank_document(&mut self) -> usize {
+        let html = self.create_element("html".to_string());
+        let head = self.create_element("head".to_string());
+        let body = self.create_element("body".to_string());
+        for idx in [head, body] {
+            self.nodes.get_mut(idx).unwrap().set_parent(Some(html));
+        }
+        self.dom_indexes
+            .children_index
+            .insert(html, vec![head, body]);
+        self.dom_indexes.root_indice = html;
+        body
+    }
+
+    fn adopt_document_stream(&mut self, stream: &mut DocumentStream) {
+        let start = stream.idx_mapping.len();
+        let end = stream.parser.ready_node_count();
+        if start == end {
+            return;
+        }
+        let first_node_idx = self.reserve_node_idxs(end - start);
+        stream
+            .idx_mapping
+            .extend(first_node_idx..first_node_idx + end - start);
+        for internal_idx in start..end {
+            let mut node = stream.parser.nodes[internal_idx].clone();
+            let idx = stream.idx_mapping[internal_idx];
+            if self.document_element().is_none() {
+                match &node {
+                    Node::Element(element) if element.tag == "html" => {
+                        self.dom_indexes.root_indice = idx;
+                    }
+                    Node::Element(_) => stream.parent_idx = Some(self.populate_blank_document()),
+                    Node::Text(text) if !text.text.trim().is_empty() => {
+                        stream.parent_idx = Some(self.populate_blank_document());
+                    }
+                    _ => {}
+                }
+            }
+            node.set_parent(
+                node.get_parent()
+                    .map(|idx| stream.idx_mapping[idx])
+                    .or(stream.parent_idx),
+            );
+            let parent = node.get_parent();
+            let previous = parent.and_then(|idx| {
+                self.dom_indexes
+                    .children_index
+                    .get(&idx)
+                    .unwrap()
+                    .last()
+                    .copied()
+            });
+            self.dom_indexes
+                .add_node(idx, &node, &mut self.css_parser.class_definitions);
+            self.insert_node_at_idx(idx, node);
+            if let Some(parent) = parent {
+                self.selector_changes.child_list_changed(parent);
+                self.record_child_list_mutation(parent, vec![idx], vec![], previous, None);
+            }
+            if let Some(&content) = stream.parser.template_contents.get(&internal_idx) {
+                self.template_contents
+                    .insert(idx, stream.idx_mapping[content]);
+            }
+        }
+        self.schedule_dom_update();
     }
 
     fn remove_disconnected_frames(&mut self) {
@@ -14015,11 +14168,12 @@ impl Frame {
         println!("Changing url to {}", final_url);
         self.url = final_url;
 
-        self.html_parser = Some(HtmlParser::new(input));
-        self.html_parser.as_mut().unwrap().parse().expect(&format!(
+        let mut parser = HtmlParser::new();
+        parser.parse(input).expect(&format!(
             "Failed to parse. Context: {}",
-            self.html_parser.as_mut().unwrap().get_context()
+            parser.get_context()
         ));
+        self.html_parser = Some(parser);
 
         if let Some(renderer) = self.renderer.clone() {
             let nodes_table =

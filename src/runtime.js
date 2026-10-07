@@ -2515,6 +2515,7 @@ class Document extends EventTarget {
         super()
         this.__activeElement = null
         this.__currentScript = null
+        this.__writing = false
         this.__ops = core.ops
         this.__nodeMap = nodeMap
         this.__nodeToElement = nodeToElement
@@ -2548,7 +2549,7 @@ class Document extends EventTarget {
         return "visible"
     }
     get readyState() {
-        return "complete"
+        return this.__writing ? "loading" : "complete"
     }
     get activeElement() {
         return this.__activeElement ?? this.body
@@ -2613,8 +2614,36 @@ class Document extends EventTarget {
         }
         return new Event("")
     }
-    write() {
-        // TODO: Implement parser insertion for document.write.
+    open() {
+        // The initial page is parsed before its scripts run; parser insertion is not supported yet.
+        if (this.__currentScript) return this
+        for (const node of this.__nodeMap.values()) {
+            if (node.ownerDocument === this && node.isConnected) {
+                denoEvent.clearEventListeners(node)
+            }
+        }
+        denoEvent.clearEventListeners(this)
+        denoEvent.clearEventListeners(globalThis)
+        this.__activeElement = null
+        this.__writing = true
+        core.ops.op_document_open()
+        return this
+    }
+    write(...values) {
+        const html = values.map(value => String(value)).join("")
+        if (!this.__writing) {
+            if (this.__currentScript) return
+            this.open()
+        }
+        core.ops.op_document_write(html)
+    }
+    writeln(...values) {
+        this.write(...values, "\n")
+    }
+    close() {
+        if (!this.__writing) return
+        this.__writing = false
+        core.ops.op_document_close()
     }
     hasStorageAccess() {
         return Promise.resolve(true)
