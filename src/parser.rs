@@ -263,7 +263,6 @@ pub enum BuildPhase {
 
 #[derive(Debug)]
 pub struct HtmlParser {
-    input: String,
     pub stage: BuildPhase,
     pub tag: String,
     value: String,
@@ -338,9 +337,8 @@ fn decode_numeric_entity(input: &str) -> Option<(char, &str)> {
 }
 
 impl HtmlParser {
-    pub fn new(input: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            input,
             tag: "".to_string(),
             value: "".to_string(),
             attribute_quote: None,
@@ -448,8 +446,32 @@ impl HtmlParser {
         format!("{} {:?}", self.tag, self.stage,)
     }
 
-    pub fn parse(&mut self) -> anyhow::Result<()> {
-        let input = self.input.clone();
+    pub fn parse(&mut self, input: String) -> anyhow::Result<()> {
+        self.feed(input)?;
+        self.finish()
+    }
+
+    pub fn ready_node_count(&self) -> usize {
+        match self.stage {
+            BuildPhase::TagDone
+            | BuildPhase::AttributeName
+            | BuildPhase::AttributeValue
+            | BuildPhase::AttributeValueInside => {
+                self.node.expect("unfinished start tag has a node")
+            }
+            _ => self.nodes.len(),
+        }
+    }
+
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        // If we're out of chars, and in the text phase, consider it done
+        if self.stage == BuildPhase::Text {
+            self.create_node_from_state()?;
+        }
+        Ok(())
+    }
+
+    pub fn feed(&mut self, input: String) -> anyhow::Result<()> {
         let chars = input.chars();
         for char in chars {
             // Raw-text elements do not parse their contents as markup.
@@ -637,10 +659,6 @@ impl HtmlParser {
                     _ => {}
                 },
             }
-        }
-        // If we're out of chars, and in the text phase, consider it done
-        if self.stage == BuildPhase::Text {
-            self.create_node_from_state()?;
         }
         Ok(())
     }

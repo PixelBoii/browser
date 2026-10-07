@@ -1,7 +1,8 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 // Vendored from deno_web 0.276.0, 02_event.js.
 // Local changes: DOM parent/root hooks, Window propagation, ancestor-only listeners,
-// trusted native dispatch, and legacy initEvent. Preserve these when updating from upstream.
+// trusted native dispatch, legacy initEvent, and document.open listener cleanup.
+// Preserve these when updating from upstream.
 // Wrapped for Deno's lazy script loader; event behavior remains based on 0.276.0.
 
 // This module follows most of the WHATWG Living Standard for the DOM logic.
@@ -1437,6 +1438,14 @@ defineEnumerableProps(PromiseRejectionEvent, [
 
 const _eventHandlers = SymbolFor("browser.EventTarget.handlers");
 
+function clearEventListeners(target) {
+  const listeners = target[eventTargetData].listeners;
+  for (const type in listeners) {
+    listeners[type].length = 0;
+  }
+  target[_eventHandlers] = undefined;
+}
+
 function makeWrappedHandler(handler, isSpecialErrorEventHandler) {
   function wrappedHandler(evt) {
     if (typeof wrappedHandler.handler !== "function") {
@@ -1582,6 +1591,7 @@ return {
   CloseEvent,
   CustomEvent,
   defineEventHandler,
+  clearEventListeners,
   dispatch,
   ErrorEvent,
   Event,
