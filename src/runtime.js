@@ -22,6 +22,7 @@ const messagePort = core.loadExtScript("ext:deno_web/13_message_port.js");
 const compression = core.loadExtScript("ext:deno_web/14_compression.js");
 const performance = core.loadExtScript("ext:deno_web/15_performance.js");
 const imageData = core.loadExtScript("ext:deno_web/16_image_data.js");
+const geometry = core.loadExtScript("ext:deno_web/17_geometry.js");
 const net = core.loadExtScript("ext:deno_net/01_net.js");
 const tls = core.loadExtScript("ext:deno_net/02_tls.js");
 const headers = core.loadExtScript("ext:deno_fetch/20_headers.js");
@@ -2266,7 +2267,8 @@ class SVGElement extends HtmlElement {
 
 class SVGGraphicsElement extends SVGElement {
     getBBox() {
-        return this.__ops.op_svg_get_bbox(this.__node_idx)
+        const bounds = this.__ops.op_svg_get_bbox(this.__node_idx)
+        return bounds ? geometry.DOMRect.fromRect(bounds) : null
     }
 }
 
@@ -2492,6 +2494,27 @@ Object.defineProperty(globalThis, "SVGGraphicsElement", {
     enumerable: true,
     configurable: true,
     writable: true,
+})
+
+Object.defineProperties(globalThis, {
+    DOMRect: {
+        value: geometry.DOMRect,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+    },
+    DOMRectReadOnly: {
+        value: geometry.DOMRectReadOnly,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+    },
+    SVGRect: {
+        value: geometry.DOMRect,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+    },
 })
 
 function tagToElement(tag, namespaceURI) {
