@@ -741,10 +741,19 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             .map(|style| style.white_space)
             .unwrap_or(StyleWhiteSpace::Normal),
         variables: Rc::new(StyleVariables::default()),
-        font_size: parent_style
-            .clone()
-            .and_then(|v| Some(v.font_size.clone()))
-            .unwrap_or(StyleSize::Px(16.)),
+        font_size: match node {
+            HtmlNode::Element(element)
+                if element.namespace.as_deref() == Some(crate::parser::SVG_NAMESPACE) =>
+            {
+                element
+                    .attributes
+                    .get_str("font-size")
+                    .and_then(|value| parse_style_size(value.as_ref()).ok())
+            }
+            _ => None,
+        }
+        .or_else(|| parent_style.map(|style| style.font_size.clone()))
+        .unwrap_or(StyleSize::Px(16.)),
         line_height: parent_style
             .clone()
             .and_then(|v| Some(v.line_height.clone()))

@@ -2280,6 +2280,16 @@ class SVGGraphicsElement extends SVGElement {
     }
 }
 
+class SVGTextContentElement extends SVGGraphicsElement {
+    getComputedTextLength() {
+        if (!this.isConnected) return 0
+        const style = getComputedStyle(this)
+        if (style.display === "none") return 0
+        const text = this.textContent.replace(/[ \t\r\n]+/g, " ").replace(/^ | $/g, "")
+        return this.__ops.op_canvas_measure_text(text, parseFloat(style.fontSize))
+    }
+}
+
 const svgGraphicsTags = new Set([
     "a", "circle", "defs", "ellipse", "foreignObject", "g", "image", "line",
     "path", "polygon", "polyline", "rect", "svg", "switch", "symbol", "text",
@@ -2504,6 +2514,13 @@ Object.defineProperty(globalThis, "SVGGraphicsElement", {
     writable: true,
 })
 
+Object.defineProperty(globalThis, "SVGTextContentElement", {
+    value: SVGTextContentElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 Object.defineProperties(globalThis, {
     DOMRect: {
         value: geometry.DOMRect,
@@ -2527,6 +2544,7 @@ Object.defineProperties(globalThis, {
 
 function tagToElement(tag, namespaceURI) {
     if (namespaceURI === SVG_NAMESPACE) {
+        if (["text", "tspan", "textPath"].includes(tag)) return SVGTextContentElement
         return svgGraphicsTags.has(tag) ? SVGGraphicsElement : SVGElement
     }
     if (namespaceURI !== HTML_NAMESPACE) return HtmlElement
