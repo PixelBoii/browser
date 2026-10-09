@@ -2264,7 +2264,11 @@ class SVGElement extends HtmlElement {
     }
 }
 
-class SVGGraphicsElement extends SVGElement {}
+class SVGGraphicsElement extends SVGElement {
+    getBBox() {
+        return this.__ops.op_svg_get_bbox(this.__node_idx)
+    }
+}
 
 const svgGraphicsTags = new Set([
     "a", "circle", "defs", "ellipse", "foreignObject", "g", "image", "line",

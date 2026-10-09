@@ -1790,6 +1790,7 @@ struct Renderer {
     tokio: Rc<RefCell<tokio::runtime::Runtime>>,
     resolved_font_sizes: NodeMap<u32>,
     resolved_pixmaps: HashMap<String, tiny_skia::Pixmap>,
+    resolved_svg_keys: NodeMap<(String, u32)>,
     window_size: PhysicalSize<u32>,
     font_handler: Rc<FontHandler>,
     pending_dom_update: bool,
@@ -2504,6 +2505,14 @@ fn clamp_with_ratio(mut main_value: u32, max_value: u32, mut other_value: u32) -
     (main_value, other_value)
 }
 
+fn svg_cache_key(svg_str: &String, style: &Style) -> (String, u32) {
+    let color_hex = match style.color {
+        StyleBackground::Hex(hex) => hex,
+        _ => 0x00_FF_FF_FF,
+    };
+    (svg_str.clone(), color_hex)
+}
+
 fn rasterize_svg(
     cached_rasterizations: &mut CachedRasterizations,
     svg_str: &String,
@@ -2514,11 +2523,8 @@ fn rasterize_svg(
     style: &Style,
     mode: &LayoutMode,
 ) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
-    let color_hex = match style.color {
-        StyleBackground::Hex(hex) => hex,
-        _ => 0x00_FF_FF_FF,
-    };
-    let key = (svg_str.clone(), color_hex);
+    let key = svg_cache_key(svg_str, style);
+    let color_hex = key.1;
     let tree = if let Some(cached) = cached_rasterizations.decoded_svgs.get(&key) {
         cached
     } else {
@@ -5656,6 +5662,16 @@ fn op_measure_element(
 }
 
 #[op2(fast)]
+fn op_svg_get_bbox(scope: &mut v8::PinScope, #[number] node_idx: usize) {
+    let host = frame_host(scope);
+    let renderer = host.renderer.borrow();
+    let Some(_tree) = renderer.get_svg_tree(node_idx) else {
+        return;
+    };
+    // TODO: Calculate the element's bounding box using this tree.
+}
+
+#[op2(fast)]
 fn op_create_comment_element(
     scope: &mut v8::PinScope,
     #[string] comment: String,
@@ -7188,6 +7204,7 @@ extension!(
     op_get_attributes,
     op_get_computed_style,
     op_measure_element,
+    op_svg_get_bbox,
     op_window_post_message,
     op_window_message_source,
     op_get_offset_y,
@@ -7757,6 +7774,7 @@ impl Renderer {
             tokio,
             resolved_font_sizes,
             resolved_pixmaps: HashMap::new(),
+            resolved_svg_keys: NodeMap::default(),
             window_size,
             font_handler,
             pending_dom_update: false,
@@ -8251,6 +8269,7 @@ impl Renderer {
         self.containing_nodes.clear();
         self.rendered_nodes_ordered.clear();
         self.resolved_pixmaps.clear();
+        self.resolved_svg_keys.clear();
         self.layout_roots.clear();
         self.resolved_specified_heights.clear();
         self.resolved_specified_widths.clear();
@@ -8682,6 +8701,15 @@ impl Renderer {
             self.selector_changes.state_changed();
             self.styles_dirty = true;
             self.ensure_layout();
+        }
+    }
+
+    fn get_svg_tree(&self, mut node_idx: usize) -> Option<&Tree> {
+        loop {
+            if let Some(key) = self.resolved_svg_keys.get(&node_idx) {
+                return self.cached_rasterizations.decoded_svgs.get(key);
+            }
+            node_idx = self.nodes.get(node_idx)?.get_parent()?;
         }
     }
 
@@ -9661,6 +9689,10 @@ impl Renderer {
                                     return None;
                                 }
                                 Ok((pixmap, height, width, opaque)) => {
+                                    if save_as_final {
+                                        self.resolved_svg_keys
+                                            .insert(node_idx, svg_cache_key(&svg_data, &style));
+                                    }
                                     (LayoutKind::PixMap((pixmap, opaque)), height, width)
                                 }
                             }
