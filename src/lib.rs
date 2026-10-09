@@ -331,6 +331,42 @@ pub struct ElementGeometry {
     client_height: u32,
 }
 
+#[derive(Debug, Serialize)]
+struct SvgBoundingBox {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Debug)]
+enum SerializerStrategy {
+    EnsureId { used_ids: HashSet<String> },
+}
+
+impl SerializerStrategy {
+    fn ensure_id(&mut self, node_idx: usize, attributes: &Attributes) -> String {
+        match self {
+            Self::EnsureId { used_ids } => {
+                if let Some(id) = attributes.get_str("id").filter(|id| !id.is_empty()) {
+                    return id.into_owned();
+                }
+                let mut id = format!("__browser_svg_{node_idx}");
+                while !used_ids.insert(id.clone()) {
+                    id.push('_');
+                }
+                id
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SerializeResult {
+    html: String,
+    ids: NodeMap<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RequestCacheEntry {
     PngData(Bytes),
@@ -1790,6 +1826,8 @@ struct Renderer {
     tokio: Rc<RefCell<tokio::runtime::Runtime>>,
     resolved_font_sizes: NodeMap<u32>,
     resolved_pixmaps: HashMap<String, tiny_skia::Pixmap>,
+    resolved_svg_keys: NodeMap<(String, u32)>,
+    resolved_svg_ids: NodeMap<String>,
     window_size: PhysicalSize<u32>,
     font_handler: Rc<FontHandler>,
     pending_dom_update: bool,
@@ -2504,6 +2542,14 @@ fn clamp_with_ratio(mut main_value: u32, max_value: u32, mut other_value: u32) -
     (main_value, other_value)
 }
 
+fn svg_cache_key(svg_str: &String, style: &Style) -> (String, u32) {
+    let color_hex = match style.color {
+        StyleBackground::Hex(hex) => hex,
+        _ => 0x00_FF_FF_FF,
+    };
+    (svg_str.clone(), color_hex)
+}
+
 fn rasterize_svg(
     cached_rasterizations: &mut CachedRasterizations,
     svg_str: &String,
@@ -2514,11 +2560,8 @@ fn rasterize_svg(
     style: &Style,
     mode: &LayoutMode,
 ) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
-    let color_hex = match style.color {
-        StyleBackground::Hex(hex) => hex,
-        _ => 0x00_FF_FF_FF,
-    };
-    let key = (svg_str.clone(), color_hex);
+    let key = svg_cache_key(svg_str, style);
+    let color_hex = key.1;
     let tree = if let Some(cached) = cached_rasterizations.decoded_svgs.get(&key) {
         cached
     } else {
@@ -5655,6 +5698,23 @@ fn op_measure_element(
     host.renderer.borrow_mut().measure_element(node_idx)
 }
 
+#[op2]
+#[serde]
+fn op_svg_get_bbox(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Option<SvgBoundingBox> {
+    let host = frame_host(scope);
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.ensure_layout();
+    let tree = renderer.get_svg_tree(node_idx)?;
+    let id = renderer.resolved_svg_ids.get(&node_idx)?;
+    let bounds = tree.node_by_id(id)?.bounding_box();
+    Some(SvgBoundingBox {
+        x: bounds.x(),
+        y: bounds.y(),
+        width: bounds.width(),
+        height: bounds.height(),
+    })
+}
+
 #[op2(fast)]
 fn op_create_comment_element(
     scope: &mut v8::PinScope,
@@ -5817,7 +5877,11 @@ fn op_get_inner_html(
     #[number] node_idx: usize,
 ) -> String {
     let host = frame_host(scope);
-    host.renderer.borrow().get_element_inner_html(node_idx)
+    let mut result = SerializeResult::default();
+    host.renderer
+        .borrow()
+        .get_element_inner_html(node_idx, &mut None, &mut result);
+    result.html
 }
 
 #[op2(nofast, reentrant)]
@@ -7188,6 +7252,7 @@ extension!(
     op_get_attributes,
     op_get_computed_style,
     op_measure_element,
+    op_svg_get_bbox,
     op_window_post_message,
     op_window_message_source,
     op_get_offset_y,
@@ -7757,6 +7822,8 @@ impl Renderer {
             tokio,
             resolved_font_sizes,
             resolved_pixmaps: HashMap::new(),
+            resolved_svg_keys: NodeMap::default(),
+            resolved_svg_ids: NodeMap::default(),
             window_size,
             font_handler,
             pending_dom_update: false,
@@ -8251,6 +8318,8 @@ impl Renderer {
         self.containing_nodes.clear();
         self.rendered_nodes_ordered.clear();
         self.resolved_pixmaps.clear();
+        self.resolved_svg_keys.clear();
+        self.resolved_svg_ids.clear();
         self.layout_roots.clear();
         self.resolved_specified_heights.clear();
         self.resolved_specified_widths.clear();
@@ -8682,6 +8751,15 @@ impl Renderer {
             self.selector_changes.state_changed();
             self.styles_dirty = true;
             self.ensure_layout();
+        }
+    }
+
+    fn get_svg_tree(&self, mut node_idx: usize) -> Option<&Tree> {
+        loop {
+            if let Some(key) = self.resolved_svg_keys.get(&node_idx) {
+                return self.cached_rasterizations.decoded_svgs.get(key);
+            }
+            node_idx = self.nodes.get(node_idx)?.get_parent()?;
         }
     }
 
@@ -9328,13 +9406,34 @@ impl Renderer {
         }
     }
 
-    fn get_element_inner_html(&self, node_idx: usize) -> String {
-        let node_idx = self.template_contents.get(&node_idx).copied().unwrap_or(node_idx);
-        let mut str = String::new();
-        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
-            str += &self.get_element_html(*child_idx);
+    fn get_element_ids(&self, node_idx: usize) -> HashSet<String> {
+        let mut pending = vec![node_idx];
+        let mut used_ids = HashSet::new();
+        while let Some(idx) = pending.pop() {
+            if let Node::Element(element) = self.nodes.get(idx).unwrap() {
+                if let Some(id) = element.attributes.get_str("id") {
+                    used_ids.insert(id.into_owned());
+                }
+            }
+            let children_idx = self.template_contents.get(&idx).copied().unwrap_or(idx);
+            if let Some(children) = self.dom_indexes.children_index.get(&children_idx) {
+                pending.extend(children.iter().rev().copied());
+            }
         }
-        str
+
+        used_ids
+    }
+
+    fn get_element_inner_html(
+        &self,
+        node_idx: usize,
+        strategy: &mut Option<SerializerStrategy>,
+        result: &mut SerializeResult,
+    ) {
+        let node_idx = self.template_contents.get(&node_idx).copied().unwrap_or(node_idx);
+        for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
+            self.get_element_html(*child_idx, strategy, result);
+        }
     }
 
     fn get_text_content(&self, node_idx: usize) -> String {
@@ -9354,37 +9453,54 @@ impl Renderer {
         str
     }
 
-    fn get_element_html(&self, node_idx: usize) -> String {
+    fn get_element_html(
+        &self,
+        node_idx: usize,
+        strategy: &mut Option<SerializerStrategy>,
+        result: &mut SerializeResult,
+    ) {
         let node = &self.nodes.get(node_idx).unwrap();
-        let mut str = String::new();
         match node {
             Node::Text(element) => {
-                str += &element.text;
+                result.html += &element.text;
             }
             Node::Element(element) => {
-                str += "<";
-                str += &element.tag;
-                for (key, value) in element.attributes.values.iter() {
-                    str += " ";
-                    str += key;
-                    str += "=\"";
-                    str += value;
-                    str += "\"";
+                result.html += "<";
+                result.html += &element.tag;
+                let id = strategy
+                    .as_mut()
+                    .map(|strategy| strategy.ensure_id(node_idx, &element.attributes));
+                if let Some(id) = &id {
+                    result.ids.insert(node_idx, id.clone());
                 }
-                str += ">";
-                str += &self.get_element_inner_html(node_idx);
-                str += "</";
-                str += &element.tag;
-                str += ">";
+                for (key, value) in element.attributes.values.iter() {
+                    if key == "id" && id.is_some() {
+                        continue;
+                    }
+                    result.html += " ";
+                    result.html += key;
+                    result.html += "=\"";
+                    result.html += value;
+                    result.html += "\"";
+                }
+                if let Some(id) = id {
+                    result.html += " id=\"";
+                    result.html += &id;
+                    result.html += "\"";
+                }
+                result.html += ">";
+                self.get_element_inner_html(node_idx, strategy, result);
+                result.html += "</";
+                result.html += &element.tag;
+                result.html += ">";
             }
             Node::Comment(element) => {
-                str += &format!("<!--{}-->", element.comment);
+                result.html += &format!("<!--{}-->", element.comment);
             }
             Node::DocumentFragment | Node::ShadowRoot { .. } => {
-                str += &self.get_element_inner_html(node_idx)
+                self.get_element_inner_html(node_idx, strategy, result)
             }
         }
-        str
     }
 
     fn get_img_src_data(&self, src: &str) -> Option<RequestCacheEntry> {
@@ -9643,7 +9759,15 @@ impl Renderer {
                             )
                         }
                         "svg" => {
-                            let mut svg_data = self.get_element_html(node_idx);
+                            let mut strategy = Some(SerializerStrategy::EnsureId {
+                                used_ids: self.get_element_ids(node_idx),
+                            });
+                            let mut serialized = SerializeResult::default();
+                            self.get_element_html(node_idx, &mut strategy, &mut serialized);
+                            let SerializeResult {
+                                html: mut svg_data,
+                                ids,
+                            } = serialized;
                             self.inject_css_variables_into_str(&mut svg_data, &style.variables);
                             let result = rasterize_svg(
                                 &mut self.cached_rasterizations,
@@ -9661,6 +9785,15 @@ impl Renderer {
                                     return None;
                                 }
                                 Ok((pixmap, height, width, opaque)) => {
+                                    if save_as_final {
+                                        self.resolved_svg_keys
+                                            .insert(node_idx, svg_cache_key(&svg_data, &style));
+                                        for (idx, id) in ids.data.into_iter().enumerate() {
+                                            if let Some(id) = id {
+                                                self.resolved_svg_ids.insert(idx, id);
+                                            }
+                                        }
+                                    }
                                     (LayoutKind::PixMap((pixmap, opaque)), height, width)
                                 }
                             }
