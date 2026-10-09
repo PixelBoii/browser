@@ -6092,6 +6092,32 @@ fn op_set_inner_html(
 }
 
 #[op2(nofast, reentrant)]
+fn op_insert_adjacent_html(
+    scope: &mut v8::PinScope,
+    #[number] node_idx: usize,
+    #[string] position: String,
+    #[string] html: String,
+) -> Result<(), JsErrorBox> {
+    {
+        let host = frame_host(scope);
+        let mut renderer = host.renderer.borrow_mut();
+        let first_idx = renderer.nodes.cursor + 1;
+        renderer.insert_adjacent_html(node_idx, &position, html)?;
+        // Fragment-parsed scripts stay inert, including during later DOM updates.
+        let mut executed_scripts = host.executed_scripts.borrow_mut();
+        for idx in first_idx..=renderer.nodes.cursor {
+            if matches!(renderer.nodes.get(idx), Some(Node::Element(element)) if element.tag == "script")
+            {
+                executed_scripts.nodes.push(idx);
+            }
+        }
+    }
+    custom_elements::deliver_reactions(scope);
+    mutation_observer::schedule(scope);
+    Ok(())
+}
+
+#[op2(nofast, reentrant)]
 fn op_document_open(scope: &mut v8::PinScope) {
     let host = frame_host(scope);
     host.renderer.borrow_mut().open_document();
@@ -7220,6 +7246,7 @@ extension!(
     op_query_selector_all,
     op_element_from_point,
     op_set_inner_html,
+    op_insert_adjacent_html,
     op_document_open,
     op_document_write,
     op_document_close,
@@ -8023,6 +8050,76 @@ impl Renderer {
         }
         self.record_child_list_mutation(node_idx, added, removed, None, None);
         self.schedule_dom_update();
+    }
+
+    fn insert_adjacent_html(
+        &mut self,
+        node_idx: usize,
+        position: &str,
+        html: String,
+    ) -> Result<(), JsErrorBox> {
+        let position = position.to_ascii_lowercase();
+        let (parent_idx, insert_pos) = match position.as_str() {
+            "beforebegin" | "afterend" => {
+                let parent_idx = self
+                    .nodes
+                    .get(node_idx)
+                    .and_then(Node::get_parent)
+                    .filter(|_| node_idx != self.dom_indexes.root_indice)
+                    .ok_or_else(|| {
+                        JsErrorBox::new(
+                            "DOMExceptionNoModificationAllowedError",
+                            "The element has no modifiable parent",
+                        )
+                    })?;
+                let siblings = self.dom_indexes.children_index.get(&parent_idx).unwrap();
+                let index = siblings.iter().position(|idx| *idx == node_idx).unwrap();
+                (parent_idx, index + usize::from(position == "afterend"))
+            }
+            "afterbegin" => (node_idx, 0),
+            "beforeend" => (
+                node_idx,
+                self.dom_indexes
+                    .children_index
+                    .get(&node_idx)
+                    .unwrap()
+                    .len(),
+            ),
+            _ => {
+                return Err(JsErrorBox::new(
+                    "DOMExceptionSyntaxError",
+                    "Invalid insertion position",
+                ));
+            }
+        };
+        let children = self
+            .dom_indexes
+            .children_index
+            .get_or_insert_default(parent_idx);
+        let old_len = children.len();
+        let previous_sibling = insert_pos.checked_sub(1).map(|idx| children[idx]);
+        let next_sibling = children.get(insert_pos).copied();
+
+        // Parsing appends to the parent; move only the new roots into position.
+        self.create_children_from_html(parent_idx, html);
+        let children = self
+            .dom_indexes
+            .children_index
+            .get_mut(&parent_idx)
+            .unwrap();
+        let added = children.split_off(old_len);
+        if added.is_empty() {
+            return Ok(());
+        }
+        children.splice(insert_pos..insert_pos, added.iter().copied());
+        if !self.node_is_connected(parent_idx) {
+            for &idx in &added {
+                self.enqueue_custom_element_upgrades(idx, None);
+            }
+        }
+        self.record_child_list_mutation(parent_idx, added, vec![], previous_sibling, next_sibling);
+        self.schedule_dom_update();
+        Ok(())
     }
 
     fn create_element(&mut self, tag: String, namespace: Option<String>) -> usize {
@@ -13179,6 +13276,9 @@ impl ExecutedScripts {
     }
 
     pub fn upsert_script(&mut self, js: &Script) -> bool {
+        if js.node_idx.is_some_and(|idx| self.nodes.contains(&idx)) {
+            return false;
+        }
         if let ScriptContent::Link(link) = &js.content {
             if self.links.contains(&link) {
                 // println!("Script has already been ran, ignoring: {}", link);
@@ -13188,13 +13288,8 @@ impl ExecutedScripts {
                 true
             }
         } else if let Some(node_idx) = js.node_idx {
-            if self.nodes.contains(&node_idx) {
-                // println!("Script has already been ran, ignoring: {}", node_idx);
-                false
-            } else {
-                self.nodes.push(node_idx);
-                true
-            }
+            self.nodes.push(node_idx);
+            true
         } else {
             true
         }
@@ -16886,6 +16981,178 @@ mod tests {
         frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
+    fn insert_adjacent_html_preserves_nodes_and_insertion_order() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script("insertAdjacentHTML positions", r#"
+            (() => {
+                const assert = (value, message) => { if (!value) throw new Error(message) }
+                const nodeName = node => node.nodeType === Node.TEXT_NODE ? '#text' :
+                    node.nodeType === Node.COMMENT_NODE ? '#comment' : node.nodeName
+                for (const position of ['beforebegin', 'afterbegin', 'beforeend', 'afterend']) {
+                    const container = document.createElement('div')
+                    container.innerHTML = '<span>left</span><div><button>old</button></div><span>right</span>'
+                    document.body.appendChild(container)
+                    const [left, target, right] = container.children
+                    const old = target.firstChild
+                    old.state = 42
+                    let clicks = 0
+                    old.addEventListener('click', () => clicks++)
+                    const result = target.insertAdjacentHTML(position.toUpperCase(), 'text<!--note--><b>one</b><i><em>two</em></i>')
+                    const parent = position === 'afterbegin' || position === 'beforeend' ? target : container
+                    const order = parent.childNodes.map(nodeName).join(',')
+                    const expected = {
+                        beforebegin: 'SPAN,#text,#comment,B,I,DIV,SPAN',
+                        afterbegin: '#text,#comment,B,I,BUTTON',
+                        beforeend: 'BUTTON,#text,#comment,B,I',
+                        afterend: 'SPAN,DIV,#text,#comment,B,I,SPAN',
+                    }[position]
+                    assert(order === expected, position + ': ' + order)
+                    assert(result === undefined, 'return value')
+                    assert(old.parentNode === target && old.state === 42, 'existing child identity')
+                    assert(container.firstChild === left && container.lastChild === right, 'existing sibling identity')
+                    assert(parent.querySelector('em').textContent === 'two', 'nested HTML')
+                    assert(parent.childNodes.every(node => node.parentNode === parent), 'parent links')
+                    assert(parent.querySelector('b').previousSibling.data === 'note', 'comment')
+                    old.click()
+                    assert(clicks === 1, 'existing event listener')
+                    target.insertAdjacentHTML(position, '')
+                    assert(parent.childNodes.map(nodeName).join(',') === expected, 'empty HTML')
+                    container.remove()
+                }
+                const empty = document.createElement('div')
+                empty.insertAdjacentHTML('afterbegin', '<b>first</b>')
+                empty.insertAdjacentHTML('beforeend', '<i>last</i>')
+                assert(empty.textContent === 'firstlast', 'detached and empty element')
+            })()
+        "#.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn insert_adjacent_html_validates_arguments_and_uses_parent_context() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script("insertAdjacentHTML validation and context", r#"
+            (() => {
+                const assert = (value, message) => { if (!value) throw new Error(message) }
+                const expectError = (callback, name) => {
+                    let caught
+                    try { callback() } catch (error) { caught = error }
+                    assert(caught?.name === name, 'expected ' + name)
+                    assert(caught instanceof (name === 'TypeError' ? TypeError : DOMException), 'error class')
+                }
+                const element = document.createElement('div')
+                expectError(() => element.insertAdjacentHTML(), 'TypeError')
+                expectError(() => element.insertAdjacentHTML('beforeend'), 'TypeError')
+                expectError(() => element.insertAdjacentHTML(Symbol(), ''), 'TypeError')
+                expectError(() => element.insertAdjacentHTML('beforeend', Symbol()), 'TypeError')
+                for (const position of ['', 'before', ' beforeend', 'beforeend ']) {
+                    expectError(() => element.insertAdjacentHTML(position, '<b>invalid</b>'), 'SyntaxError')
+                }
+                for (const position of ['beforebegin', 'afterend']) {
+                    expectError(() => element.insertAdjacentHTML(position, ''), 'NoModificationAllowedError')
+                    expectError(() => document.documentElement.insertAdjacentHTML(position, ''), 'NoModificationAllowedError')
+                }
+                assert(element.childNodes.length === 0, 'errors must not insert nodes')
+                element.insertAdjacentHTML({ toString: () => 'BEFOREEND' }, { toString: () => '<b>converted</b>' })
+                element.insertAdjacentHTML('beforeend', null)
+                element.insertAdjacentHTML('beforeend', undefined)
+                assert(element.textContent === 'convertednullundefined', 'string conversion')
+
+                const fragment = document.createDocumentFragment()
+                fragment.appendChild(element)
+                element.insertAdjacentHTML('beforebegin', '<span>before</span>')
+                element.insertAdjacentHTML('afterend', '<span>after</span>')
+                assert(fragment.firstChild.textContent === 'before' && fragment.lastChild.textContent === 'after', 'fragment parent')
+                const template = document.createElement('template')
+                template.insertAdjacentHTML('beforeend', '<b>child</b>')
+                assert(template.firstChild.textContent === 'child' && template.content.childNodes.length === 0, 'template children')
+
+                const svgNS = 'http://www.w3.org/2000/svg'
+                const svg = document.createElementNS(svgNS, 'svg')
+                svg.insertAdjacentHTML('afterbegin', '<g></g>')
+                const group = svg.firstChild
+                group.insertAdjacentHTML('afterend', '<circle></circle>')
+                assert(group.namespaceURI === svgNS && svg.lastChild.namespaceURI === svgNS, 'SVG parent context')
+                const foreign = document.createElementNS(svgNS, 'foreignObject')
+                foreign.insertAdjacentHTML('beforeend', '<div>HTML</div>')
+                assert(foreign.firstChild.namespaceURI === 'http://www.w3.org/1999/xhtml', 'SVG HTML integration point')
+            })()
+        "#.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn insert_adjacent_html_notifies_observers_updates_layout_and_keeps_scripts_inert() -> Result<()>
+    {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script("insertAdjacentHTML DOM integration", r#"
+            (() => {
+                const assert = (value, message) => { if (!value) throw new Error(message) }
+                const target = document.createElement('div')
+                target.style.cssText = 'width:100px'
+                target.innerHTML = '<div style="height:10px"></div>'
+                document.body.appendChild(target)
+                const old = target.firstChild
+                const height = target.getBoundingClientRect().height
+                const observer = new MutationObserver(() => {})
+                observer.observe(target, { childList: true, subtree: true })
+                target.insertAdjacentHTML('afterbegin', '<div style="height:20px">new</div><!--note-->')
+                const records = observer.takeRecords()
+                assert(records.length === 1, 'one childList record for the fragment')
+                const record = records[0]
+                assert(record.type === 'childList' && record.target === target, 'mutation target')
+                assert(record.addedNodes.length === 2 && record.removedNodes.length === 0, 'mutation nodes')
+                assert(record.previousSibling === null && record.nextSibling === old, 'mutation siblings')
+                assert(target.getBoundingClientRect().height === height + 20, 'layout invalidation')
+                target.insertAdjacentHTML('beforeend', '')
+                assert(observer.takeRecords().length === 0, 'empty HTML has no mutation')
+                observer.disconnect()
+
+                let connected = 0
+                customElements.define('adjacent-test', class extends HTMLElement {
+                    connectedCallback() { connected++ }
+                })
+                target.insertAdjacentHTML('beforeend', '<adjacent-test></adjacent-test>')
+                assert(connected === 1, 'custom element reaction')
+                const detached = document.createElement('div')
+                detached.insertAdjacentHTML('beforeend', '<adjacent-test></adjacent-test>')
+                assert(detached.firstChild instanceof customElements.get('adjacent-test'), 'detached custom element upgrade')
+                assert(connected === 1, 'detached custom element stays disconnected')
+
+                globalThis.adjacentScriptRan = false
+                target.insertAdjacentHTML('beforeend', '<script>globalThis.adjacentScriptRan = true</script><script src="https://invalid.test/adjacent.js"></script><script type="module">globalThis.adjacentScriptRan = true</script>')
+                assert(!globalThis.adjacentScriptRan, 'scripts must stay inert on insertion')
+            })()
+        "#.to_string())?;
+        frame.execute_dom_update();
+        frame.execute_host_script("insertAdjacentHTML scripts after DOM update", r#"
+            if (globalThis.adjacentScriptRan) throw new Error('fragment scripts ran during DOM update')
+        "#.to_string())?;
+        Ok(())
     }
 
     #[test]

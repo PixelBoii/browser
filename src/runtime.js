@@ -490,7 +490,7 @@ Object.defineProperty(globalThis, "Range", {
 
 const customElementRegistryToken = Symbol()
 
-for (const name of ["SyntaxError", "NotSupportedError", "InvalidStateError", "IndexSizeError"]) {
+for (const name of ["SyntaxError", "NotSupportedError", "InvalidStateError", "IndexSizeError", "NoModificationAllowedError"]) {
     core.registerErrorBuilder(`DOMException${name}`, message => new DOMException.DOMException(message, name))
 }
 
@@ -1054,6 +1054,14 @@ class HtmlElement extends BaseNode {
 
     set innerHTML(value) {
         this.__ops.op_set_inner_html(this.__node_idx, value);
+    }
+
+    insertAdjacentHTML(position, html) {
+        const prefix = "Failed to execute 'insertAdjacentHTML' on 'Element'"
+        webidl.requiredArguments(arguments.length, 2, prefix)
+        position = webidl.converters.DOMString(position, prefix, "Argument 1")
+        html = webidl.converters.DOMString(html, prefix, "Argument 2")
+        this.__ops.op_insert_adjacent_html(this.__node_idx, position, html)
     }
 
     get classList() {
