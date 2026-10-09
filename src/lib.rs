@@ -5702,7 +5702,8 @@ fn op_measure_element(
 #[serde]
 fn op_svg_get_bbox(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Option<SvgBoundingBox> {
     let host = frame_host(scope);
-    let renderer = host.renderer.borrow();
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.ensure_layout();
     let tree = renderer.get_svg_tree(node_idx)?;
     let id = renderer.resolved_svg_ids.get(&node_idx)?;
     let bounds = tree.node_by_id(id)?.bounding_box();
