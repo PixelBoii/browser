@@ -628,27 +628,21 @@ Object.defineProperty(globalThis, "TreeWalker", {
     writable: true,
 })
 
-class TextNode extends BaseNode {
-    constructor(text) {
+class CharacterData extends BaseNode {
+    constructor() {
         super()
-        this.text = text
-        if (autoRegisterNode) {
-            this.registerInBackend()
-        }
-    }
-
-    registerInBackend() {
-        this.__node_idx = core.ops.op_create_text_element(this.text)
-        cacheNodeElement(this.__node_idx, this)
+        if (new.target === CharacterData) throw new TypeError("Illegal constructor")
     }
 
     get data() {
-        return this.__node_idx == null ? this.text : this.__ops.op_get_text_content(this.__node_idx)
+        return this.__node_idx == null ? this.__initialData : this.__ops.op_get_text_content(this.__node_idx)
     }
     set data(value) {
-        this.text = String(value)
-        if (this.__node_idx != null) {
-            this.__ops.op_set_text_content(this.__node_idx, this.text)
+        value = String(value)
+        if (this.__node_idx == null) {
+            this.__initialData = value
+        } else {
+            this.__ops.op_set_text_content(this.__node_idx, value)
         }
     }
 
@@ -657,6 +651,38 @@ class TextNode extends BaseNode {
 
     get textContent() { return this.data }
     set textContent(value) { this.data = value }
+
+    get length() { return this.data.length }
+
+    appendData(data) {
+        if (!(this instanceof CharacterData)) throw new TypeError("Illegal invocation")
+        const prefix = "Failed to execute 'appendData' on 'CharacterData'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        data = webidl.converters.DOMString(data, prefix, "Argument 1")
+        this.data = this.data + data
+    }
+}
+
+Object.defineProperty(globalThis, "CharacterData", {
+    value: CharacterData,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+class TextNode extends CharacterData {
+    constructor(text) {
+        super()
+        this.__initialData = text
+        if (autoRegisterNode) {
+            this.registerInBackend()
+        }
+    }
+
+    registerInBackend() {
+        this.__node_idx = core.ops.op_create_text_element(this.__initialData)
+        cacheNodeElement(this.__node_idx, this)
+    }
 
     get nodeType() {
         return 3
@@ -685,8 +711,7 @@ Object.defineProperty(globalThis, "CDATASection", {
     writable: true,
 })
 
-// TODO: CharacterData inheritance once that interface is implemented.
-class ProcessingInstruction extends BaseNode {
+class ProcessingInstruction extends CharacterData {
     constructor() {
         throw new TypeError("ProcessingInstruction construction is not implemented")
     }
@@ -2376,29 +2401,18 @@ Object.defineProperty(globalThis, "HTMLTemplateElement", {
     writable: true,
 })
 
-class CommentNode extends BaseNode {
+class CommentNode extends CharacterData {
     constructor(data) {
         super()
-        this.data = data
+        this.__initialData = data
         if (autoRegisterNode) {
             this.registerInBackend()
         }
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_comment_element(this.data)
+        this.__node_idx = core.ops.op_create_comment_element(this.__initialData)
         cacheNodeElement(this.__node_idx, this)
-    }
-
-    get nodeValue() { return this.data }
-    set nodeValue(value) { this.textContent = value }
-
-    get textContent() { return this.data }
-    set textContent(value) {
-        this.data = String(value)
-        if (this.__node_idx != null) {
-            this.__ops.op_set_text_content(this.__node_idx, this.data)
-        }
     }
 
     get nodeType() {

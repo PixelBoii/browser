@@ -9630,10 +9630,14 @@ impl Renderer {
             }
             Node::Element(_) | Node::DocumentFragment | Node::ShadowRoot { .. } => {
                 for child_idx in self.dom_indexes.children_index.get(&node_idx).unwrap() {
-                    str += &self.get_text_content(*child_idx);
+                    if !matches!(self.nodes.get(*child_idx), Some(Node::Comment(_))) {
+                        str += &self.get_text_content(*child_idx);
+                    }
                 }
             }
-            Node::Comment(_) => {}
+            Node::Comment(element) => {
+                str += &element.comment;
+            }
         };
         str
     }
