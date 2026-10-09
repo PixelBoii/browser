@@ -753,6 +753,7 @@ impl CanvasBuffer {
                     cp2: _,
                     endpoint: _,
                 }
+                | CanvasPathCommand::QuadraticCurve { cp: _, endpoint: _ }
                 | CanvasPathCommand::Close => {
                     self.current_path.push(cmd);
                 }
@@ -1025,6 +1026,42 @@ impl CanvasBuffer {
                     cursor.x = x.round() as i32;
                     cursor.y = y.round() as i32;
                 }
+                &CanvasPathCommand::QuadraticCurve {
+                    mut cp,
+                    mut endpoint,
+                } => {
+                    if let Some(transform) = transform {
+                        cp = self.compute_point_transform(&cp, transform)?;
+                        endpoint = self.compute_point_transform(&endpoint, transform)?;
+                    }
+                    if subpath_start.is_none() {
+                        cursor.x = cp[0].round() as i32;
+                        cursor.y = cp[1].round() as i32;
+                        subpath_start = Some(cp);
+                    }
+                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp[0], cp[1]))
+                        + distance((cp[0], cp[1]), (endpoint[0], endpoint[1])))
+                    .ceil()
+                    .mul(3.)
+                    .max(1.) as usize;
+                    let mut last_y = None;
+                    for t_idx in 0..=steps {
+                        let t = t_idx as f32 / steps as f32;
+                        let x = quadratic_bezier(t, cursor.x, cp[0] as i32, endpoint[0] as i32);
+                        let y = quadratic_bezier(t, cursor.y, cp[1] as i32, endpoint[1] as i32);
+                        if x >= 0
+                            && x < self.width as i32
+                            && y >= 0
+                            && y < self.height as i32
+                            && last_y.is_none_or(|last| last != y)
+                        {
+                            y_pixels[y as usize].push(x as usize);
+                            last_y = Some(y);
+                        }
+                    }
+                    cursor.x = endpoint[0].round() as i32;
+                    cursor.y = endpoint[1].round() as i32;
+                }
                 &CanvasPathCommand::BezierCurve {
                     mut cp1,
                     mut cp2,
@@ -1034,6 +1071,11 @@ impl CanvasBuffer {
                         cp1 = self.compute_point_transform(&cp1, transform)?;
                         cp2 = self.compute_point_transform(&cp2, transform)?;
                         endpoint = self.compute_point_transform(&endpoint, transform)?;
+                    }
+                    if subpath_start.is_none() {
+                        cursor.x = cp1[0].round() as i32;
+                        cursor.y = cp1[1].round() as i32;
+                        subpath_start = Some(cp1);
                     }
                     let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1]))
                         + distance((cp1[0], cp1[1]), (cp2[0], cp2[1]))
@@ -1252,6 +1294,36 @@ impl CanvasBuffer {
                     cursor.x = x.round() as i32;
                     cursor.y = y.round() as i32;
                 }
+                &CanvasPathCommand::QuadraticCurve {
+                    mut cp,
+                    mut endpoint,
+                } => {
+                    if let Some(transform) = transform {
+                        cp = self.compute_point_transform(&cp, transform)?;
+                        endpoint = self.compute_point_transform(&endpoint, transform)?;
+                    }
+                    if subpath_start.is_none() {
+                        cursor.x = cp[0].round() as i32;
+                        cursor.y = cp[1].round() as i32;
+                        subpath_start = Some(cp);
+                    }
+                    let steps = (distance((cursor.x as f64, cursor.y as f64), (cp[0], cp[1]))
+                        + distance((cp[0], cp[1]), (endpoint[0], endpoint[1])))
+                    .ceil()
+                    .max(1.) as usize;
+                    for t_idx in 0..=steps {
+                        let t = t_idx as f32 / steps as f32;
+                        let x = quadratic_bezier(t, cursor.x, cp[0] as i32, endpoint[0] as i32);
+                        let y = quadratic_bezier(t, cursor.y, cp[1] as i32, endpoint[1] as i32);
+                        for wxidx in line_width_offset..line_width_end {
+                            for wyidx in line_width_offset..line_width_end {
+                                self.blend_pixel(x + wxidx, y + wyidx, color_tuple, u8::MAX);
+                            }
+                        }
+                    }
+                    cursor.x = endpoint[0].round() as i32;
+                    cursor.y = endpoint[1].round() as i32;
+                }
                 &CanvasPathCommand::BezierCurve {
                     mut cp1,
                     mut cp2,
@@ -1261,6 +1333,11 @@ impl CanvasBuffer {
                         cp1 = self.compute_point_transform(&cp1, transform)?;
                         cp2 = self.compute_point_transform(&cp2, transform)?;
                         endpoint = self.compute_point_transform(&endpoint, transform)?;
+                    }
+                    if subpath_start.is_none() {
+                        cursor.x = cp1[0].round() as i32;
+                        cursor.y = cp1[1].round() as i32;
+                        subpath_start = Some(cp1);
                     }
                     let steps = (distance((cursor.x as f64, cursor.y as f64), (cp1[0], cp1[1]))
                         + distance((cp1[0], cp1[1]), (cp2[0], cp2[1]))
@@ -6543,6 +6620,10 @@ enum CanvasPathCommand {
     Point {
         point: [f64; 2],
     },
+    QuadraticCurve {
+        cp: [f64; 2],
+        endpoint: [f64; 2],
+    },
     BezierCurve {
         cp1: [f64; 2],
         cp2: [f64; 2],
@@ -6621,6 +6702,13 @@ struct CanvasDrawImageRequest {
     y: f64,
     width: Option<f64>,
     height: Option<f64>,
+}
+
+fn quadratic_bezier(t: f32, p0: i32, p1: i32, p2: i32) -> i32 {
+    let result = (1. - t).powi(2) * p0 as f32
+        + 2. * (1. - t) * t * p1 as f32
+        + t.powi(2) * p2 as f32;
+    result.round() as i32
 }
 
 fn cubic_bezier(t: f32, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {

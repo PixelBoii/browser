@@ -1297,6 +1297,7 @@ const CANVAS_COMMAND_POINT = "point"
 const CANVAS_COMMAND_MOVE_TO = "moveTo"
 const CANVAS_COMMAND_CLOSE = "close"
 const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
+const CANVAS_COMMAND_QUADRATIC_CURVE = "quadraticCurve"
 const CANVAS_COMMAND_FILL_RECT = "fillRect"
 const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
 const CANVAS_COMMAND_TRANSFORM = "transform"
@@ -1506,6 +1507,21 @@ class CanvasRenderingContext2D {
         })
     }
 
+    quadraticCurveTo(cpx, cpy, x, y) {
+        const prefix = "Failed to execute 'quadraticCurveTo' on 'CanvasRenderingContext2D'"
+        webidl.requiredArguments(arguments.length, 4, prefix)
+        cpx = +cpx
+        cpy = +cpy
+        x = +x
+        y = +y
+        if (![cpx, cpy, x, y].every(Number.isFinite)) return
+        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_QUADRATIC_CURVE,
+            cp: [cpx, cpy],
+            endpoint: [x, y]
+        })
+    }
+
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
         this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
             type: CANVAS_COMMAND_BEZIER_CURVE,
@@ -1591,6 +1607,21 @@ class Path2D {
 
     closePath() {
         this.path.push({ type: CANVAS_COMMAND_CLOSE })
+    }
+
+    quadraticCurveTo(cpx, cpy, x, y) {
+        const prefix = "Failed to execute 'quadraticCurveTo' on 'Path2D'"
+        webidl.requiredArguments(arguments.length, 4, prefix)
+        cpx = +cpx
+        cpy = +cpy
+        x = +x
+        y = +y
+        if (![cpx, cpy, x, y].every(Number.isFinite)) return
+        this.path.push({
+            type: CANVAS_COMMAND_QUADRATIC_CURVE,
+            cp: [cpx, cpy],
+            endpoint: [x, y]
+        })
     }
 
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
