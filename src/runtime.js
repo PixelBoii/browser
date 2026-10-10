@@ -3354,30 +3354,44 @@ Object.defineProperty(globalThis, "matchMedia", {
 const pluginArrayToken = Symbol("PluginArray")
 
 class PluginArray {
+    #plugins = []
+
     constructor(token) {
         if (token !== pluginArrayToken) throw new TypeError("Illegal constructor")
     }
 
     get length() {
-        return 0
+        return this.#plugins.length
     }
 
-    item() {
-        return null
+    item(index) {
+        const plugins = this.#plugins
+        const prefix = "Failed to execute 'item' on 'PluginArray'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        index = webidl.converters["unsigned long"](index, prefix, "Argument 1")
+        return plugins[index] ?? null
     }
 
-    namedItem() {
-        return null
+    namedItem(name) {
+        const plugins = this.#plugins
+        const prefix = "Failed to execute 'namedItem' on 'PluginArray'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        name = webidl.converters.DOMString(name, prefix, "Argument 1")
+        return plugins.find(plugin => plugin.name === name) ?? null
     }
 
-    refresh() {}
-
-    *[Symbol.iterator]() {}
+    refresh() {
+        // Access the private field to check the receiver; refreshing is a no-op.
+        void this.#plugins
+    }
 }
 
-Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {
-    value: "PluginArray",
+webidl.configureInterface(PluginArray)
+
+Object.defineProperty(PluginArray.prototype, Symbol.iterator, {
+    value: Array.prototype.values,
     configurable: true,
+    writable: true,
 })
 
 Object.defineProperty(globalThis, "PluginArray", {
