@@ -631,6 +631,7 @@ dependencies = [
  "deno_web",
  "deno_webidl",
  "fixedbitset",
+ "half",
  "image",
  "palette",
  "percent-encoding",

@@ -28,6 +28,7 @@ sys_traits = { version = "=0.1.28", features = ["libc", "real"] }
 deno_crypto = { path = "../deno/ext/crypto" }
 image = "0.25.10"
 fixedbitset = "0.5.7"
+half = "2.7.1"
 deno_error = "=0.7.1"
 palette = "0.7.6"
 serde = { version = "1", features = ["derive"] }

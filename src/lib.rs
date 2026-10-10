@@ -6621,6 +6621,13 @@ enum CanvasFillRule {
     EvenOdd,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CanvasPixelFormat {
+    RgbaUnorm8,
+    RgbaFloat16,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CanvasPathCommand {
@@ -7184,7 +7191,7 @@ fn op_canvas_stroke_text(
     Ok(true)
 }
 
-#[op2(fast)]
+#[op2]
 fn op_canvas_get_image_data(
     scope: &mut v8::PinScope,
     #[number] node_idx: usize,
@@ -7192,13 +7199,18 @@ fn op_canvas_get_image_data(
     sy: i32,
     sw: i32,
     sh: i32,
+    #[serde] pixel_format: CanvasPixelFormat,
     #[arraybuffer] output: &mut [u8],
 ) -> Result<(), JsErrorBox> {
     let width = sw.unsigned_abs() as usize;
     let height = sh.unsigned_abs() as usize;
+    let bytes_per_pixel = match pixel_format {
+        CanvasPixelFormat::RgbaUnorm8 => 4,
+        CanvasPixelFormat::RgbaFloat16 => 8,
+    };
     let byte_length = width
         .checked_mul(height)
-        .and_then(|size| size.checked_mul(4));
+        .and_then(|size| size.checked_mul(bytes_per_pixel));
     if byte_length != Some(output.len()) {
         return Err(JsErrorBox::range_error("Invalid image data buffer length"));
     }
@@ -7234,13 +7246,22 @@ fn op_canvas_get_image_data(
                     ((u32::from(channel) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
                 }
             };
-            let offset = ((y - top) as usize * width + (x - left) as usize) * 4;
-            output[offset..offset + 4].copy_from_slice(&[
-                unpremultiply(r),
-                unpremultiply(g),
-                unpremultiply(b),
-                a,
-            ]);
+            let offset = ((y - top) as usize * width + (x - left) as usize) * bytes_per_pixel;
+            let channels = [unpremultiply(r), unpremultiply(g), unpremultiply(b), a];
+            match pixel_format {
+                CanvasPixelFormat::RgbaUnorm8 => {
+                    output[offset..offset + 4].copy_from_slice(&channels);
+                }
+                CanvasPixelFormat::RgbaFloat16 => {
+                    for (bytes, channel) in output[offset..offset + 8]
+                        .chunks_exact_mut(2)
+                        .zip(channels)
+                    {
+                        let value = half::f16::from_f64(f64::from(channel) / 255.0);
+                        bytes.copy_from_slice(&value.to_ne_bytes());
+                    }
+                }
+            }
         }
     }
     Ok(())

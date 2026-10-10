@@ -1405,12 +1405,14 @@ class CanvasRenderingContext2D {
         if (!Number.isSafeInteger(byteLength) || byteLength > 0x7fffffff) {
             throw new RangeError("Requested image data is too large")
         }
-        const data = new Uint8ClampedArray(byteLength)
-        const result = new imageData.ImageData(data, width, height, settings)
-        if (result.colorSpace !== "srgb" || result.pixelFormat !== "rgba-unorm8") {
-            throw new DOMException.DOMException("Only 8-bit sRGB image data is supported", "NotSupportedError")
+        const result = new imageData.ImageData(width, height, settings)
+        if (result.colorSpace !== "srgb") {
+            throw new DOMException.DOMException("Only sRGB image data is supported", "NotSupportedError")
         }
-        this.canvas.__ops.op_canvas_get_image_data(this.canvas.__node_idx, sx, sy, sw, sh, data.buffer)
+        this.canvas.__ops.op_canvas_get_image_data(
+            this.canvas.__node_idx, sx, sy, sw, sh,
+            result.pixelFormat, result.data.buffer,
+        )
         return result
     }
 
