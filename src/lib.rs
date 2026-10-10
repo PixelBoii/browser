@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
-use ab_glyph::{Font, FontRef, ScaleFont};
+use ab_glyph::{Font, FontRef, OutlineCurve, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use deno_core::error::JsError;
@@ -925,6 +925,11 @@ impl CanvasBuffer {
                     path,
                     line_width,
                     color,
+                }
+                | CanvasPathCommand::StrokeText {
+                    path,
+                    line_width,
+                    color,
                 } => {
                     let transform = self.state.transform.clone();
                     self.apply_stroke(&path, line_width, &transform, color)
@@ -1244,7 +1249,7 @@ impl CanvasBuffer {
         let mut subpath_start: Option<[f64; 2]> = None;
         let color_tuple = rgba_to_premul_tuple(color);
         let line_width_offset = -line_width as i32 / 2;
-        let line_width_end = line_width as i32 / 2;
+        let line_width_end = (line_width / 2.0).ceil() as i32;
         for cmd in queued_commands {
             match cmd {
                 &CanvasPathCommand::MoveTo { mut point } => {
@@ -6699,6 +6704,74 @@ enum CanvasPathCommand {
         x: i32,
         y: i32,
     },
+    #[serde(skip)]
+    StrokeText {
+        path: Vec<CanvasPathCommand>,
+        line_width: f64,
+        color: u32,
+    },
+}
+
+impl CanvasPathCommand {
+    fn from_ab_glyph(
+        outline: ab_glyph::Outline,
+        scale: ab_glyph::PxScaleFactor,
+        x: f64,
+        y: f64,
+    ) -> Vec<Self> {
+        let position = |point: ab_glyph::Point| {
+            [
+                x + f64::from(point.x * scale.horizontal),
+                y - f64::from(point.y * scale.vertical),
+            ]
+        };
+        let mut path = vec![];
+        let mut cursor = None;
+        let mut subpath_start = None;
+        for curve in outline.curves {
+            let (start, end, command) = match curve {
+                OutlineCurve::Line(start, end) => (
+                    start,
+                    end,
+                    Self::Point {
+                        point: position(end),
+                    },
+                ),
+                OutlineCurve::Quad(start, cp, end) => (
+                    start,
+                    end,
+                    Self::QuadraticCurve {
+                        cp: position(cp),
+                        endpoint: position(end),
+                    },
+                ),
+                OutlineCurve::Cubic(start, cp1, cp2, end) => (
+                    start,
+                    end,
+                    Self::BezierCurve {
+                        cp1: position(cp1),
+                        cp2: position(cp2),
+                        endpoint: position(end),
+                    },
+                ),
+            };
+            if cursor != Some(start) {
+                path.push(Self::MoveTo {
+                    point: position(start),
+                });
+                subpath_start = Some(start);
+            }
+            path.push(command);
+            // ab_glyph includes the closing edge in each contour's curves.
+            if subpath_start == Some(end) {
+                path.push(Self::Close);
+                cursor = None;
+            } else {
+                cursor = Some(end);
+            }
+        }
+        path
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -7058,6 +7131,55 @@ fn op_canvas_fill_text(
         image,
         x: x.round() as i32,
         y: (y - f64::from(baseline)).round() as i32,
+    });
+    Ok(true)
+}
+
+#[op2(fast)]
+fn op_canvas_stroke_text(
+    scope: &mut v8::PinScope,
+    #[number] node_idx: usize,
+    #[string] text: String,
+    x: f64,
+    y: f64,
+    font_size: f64,
+    line_width: f64,
+    #[string] stroke_style: String,
+) -> Result<bool, JsErrorBox> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !font_size.is_finite()
+        || font_size <= 0.0
+        || !line_width.is_finite()
+        || line_width <= 0.0
+    {
+        return Ok(false);
+    }
+    let color = match style::parse_color(stroke_style)
+        .map_err(|err| JsErrorBox::generic(err.to_string()))?
+    {
+        StyleBackground::Hex(color) => color,
+        StyleBackground::Transparent => 0,
+        _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
+    };
+    let host = frame_host(scope);
+    let mut renderer = host.renderer.borrow_mut();
+    let (Some(width), Some(height)) = get_canvas_wh(renderer.nodes.get(node_idx).unwrap()) else {
+        return Ok(false);
+    };
+    let path = renderer.font_handler.text_path(&text, font_size as u32, x, y);
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let canvas = renderer
+        .canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(width, height));
+    canvas.resize_if_needed(width, height);
+    canvas.commands.push(CanvasPathCommand::StrokeText {
+        path,
+        line_width,
+        color,
     });
     Ok(true)
 }
@@ -7453,6 +7575,7 @@ extension!(
     op_canvas_paint,
     op_canvas_get_image_data,
     op_canvas_fill_text,
+    op_canvas_stroke_text,
     op_canvas_measure_text,
     op_svg_get_extent_of_char,
     op_set_cookie,
@@ -13417,6 +13540,31 @@ impl FontHandler {
             font,
             glyphs: RefCell::new(HashMap::new()),
         })
+    }
+
+    fn text_path(&self, text: &str, font_px: u32, x: f64, y: f64) -> Vec<CanvasPathCommand> {
+        let font = self.font.as_scaled(font_px as f32);
+        let scale = font.scale_factor();
+        let mut path = vec![];
+        let mut pen_x = 0.0;
+        let mut previous = None;
+        for ch in text.chars() {
+            let glyph_id = self.font.glyph_id(ch);
+            if let Some(previous_id) = previous {
+                pen_x += font.kern(previous_id, glyph_id);
+            }
+            if let Some(outline) = self.font.outline(glyph_id) {
+                path.extend(CanvasPathCommand::from_ab_glyph(
+                    outline,
+                    scale,
+                    x + f64::from(pen_x),
+                    y,
+                ));
+            }
+            pen_x += font.h_advance(glyph_id);
+            previous = Some(glyph_id);
+        }
+        path
     }
 
     // Coverage can be shared across strings and colors; placement and blending happen later.

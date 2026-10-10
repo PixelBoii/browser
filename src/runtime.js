@@ -1376,6 +1376,17 @@ class CanvasRenderingContext2D {
         }
     }
 
+    strokeText(text, x, y) {
+        const prefix = "Failed to execute 'strokeText' on 'CanvasRenderingContext2D'"
+        webidl.requiredArguments(arguments.length, 3, prefix)
+        text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
+        const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
+        const strokeStyle = typeof this.strokeStyle === "string" ? this.strokeStyle : "#000000"
+        if (this.canvas.__ops.op_canvas_stroke_text(this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle)) {
+            this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        }
+    }
+
     getImageData(sx, sy, sw, sh, settings = {}) {
         const prefix = "Failed to execute 'getImageData' on 'CanvasRenderingContext2D'"
         webidl.requiredArguments(arguments.length, 4, prefix)
