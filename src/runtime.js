@@ -1338,8 +1338,11 @@ Object.defineProperty(globalThis, "ImageData", {
     writable: true,
 })
 
+const canvasGradientToken = Symbol("CanvasGradient")
+
 class CanvasGradient {
-    constructor() {
+    constructor(token) {
+        if (token !== canvasGradientToken) throw new TypeError("Illegal constructor")
         this.colorStops = []
     }
 
@@ -1348,8 +1351,11 @@ class CanvasGradient {
     }
 }
 
+const canvasRenderingContext2DToken = Symbol("CanvasRenderingContext2D")
+
 class CanvasRenderingContext2D {
-    constructor(canvas) {
+    constructor(token, canvas) {
+        if (token !== canvasRenderingContext2DToken) throw new TypeError("Illegal constructor")
         this.canvas = canvas
         this.lineWidth = 1
         this.fillStyle = "#000000"
@@ -1476,12 +1482,12 @@ class CanvasRenderingContext2D {
 
     // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
     createLinearGradient() {
-        return new CanvasGradient()
+        return new CanvasGradient(canvasGradientToken)
     }
 
     // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
     createRadialGradient() {
-        return new CanvasGradient()
+        return new CanvasGradient(canvasGradientToken)
     }
 
     drawImage(image, ...args) {
@@ -1679,7 +1685,7 @@ class HtmlCanvasElement extends HtmlElement {
     getContext(type) {
         if (type === "2d") {
             if (!this.__contexts["2d"]) {
-                this.__contexts["2d"] = new CanvasRenderingContext2D(this)
+                this.__contexts["2d"] = new CanvasRenderingContext2D(canvasRenderingContext2DToken, this)
             }
             return this.__contexts["2d"]
         } else {
