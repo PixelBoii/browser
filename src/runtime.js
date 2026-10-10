@@ -1406,12 +1406,9 @@ class CanvasRenderingContext2D {
             throw new RangeError("Requested image data is too large")
         }
         const result = new imageData.ImageData(width, height, settings)
-        if (result.colorSpace !== "srgb") {
-            throw new DOMException.DOMException("Only sRGB image data is supported", "NotSupportedError")
-        }
         this.canvas.__ops.op_canvas_get_image_data(
             this.canvas.__node_idx, sx, sy, sw, sh,
-            result.pixelFormat, result.data.buffer,
+            result.pixelFormat, result.colorSpace, result.data.buffer,
         )
         return result
     }
