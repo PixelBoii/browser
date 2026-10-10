@@ -194,6 +194,24 @@ pub enum StyleAlign {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StyleTextAnchor {
+    Start,
+    Middle,
+    End,
+}
+
+impl StyleTextAnchor {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "start" => Some(Self::Start),
+            "middle" => Some(Self::Middle),
+            "end" => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StyleWhiteSpace {
     Normal,
     NoWrap,
@@ -422,6 +440,12 @@ impl_css_keyword!(
     StyleWhiteSpace::NoWrap => "nowrap",
 );
 impl_css_keyword!(
+    StyleTextAnchor,
+    StyleTextAnchor::Start => "start",
+    StyleTextAnchor::Middle => "middle",
+    StyleTextAnchor::End => "end",
+);
+impl_css_keyword!(
     StyleBorderStyle,
     StyleBorderStyle::None => "none",
     StyleBorderStyle::Solid => "solid",
@@ -508,6 +532,7 @@ pub struct Style {
     pub top: StyleSize,
     pub bottom: StyleSize,
     pub text_align: StyleAlign,
+    pub text_anchor: StyleTextAnchor,
     pub white_space: StyleWhiteSpace,
     pub variables: Rc<StyleVariables>,
     pub font_size: StyleSize,
@@ -568,6 +593,7 @@ impl Style {
             top: self.top.clone(),
             bottom: self.bottom.clone(),
             text_align: self.text_align,
+            text_anchor: self.text_anchor,
             white_space: self.white_space,
             variables: Rc::new(StyleVariables::default()),
             font_size: self.font_size.clone(),
@@ -737,6 +763,19 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
             | HtmlNode::DocumentFragment
             | HtmlNode::ShadowRoot { .. } => implied_text_align,
         },
+        text_anchor: match node {
+            HtmlNode::Element(element)
+                if element.namespace.as_deref() == Some(crate::parser::SVG_NAMESPACE) =>
+            {
+                element
+                    .attributes
+                    .get_str("text-anchor")
+                    .and_then(|value| StyleTextAnchor::parse(value.as_ref()))
+            }
+            _ => None,
+        }
+        .or_else(|| parent_style.map(|style| style.text_anchor))
+        .unwrap_or(StyleTextAnchor::Start),
         white_space: parent_style
             .map(|style| style.white_space)
             .unwrap_or(StyleWhiteSpace::Normal),
@@ -2176,6 +2215,10 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                 }
                 .with_context(|| "Failed to parse text-align")?,
             ),
+            "text-anchor" => PropertyValue::TextAnchor(
+                StyleTextAnchor::parse(&value)
+                    .with_context(|| "Failed to parse text-anchor")?,
+            ),
             "white-space" => PropertyValue::WhiteSpace(
                 match value.trim().to_ascii_lowercase().as_str() {
                     "normal" => Some(StyleWhiteSpace::Normal),
@@ -2467,6 +2510,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("text-align", PropertyValue::Align(value)) => {
             style.text_align = value;
+        }
+        ("text-anchor", PropertyValue::TextAnchor(value)) => {
+            style.text_anchor = value;
         }
         ("white-space", PropertyValue::WhiteSpace(value)) => {
             style.white_space = value;

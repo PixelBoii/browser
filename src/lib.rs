@@ -32,7 +32,8 @@ use serde::Serialize;
 use shadow_dom::{op_attach_shadow, op_get_shadow_root};
 use style::{
     Style, StyleBackground, StyleDisplay, StyleFlexDirection, StyleJustifyContent, StylePosition,
-    StyleSize, StyleTransform, StyleTransformOperation, StyleVariables, StyleVisibility, StyleWhiteSpace,
+    StyleSize, StyleTextAnchor, StyleTransform, StyleTransformOperation, StyleVariables,
+    StyleVisibility, StyleWhiteSpace,
     get_base_style, parse_style,
 };
 use window_messaging::{ParentWindow, op_window_message_source, op_window_post_message};
@@ -2650,6 +2651,9 @@ fn rasterize_svg(
             svg_str.as_bytes()
         };
         let mut opt = usvg::Options::default();
+        opt.fontdb = Arc::clone(&cached_rasterizations.svg_fontdb);
+        opt.font_family = "Inter Variable".to_string();
+        opt.font_size = 16.0;
         opt.style_sheet = Some(
             format!(
                 "svg {{ color: #{:08X} !important; fill: currentColor }}",
@@ -5703,6 +5707,7 @@ fn computed_style_properties(renderer: &mut Renderer, node_idx: usize) -> HashMa
         ("top".to_string(), style.top.to_string()),
         ("bottom".to_string(), style.bottom.to_string()),
         ("text-align".to_string(), style.text_align.to_string()),
+        ("text-anchor".to_string(), style.text_anchor.to_string()),
         ("white-space".to_string(), style.white_space.to_string()),
         ("font-size".to_string(), style.font_size.to_string()),
         (
@@ -6921,6 +6926,98 @@ fn op_canvas_measure_text(scope: &mut v8::PinScope, #[string] text: String, font
     f64::from(width)
 }
 
+#[op2]
+#[serde]
+fn op_svg_get_extent_of_char(
+    scope: &mut v8::PinScope,
+    #[number] node_idx: usize,
+    index: u32,
+) -> Result<SvgBoundingBox, JsErrorBox> {
+    let index_error = || {
+        JsErrorBox::new(
+            "DOMExceptionIndexSizeError",
+            "The character index is out of range",
+        )
+    };
+    let host = frame_host(scope);
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.ensure_styles(StylesheetLoad::AvailableOnly);
+    if !renderer.node_is_connected(node_idx) {
+        return Err(index_error());
+    }
+    let style = &renderer.node_styles[&node_idx];
+    if style.display == StyleDisplay::None {
+        return Err(index_error());
+    }
+    let Node::Element(element) = renderer.nodes.get(node_idx).unwrap() else {
+        unreachable!("SVG text methods require an element");
+    };
+    let coordinate = |name: &str| {
+        element
+            .attributes
+            .get_str(name)
+            .and_then(|value| {
+                value
+                    .split([' ', '\t', '\r', '\n', ','])
+                    .find(|part| !part.is_empty())?
+                    .trim_end_matches("px")
+                    .parse::<f32>()
+                    .ok()
+            })
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+    };
+    let text_x = coordinate("x");
+    let text_y = coordinate("y");
+    let anchor_factor = match style.text_anchor {
+        StyleTextAnchor::Start => 0.0,
+        StyleTextAnchor::Middle => 0.5,
+        StyleTextAnchor::End => 1.0,
+    };
+    // Match getComputedTextLength's collapse and trimming of SVG whitespace.
+    let text = renderer
+        .get_text_content(node_idx)
+        .split([' ', '\t', '\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let font_px = renderer.resolved_font_sizes[&node_idx];
+    let font = renderer.font_handler.font.as_scaled(font_px as f32);
+    let mut x = 0.0;
+    let mut previous = None;
+    let mut utf16_start = 0;
+    let mut bounds = None;
+    let index = index as usize;
+    // Approximate horizontal text using getComputedTextLength's font metrics.
+    // Per-character positioning and shaping are omitted.
+    for ch in text.chars() {
+        let glyph_id = font.glyph_id(ch);
+        if let Some(previous_id) = previous {
+            x += font.kern(previous_id, glyph_id);
+        }
+        let advance = font.h_advance(glyph_id);
+        let utf16_end = utf16_start + ch.len_utf16();
+        // Both UTF-16 units of a supplementary character share its cell.
+        if (utf16_start..utf16_end).contains(&index) {
+            bounds = Some(SvgBoundingBox {
+                x: text_x + x,
+                y: text_y - font.ascent(),
+                width: advance,
+                height: font.ascent() - font.descent(),
+            });
+            if anchor_factor == 0.0 {
+                break;
+            }
+        }
+        x += advance;
+        previous = Some(glyph_id);
+        utf16_start = utf16_end;
+    }
+    let mut bounds = bounds.ok_or_else(index_error)?;
+    bounds.x -= x * anchor_factor;
+    Ok(bounds)
+}
+
 #[op2(fast)]
 fn op_canvas_fill_text(
     scope: &mut v8::PinScope,
@@ -7357,6 +7454,7 @@ extension!(
     op_canvas_get_image_data,
     op_canvas_fill_text,
     op_canvas_measure_text,
+    op_svg_get_extent_of_char,
     op_set_cookie,
     op_get_cookie,
     op_set_location_href,
@@ -7638,6 +7736,7 @@ fn get_dom_indexes(
 
 #[derive(Debug)]
 struct CachedRasterizations {
+    svg_fontdb: Arc<usvg::fontdb::Database>,
     decoded_pngs: HashMap<String, Pixmap>,
     decoded_jpegs: HashMap<String, DynamicImage>,
     decoded_gifs: HashMap<String, DynamicImage>,
@@ -7651,7 +7750,16 @@ struct CachedRasterizations {
 
 impl CachedRasterizations {
     pub fn new() -> Self {
+        let mut svg_fontdb = usvg::fontdb::Database::new();
+        svg_fontdb.load_font_data(include_bytes!("./InterVariable.ttf").to_vec());
+        // The rest of the browser also uses Inter for every requested family.
+        svg_fontdb.set_serif_family("Inter Variable");
+        svg_fontdb.set_sans_serif_family("Inter Variable");
+        svg_fontdb.set_monospace_family("Inter Variable");
+        svg_fontdb.set_cursive_family("Inter Variable");
+        svg_fontdb.set_fantasy_family("Inter Variable");
         Self {
+            svg_fontdb: Arc::new(svg_fontdb),
             decoded_pngs: HashMap::new(),
             decoded_jpegs: HashMap::new(),
             decoded_gifs: HashMap::new(),

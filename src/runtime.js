@@ -2337,6 +2337,14 @@ class SVGGraphicsElement extends SVGElement {
 }
 
 class SVGTextContentElement extends SVGGraphicsElement {
+    getExtentOfChar(index) {
+        const prefix = "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        index = webidl.converters["unsigned long"](index, prefix, "Argument 1")
+        const bounds = this.__ops.op_svg_get_extent_of_char(this.__node_idx, index)
+        return geometry.DOMRect.fromRect(bounds)
+    }
+
     getComputedTextLength() {
         if (!this.isConnected) return 0
         const style = getComputedStyle(this)
