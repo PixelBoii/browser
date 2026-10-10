@@ -1970,6 +1970,20 @@ class HTMLAudioElement extends HTMLMediaElement {
     }
 }
 
+Object.defineProperty(globalThis, "CanvasRenderingContext2D", {
+    value: CanvasRenderingContext2D,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
+Object.defineProperty(globalThis, "CanvasGradient", {
+    value: CanvasGradient,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
 Object.defineProperty(globalThis, "Path2D", {
     value: Path2D,
     enumerable: true,
