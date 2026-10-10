@@ -407,6 +407,12 @@ Object.defineProperty(globalThis, "FormData", {
 });
 
 Object.defineProperties(globalThis, {
+  Blob: {
+    value: file.Blob,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  },
   atob: {
     value: base64.atob,
     enumerable: true,
