@@ -3337,23 +3337,48 @@ Object.defineProperty(globalThis, "matchMedia", {
     writable: true
 })
 
+const pluginArrayToken = Symbol("PluginArray")
+
+class PluginArray {
+    constructor(token) {
+        if (token !== pluginArrayToken) throw new TypeError("Illegal constructor")
+    }
+
+    get length() {
+        return 0
+    }
+
+    item() {
+        return null
+    }
+
+    namedItem() {
+        return null
+    }
+
+    refresh() {}
+
+    *[Symbol.iterator]() {}
+}
+
+Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {
+    value: "PluginArray",
+    configurable: true,
+})
+
+Object.defineProperty(globalThis, "PluginArray", {
+    value: PluginArray,
+    configurable: true,
+    writable: true,
+})
+
 const navigator = {
     // This is set by setup_js_dom in rust
     userAgent: null,
     platform: "Linux x86_64",
     language: "en-US",
     languages: ["en-US", "en"],
-    plugins: {
-        length: 0,
-        item() {
-            return null
-        },
-        namedItem() {
-            return null
-        },
-        refresh() {},
-        *[Symbol.iterator]() {},
-    },
+    plugins: new PluginArray(pluginArrayToken),
     cookieEnabled: true,
     onLine: true,
     maxTouchPoints: 0,
