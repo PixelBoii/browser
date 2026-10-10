@@ -3386,22 +3386,19 @@ Object.defineProperty(globalThis, "PluginArray", {
     writable: true,
 })
 
-const navigator = {
+const navigatorToken = Symbol("Navigator")
+
+class Navigator {
     // This is set by setup_js_dom in rust
-    userAgent: null,
-    platform: "Linux x86_64",
-    language: "en-US",
-    languages: ["en-US", "en"],
-    plugins: new PluginArray(pluginArrayToken),
-    cookieEnabled: true,
-    onLine: true,
-    maxTouchPoints: 0,
-    mediaDevices: {
+    #userAgent = null
+    #languages = Object.freeze(["en-US", "en"])
+    #plugins = new PluginArray(pluginArrayToken)
+    #mediaDevices = {
         enumerateDevices() {
             return Promise.resolve([])
         },
-    },
-    userAgentData: {
+    }
+    #userAgentData = {
         brands: [
             { brand: "Chromium", version: "124" },
             { brand: "Not-A.Brand", version: "99" },
@@ -3423,8 +3420,40 @@ const navigator = {
 
             return Promise.resolve(Object.fromEntries(String(hints ?? "").split(",").filter(Boolean).map(hint => [hint, values[hint]])))
         },
-    },
+    }
+
+    constructor(token) {
+        if (token !== navigatorToken) throw new TypeError("Illegal constructor")
+        Object.defineProperty(globalThis, "__init_navigator", {
+            value: userAgent => {
+                this.#userAgent = userAgent
+            },
+            configurable: true,
+            writable: true,
+        })
+    }
+
+    get userAgent() { return this.#userAgent }
+    get platform() { return "Linux x86_64" }
+    get language() { return "en-US" }
+    get languages() { return this.#languages }
+    get plugins() { return this.#plugins }
+    get cookieEnabled() { return true }
+    get onLine() { return true }
+    get maxTouchPoints() { return 0 }
+    get mediaDevices() { return this.#mediaDevices }
+    get userAgentData() { return this.#userAgentData }
 }
+
+webidl.configureInterface(Navigator)
+
+Object.defineProperty(globalThis, "Navigator", {
+    value: Navigator,
+    configurable: true,
+    writable: true,
+})
+
+const navigator = new Navigator(navigatorToken)
 
 Object.defineProperty(globalThis, "navigator", {
     value: navigator,

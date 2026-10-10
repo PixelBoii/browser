@@ -15274,7 +15274,7 @@ impl Frame {
     fn js_dom_code(&self) -> String {
         format!(
             r#"
-                navigator.userAgent = {};
+                window.__init_navigator({});
                 window.__init_location({});
                 window.name = {};
                 window.innerWidth = {};
