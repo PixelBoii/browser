@@ -3344,6 +3344,17 @@ const navigator = {
     platform: "Linux x86_64",
     language: "en-US",
     languages: ["en-US", "en"],
+    plugins: {
+        length: 0,
+        item() {
+            return null
+        },
+        namedItem() {
+            return null
+        },
+        refresh() {},
+        *[Symbol.iterator]() {},
+    },
     cookieEnabled: true,
     onLine: true,
     maxTouchPoints: 0,
