@@ -1,5 +1,6 @@
 mod css;
 mod custom_elements;
+mod document;
 mod frame_context;
 mod loader;
 mod mutation_observer;
@@ -10,6 +11,7 @@ mod ui;
 mod window_messaging;
 
 use deno_core::serde::Deserialize;
+use document::{document_state, op_parse_html_document};
 use deno_error::JsErrorBox;
 use custom_elements::{
     op_custom_element_construct, op_custom_element_create, op_custom_element_define,
@@ -5378,28 +5380,37 @@ fn op_get_cookie(scope: &mut v8::PinScope, #[string] url: String) -> Result<Stri
 #[op2]
 fn op_create_element(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] tag: String,
     #[string] namespace: Option<String>,
 ) -> i32 {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer.borrow_mut().create_element(tag, namespace) as i32
 }
 
 #[op2(fast)]
-fn op_create_document_fragment(scope: &mut v8::PinScope) -> u32 {
-    let host = frame_host(scope);
+fn op_create_document_fragment(scope: &mut v8::PinScope, document: v8::Local<v8::Object>) -> u32 {
+    let host = document_state(scope, document);
     host.renderer.borrow_mut().create_document_fragment() as u32
 }
 
 #[op2(fast)]
-fn op_get_template_content(scope: &mut v8::PinScope, #[number] node_idx: usize) -> u32 {
-    let host = frame_host(scope);
+fn op_get_template_content(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> u32 {
+    let host = document_state(scope, document);
     host.renderer.borrow().template_content(node_idx) as u32
 }
 
 #[op2(fast)]
-fn op_create_text_element(scope: &mut v8::PinScope, #[string] text: String) -> Result<i32, JsError> {
-    let host = frame_host(scope);
+fn op_create_text_element(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[string] text: String,
+) -> Result<i32, JsError> {
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Text(TextElement { text, parent: None }));
     let node_idx = renderer.nodes.cursor;
@@ -5410,10 +5421,11 @@ fn op_create_text_element(scope: &mut v8::PinScope, #[string] text: String) -> R
 #[op2]
 fn op_get_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
     #[number] node_idx: usize,
     #[string] attribute: String,
 ) -> Result<Option<v8::Local<'s, v8::Value>>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
@@ -5429,10 +5441,14 @@ fn op_get_attribute<'s>(
 #[op2(reentrant)]
 fn op_spawn_frame(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] url: Option<String>,
 ) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
+    if host.detached {
+        return Ok(());
+    }
     let init = {
         let mut renderer = host.renderer.borrow_mut();
         let init = renderer
@@ -5464,11 +5480,12 @@ fn op_spawn_frame(
 #[op2]
 fn op_frame_window<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
     #[number] node_idx: usize,
     same_origin_only: bool,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let origin = caller_origin(scope);
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let handle = renderer.frames.get(&node_idx)?;
     let js = handle.js.borrow();
@@ -5517,33 +5534,31 @@ fn clone_node(
 #[op2(nofast, reentrant)]
 fn op_clone_node(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     deep: bool,
 ) -> Result<u32, JsErrorBox> {
     let new_node_idx = {
-        let host = frame_host(scope);
+        let host = document_state(scope, document);
         let mut renderer = host.renderer.borrow_mut();
         clone_node(&mut renderer, node_idx, None, deep)
             .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))?
     };
-    custom_elements::upgrade_subtree(scope, Some(new_node_idx), None);
+    if !document_state(scope, document).detached {
+        custom_elements::upgrade_subtree(scope, Some(new_node_idx), None);
+    }
     Ok(new_node_idx as u32)
 }
 
 #[op2]
 fn op_adopt_node(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     source_document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<Vec<(usize, usize)>, JsErrorBox> {
-    let context = source_document
-        .get_creation_context(scope)
-        .ok_or_else(|| JsErrorBox::type_error("Expected a document"))?;
-    let source_state = context
-        .get_slot::<RefCell<frame_context::FrameState>>()
-        .ok_or_else(|| JsErrorBox::type_error("Expected a document"))?;
-    let source_host = source_state.borrow().host.clone();
-    let host = frame_host(scope);
+    let source_host = document_state(scope, source_document);
+    let host = document_state(scope, document);
     if Rc::ptr_eq(&source_host.renderer, &host.renderer) {
         return Ok(vec![]);
     }
@@ -5603,8 +5618,11 @@ fn op_adopt_node(
         destination.schedule_dom_update();
         moved
     };
-    let source_scope = &mut v8::ContextScope::new(scope, context);
-    mutation_observer::schedule(source_scope);
+    if !source_host.detached {
+        let context = source_document.get_creation_context(scope).unwrap();
+        let source_scope = &mut v8::ContextScope::new(scope, context);
+        mutation_observer::schedule(source_scope);
+    }
     Ok(moved)
 }
 
@@ -5621,8 +5639,12 @@ fn get_offset_y_walk(renderer: &Ref<'_, Renderer>, node_idx: usize, mut parent_o
 }
 
 #[op2(fast)]
-fn op_get_offset_y(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Result<i32, JsError> {
-    let host = frame_host(scope);
+fn op_get_offset_y(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> Result<i32, JsError> {
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let offset_y = get_offset_y_walk(&renderer, node_idx, 0);
     Ok(offset_y)
@@ -5631,9 +5653,10 @@ fn op_get_offset_y(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Resul
 #[op2]
 fn op_get_attributes(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<Option<Attributes>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow_mut();
     let value = renderer
         .nodes
@@ -5768,9 +5791,10 @@ fn computed_style_properties(renderer: &mut Renderer, node_idx: usize) -> HashMa
 #[serde]
 fn op_get_computed_style(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> HashMap<String, String> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     computed_style_properties(&mut renderer, node_idx)
 }
@@ -5779,16 +5803,27 @@ fn op_get_computed_style(
 #[serde]
 fn op_measure_element(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> ElementGeometry {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
+    if host.detached {
+        return ElementGeometry::default();
+    }
     host.renderer.borrow_mut().measure_element(node_idx)
 }
 
 #[op2]
 #[serde]
-fn op_svg_get_bbox(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Option<SvgBoundingBox> {
-    let host = frame_host(scope);
+fn op_svg_get_bbox(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> Option<SvgBoundingBox> {
+    let host = document_state(scope, document);
+    if host.detached {
+        return None;
+    }
     let mut renderer = host.renderer.borrow_mut();
     renderer.ensure_layout();
     let tree = renderer.get_svg_tree(node_idx)?;
@@ -5805,9 +5840,10 @@ fn op_svg_get_bbox(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Optio
 #[op2(fast)]
 fn op_create_comment_element(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] comment: String,
 ) -> Result<i32, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     renderer.push_node(Node::Comment(CommentElement {
         comment,
@@ -5821,10 +5857,11 @@ fn op_create_comment_element(
 #[op2(fast)]
 fn op_would_create_cycle(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] parent_idx: usize,
     #[number] node_idx: usize,
 ) -> bool {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let mut current = Some(parent_idx);
     while let Some(idx) = current {
@@ -5833,9 +5870,10 @@ fn op_would_create_cycle(
         }
         current = match renderer.nodes.get(idx) {
             // Template contents have no DOM parent, but still belong to a template.
-            Some(Node::DocumentFragment) => renderer.template_contents.iter().find_map(
-                |(template, content)| (*content == idx).then_some(*template),
-            ),
+            Some(Node::DocumentFragment) => renderer
+                .template_contents
+                .iter()
+                .find_map(|(template, content)| (*content == idx).then_some(*template)),
             Some(node) => node.shadow_including_parent(),
             None => None,
         };
@@ -5846,11 +5884,12 @@ fn op_would_create_cycle(
 #[op2(reentrant)]
 fn op_append_child<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
     #[number] parent_idx: usize,
     #[number] node_idx: usize,
     #[number] before_reference_idx: Option<usize>,
 ) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.clone();
     let executed_scripts = host.executed_scripts.clone();
 
@@ -5922,7 +5961,7 @@ fn op_append_child<'s>(
                 script_type: ScriptType::Classic,
                 content: ScriptContent::Code(code),
                 ..
-            }) => {
+            }) if !host.detached => {
                 let mut executed_scripts = executed_scripts.borrow_mut();
                 if executed_scripts.nodes.contains(&node_idx) {
                     None
@@ -5935,8 +5974,8 @@ fn op_append_child<'s>(
         }
     };
 
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
     if let Some(code) = script_to_run {
         run_v8_source(
             scope,
@@ -5961,9 +6000,10 @@ fn op_append_child<'s>(
 #[string]
 fn op_get_inner_html(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> String {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut result = SerializeResult::default();
     host.renderer
         .borrow()
@@ -5972,15 +6012,19 @@ fn op_get_inner_html(
 }
 
 #[op2(nofast, reentrant)]
-fn op_remove_child(scope: &mut v8::PinScope, #[number] child_idx: usize) -> Result<(), JsError> {
+fn op_remove_child(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] child_idx: usize,
+) -> Result<(), JsError> {
     {
-        let host = frame_host(scope);
+        let host = document_state(scope, document);
         let mut renderer = host.renderer.borrow_mut();
         renderer.detach_node(child_idx);
         renderer.schedule_dom_update();
     }
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
     Ok(())
 }
 
@@ -6012,9 +6056,10 @@ fn op_bind_node_wrapper(
 #[op2]
 fn op_get_node(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     Ok(renderer
         .nodes
@@ -6023,18 +6068,22 @@ fn op_get_node(
 }
 
 #[op2]
-fn op_get_document_element(scope: &mut v8::PinScope) -> Option<(usize, Node)> {
-    let host = frame_host(scope);
+fn op_get_document_element(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+) -> Option<(usize, Node)> {
+    let host = document_state(scope, document);
     host.renderer.borrow().document_element()
 }
 
 #[op2]
 fn op_get_element_by_id(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] id: String,
     #[number] root_idx: Option<usize>,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let node_idx = renderer.dom_indexes.id_elements.get(&id).and_then(|v| {
         v.ones().find(|idx| {
@@ -6052,10 +6101,11 @@ fn op_get_element_by_id(
 #[op2]
 fn op_get_elements_by_tag_name(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] tag: String,
     #[number] required_parent: Option<usize>,
 ) -> Vec<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer
         .borrow()
         .get_elements_by_tag_name(&tag, required_parent)
@@ -6064,10 +6114,11 @@ fn op_get_elements_by_tag_name(
 #[op2]
 fn op_get_elements_by_name(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] name: String,
     #[number] required_parent: Option<usize>,
 ) -> Vec<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer
         .borrow()
         .get_elements_by_name(&name, required_parent)
@@ -6076,28 +6127,38 @@ fn op_get_elements_by_name(
 #[op2]
 fn op_get_elements_by_class_name(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] class_names: String,
     #[number] required_parent: Option<usize>,
 ) -> Vec<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer
         .borrow()
         .get_elements_by_class_name(&class_names, required_parent)
 }
 
 #[op2]
-fn op_element_from_point(scope: &mut v8::PinScope, x: f64, y: f64) -> Option<(usize, Node)> {
-    let host = frame_host(scope);
+fn op_element_from_point(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    x: f64,
+    y: f64,
+) -> Option<(usize, Node)> {
+    let host = document_state(scope, document);
+    if host.detached {
+        return None;
+    }
     host.renderer.borrow_mut().element_from_point(x, y)
 }
 
 #[op2]
 fn op_query_selector(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] selector: String,
     #[number] required_parent: Option<usize>,
 ) -> Option<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer
         .borrow_mut()
         .query_selector_node(selector, required_parent)
@@ -6113,10 +6174,11 @@ fn walk_closest(buffer: &mut Vec<usize>, nodes: &NodesTable, node_idx: usize) {
 #[op2]
 fn op_get_closest(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] selector: String,
     #[number] node_idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let selector = selector_to_parts(&selector, &mut renderer.css_parser.class_definitions);
     let matched_idxs: Vec<usize> = query_selector_all(
@@ -6154,10 +6216,11 @@ fn has_parent(nodes_table: &NodesTable, node_idx: usize, target_parent: usize) -
 #[op2]
 fn op_query_selector_all(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[string] selector: String,
     #[number] required_parent: Option<usize>,
 ) -> Vec<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer
         .borrow_mut()
         .query_selector_all_nodes(selector, required_parent)
@@ -6166,27 +6229,29 @@ fn op_query_selector_all(
 #[op2(nofast, reentrant)]
 fn op_set_inner_html(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] html: String,
 ) {
     {
-        let host = frame_host(scope);
+        let host = document_state(scope, document);
         let mut renderer = host.renderer.borrow_mut();
         renderer.replace_inner_html(node_idx, html);
     }
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
 }
 
 #[op2(nofast, reentrant)]
 fn op_insert_adjacent_html(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] position: String,
     #[string] html: String,
 ) -> Result<(), JsErrorBox> {
     {
-        let host = frame_host(scope);
+        let host = document_state(scope, document);
         let mut renderer = host.renderer.borrow_mut();
         let first_idx = renderer.nodes.cursor + 1;
         renderer.insert_adjacent_html(node_idx, &position, html)?;
@@ -6199,22 +6264,26 @@ fn op_insert_adjacent_html(
             }
         }
     }
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
     Ok(())
 }
 
 #[op2(nofast, reentrant)]
-fn op_document_open(scope: &mut v8::PinScope) {
-    let host = frame_host(scope);
+fn op_document_open(scope: &mut v8::PinScope, document: v8::Local<v8::Object>) {
+    let host = document_state(scope, document);
     host.renderer.borrow_mut().open_document();
     *host.executed_scripts.borrow_mut() = ExecutedScripts::new();
-    custom_elements::deliver_reactions(scope);
+    document::deliver_reactions(scope, document);
 }
 
 #[op2(nofast, reentrant)]
-fn op_document_write(scope: &mut v8::PinScope, #[string] html: String) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+fn op_document_write(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[string] html: String,
+) -> Result<(), JsErrorBox> {
+    let host = document_state(scope, document);
     {
         let mut renderer = host.renderer.borrow_mut();
         let stream = renderer.document_stream.as_mut().unwrap();
@@ -6226,14 +6295,17 @@ fn op_document_write(scope: &mut v8::PinScope, #[string] html: String) -> Result
         renderer.adopt_document_stream(&mut stream);
         renderer.document_stream = Some(stream);
     }
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
     Ok(())
 }
 
 #[op2(nofast, reentrant)]
-fn op_document_close(scope: &mut v8::PinScope) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+fn op_document_close(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+) -> Result<(), JsErrorBox> {
+    let host = document_state(scope, document);
     {
         let mut renderer = host.renderer.borrow_mut();
         let mut stream = renderer.document_stream.take().unwrap();
@@ -6247,21 +6319,22 @@ fn op_document_close(scope: &mut v8::PinScope) -> Result<(), JsErrorBox> {
             renderer.schedule_dom_update();
         }
     }
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
     Ok(())
 }
 
 #[op2(nofast, reentrant)]
 fn op_set_text_content(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] text: String,
 ) {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer.borrow_mut().set_text_content(node_idx, text);
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
 }
 
 
@@ -6269,17 +6342,22 @@ fn op_set_text_content(
 #[string]
 fn op_get_text_content(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<String, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let text = host.renderer.borrow().get_text_content(node_idx);
     Ok(text)
 }
 
 #[op2]
 #[serde]
-fn op_get_stylesheet_nodes(scope: &mut v8::PinScope, #[number] root: usize) -> Vec<usize> {
-    let host = frame_host(scope);
+fn op_get_stylesheet_nodes(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] root: usize,
+) -> Vec<usize> {
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let mut result = vec![];
     let mut pending = vec![root];
@@ -6306,10 +6384,11 @@ struct StyleSheetData {
 #[serde]
 fn op_get_stylesheet(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     include_rules: bool,
 ) -> Result<Option<StyleSheetData>, JsErrorBox> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let Some(Node::Element(element)) = renderer.nodes.get(node_idx) else {
         return Ok(None);
@@ -6380,12 +6459,13 @@ fn op_get_stylesheet(
 #[op2(nofast, reentrant)]
 fn op_insert_css_rule(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] rule: String,
     index: u32,
 ) -> Result<u32, JsErrorBox> {
     {
-        let host = frame_host(scope);
+        let host = document_state(scope, document);
         let mut renderer = host.renderer.borrow_mut();
         if !matches!(renderer.nodes.get(node_idx), Some(Node::Element(element)) if element.tag == "style")
         {
@@ -6421,8 +6501,8 @@ fn op_insert_css_rule(
         // Updating DOM text also schedules a restyle under the new source-text cache key.
         renderer.set_text_content(node_idx, text);
     }
-    custom_elements::deliver_reactions(scope);
-    mutation_observer::schedule(scope);
+    document::deliver_reactions(scope, document);
+    document::schedule_mutations(scope, document);
     Ok(index)
 }
 
@@ -6446,9 +6526,10 @@ fn op_media_query_matches(
 #[op2]
 fn op_get_child_nodes(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<Vec<(usize, Node)>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow_mut();
     let children: Vec<(usize, Node)> = renderer
         .dom_indexes
@@ -6464,9 +6545,10 @@ fn op_get_child_nodes(
 #[op2]
 fn op_get_descendant_nodes(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: Option<usize>,
 ) -> Vec<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let mut pending = match node_idx {
         Some(idx) => match renderer.dom_indexes.children_index.get(&idx) {
@@ -6489,10 +6571,11 @@ fn op_get_descendant_nodes(
 #[op2]
 fn op_get_sibling(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     previous: bool,
 ) -> Option<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let parent = renderer.nodes.get(node_idx)?.get_parent()?;
     let children = renderer.dom_indexes.children_index.get(&parent)?;
@@ -6509,10 +6592,11 @@ fn op_get_sibling(
 #[op2]
 fn op_get_edge_child(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     last: bool,
 ) -> Option<(usize, Node)> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let children = renderer.dom_indexes.children_index.get(&node_idx)?;
     let child = *(if last {
@@ -6526,9 +6610,10 @@ fn op_get_edge_child(
 #[op2]
 fn op_get_parent_node(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<Option<(usize, Node)>, JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow_mut();
     let parent_idx = if let Some(parent) = renderer.nodes.get(node_idx).and_then(|v| v.get_parent())
     {
@@ -6543,32 +6628,34 @@ fn op_get_parent_node(
 #[op2]
 fn op_update_attributes(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[serde] attributes: HashMap<String, String>,
 ) -> Result<(), JsErrorBox> {
     let result = {
-        let host = frame_host(scope);
+        let host = document_state(scope, document);
         let mut renderer = host.renderer.borrow_mut();
         let attributes = Attributes::from_hash_map(attributes);
         renderer
             .update_element_attributes(node_idx, attributes)
             .map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
     };
-    mutation_observer::schedule(scope);
+    document::schedule_mutations(scope, document);
     result
 }
 
 #[op2(nofast)]
 fn op_remove_attribute(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] attribute: String,
 ) {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     host.renderer
         .borrow_mut()
         .remove_attribute(node_idx, attribute);
-    mutation_observer::schedule(scope);
+    document::schedule_mutations(scope, document);
 }
 
 
@@ -6593,10 +6680,11 @@ fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
 #[op2]
 fn op_canvas_record_command(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[serde] command: CanvasPathCommand,
 ) -> Result<(), JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6820,6 +6908,7 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 #[op2]
 fn op_canvas_draw_image(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] canvas_node_idx: usize,
     #[number] image_node_idx: usize,
     #[serde] request: CanvasDrawImageRequest,
@@ -6846,7 +6935,7 @@ fn op_canvas_draw_image(
         _ => return Ok(false),
     };
 
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     if !renderer.nodes.contains_key(image_node_idx) {
         return Ok(false);
@@ -6879,6 +6968,7 @@ fn op_canvas_draw_image(
 #[op2]
 fn op_canvas_path_stroke(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     line_width: f64,
@@ -6892,7 +6982,7 @@ fn op_canvas_path_stroke(
         _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
     };
 
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6922,6 +7012,7 @@ fn op_canvas_path_stroke(
 #[op2]
 fn op_canvas_path_fill(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[string] fill_style: String,
@@ -6934,7 +7025,7 @@ fn op_canvas_path_fill(
             _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
         };
 
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6964,11 +7055,12 @@ fn op_canvas_path_fill(
 #[op2]
 fn op_canvas_path_clip(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[serde] fill_rule: CanvasFillRule,
 ) -> Result<(), JsError> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let node = renderer.nodes.get(node_idx).unwrap();
     let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
@@ -6992,11 +7084,16 @@ fn op_canvas_path_clip(
 }
 
 #[op2(fast)]
-fn op_canvas_measure_text(scope: &mut v8::PinScope, #[string] text: String, font_size: f64) -> f64 {
+fn op_canvas_measure_text(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[string] text: String,
+    font_size: f64,
+) -> f64 {
     if !font_size.is_finite() || font_size <= 0.0 {
         return 0.0;
     }
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let font_px = font_size as u32;
     let font = renderer.font_handler.font.as_scaled(font_px as f32);
@@ -7017,6 +7114,7 @@ fn op_canvas_measure_text(scope: &mut v8::PinScope, #[string] text: String, font
 #[serde]
 fn op_svg_get_extent_of_char(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     index: u32,
 ) -> Result<SvgBoundingBox, JsErrorBox> {
@@ -7026,7 +7124,7 @@ fn op_svg_get_extent_of_char(
             "The character index is out of range",
         )
     };
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     renderer.ensure_styles(StylesheetLoad::AvailableOnly);
     if !renderer.node_is_connected(node_idx) {
@@ -7108,6 +7206,7 @@ fn op_svg_get_extent_of_char(
 #[op2(fast)]
 fn op_canvas_fill_text(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] text: String,
     x: f64,
@@ -7124,7 +7223,7 @@ fn op_canvas_fill_text(
             StyleBackground::Transparent => 0,
             _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
         };
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
         return Ok(false);
@@ -7152,6 +7251,7 @@ fn op_canvas_fill_text(
 #[op2(fast)]
 fn op_canvas_stroke_text(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[string] text: String,
     x: f64,
@@ -7176,12 +7276,14 @@ fn op_canvas_stroke_text(
         StyleBackground::Transparent => 0,
         _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
     };
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let (Some(width), Some(height)) = get_canvas_wh(renderer.nodes.get(node_idx).unwrap()) else {
         return Ok(false);
     };
-    let path = renderer.font_handler.text_path(&text, font_size as u32, x, y);
+    let path = renderer
+        .font_handler
+        .text_path(&text, font_size as u32, x, y);
     if path.is_empty() {
         return Ok(false);
     }
@@ -7227,6 +7329,7 @@ fn srgb_to_display_p3(rgb: [f64; 3]) -> [f64; 3] {
 #[op2]
 fn op_canvas_get_image_data(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     sx: i32,
     sy: i32,
@@ -7249,7 +7352,7 @@ fn op_canvas_get_image_data(
         return Err(JsErrorBox::range_error("Invalid image data buffer length"));
     }
 
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let dimensions = renderer.nodes.get(node_idx).map(get_canvas_wh);
     let Some((Some(canvas_width), Some(canvas_height))) = dimensions else {
@@ -7293,9 +7396,8 @@ fn op_canvas_get_image_data(
                         .copy_from_slice(&channels.map(|channel| (channel * 255.0).round() as u8));
                 }
                 CanvasPixelFormat::RgbaFloat16 => {
-                    for (bytes, channel) in output[offset..offset + 8]
-                        .chunks_exact_mut(2)
-                        .zip(channels)
+                    for (bytes, channel) in
+                        output[offset..offset + 8].chunks_exact_mut(2).zip(channels)
                     {
                         let value = half::f16::from_f64(channel);
                         bytes.copy_from_slice(&value.to_ne_bytes());
@@ -7308,8 +7410,12 @@ fn op_canvas_get_image_data(
 }
 
 #[op2(fast)]
-fn op_canvas_paint(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+fn op_canvas_paint(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> Result<(), JsErrorBox> {
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
 
     let canvas = renderer
@@ -7328,9 +7434,10 @@ fn op_canvas_paint(scope: &mut v8::PinScope, #[number] node_idx: usize) -> Resul
 #[serde]
 fn op_collect_data_for_form(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] form_node_idx: usize,
 ) -> HashMap<String, String> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let inputs = renderer.collect_inputs_in_form(form_node_idx, None);
     let mut data = HashMap::new();
@@ -7349,33 +7456,38 @@ fn op_collect_data_for_form(
 #[op2(fast)]
 fn op_submit_form(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] form_node_idx: usize,
 ) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
-    let result = host
-        .renderer
-        .borrow_mut()
-        .submit_form(form_node_idx, None);
+    let host = document_state(scope, document);
+    if host.detached {
+        return Ok(());
+    }
+    let result = host.renderer.borrow_mut().submit_form(form_node_idx, None);
     result.map_err(|err| JsErrorBox::generic(err.root_cause().to_string()))
 }
 
 #[op2(fast)]
 fn op_track_intersection(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
-    renderer.track_intersection(node_idx);
+    if !host.detached {
+        renderer.track_intersection(node_idx);
+    }
     Ok(())
 }
 
 #[op2(fast)]
 fn op_untrack_intersection(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
 ) -> Result<(), JsErrorBox> {
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     renderer.untrack_intersection(node_idx);
     Ok(())
@@ -7589,6 +7701,7 @@ extension!(
     op_mutation_observer_observe,
     op_mutation_observer_disconnect,
     op_mutation_observer_take_records,
+    op_parse_html_document,
     op_create_element,
     op_create_document_fragment,
     op_attach_shadow,
@@ -8167,6 +8280,7 @@ impl Renderer {
         mut dom_indexes: DomIndexes,
         nodes_idxs: Vec<usize>,
         blob_store: Arc<BlobStore>,
+        detached: bool,
     ) -> Self {
         let request_cache = HashMap::new();
 
@@ -8183,26 +8297,36 @@ impl Renderer {
         let mut style_cache = StyleCache::default();
 
         let (node_styles, resolved_font_sizes, variable_definitions, hovering_impact, styles_dirty) =
-            compute_node_styles(
-                &url,
-                &tokio,
-                &network_fetch,
-                &nodes_table,
-                &nodes_idxs,
-                &HashMap::new(),
-                dom_indexes.root_indice,
-                &window_size,
-                &mut dom_indexes,
-                &mut css_parse_cache,
-                &mut flattened_css_cache,
-                &vec![],
-                &mut css_parser,
-                NodeMap::default(),
-                NodeMap::default(),
-                &mut style_cache,
-                &SelectorChanges::default(),
-                StylesheetLoad::AllowFetch,
-            );
+            if detached {
+                (
+                    NodeMap::default(),
+                    NodeMap::default(),
+                    VariableDefinitions::new(),
+                    HashSet::new(),
+                    true,
+                )
+            } else {
+                compute_node_styles(
+                    &url,
+                    &tokio,
+                    &network_fetch,
+                    &nodes_table,
+                    &nodes_idxs,
+                    &HashMap::new(),
+                    dom_indexes.root_indice,
+                    &window_size,
+                    &mut dom_indexes,
+                    &mut css_parse_cache,
+                    &mut flattened_css_cache,
+                    &vec![],
+                    &mut css_parser,
+                    NodeMap::default(),
+                    NodeMap::default(),
+                    &mut style_cache,
+                    &SelectorChanges::default(),
+                    StylesheetLoad::AllowFetch,
+                )
+            };
 
         Self {
             origin: ReqwestUrl::parse(&url).unwrap().origin(),
@@ -15311,6 +15435,7 @@ impl Frame {
             dom_indexes,
             nodes_idxs,
             Arc::clone(&self.blob_store),
+            false,
         ))));
     }
 
@@ -16481,7 +16606,7 @@ pub fn run() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "https://2captcha.com/demo/cloudflare-turnstile".to_string(),
+        "file:///home/pixel/browser/pages/dom-parser.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;

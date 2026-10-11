@@ -1,13 +1,14 @@
 use deno_core::{op2, v8};
 use deno_error::JsErrorBox;
 
-use crate::frame_context::frame_host;
+use crate::document::document_state;
 use crate::{Node, Renderer, custom_elements, parser::ShadowRootMode};
 
 #[op2(fast)]
 #[number]
 pub fn op_attach_shadow(
     scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
     #[number] host_idx: usize,
     #[string] mode: &str,
 ) -> Result<usize, JsErrorBox> {
@@ -20,7 +21,7 @@ pub fn op_attach_shadow(
             ));
         }
     };
-    let host = frame_host(scope);
+    let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let Some(Node::Element(element)) = renderer.nodes.get(host_idx) else {
         return Err(JsErrorBox::type_error("Expected a shadow host element"));
@@ -66,8 +67,12 @@ pub fn op_attach_shadow(
 }
 
 #[op2]
-pub fn op_get_shadow_root(scope: &mut v8::PinScope, #[number] host_idx: usize) -> Option<u32> {
-    let host = frame_host(scope);
+pub fn op_get_shadow_root(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] host_idx: usize,
+) -> Option<u32> {
+    let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let root = *renderer.shadow_roots.get(&host_idx)?;
     matches!(

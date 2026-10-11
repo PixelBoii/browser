@@ -134,6 +134,7 @@ pub(crate) fn bind_frame_state(
     let sources = shared.borrow_mut::<WindowSources>();
     let window_id = sources.0.len();
     sources.0.push(v8::Global::new(scope, context));
+    crate::document::bind_frame_document(scope, &host);
     context.set_slot(Rc::new(RefCell::new(FrameState {
         host: Rc::new(host),
         custom_elements: custom_elements::Registry::default(),

@@ -159,11 +159,6 @@ class BaseNode extends EventTarget {
         this.ownerDocument = document
     }
 
-    get __ops() {
-        // Adopted wrappers keep their original realm; backend calls follow their owner document.
-        return this.ownerDocument.__ops
-    }
-
     get baseURI() {
         return this.ownerDocument.baseURI
     }
@@ -177,7 +172,7 @@ class BaseNode extends EventTarget {
     }
 
     get parentNode() {
-        const parent = this.__ops.op_get_parent_node(this.__node_idx)
+        const parent = core.ops.op_get_parent_node(this.ownerDocument, this.__node_idx)
         return parent ? this.ownerDocument.__nodeToElement(parent) : null
     }
 
@@ -187,17 +182,17 @@ class BaseNode extends EventTarget {
     }
 
     get nextSibling() {
-        const sibling = this.__ops.op_get_sibling(this.__node_idx, false)
+        const sibling = core.ops.op_get_sibling(this.ownerDocument, this.__node_idx, false)
         return sibling ? this.ownerDocument.__nodeToElement(sibling) : null
     }
 
     get previousSibling() {
-        const sibling = this.__ops.op_get_sibling(this.__node_idx, true)
+        const sibling = core.ops.op_get_sibling(this.ownerDocument, this.__node_idx, true)
         return sibling ? this.ownerDocument.__nodeToElement(sibling) : null
     }
 
     get firstChild() {
-        const child = this.__ops.op_get_edge_child(this.__node_idx, false)
+        const child = core.ops.op_get_edge_child(this.ownerDocument, this.__node_idx, false)
         return child ? this.ownerDocument.__nodeToElement(child) : null
     }
 
@@ -213,7 +208,7 @@ class BaseNode extends EventTarget {
     }
 
     cloneNode(deep = false) {
-        let newNodeIdx = this.__ops.op_clone_node(this.__node_idx, deep)
+        let newNodeIdx = core.ops.op_clone_node(this.ownerDocument, this.__node_idx, deep)
         return this.ownerDocument.__elementFromNodeIdx(newNodeIdx)
     }
 
@@ -259,7 +254,7 @@ class BaseNode extends EventTarget {
     }
 
     get childNodes() {
-        return this.__ops.op_get_child_nodes(this.__node_idx)
+        return core.ops.op_get_child_nodes(this.ownerDocument, this.__node_idx)
             .map(this.ownerDocument.__nodeToElement)
     }
 
@@ -268,7 +263,7 @@ class BaseNode extends EventTarget {
     }
 
     get lastChild() {
-        const child = this.__ops.op_get_edge_child(this.__node_idx, true)
+        const child = core.ops.op_get_edge_child(this.ownerDocument, this.__node_idx, true)
         return child ? this.ownerDocument.__nodeToElement(child) : null
     }
 
@@ -285,7 +280,7 @@ class BaseNode extends EventTarget {
             throw new DOMException.DOMException("The node belongs to another document", "NotFoundError")
         }
         if (element.__node_idx != null) {
-            this.__ops.op_remove_child(element.__node_idx)
+            core.ops.op_remove_child(this.ownerDocument, element.__node_idx)
         }
         return element
     }
@@ -311,7 +306,7 @@ class BaseNode extends EventTarget {
         }
         if (newNode.ownerDocument !== this.ownerDocument) {
             this.ownerDocument.__adoptNode(newNode)
-        } else if (this.__ops.op_would_create_cycle(this.__node_idx, newNode.__node_idx)) {
+        } else if (core.ops.op_would_create_cycle(this.ownerDocument, this.__node_idx, newNode.__node_idx)) {
             throw new Error("Cannot insert a node into itself or its descendants")
         }
         if (newNode.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
@@ -320,30 +315,30 @@ class BaseNode extends EventTarget {
             }
             return newNode
         }
-        this.__ops.op_append_child(this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
+        core.ops.op_append_child(this.ownerDocument, this.__node_idx, newNode.__node_idx, referenceNode?.__node_idx)
         return newNode
     }
 
     querySelector(selector) {
-        const node = this.__ops.op_query_selector(selector, this.__node_idx)
+        const node = core.ops.op_query_selector(this.ownerDocument, selector, this.__node_idx)
         return node ? this.ownerDocument.__nodeToElement(node) : null
     }
 
     querySelectorAll(selector) {
-        const nodes = this.__ops.op_query_selector_all(selector, this.__node_idx)
+        const nodes = core.ops.op_query_selector_all(this.ownerDocument, selector, this.__node_idx)
         return nodes.map(this.ownerDocument.__nodeToElement)
     }
 
     get textContent() {
-        return this.__ops.op_get_text_content(this.__node_idx)
+        return core.ops.op_get_text_content(this.ownerDocument, this.__node_idx)
     }
 
     set textContent(value) {
-        this.__ops.op_set_text_content(this.__node_idx, value);
+        core.ops.op_set_text_content(this.ownerDocument, this.__node_idx, value);
     }
 
     getElementsByTagName(tag) {
-        const nodes = this.__ops.op_get_elements_by_tag_name(tag, this.__node_idx)
+        const nodes = core.ops.op_get_elements_by_tag_name(this.ownerDocument, tag, this.__node_idx)
         return nodes.map(this.ownerDocument.__nodeToElement)
     }
 }
@@ -510,6 +505,9 @@ class CustomElementRegistry {
 
     upgrade(root) {
         if (!(root instanceof BaseNode) && !(root instanceof Document)) throw new TypeError("Expected a Node")
+        if ((root.ownerDocument ?? root).__detached) {
+            throw new DOMException.DOMException("Detached document custom elements are not implemented", "NotSupportedError")
+        }
         core.ops.op_custom_element_upgrade(root.__node_idx ?? null)
     }
 }
@@ -537,7 +535,7 @@ class DocumentFragment extends BaseNode {
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_document_fragment()
+        this.__node_idx = core.ops.op_create_document_fragment(this.ownerDocument)
         cacheNodeElement(this.__node_idx, this)
     }
 
@@ -546,7 +544,7 @@ class DocumentFragment extends BaseNode {
     get nodeValue() { return null }
 
     getElementById(id) {
-        const node = this.__ops.op_get_element_by_id(String(id), this.__node_idx)
+        const node = core.ops.op_get_element_by_id(this.ownerDocument, String(id), this.__node_idx)
         return node ? this.ownerDocument.__nodeToElement(node) : null
     }
 }
@@ -577,11 +575,11 @@ class ShadowRoot extends DocumentFragment {
     }
 
     get innerHTML() {
-        return this.__ops.op_get_inner_html(this.__node_idx)
+        return core.ops.op_get_inner_html(this.ownerDocument, this.__node_idx)
     }
 
     set innerHTML(value) {
-        this.__ops.op_set_inner_html(this.__node_idx, String(value))
+        core.ops.op_set_inner_html(this.ownerDocument, this.__node_idx, String(value))
     }
 
     cloneNode() {
@@ -609,7 +607,7 @@ class TreeWalker {
         this.currentNode = root
         // TODO: Filtering, live DOM changes, and repositioning currentNode.
         const ownerDocument = root.ownerDocument ?? root
-        this.nodes = ownerDocument.__ops.op_get_descendant_nodes(root.__node_idx ?? null)
+        this.nodes = core.ops.op_get_descendant_nodes(ownerDocument, root.__node_idx ?? null)
             .map(ownerDocument.__nodeToElement)
         this.index = 0
     }
@@ -635,14 +633,14 @@ class CharacterData extends BaseNode {
     }
 
     get data() {
-        return this.__node_idx == null ? this.__initialData : this.__ops.op_get_text_content(this.__node_idx)
+        return this.__node_idx == null ? this.__initialData : core.ops.op_get_text_content(this.ownerDocument, this.__node_idx)
     }
     set data(value) {
         value = String(value)
         if (this.__node_idx == null) {
             this.__initialData = value
         } else {
-            this.__ops.op_set_text_content(this.__node_idx, value)
+            core.ops.op_set_text_content(this.ownerDocument, this.__node_idx, value)
         }
     }
 
@@ -680,7 +678,7 @@ class TextNode extends CharacterData {
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_text_element(this.__initialData)
+        this.__node_idx = core.ops.op_create_text_element(this.ownerDocument, this.__initialData)
         cacheNodeElement(this.__node_idx, this)
     }
 
@@ -920,7 +918,7 @@ class HtmlElement extends BaseNode {
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_element(this.tag, this.namespaceURI)
+        this.__node_idx = core.ops.op_create_element(this.ownerDocument, this.tag, this.namespaceURI)
         cacheNodeElement(this.__node_idx, this)
     }
 
@@ -928,12 +926,12 @@ class HtmlElement extends BaseNode {
         if (this.namespaceURI !== HTML_NAMESPACE) {
             throw new DOMException.DOMException("Shadow hosts must be HTML elements", "NotSupportedError")
         }
-        const root = this.__ops.op_attach_shadow(this.__node_idx, String(init?.mode))
+        const root = core.ops.op_attach_shadow(this.ownerDocument, this.__node_idx, String(init?.mode))
         return this.ownerDocument.__elementFromNodeIdx(root)
     }
 
     get shadowRoot() {
-        const root = this.__ops.op_get_shadow_root(this.__node_idx)
+        const root = core.ops.op_get_shadow_root(this.ownerDocument, this.__node_idx)
         return root == null ? null : this.ownerDocument.__elementFromNodeIdx(root)
     }
 
@@ -951,7 +949,7 @@ class HtmlElement extends BaseNode {
     }
 
     get attributes() {
-        const attributeEntries = Object.entries(this.__ops.op_get_attributes(this.__node_idx))
+        const attributeEntries = Object.entries(core.ops.op_get_attributes(this.ownerDocument, this.__node_idx))
         const attributes = attributeEntries.map(([name, value]) => ({
             name,
             value,
@@ -971,7 +969,7 @@ class HtmlElement extends BaseNode {
     }
 
     getAttributeNames() {
-        return Object.keys(this.__ops.op_get_attributes(this.__node_idx))
+        return Object.keys(core.ops.op_get_attributes(this.ownerDocument, this.__node_idx))
     }
 
     hasAttributes() {
@@ -979,7 +977,8 @@ class HtmlElement extends BaseNode {
     }
 
     getElementsByClassName(classNames) {
-        const nodes = this.__ops.op_get_elements_by_class_name(
+        const nodes = core.ops.op_get_elements_by_class_name(
+            this.ownerDocument,
             String(classNames),
             this.__node_idx,
         )
@@ -987,11 +986,11 @@ class HtmlElement extends BaseNode {
     }
 
     getAttribute(attr) {
-        return this.__ops.op_get_attribute(this.__node_idx, String(attr))
+        return core.ops.op_get_attribute(this.ownerDocument, this.__node_idx, String(attr))
     }
 
     setAttribute(attr, value) {
-        this.__ops.op_update_attributes(this.__node_idx, { [String(attr)]: String(value) })
+        core.ops.op_update_attributes(this.ownerDocument, this.__node_idx, { [String(attr)]: String(value) })
     }
 
     setAttributeNS(namespace, qualifiedName, value) {
@@ -999,7 +998,7 @@ class HtmlElement extends BaseNode {
     }
 
     removeAttribute(attr) {
-        this.__ops.op_remove_attribute(this.__node_idx, String(attr))
+        core.ops.op_remove_attribute(this.ownerDocument, this.__node_idx, String(attr))
     }
 
     hasAttribute(attr) {
@@ -1033,12 +1032,12 @@ class HtmlElement extends BaseNode {
     }
 
     closest(selector) {
-        const node = this.__ops.op_get_closest(selector, this.__node_idx)
+        const node = core.ops.op_get_closest(this.ownerDocument, selector, this.__node_idx)
         return node ? this.ownerDocument.__nodeToElement(node) : null
     }
 
     matches(selector) {
-        const node = this.__ops.op_get_closest(selector, this.__node_idx)
+        const node = core.ops.op_get_closest(this.ownerDocument, selector, this.__node_idx)
         return node ? node[0] === this.__node_idx : false
     }
 
@@ -1063,7 +1062,7 @@ class HtmlElement extends BaseNode {
     }
 
     get innerHTML() {
-        return this.__ops.op_get_inner_html(this.__node_idx)
+        return core.ops.op_get_inner_html(this.ownerDocument, this.__node_idx)
     }
 
     get outerHTML() {
@@ -1078,7 +1077,7 @@ class HtmlElement extends BaseNode {
     }
 
     set innerHTML(value) {
-        this.__ops.op_set_inner_html(this.__node_idx, value);
+        core.ops.op_set_inner_html(this.ownerDocument, this.__node_idx, value);
     }
 
     insertAdjacentHTML(position, html) {
@@ -1086,7 +1085,7 @@ class HtmlElement extends BaseNode {
         webidl.requiredArguments(arguments.length, 2, prefix)
         position = webidl.converters.DOMString(position, prefix, "Argument 1")
         html = webidl.converters.DOMString(html, prefix, "Argument 2")
-        this.__ops.op_insert_adjacent_html(this.__node_idx, position, html)
+        core.ops.op_insert_adjacent_html(this.ownerDocument, this.__node_idx, position, html)
     }
 
     get classList() {
@@ -1097,7 +1096,7 @@ class HtmlElement extends BaseNode {
         if ((this.tag !== "style" && this.tag !== "link") || !this.isConnected) {
             return null
         }
-        const data = this.__ops.op_get_stylesheet(this.__node_idx, false)
+        const data = core.ops.op_get_stylesheet(this.ownerDocument, this.__node_idx, false)
         if (!data) return null
         let sheet = styleSheets.get(this)
         if (!sheet || sheet.href !== data.href) {
@@ -1299,7 +1298,7 @@ class HtmlElement extends BaseNode {
     select() {}
 
     get dataset() {
-        const attributes = this.__ops.op_get_attributes(this.__node_idx)
+        const attributes = core.ops.op_get_attributes(this.ownerDocument, this.__node_idx)
         let data = Object.entries(attributes)
             .filter(([key, value]) => key.startsWith('data-'))
             .map(([key, value]) => [camelize(key.replace('data-', '')).replaceAll('-', ''), value])
@@ -1308,7 +1307,7 @@ class HtmlElement extends BaseNode {
 }
 
 function measureElement(element) {
-    return element.__ops.op_measure_element(element.__node_idx)
+    return core.ops.op_measure_element(element.ownerDocument, element.__node_idx)
 }
 
 function camelize(str) {
@@ -1368,7 +1367,7 @@ class CanvasRenderingContext2D {
         webidl.requiredArguments(arguments.length, 1, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
-        return { width: core.ops.op_canvas_measure_text(text, fontSize) }
+        return { width: core.ops.op_canvas_measure_text(this.canvas.ownerDocument, text, fontSize) }
     }
 
     fillText(text, x, y) {
@@ -1377,8 +1376,8 @@ class CanvasRenderingContext2D {
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
-        if (this.canvas.__ops.op_canvas_fill_text(this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle)) {
-            this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle)) {
+            core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
 
@@ -1388,8 +1387,8 @@ class CanvasRenderingContext2D {
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const strokeStyle = typeof this.strokeStyle === "string" ? this.strokeStyle : "#000000"
-        if (this.canvas.__ops.op_canvas_stroke_text(this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle)) {
-            this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle)) {
+            core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
 
@@ -1412,7 +1411,8 @@ class CanvasRenderingContext2D {
             throw new RangeError("Requested image data is too large")
         }
         const result = new imageData.ImageData(width, height, settings)
-        this.canvas.__ops.op_canvas_get_image_data(
+        core.ops.op_canvas_get_image_data(
+            this.canvas.ownerDocument,
             this.canvas.__node_idx, sx, sy, sw, sh,
             result.pixelFormat, result.colorSpace, result.data.buffer,
         )
@@ -1420,18 +1420,18 @@ class CanvasRenderingContext2D {
     }
 
     fillRect(x, y, width, height) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_FILL_RECT,
             x,
             y,
             width,
             height
         })
-        this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
     strokeRect(x, y, width, height) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_STROKE_RECT,
             x,
             y,
@@ -1439,28 +1439,28 @@ class CanvasRenderingContext2D {
             height,
             line_width: lineWidth
         })
-        this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
     clearRect(x, y, width, height) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_CLEAR_RECT,
             x,
             y,
             width,
             height
         })
-        this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
     save() {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_SAVE
         })
     }
 
     restore() {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_RESTORE
         })
     }
@@ -1477,7 +1477,7 @@ class CanvasRenderingContext2D {
             fillRule = firstArg
         }
 
-        this.canvas.__ops.op_canvas_path_clip(this.canvas.__node_idx, path, fillRule)
+        core.ops.op_canvas_path_clip(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillRule)
     }
 
     // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
@@ -1508,31 +1508,32 @@ class CanvasRenderingContext2D {
             return
         }
 
-        const queued = this.canvas.__ops.op_canvas_draw_image(
+        const queued = core.ops.op_canvas_draw_image(
+            this.canvas.ownerDocument,
             this.canvas.__node_idx,
             image.__node_idx,
             { x, y, width, height },
         )
         if (queued) {
-            this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+            core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
 
     beginPath() {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_BEGIN_PATH
         })
     }
 
     moveTo(x, y) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_MOVE_TO,
             point: [x, y]
         })
     }
 
     lineTo(x, y) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_POINT,
             point: [x, y]
         })
@@ -1543,7 +1544,7 @@ class CanvasRenderingContext2D {
     }
 
     closePath() {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_CLOSE
         })
     }
@@ -1556,7 +1557,7 @@ class CanvasRenderingContext2D {
         x = +x
         y = +y
         if (![cpx, cpy, x, y].every(Number.isFinite)) return
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_QUADRATIC_CURVE,
             cp: [cpx, cpy],
             endpoint: [x, y]
@@ -1564,7 +1565,7 @@ class CanvasRenderingContext2D {
     }
 
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_BEZIER_CURVE,
             cp1: [cp1x, cp1y],
             cp2: [cp2x, cp2y],
@@ -1577,8 +1578,8 @@ class CanvasRenderingContext2D {
         const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
         const strokeStyle = typeof this.strokeStyle === "string" ? this.strokeStyle : "#000000"
 
-        this.canvas.__ops.op_canvas_path_stroke(this.canvas.__node_idx, path, lineWidth, strokeStyle)
-        this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle)
+        core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
     fill(firstArg = null, secondArg = null) {
@@ -1596,12 +1597,12 @@ class CanvasRenderingContext2D {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
 
-        this.canvas.__ops.op_canvas_path_fill(this.canvas.__node_idx, path, fillStyle, fillRule)
-        this.canvas.__ops.op_canvas_paint(this.canvas.__node_idx)
+        core.ops.op_canvas_path_fill(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillStyle, fillRule)
+        core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
     transform(a, b, c, d, e, f) {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_TRANSFORM,
             matrix: {
                 data: [
@@ -1620,7 +1621,7 @@ class CanvasRenderingContext2D {
     }
 
     resetTransform() {
-        this.canvas.__ops.op_canvas_record_command(this.canvas.__node_idx, {
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_RESET_TRANSFORM,
         })
     }
@@ -1714,7 +1715,7 @@ class HTMLIFrameElement extends HtmlElement {
     }
 
     spawnFrame() {
-        this.__ops.op_spawn_frame(this.__node_idx, this.getAttribute("src"))
+        core.ops.op_spawn_frame(this.ownerDocument, this.__node_idx, this.getAttribute("src"))
     }
 
     get src() {
@@ -1735,13 +1736,13 @@ class HTMLIFrameElement extends HtmlElement {
 
     get contentDocument() {
         this.spawnFrame()
-        return this.__ops.op_frame_window(this.__node_idx, true)?.document ?? null
+        return core.ops.op_frame_window(this.ownerDocument, this.__node_idx, true)?.document ?? null
     }
 
     get contentWindow() {
         // Navigation replaces the realm; retained globals keep their old document.
         this.spawnFrame()
-        return this.__ops.op_frame_window(this.__node_idx, false)
+        return core.ops.op_frame_window(this.ownerDocument, this.__node_idx, false)
     }
 }
 
@@ -1893,7 +1894,7 @@ class HTMLFormElement extends HtmlElement {
     }
 
     submit() {
-        this.__ops.op_submit_form(this.__node_idx)
+        core.ops.op_submit_form(this.ownerDocument, this.__node_idx)
     }
 }
 
@@ -2098,12 +2099,15 @@ class IntersectionObserver {
         if (!(target instanceof HTMLElement)) {
             throw new Error("Target must be an element")
         }
+        if (target.ownerDocument.__detached) {
+            throw new DOMException.DOMException("Detached document intersection observers are not implemented", "NotSupportedError")
+        }
         if (this.targets.has(target)) {
             return
         }
         this.targets.add(target)
         intersectionObserverMapping[target.__node_idx] = this
-        core.ops.op_track_intersection(target.__node_idx)
+        core.ops.op_track_intersection(target.ownerDocument, target.__node_idx)
     }
 
     unobserve(target) {
@@ -2111,13 +2115,13 @@ class IntersectionObserver {
             return
         }
         intersectionObserverMapping[target.__node_idx] = undefined
-        core.ops.op_untrack_intersection(target.__node_idx)
+        core.ops.op_untrack_intersection(target.ownerDocument, target.__node_idx)
     }
 
     disconnect() {
         for (const target of this.targets) {
             intersectionObserverMapping[target.__node_idx] = undefined
-            core.ops.op_untrack_intersection(target.__node_idx)
+            core.ops.op_untrack_intersection(target.ownerDocument, target.__node_idx)
         }
         this.targets.clear()
     }
@@ -2230,7 +2234,7 @@ class CSSStyleSheet {
     }
 
     get cssRules() {
-        const data = this.ownerNode.__ops.op_get_stylesheet(this.ownerNode.__node_idx, true)
+        const data = core.ops.op_get_stylesheet(this.ownerNode.ownerDocument, this.ownerNode.__node_idx, true)
         if (data?.href && new URL(data.href).origin !== new URL(this.ownerNode.ownerDocument.location.href).origin) {
             throw new DOMException.DOMException("Cannot read a cross-origin stylesheet", "SecurityError")
         }
@@ -2248,7 +2252,7 @@ class CSSStyleSheet {
         webidl.requiredArguments(arguments.length, 1, prefix)
         rule = webidl.converters.DOMString(rule, prefix, "Argument 1")
         index = webidl.converters["unsigned long"](index, prefix, "Argument 2")
-        return this.ownerNode.__ops.op_insert_css_rule(this.ownerNode.__node_idx, rule, index)
+        return core.ops.op_insert_css_rule(this.ownerNode.ownerDocument, this.ownerNode.__node_idx, rule, index)
     }
 }
 
@@ -2333,7 +2337,7 @@ class CSSStyleDeclaration {
     sync() {
         const out = this.cssText
         this.__element.__style = out
-        this.__element.__ops.op_update_attributes(this.__element.__node_idx, { style: out })
+        core.ops.op_update_attributes(this.__element.ownerDocument, this.__element.__node_idx, { style: out })
     }
 }
 
@@ -2361,7 +2365,7 @@ class SVGElement extends HtmlElement {
 
 class SVGGraphicsElement extends SVGElement {
     getBBox() {
-        const bounds = this.__ops.op_svg_get_bbox(this.__node_idx)
+        const bounds = core.ops.op_svg_get_bbox(this.ownerDocument, this.__node_idx)
         return bounds ? geometry.DOMRect.fromRect(bounds) : null
     }
 }
@@ -2371,7 +2375,7 @@ class SVGTextContentElement extends SVGGraphicsElement {
         const prefix = "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement'"
         webidl.requiredArguments(arguments.length, 1, prefix)
         index = webidl.converters["unsigned long"](index, prefix, "Argument 1")
-        const bounds = this.__ops.op_svg_get_extent_of_char(this.__node_idx, index)
+        const bounds = core.ops.op_svg_get_extent_of_char(this.ownerDocument, this.__node_idx, index)
         return geometry.DOMRect.fromRect(bounds)
     }
 
@@ -2380,7 +2384,7 @@ class SVGTextContentElement extends SVGGraphicsElement {
         const style = getComputedStyle(this)
         if (style.display === "none") return 0
         const text = this.textContent.replace(/[ \t\r\n]+/g, " ").replace(/^ | $/g, "")
-        return this.__ops.op_canvas_measure_text(text, parseFloat(style.fontSize))
+        return core.ops.op_canvas_measure_text(this.ownerDocument, text, parseFloat(style.fontSize))
     }
 }
 
@@ -2428,7 +2432,7 @@ Object.defineProperty(globalThis, "HTMLImageElement", {
 
 class HTMLTemplateElement extends HtmlElement {
     get content() {
-        return this.ownerDocument.__elementFromNodeIdx(this.__ops.op_get_template_content(this.__node_idx))
+        return this.ownerDocument.__elementFromNodeIdx(core.ops.op_get_template_content(this.ownerDocument, this.__node_idx))
     }
 }
 
@@ -2449,7 +2453,7 @@ class CommentNode extends CharacterData {
     }
 
     registerInBackend() {
-        this.__node_idx = core.ops.op_create_comment_element(this.__initialData)
+        this.__node_idx = core.ops.op_create_comment_element(this.ownerDocument, this.__initialData)
         cacheNodeElement(this.__node_idx, this)
     }
 
@@ -2473,7 +2477,7 @@ class ClassList {
 
     sync() {
         const value = Array.from(this.list).join(" ")
-        this.element.__ops.op_update_attributes(this.element.__node_idx, { class: value })
+        core.ops.op_update_attributes(this.element.ownerDocument, this.element.__node_idx, { class: value })
     }
 
     add(...tokens) {
@@ -2533,16 +2537,15 @@ class ClassList {
     }
 }
 
-const nodeMap = new Map()
-
 function cacheNodeElement(nodeIdx, element) {
     if (nodeIdx != null) {
         core.ops.op_bind_node_wrapper(element, nodeIdx)
-        nodeMap.set(nodeIdx, element)
+        element.ownerDocument.__nodeMap.set(nodeIdx, element)
     }
 }
 
-function nodeToElement(pair) {
+function nodeToElement(pair, ownerDocument = document) {
+    const nodeMap = ownerDocument.__nodeMap
     const node_idx = pair[0]
     const node = pair[1]
     const existing = nodeMap.get(node_idx)
@@ -2557,23 +2560,25 @@ function nodeToElement(pair) {
         element = withoutAutoRegisterNode(() => new DocumentFragment())
     } else if (node.kind === "shadow-root") {
         element = withoutAutoRegisterNode(() => new ShadowRoot(
-            shadowRootToken, elementFromNodeIdx(node.host), node.mode,
+            shadowRootToken, ownerDocument.__elementFromNodeIdx(node.host), node.mode,
         ))
     } else if (node.kind === "comment") {
         element = withoutAutoRegisterNode(() => new CommentNode(node.comment))
     } else if (node.kind === "text") {
         element = withoutAutoRegisterNode(() => new TextNode(node.text))
     }
+    element.ownerDocument = ownerDocument
     element.__node_idx = node_idx
     cacheNodeElement(node_idx, element)
     return element
 }
 
-function elementFromNodeIdx(idx) {
+function elementFromNodeIdx(idx, ownerDocument = document) {
+    const nodeMap = ownerDocument.__nodeMap
     const existing = nodeMap.get(idx)
     if (existing) return existing
-    const element = core.ops.op_get_node(idx)
-    return element ? nodeToElement(element) : null
+    const element = core.ops.op_get_node(ownerDocument, idx)
+    return element ? ownerDocument.__nodeToElement(element) : null
 }
 
 Object.defineProperty(globalThis, "__elementFromNodeIdx", {
@@ -2664,24 +2669,28 @@ function tagToElement(tag, namespaceURI) {
                                 HtmlElement
 }
 
+const documentToken = Symbol()
+
 class Document extends EventTarget {
-    constructor() {
+    constructor(token) {
         super()
+        if (token !== documentToken) throw new TypeError("new Document() is not implemented")
         this.__activeElement = null
         this.__currentScript = null
         this.__writing = false
-        this.__ops = core.ops
-        this.__nodeMap = nodeMap
-        this.__nodeToElement = nodeToElement
-        this.__elementFromNodeIdx = elementFromNodeIdx
+        this.__detached = false
+        this.__url = null
+        this.__nodeMap = new Map()
+        this.__nodeToElement = pair => nodeToElement(pair, this)
+        this.__elementFromNodeIdx = idx => elementFromNodeIdx(idx, this)
     }
 
     __adoptNode(node) {
         const source = node.ownerDocument
-        const moved = core.ops.op_adopt_node(source, node.__node_idx)
+        const moved = core.ops.op_adopt_node(this, source, node.__node_idx)
         // Parents precede children, so shadow roots can look up their adopted hosts.
         for (const [oldIdx, newIdx] of moved) {
-            const element = source.__nodeMap.get(oldIdx) ?? elementFromNodeIdx(newIdx)
+            const element = source.__nodeMap.get(oldIdx) ?? this.__elementFromNodeIdx(newIdx)
             element.__node_idx = newIdx
             element.ownerDocument = this
             cacheNodeElement(newIdx, element)
@@ -2712,16 +2721,20 @@ class Document extends EventTarget {
         this.__activeElement = element
     }
     get defaultView() {
-        return globalThis
+        return this.__detached ? null : globalThis
     }
     get location() {
-        return globalThis.location
+        return this.__detached ? null : globalThis.location
     }
     set location(value) {
-        globalThis.location.href = value
+        if (!this.__detached) globalThis.location.href = value
     }
+    get URL() { return this.__url ?? globalThis.location?.href ?? "about:blank" }
+    get documentURI() { return this.URL }
+    get contentType() { return "text/html" }
+    get characterSet() { return "UTF-8" }
     get baseURI() {
-        const fallback = this.location?.href ?? "about:blank"
+        const fallback = this.URL
         const href = this.querySelector("base[href]")?.getAttribute("href")
         if (href != null) {
             try {
@@ -2732,15 +2745,17 @@ class Document extends EventTarget {
         return fallback
     }
     get cookie() {
+        if (this.__detached) throw new DOMException.DOMException("Document has no browsing context", "InvalidStateError")
         return core.ops.op_get_cookie(globalThis.location.href)
     }
     set cookie(newValue) {
+        if (this.__detached) throw new DOMException.DOMException("Document has no browsing context", "InvalidStateError")
         core.ops.op_set_cookie(globalThis.location.href, String(newValue))
     }
     get styleSheets() {
         const root = this.documentElement
-        const sheets = root ? core.ops.op_get_stylesheet_nodes(root.__node_idx)
-            .map(idx => elementFromNodeIdx(idx).sheet).filter(Boolean) : []
+        const sheets = root ? core.ops.op_get_stylesheet_nodes(this, root.__node_idx)
+            .map(idx => this.__elementFromNodeIdx(idx).sheet).filter(Boolean) : []
         sheets.item = index => sheets[index] ?? null
         return sheets
     }
@@ -2777,10 +2792,10 @@ class Document extends EventTarget {
             }
         }
         denoEvent.clearEventListeners(this)
-        denoEvent.clearEventListeners(globalThis)
+        if (!this.__detached) denoEvent.clearEventListeners(globalThis)
         this.__activeElement = null
         this.__writing = true
-        core.ops.op_document_open()
+        core.ops.op_document_open(this)
         return this
     }
     write(...values) {
@@ -2789,7 +2804,7 @@ class Document extends EventTarget {
             if (this.__currentScript) return
             this.open()
         }
-        core.ops.op_document_write(html)
+        core.ops.op_document_write(this, html)
     }
     writeln(...values) {
         this.write(...values, "\n")
@@ -2797,7 +2812,7 @@ class Document extends EventTarget {
     close() {
         if (!this.__writing) return
         this.__writing = false
-        core.ops.op_document_close()
+        core.ops.op_document_close(this)
     }
     hasStorageAccess() {
         return Promise.resolve(true)
@@ -2823,8 +2838,8 @@ class Document extends EventTarget {
         }
     }
     get documentElement() {
-        const node = core.ops.op_get_document_element()
-        return node ? nodeToElement(node) : null
+        const node = core.ops.op_get_document_element(this)
+        return node ? this.__nodeToElement(node) : null
     }
     get head() {
         return this.querySelector("head")
@@ -2832,50 +2847,56 @@ class Document extends EventTarget {
     get body() {
         return this.querySelector("body")
     }
+    __createNode(factory) {
+        const node = withoutAutoRegisterNode(factory)
+        node.ownerDocument = this
+        node.registerInBackend()
+        return node
+    }
     createElementNS(ns, tag) {
         ns = ns == null ? null : String(ns) || null
         tag = String(tag)
-        if (ns === HTML_NAMESPACE) {
+        if (!this.__detached && ns === HTML_NAMESPACE) {
             const element = core.ops.op_custom_element_create(tag)
             if (element) return element
         }
         const elementClass = tagToElement(tag, ns)
-        return new elementClass(tag, ns)
+        return this.__createNode(() => new elementClass(tag, ns))
     }
     createElement(tag) {
         tag = String(tag).replace(/[A-Z]/g, char => char.toLowerCase())
         return this.createElementNS(HTML_NAMESPACE, tag)
     }
     createComment(data) {
-        return new CommentNode(data)
+        return this.__createNode(() => new CommentNode(data))
     }
     getElementById(id) {
-        const node = core.ops.op_get_element_by_id(id)
-        return node ? nodeToElement(node) : null
+        const node = core.ops.op_get_element_by_id(this, id)
+        return node ? this.__nodeToElement(node) : null
     }
     getElementsByName(name) {
-        const nodes = core.ops.op_get_elements_by_name(String(name), null)
-        return nodes.map(nodeToElement)
+        const nodes = core.ops.op_get_elements_by_name(this, String(name), null)
+        return nodes.map(this.__nodeToElement)
     }
     getElementsByTagName(tag) {
-        const nodes = core.ops.op_get_elements_by_tag_name(tag, null)
-        return nodes.map(nodeToElement)
+        const nodes = core.ops.op_get_elements_by_tag_name(this, tag, null)
+        return nodes.map(this.__nodeToElement)
     }
     getElementsByClassName(classNames) {
-        const nodes = core.ops.op_get_elements_by_class_name(String(classNames), null)
-        return nodes.map(nodeToElement)
+        const nodes = core.ops.op_get_elements_by_class_name(this, String(classNames), null)
+        return nodes.map(this.__nodeToElement)
     }
     elementFromPoint(x, y) {
-        const node = core.ops.op_element_from_point(Number(x), Number(y))
-        return node ? nodeToElement(node) : null
+        const node = core.ops.op_element_from_point(this, Number(x), Number(y))
+        return node ? this.__nodeToElement(node) : null
     }
     querySelector(selector) {
-        const node = core.ops.op_query_selector(selector, null)
-        return node ? nodeToElement(node) : null
+        const node = core.ops.op_query_selector(this, selector, null)
+        return node ? this.__nodeToElement(node) : null
     }
     querySelectorAll(selector) {
-        const nodes = core.ops.op_query_selector_all(selector, null)
-        return nodes.map(nodeToElement)
+        const nodes = core.ops.op_query_selector_all(this, selector, null)
+        return nodes.map(this.__nodeToElement)
     }
     getParent(event) {
         return event?.type === "load" ? null : this.defaultView
@@ -2887,8 +2908,7 @@ class Document extends EventTarget {
         return nodesAreEqual(this, other)
     }
     createTextNode(text) {
-        const element = new TextNode(text)
-        return element
+        return this.__createNode(() => new TextNode(text))
     }
     importNode(node, deep = false) {
         // TODO: Copy nodes between document backends.
@@ -2898,7 +2918,7 @@ class Document extends EventTarget {
         return node.cloneNode(deep)
     }
     createDocumentFragment() {
-        return new DocumentFragment()
+        return this.__createNode(() => new DocumentFragment())
     }
     createTreeWalker(root) {
         return new TreeWalker(root)
@@ -2912,15 +2932,21 @@ class Document extends EventTarget {
         return createNodeIterator(root, whatToShow, filter)
     }
     hasFocus() {
-        return true
+        return !this.__detached
     }
     get implementation() {
         return {
-            createHTMLDocument() {
-                const element = new HTMLIFrameElement()
-                element.setAttribute('src', 'about:blank')
-                element.spawnFrame()
-                return element.contentDocument
+            createHTMLDocument(title) {
+                const result = new Document(documentToken)
+                result.__detached = true
+                result.__url = "about:blank"
+                core.ops.op_parse_html_document(result, "", result.URL)
+                if (title !== undefined) {
+                    const element = result.createElement("title")
+                    element.textContent = String(title)
+                    result.head.appendChild(element)
+                }
+                return result
             },
             hasFeature() {
                 return false
@@ -2929,7 +2955,32 @@ class Document extends EventTarget {
     }
 }
 
-const document = new Document()
+class DOMParser {
+    parseFromString(input, type) {
+        input = String(input)
+        type = String(type)
+        if (!["text/html", "text/xml", "application/xml", "application/xhtml+xml", "image/svg+xml"].includes(type)) {
+            throw new TypeError("Invalid DOMParser content type")
+        }
+        if (type !== "text/html") {
+            throw new DOMException.DOMException("XML parsing is not implemented", "NotSupportedError")
+        }
+        const result = new Document(documentToken)
+        result.__detached = true
+        result.__url = document.URL
+        core.ops.op_parse_html_document(result, input, result.URL)
+        return result
+    }
+}
+
+Object.defineProperty(globalThis, "DOMParser", {
+    value: DOMParser,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+const document = new Document(documentToken)
 
 Object.defineProperty(globalThis, "document", {
   value: document,
@@ -3026,7 +3077,7 @@ Object.defineProperty(globalThis, "scrollY", {
         if (nodeIdx == null) {
             return 0
         } else {
-            return -core.ops.op_get_offset_y(nodeIdx)
+            return -core.ops.op_get_offset_y(document, nodeIdx)
         }
     },
     enumerable: true,
@@ -3158,13 +3209,16 @@ function getComputedStyle(element) {
         throw new TypeError("getComputedStyle requires an Element")
     }
 
+    if (element.ownerDocument?.__detached) {
+        throw new DOMException.DOMException("Detached document styles are not implemented", "NotSupportedError")
+    }
     if (element.ownerDocument && element.ownerDocument !== document) {
         return element.ownerDocument.defaultView.getComputedStyle(element)
     }
 
     const properties = {
         "font-size": "16px",
-        ...core.ops.op_get_computed_style(element.__node_idx),
+        ...core.ops.op_get_computed_style(element.ownerDocument, element.__node_idx),
         "transition-duration": "0s",
         "transition-delay": "0s",
         "scroll-behavior": "auto",
@@ -3870,8 +3924,8 @@ Object.defineProperty(globalThis, "XMLHttpRequest", {
 function mutationRecordsFromBackend(records) {
     return records.map(record => ({
         ...record, target: elementFromNodeIdx(record.target),
-        addedNodes: record.addedNodes.map(elementFromNodeIdx),
-        removedNodes: record.removedNodes.map(elementFromNodeIdx),
+        addedNodes: record.addedNodes.map(idx => elementFromNodeIdx(idx)),
+        removedNodes: record.removedNodes.map(idx => elementFromNodeIdx(idx)),
         previousSibling: record.previousSibling == null ? null : elementFromNodeIdx(record.previousSibling),
         nextSibling: record.nextSibling == null ? null : elementFromNodeIdx(record.nextSibling),
         attributeNamespace: null,
@@ -3892,6 +3946,9 @@ class MutationObserver {
 
     observe(node, config = {}) {
         if (!(node instanceof BaseNode) && !(node instanceof Document)) throw new TypeError("Expected a Node")
+        if ((node.ownerDocument ?? node).__detached) {
+            throw new DOMException.DOMException("Detached document mutation observers are not implemented", "NotSupportedError")
+        }
         core.ops.op_mutation_observer_observe(this.#id, node.__node_idx ?? null, config, this.#deliver)
     }
 
@@ -3979,7 +4036,7 @@ class FormData extends formData.FormData {
     constructor(formElement = null) {
         super()
         if (formElement instanceof Node) {
-            const data = formElement.__ops.op_collect_data_for_form(formElement.__node_idx)
+            const data = core.ops.op_collect_data_for_form(formElement.ownerDocument, formElement.__node_idx)
             for (const [name, value] of Object.entries(data)) {
                 this.append(name, value)
             }
