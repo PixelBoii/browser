@@ -1365,6 +1365,8 @@ class CanvasRenderingContext2D {
         this.fillStyle = "#000000"
         this.strokeStyle = "#000000"
         this.font = "10px sans-serif"
+        this.textAlign = "start"
+        this.textBaseline = "alphabetic"
     }
 
     measureText(text) {
@@ -1372,7 +1374,9 @@ class CanvasRenderingContext2D {
         webidl.requiredArguments(arguments.length, 1, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
-        return { width: core.ops.op_canvas_measure_text(this.canvas.ownerDocument, text, fontSize) }
+        return core.ops.op_canvas_measure_text(
+            this.canvas.ownerDocument, text, fontSize, this.textAlign, this.textBaseline,
+        )
     }
 
     fillText(text, x, y) {
@@ -2453,7 +2457,9 @@ class SVGTextContentElement extends SVGGraphicsElement {
         const style = getComputedStyle(this)
         if (style.display === "none") return 0
         const text = this.textContent.replace(/[ \t\r\n]+/g, " ").replace(/^ | $/g, "")
-        return core.ops.op_canvas_measure_text(this.ownerDocument, text, parseFloat(style.fontSize))
+        return core.ops.op_canvas_measure_text(
+            this.ownerDocument, text, parseFloat(style.fontSize), "left", "alphabetic",
+        ).width
     }
 }
 

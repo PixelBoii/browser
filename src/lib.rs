@@ -7146,31 +7146,100 @@ fn op_canvas_path_clip(
     Ok(())
 }
 
-#[op2(fast)]
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanvasTextMetrics {
+    width: f64,
+    actual_bounding_box_left: f64,
+    actual_bounding_box_right: f64,
+    actual_bounding_box_ascent: f64,
+    actual_bounding_box_descent: f64,
+    font_bounding_box_ascent: f64,
+    font_bounding_box_descent: f64,
+    em_height_ascent: f64,
+    em_height_descent: f64,
+    hanging_baseline: f64,
+    alphabetic_baseline: f64,
+    ideographic_baseline: f64,
+}
+
+#[op2]
+#[serde]
 fn op_canvas_measure_text(
     scope: &mut v8::PinScope,
     document: v8::Local<v8::Object>,
     #[string] text: String,
     font_size: f64,
-) -> f64 {
+    #[string] text_align: String,
+    #[string] text_baseline: String,
+) -> CanvasTextMetrics {
     if !font_size.is_finite() || font_size <= 0.0 {
-        return 0.0;
+        return CanvasTextMetrics::default();
     }
     let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let font_px = font_size as u32;
     let font = renderer.font_handler.font.as_scaled(font_px as f32);
+    let scale = font.scale_factor();
     let mut width = 0.0;
     let mut previous = None;
+    let mut bounds: Option<ab_glyph::Rect> = None;
     for ch in text.chars() {
         let glyph_id = font.glyph_id(ch);
         if let Some(previous_id) = previous {
             width += font.kern(previous_id, glyph_id);
         }
+        if let Some(outline) = font.font().outline(glyph_id) {
+            // Use outline bounds rather than the rounded rasterization bounds.
+            let mut glyph_bounds = outline.bounds;
+            glyph_bounds.min.x = width + glyph_bounds.min.x * scale.horizontal;
+            glyph_bounds.max.x = width + glyph_bounds.max.x * scale.horizontal;
+            glyph_bounds.min.y *= -scale.vertical;
+            glyph_bounds.max.y *= -scale.vertical;
+            if let Some(bounds) = &mut bounds {
+                bounds.min.x = bounds.min.x.min(glyph_bounds.min.x);
+                bounds.min.y = bounds.min.y.min(glyph_bounds.min.y);
+                bounds.max.x = bounds.max.x.max(glyph_bounds.max.x);
+                bounds.max.y = bounds.max.y.max(glyph_bounds.max.y);
+            } else {
+                bounds = Some(glyph_bounds);
+            }
+        }
         width += font.h_advance(glyph_id);
         previous = Some(glyph_id);
     }
-    f64::from(width)
+    // Approximate the em box with the existing height-based font scale. Baseline
+    // tables are not exposed by ab_glyph; synthesize hanging and ideographic.
+    let ascent = f64::from(font.ascent());
+    let descent = -f64::from(font.descent());
+    let hanging_baseline = f64::from(font_px) * 0.6;
+    let width = f64::from(width);
+    let x = match text_align.as_str() {
+        "center" => width / 2.0,
+        "right" | "end" => width,
+        _ => 0.0,
+    };
+    let y = match text_baseline.as_str() {
+        "top" => -ascent,
+        "hanging" => -hanging_baseline,
+        "middle" => (descent - ascent) / 2.0,
+        "ideographic" | "bottom" => descent,
+        _ => 0.0,
+    };
+    CanvasTextMetrics {
+        width,
+        actual_bounding_box_left: bounds.map_or(0.0, |bounds| -f64::from(bounds.min.x)) + x,
+        actual_bounding_box_right: bounds.map_or(0.0, |bounds| f64::from(bounds.max.x)) - x,
+        actual_bounding_box_ascent: bounds.map_or(0.0, |bounds| -f64::from(bounds.min.y)) + y,
+        actual_bounding_box_descent: bounds.map_or(0.0, |bounds| f64::from(bounds.max.y)) - y,
+        font_bounding_box_ascent: ascent + y,
+        font_bounding_box_descent: descent - y,
+        em_height_ascent: ascent + y,
+        em_height_descent: descent - y,
+        hanging_baseline: hanging_baseline + y,
+        alphabetic_baseline: y,
+        ideographic_baseline: -descent + y,
+    }
 }
 
 #[op2]
