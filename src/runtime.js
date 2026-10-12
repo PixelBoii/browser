@@ -1391,11 +1391,13 @@ class CanvasRenderingContext2D {
     }
 
     // TODO: Apply alpha, desynchronized and willReadFrequently; colorSpace only
-    // sets the getImageData default, the canvas itself stays sRGB internally.
+    // sets the getImageData default, and colorType is only reported here; the
+    // canvas itself stays sRGB unorm8 internally.
     getContextAttributes() {
         return {
             alpha: this.__settings.alpha,
             colorSpace: this.__settings.colorSpace,
+            colorType: this.__settings.colorType,
             desynchronized: this.__settings.desynchronized,
             willReadFrequently: this.__settings.willReadFrequently,
         }
@@ -1744,6 +1746,7 @@ class HtmlCanvasElement extends HtmlElement {
                 const settings = {
                     alpha: true,
                     colorSpace: "srgb",
+                    colorType: "unorm8",
                     desynchronized: false,
                     willReadFrequently: false,
                 }
@@ -1754,6 +1757,12 @@ class HtmlCanvasElement extends HtmlElement {
                             throw new TypeError("Invalid colorSpace")
                         }
                         settings.colorSpace = options.colorSpace
+                    }
+                    if (options.colorType !== undefined) {
+                        if (options.colorType !== "unorm8" && options.colorType !== "float16") {
+                            throw new TypeError("Invalid colorType")
+                        }
+                        settings.colorType = options.colorType
                     }
                     if (options.desynchronized !== undefined) settings.desynchronized = Boolean(options.desynchronized)
                     if (options.willReadFrequently !== undefined) settings.willReadFrequently = Boolean(options.willReadFrequently)
