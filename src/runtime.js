@@ -1515,7 +1515,11 @@ class CanvasRenderingContext2D {
     }
 
     drawImage(image, ...args) {
-        if (!(image instanceof HTMLImageElement) || image.__node_idx == null) {
+        const isBitmap = image instanceof ImageBitmap
+        if (!isBitmap && (!(image instanceof HTMLImageElement) || image.__node_idx == null)) {
+            return
+        }
+        if (isBitmap && image.__bitmapId == null) {
             return
         }
 
@@ -1532,12 +1536,19 @@ class CanvasRenderingContext2D {
             return
         }
 
-        const queued = core.ops.op_canvas_draw_image(
-            this.canvas.ownerDocument,
-            this.canvas.__node_idx,
-            image.__node_idx,
-            { x, y, width, height },
-        )
+        const queued = isBitmap ?
+            core.ops.op_canvas_draw_image_bitmap(
+                this.canvas.ownerDocument,
+                this.canvas.__node_idx,
+                image.__bitmapId,
+                { x, y, width, height },
+            ) :
+            core.ops.op_canvas_draw_image(
+                this.canvas.ownerDocument,
+                this.canvas.__node_idx,
+                image.__node_idx,
+                { x, y, width, height },
+            )
         if (queued) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
@@ -1749,6 +1760,132 @@ function windowMessageOptions(targetOrigin, transfer) {
     }
     return { targetOrigin, transfer }
 }
+
+const imageBitmapToken = Symbol("ImageBitmap")
+
+class ImageBitmap {
+    constructor(token, ownerDocument, bitmapId, width, height) {
+        if (token !== imageBitmapToken) throw new TypeError("Illegal constructor")
+        this.ownerDocument = ownerDocument
+        this.__bitmapId = bitmapId
+        this.__width = width
+        this.__height = height
+    }
+
+    get width() {
+        return this.__width
+    }
+
+    get height() {
+        return this.__height
+    }
+
+    close() {
+        if (this.__bitmapId != null) {
+            core.ops.op_image_bitmap_close(this.ownerDocument, this.__bitmapId)
+            this.__bitmapId = null
+        }
+        this.__width = 0
+        this.__height = 0
+    }
+}
+
+async function createImageBitmapAsync(source, args) {
+    let options = {}
+    if (args.length > 0 && typeof args[args.length - 1] === "object" && args[args.length - 1] !== null) {
+        options = args.pop()
+    }
+    let sx = 0
+    let sy = 0
+    let sw = null
+    let sh = null
+    if (args.length > 0) {
+        if (args.length !== 4) {
+            throw new TypeError("Failed to execute 'createImageBitmap': Invalid number of arguments")
+        }
+        sx = Math.trunc(Number(args[0]))
+        sy = Math.trunc(Number(args[1]))
+        sw = Math.trunc(Number(args[2]))
+        sh = Math.trunc(Number(args[3]))
+        if (![sx, sy, sw, sh].every(Number.isFinite)) {
+            throw new TypeError("Failed to execute 'createImageBitmap': Crop values must be finite")
+        }
+        if (sw < 0) {
+            sx += sw
+            sw = -sw
+        }
+        if (sh < 0) {
+            sy += sh
+            sh = -sh
+        }
+        if (sw === 0 || sh === 0) {
+            throw new DOMException.DOMException("The crop rectangle has zero size", "InvalidStateError")
+        }
+    }
+    // TODO: Honor imageOrientation, premultiplyAlpha, colorSpaceConversion and resizeQuality.
+    const crop = {
+        sx,
+        sy,
+        sw,
+        sh,
+        resizeWidth: options.resizeWidth == null ? null : Math.trunc(Number(options.resizeWidth)),
+        resizeHeight: options.resizeHeight == null ? null : Math.trunc(Number(options.resizeHeight)),
+    }
+
+    const ownerDocument = source?.ownerDocument ?? document
+    let result
+    if (source instanceof ImageBitmap) {
+        if (source.__bitmapId == null) {
+            throw new DOMException.DOMException("The ImageBitmap is closed", "InvalidStateError")
+        }
+        result = core.ops.op_image_bitmap_from_bitmap(ownerDocument, source.__bitmapId, crop)
+    } else if (source instanceof HTMLImageElement) {
+        if (source.__node_idx == null) {
+            throw new DOMException.DOMException("The image has no data", "InvalidStateError")
+        }
+        result = core.ops.op_image_bitmap_from_image(ownerDocument, source.__node_idx, crop)
+    } else if (source instanceof HTMLCanvasElement) {
+        result = core.ops.op_image_bitmap_from_canvas(ownerDocument, source.__node_idx, crop)
+    } else if (source instanceof imageData.ImageData) {
+        // TODO: Support float16 ImageData instead of rejecting it.
+        if (source.pixelFormat !== "rgba-unorm8") {
+            throw new DOMException.DOMException("Only rgba-unorm8 ImageData is supported", "NotSupportedError")
+        }
+        result = core.ops.op_image_bitmap_from_pixels(ownerDocument, source.width, source.height, new Uint8Array(source.data.buffer, source.data.byteOffset, source.data.byteLength), crop)
+    } else if (source instanceof file.Blob) {
+        const bytes = new Uint8Array(await source.arrayBuffer())
+        result = core.ops.op_image_bitmap_from_encoded(ownerDocument, bytes, crop)
+    } else {
+        // TODO: Support HTMLVideoElement, OffscreenCanvas and VideoFrame sources.
+        throw new TypeError("Failed to execute 'createImageBitmap': The provided value is not a supported image source")
+    }
+    if (result == null) {
+        throw new DOMException.DOMException("The source image could not be decoded", "InvalidStateError")
+    }
+    const [bitmapId, width, height] = result
+    return new ImageBitmap(imageBitmapToken, ownerDocument, bitmapId, width, height)
+}
+
+function createImageBitmapImpl(source, ...args) {
+    if (arguments.length === 0) {
+        throw new TypeError("Failed to execute 'createImageBitmap': 1 argument required, but only 0 present")
+    }
+    return createImageBitmapAsync(source, args)
+}
+
+Object.defineProperty(globalThis, "ImageBitmap", {
+    value: ImageBitmap,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "createImageBitmap", {
+    value: createImageBitmapImpl,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
 
 class HTMLIFrameElement extends HtmlElement {
     constructor() {

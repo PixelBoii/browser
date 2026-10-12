@@ -802,6 +802,7 @@ impl CanvasBuffer {
                     self.clear_rect(x, y, width, height);
                 }
                 CanvasPathCommand::DrawImage { x, y, .. }
+                | CanvasPathCommand::DrawImageBitmap { x, y, .. }
                 | CanvasPathCommand::FillText { x, y, .. } => {
                     let image = match &cmd {
                         CanvasPathCommand::DrawImage {
@@ -812,6 +813,7 @@ impl CanvasBuffer {
                         } => self
                             .images
                             .get(&(*image_node_idx, *image_width, *image_height)),
+                        CanvasPathCommand::DrawImageBitmap { image, .. } => Some(image),
                         CanvasPathCommand::FillText { image, .. } => Some(image),
                         _ => unreachable!(),
                     };
@@ -1926,6 +1928,8 @@ struct Renderer {
     dom_indexes: DomIndexes,
     document_stream: Option<DocumentStream>,
     canvas_buffers: HashMap<usize, CanvasBuffer>,
+    image_bitmaps: HashMap<u32, Pixmap>,
+    next_image_bitmap_id: u32,
     pending_canvas_update: bool,
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
@@ -6864,6 +6868,12 @@ enum CanvasPathCommand {
         y: i32,
     },
     #[serde(skip)]
+    DrawImageBitmap {
+        image: Pixmap,
+        x: i32,
+        y: i32,
+    },
+    #[serde(skip)]
     FillText {
         image: Pixmap,
         x: i32,
@@ -7025,6 +7035,280 @@ fn op_canvas_draw_image(
         y: request.y.round() as i32,
     });
 
+    Ok(true)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageBitmapCrop {
+    sx: i32,
+    sy: i32,
+    sw: Option<u32>,
+    sh: Option<u32>,
+    resize_width: Option<u32>,
+    resize_height: Option<u32>,
+}
+
+// Applies the createImageBitmap crop rect and resize options to a decoded
+// source. A missing crop extent means "to the edge of the source".
+fn crop_image_bitmap(source: &Pixmap, crop: &ImageBitmapCrop) -> Option<Pixmap> {
+    let crop_width = crop
+        .sw
+        .unwrap_or_else(|| source.width().saturating_sub(crop.sx.max(0) as u32));
+    let crop_height = crop
+        .sh
+        .unwrap_or_else(|| source.height().saturating_sub(crop.sy.max(0) as u32));
+    if crop_width == 0 || crop_height == 0 {
+        return None;
+    }
+    let (width, height) = match (crop.resize_width, crop.resize_height) {
+        (Some(width), Some(height)) => (width, height),
+        (Some(width), None) => (
+            width,
+            ((f64::from(crop_height) * f64::from(width) / f64::from(crop_width)).round()
+                as u32)
+                .max(1),
+        ),
+        (None, Some(height)) => (
+            ((f64::from(crop_width) * f64::from(height) / f64::from(crop_height)).round()
+                as u32)
+                .max(1),
+            height,
+        ),
+        (None, None) => (crop_width, crop_height),
+    };
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if crop.sx == 0
+        && crop.sy == 0
+        && crop_width == source.width()
+        && crop_height == source.height()
+        && width == crop_width
+        && height == crop_height
+    {
+        return Some(source.clone());
+    }
+    let mut result = Pixmap::new(width, height)?;
+    let scale_x = f64::from(width) / f64::from(crop_width);
+    let scale_y = f64::from(height) / f64::from(crop_height);
+    result.as_mut().draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        tiny_skia::Transform::from_row(
+            scale_x as f32,
+            0.0,
+            0.0,
+            scale_y as f32,
+            (-f64::from(crop.sx) * scale_x) as f32,
+            (-f64::from(crop.sy) * scale_y) as f32,
+        ),
+        None,
+    );
+    Some(result)
+}
+
+fn store_image_bitmap(
+    renderer: &mut Renderer,
+    source: &Pixmap,
+    crop: &ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    let pixmap = crop_image_bitmap(source, crop)?;
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let id = renderer.next_image_bitmap_id;
+    renderer.next_image_bitmap_id += 1;
+    renderer.image_bitmaps.insert(id, pixmap);
+    Some((id, width, height))
+}
+
+fn pixmap_from_rgba(width: u32, height: u32, data: &[u8]) -> Option<Pixmap> {
+    if data.len() != width as usize * height as usize * 4 {
+        return None;
+    }
+    let mut premultiplied = Vec::with_capacity(data.len());
+    for pixel in data.chunks_exact(4) {
+        let alpha = u32::from(pixel[3]);
+        premultiplied.extend_from_slice(&[
+            (u32::from(pixel[0]) * alpha / 255) as u8,
+            (u32::from(pixel[1]) * alpha / 255) as u8,
+            (u32::from(pixel[2]) * alpha / 255) as u8,
+            pixel[3],
+        ]);
+    }
+    Pixmap::from_vec(premultiplied, IntSize::from_wh(width, height)?)
+}
+
+#[op2]
+fn op_image_bitmap_from_image(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] image_node_idx: usize,
+    #[serde] crop: ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let (pixmap, _, _, _) =
+        renderer.decode_and_rasterize_img(image_node_idx, &LayoutMode::Complete, None, None, None, None)?;
+    store_image_bitmap(&mut renderer, &pixmap, &crop)
+}
+
+#[op2]
+fn op_image_bitmap_from_canvas(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] canvas_node_idx: usize,
+    #[serde] crop: ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.resolve_pending_canvas_images(Some(canvas_node_idx));
+    let (Some(width), Some(height)) = renderer
+        .nodes
+        .get(canvas_node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return None;
+    };
+    let pixmap = match renderer.canvas_buffers.get_mut(&canvas_node_idx) {
+        Some(canvas) => {
+            canvas.resize_if_needed(width, height);
+            canvas.update_if_needed();
+            Pixmap::from_vec(
+                premul_rgba_buffer_to_bytes(&canvas.buffer),
+                IntSize::from_wh(canvas.width, canvas.height)?,
+            )?
+        }
+        None => Pixmap::new(width, height)?,
+    };
+    store_image_bitmap(&mut renderer, &pixmap, &crop)
+}
+
+#[op2]
+fn op_image_bitmap_from_pixels(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    width: u32,
+    height: u32,
+    #[buffer] data: &[u8],
+    #[serde] crop: ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    let pixmap = pixmap_from_rgba(width, height, data)?;
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    store_image_bitmap(&mut renderer, &pixmap, &crop)
+}
+
+#[op2]
+fn op_image_bitmap_from_encoded(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[buffer] data: &[u8],
+    #[serde] crop: ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    // Raster formats only; an SVG Blob is a hole for now.
+    let image = image::load_from_memory(data).ok()?;
+    let rgba = image.to_rgba8();
+    let pixmap = pixmap_from_rgba(rgba.width(), rgba.height(), &rgba)?;
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    store_image_bitmap(&mut renderer, &pixmap, &crop)
+}
+
+#[op2]
+fn op_image_bitmap_from_bitmap(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    bitmap_id: u32,
+    #[serde] crop: ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let pixmap = renderer.image_bitmaps.get(&bitmap_id)?.clone();
+    store_image_bitmap(&mut renderer, &pixmap, &crop)
+}
+
+#[op2(fast)]
+fn op_image_bitmap_close(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    bitmap_id: u32,
+) {
+    let host = document_state(scope, document);
+    host.renderer.borrow_mut().image_bitmaps.remove(&bitmap_id);
+}
+
+#[op2]
+fn op_canvas_draw_image_bitmap(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] canvas_node_idx: usize,
+    bitmap_id: u32,
+    #[serde] request: CanvasDrawImageRequest,
+) -> Result<bool, JsErrorBox> {
+    if !request.x.is_finite() || !request.y.is_finite() {
+        return Ok(false);
+    }
+    let (input_width, input_height) = match (request.width, request.height) {
+        (None, None) => (None, None),
+        (Some(width), Some(height))
+            if width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0
+                && width <= u32::MAX as f64
+                && height <= u32::MAX as f64 =>
+        {
+            (
+                Some(width.round().max(1.0) as u32),
+                Some(height.round().max(1.0) as u32),
+            )
+        }
+        _ => return Ok(false),
+    };
+
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let Some(bitmap) = renderer.image_bitmaps.get(&bitmap_id).cloned() else {
+        return Ok(false);
+    };
+    let image = match (input_width, input_height) {
+        (Some(width), Some(height)) if width != bitmap.width() || height != bitmap.height() => {
+            let crop = ImageBitmapCrop {
+                sx: 0,
+                sy: 0,
+                sw: None,
+                sh: None,
+                resize_width: Some(width),
+                resize_height: Some(height),
+            };
+            match crop_image_bitmap(&bitmap, &crop) {
+                Some(image) => image,
+                None => return Ok(false),
+            }
+        }
+        _ => bitmap,
+    };
+    let (Some(canvas_width), Some(canvas_height)) = renderer
+        .nodes
+        .get(canvas_node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return Ok(false);
+    };
+    let canvas = renderer
+        .canvas_buffers
+        .entry(canvas_node_idx)
+        .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
+    canvas.resize_if_needed(canvas_width, canvas_height);
+    canvas.commands.push(CanvasPathCommand::DrawImageBitmap {
+        image,
+        x: request.x.round() as i32,
+        y: request.y.round() as i32,
+    });
     Ok(true)
 }
 
@@ -7876,6 +8160,13 @@ extension!(
     op_tls_peer_certificate,
     op_canvas_record_command,
     op_canvas_draw_image,
+    op_canvas_draw_image_bitmap,
+    op_image_bitmap_from_image,
+    op_image_bitmap_from_canvas,
+    op_image_bitmap_from_pixels,
+    op_image_bitmap_from_encoded,
+    op_image_bitmap_from_bitmap,
+    op_image_bitmap_close,
     op_canvas_path_stroke,
     op_canvas_path_fill,
     op_canvas_path_clip,
@@ -8502,6 +8793,8 @@ impl Renderer {
             dom_indexes,
             document_stream: None,
             canvas_buffers: HashMap::new(),
+            image_bitmaps: HashMap::new(),
+            next_image_bitmap_id: 0,
             pending_canvas_update: false,
             network_fetch,
             cached_rasterizations: CachedRasterizations::new(),
