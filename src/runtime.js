@@ -1376,6 +1376,11 @@ class TextMetrics {
     get ideographicBaseline() { return this.__metrics.ideographicBaseline ?? 0 }
 }
 
+Object.defineProperty(TextMetrics.prototype, Symbol.toStringTag, {
+    value: "TextMetrics",
+    configurable: true,
+})
+
 const canvasRenderingContext2DToken = Symbol("CanvasRenderingContext2D")
 
 class CanvasRenderingContext2D {
