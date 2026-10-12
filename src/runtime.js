@@ -1479,7 +1479,7 @@ class CanvasRenderingContext2D {
             y,
             width,
             height,
-            line_width: lineWidth
+            line_width: this.lineWidth
         })
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
