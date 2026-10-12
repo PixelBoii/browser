@@ -1355,6 +1355,26 @@ class CanvasGradient {
     }
 }
 
+const textMetricsToken = Symbol("TextMetrics")
+
+class TextMetrics {
+    constructor(token, metrics = {}) {
+        if (token !== textMetricsToken) throw new TypeError("Illegal constructor")
+        this.width = metrics.width ?? 0
+        this.actualBoundingBoxLeft = metrics.actualBoundingBoxLeft ?? 0
+        this.actualBoundingBoxRight = metrics.actualBoundingBoxRight ?? 0
+        this.actualBoundingBoxAscent = metrics.actualBoundingBoxAscent ?? 0
+        this.actualBoundingBoxDescent = metrics.actualBoundingBoxDescent ?? 0
+        this.fontBoundingBoxAscent = metrics.fontBoundingBoxAscent ?? 0
+        this.fontBoundingBoxDescent = metrics.fontBoundingBoxDescent ?? 0
+        this.emHeightAscent = metrics.emHeightAscent ?? 0
+        this.emHeightDescent = metrics.emHeightDescent ?? 0
+        this.hangingBaseline = metrics.hangingBaseline ?? 0
+        this.alphabeticBaseline = metrics.alphabeticBaseline ?? 0
+        this.ideographicBaseline = metrics.ideographicBaseline ?? 0
+    }
+}
+
 const canvasRenderingContext2DToken = Symbol("CanvasRenderingContext2D")
 
 class CanvasRenderingContext2D {
@@ -1386,9 +1406,9 @@ class CanvasRenderingContext2D {
         webidl.requiredArguments(arguments.length, 1, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
-        return core.ops.op_canvas_measure_text(
+        return new TextMetrics(textMetricsToken, core.ops.op_canvas_measure_text(
             this.canvas.ownerDocument, text, fontSize, this.textAlign, this.textBaseline,
-        )
+        ))
     }
 
     fillText(text, x, y) {
@@ -2171,6 +2191,13 @@ class HTMLAudioElement extends HTMLMediaElement {
 
 Object.defineProperty(globalThis, "CanvasRenderingContext2D", {
     value: CanvasRenderingContext2D,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+
+Object.defineProperty(globalThis, "TextMetrics", {
+    value: TextMetrics,
     enumerable: true,
     configurable: true,
     writable: true,
