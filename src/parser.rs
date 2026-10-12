@@ -282,6 +282,7 @@ pub enum BuildPhase {
 
 #[derive(Debug)]
 pub struct HtmlParser {
+    pub auto_repair: bool,
     pub stage: BuildPhase,
     pub tag: String,
     value: String,
@@ -360,6 +361,7 @@ fn decode_numeric_entity(input: &str) -> Option<(char, &str)> {
 impl HtmlParser {
     pub fn new(context: Option<&Element>) -> Self {
         Self {
+            auto_repair: false,
             tag: "".to_string(),
             value: "".to_string(),
             attribute_quote: None,
@@ -410,6 +412,20 @@ impl HtmlParser {
     }
 
     fn create_node_from_state(&mut self) -> anyhow::Result<bool> {
+        if self.auto_repair {
+            // Whitespace around the document wrappers does not start the body.
+            if self.stage == BuildPhase::Text
+                && self.tag.bytes().all(|ch| matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+                && self.node.is_none_or(|idx| {
+                    matches!(&self.nodes[idx], Node::Element(element)
+                        if element.tag == "html" && element.namespace.as_deref() == Some(HTML_NAMESPACE))
+                })
+            {
+                return Ok(false);
+            }
+            let tag = (self.stage != BuildPhase::Text).then(|| self.tag.trim().to_string());
+            self.repair_parent(tag.as_deref());
+        }
         let parent = self.insertion_parent();
         let node = match self.stage {
             BuildPhase::Text => Node::Text(TextElement {
@@ -514,7 +530,66 @@ impl HtmlParser {
         if self.stage == BuildPhase::Text {
             self.create_node_from_state()?;
         }
+        if self.auto_repair {
+            let node = self.node;
+            self.node = self.find_document_element("html", None);
+            self.repair_parent(None);
+            self.node = node;
+        }
         Ok(())
+    }
+
+    fn find_document_element(&self, tag: &str, parent: Option<usize>) -> Option<usize> {
+        self.nodes.iter().position(|node| {
+            matches!(node, Node::Element(element)
+                if element.tag == tag && element.parent == parent
+                    && element.namespace.as_deref() == Some(HTML_NAMESPACE))
+        })
+    }
+
+    fn create_document_element(&mut self, tag: &str, parent: Option<usize>) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(Node::Element(Element {
+            tag: tag.to_string(),
+            namespace: Some(HTML_NAMESPACE.to_string()),
+            attributes: Attributes::new(),
+            parent,
+        }));
+        idx
+    }
+
+    fn repair_parent(&mut self, tag: Option<&str>) {
+        match self.node.map(|idx| &self.nodes[idx]) {
+            Some(Node::Element(element))
+                if element.tag == "html"
+                    && element.namespace.as_deref() == Some(HTML_NAMESPACE) => {}
+            Some(_) => return,
+            None => {
+                if tag == Some("html") {
+                    return;
+                }
+                let html = match self.find_document_element("html", None) {
+                    Some(html) => html,
+                    None => self.create_document_element("html", None),
+                };
+                self.node = Some(html);
+            }
+        }
+        let html = self.node;
+        if tag == Some("head") {
+            return;
+        }
+        if self.find_document_element("head", html).is_none() {
+            self.create_document_element("head", html);
+        }
+        if tag == Some("body") {
+            return;
+        }
+        let body = match self.find_document_element("body", html) {
+            Some(body) => body,
+            None => self.create_document_element("body", html),
+        };
+        self.node = Some(body);
     }
 
     pub fn feed(&mut self, input: String) -> anyhow::Result<()> {
@@ -565,8 +640,9 @@ impl HtmlParser {
                         self.stage = BuildPhase::Tag;
                     }
                     BuildPhase::Text => {
-                        self.create_node_from_state()?;
-                        self.close_node()?;
+                        if self.create_node_from_state()? {
+                            self.close_node()?;
+                        }
                         self.stage = BuildPhase::Tag;
                         self.tag = "".to_string();
                     }

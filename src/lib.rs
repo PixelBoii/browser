@@ -1880,7 +1880,6 @@ impl SelectorChanges {
 struct DocumentStream {
     parser: HtmlParser,
     idx_mapping: Vec<usize>,
-    parent_idx: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -6316,10 +6315,6 @@ fn op_document_close(
             .finish()
             .map_err(|err| JsErrorBox::generic(err.to_string()))?;
         renderer.adopt_document_stream(&mut stream);
-        if renderer.document_element().is_none() {
-            renderer.populate_blank_document();
-            renderer.schedule_dom_update();
-        }
     }
     document::deliver_reactions(scope, document);
     document::schedule_mutations(scope, document);
@@ -13674,10 +13669,11 @@ impl Renderer {
         self.custom_element_connection_changed(self.dom_indexes.root_indice, false);
         // Keep the detached subtree and its IDs alive for existing JS references.
         self.dom_indexes.root_indice = self.create_document_fragment();
+        let mut parser = HtmlParser::new(None);
+        parser.auto_repair = true;
         self.document_stream = Some(DocumentStream {
-            parser: HtmlParser::new(None),
+            parser,
             idx_mapping: Vec::new(),
-            parent_idx: None,
         });
         self.remove_disconnected_frames();
         self.hovering = None;
@@ -13688,20 +13684,6 @@ impl Renderer {
         self.selector_changes.force_full_rematch();
         self.clear_layout_state();
         self.schedule_dom_update();
-    }
-
-    fn populate_blank_document(&mut self) -> usize {
-        let html = self.create_element("html".to_string(), Some(HTML_NAMESPACE.to_string()));
-        let head = self.create_element("head".to_string(), Some(HTML_NAMESPACE.to_string()));
-        let body = self.create_element("body".to_string(), Some(HTML_NAMESPACE.to_string()));
-        for idx in [head, body] {
-            self.nodes.get_mut(idx).unwrap().set_parent(Some(html));
-        }
-        self.dom_indexes
-            .children_index
-            .insert(html, vec![head, body]);
-        self.dom_indexes.root_indice = html;
-        body
     }
 
     fn adopt_document_stream(&mut self, stream: &mut DocumentStream) {
@@ -13717,23 +13699,12 @@ impl Renderer {
         for internal_idx in start..end {
             let mut node = stream.parser.nodes[internal_idx].clone();
             let idx = stream.idx_mapping[internal_idx];
-            if self.document_element().is_none() {
-                match &node {
-                    Node::Element(element) if element.tag == "html" => {
-                        self.dom_indexes.root_indice = idx;
-                    }
-                    Node::Element(_) => stream.parent_idx = Some(self.populate_blank_document()),
-                    Node::Text(text) if !text.text.trim().is_empty() => {
-                        stream.parent_idx = Some(self.populate_blank_document());
-                    }
-                    _ => {}
-                }
+            if self.document_element().is_none()
+                && matches!(&node, Node::Element(element) if element.tag == "html")
+            {
+                self.dom_indexes.root_indice = idx;
             }
-            node.set_parent(
-                node.get_parent()
-                    .map(|idx| stream.idx_mapping[idx])
-                    .or(stream.parent_idx),
-            );
+            node.set_parent(node.get_parent().map(|idx| stream.idx_mapping[idx]));
             let parent = node.get_parent();
             let previous = parent.and_then(|idx| {
                 self.dom_indexes
@@ -15028,6 +14999,7 @@ impl Frame {
         self.url = final_url;
 
         let mut parser = HtmlParser::new(None);
+        parser.auto_repair = true;
         parser.parse(input).expect(&format!(
             "Failed to parse. Context: {}",
             parser.get_context()

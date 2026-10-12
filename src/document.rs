@@ -6,8 +6,8 @@ use deno_error::JsErrorBox;
 
 use crate::frame_context::frame_host;
 use crate::{
-    BLANK_DOCUMENT, ExecutedScripts, JsHostState, Node, NodesTable, Renderer, custom_elements,
-    get_dom_indexes, mutation_observer, parser::HtmlParser, sorted_node_idxs,
+    ExecutedScripts, JsHostState, Node, NodesTable, Renderer, custom_elements, get_dom_indexes,
+    mutation_observer, parser::HtmlParser, sorted_node_idxs,
 };
 
 #[derive(Clone)]
@@ -87,21 +87,10 @@ pub(crate) fn op_parse_html_document(
     let host = frame_host(scope);
     let source = host.renderer.borrow();
     let mut parser = HtmlParser::new(None);
+    parser.auto_repair = true;
     parser
         .parse(html)
         .map_err(|err| JsErrorBox::generic(err.to_string()))?;
-    // Indexes need an element or text root. Keep parsed comments and supply the
-    // existing blank document when there is no root to index.
-    if !parser
-        .nodes
-        .iter()
-        .any(|node| node.get_parent().is_none() && matches!(node, Node::Element(_) | Node::Text(_)))
-    {
-        parser
-            .parse(BLANK_DOCUMENT.to_string())
-            .map_err(|err| JsErrorBox::generic(err.to_string()))?;
-    }
-    // Implied html/head/body elements remain a limitation of the shared parser.
     let nodes = NodesTable::new_from_nodes(parser.nodes);
     let nodes_idxs = sorted_node_idxs(&nodes);
     let mut classes = crate::ClassIndexes::new();
