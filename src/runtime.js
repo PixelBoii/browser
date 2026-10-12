@@ -1390,7 +1390,7 @@ class CanvasRenderingContext2D {
         this.textBaseline = "alphabetic"
     }
 
-    // TODO: Apply alpha, desynchronized and willReadFrequently; colorSpace only
+    // TODO: Apply desynchronized and willReadFrequently; colorSpace only
     // sets the getImageData default, and colorType is only reported here; the
     // canvas itself stays sRGB unorm8 internally.
     getContextAttributes() {
@@ -1768,6 +1768,9 @@ class HtmlCanvasElement extends HtmlElement {
                     if (options.willReadFrequently !== undefined) settings.willReadFrequently = Boolean(options.willReadFrequently)
                 }
                 this.__contexts["2d"] = new CanvasRenderingContext2D(canvasRenderingContext2DToken, this, settings)
+                if (!settings.alpha && this.__node_idx != null) {
+                    core.ops.op_canvas_set_opaque(this.ownerDocument, this.__node_idx)
+                }
             }
             return this.__contexts["2d"]
         } else {

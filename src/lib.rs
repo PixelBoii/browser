@@ -624,6 +624,7 @@ struct CanvasBuffer {
     state: CanvasState,
     state_stack: Vec<CanvasState>,
     dirty: bool,
+    opaque: bool,
 }
 
 impl CanvasBuffer {
@@ -638,7 +639,24 @@ impl CanvasBuffer {
             state: CanvasState::default(),
             state_stack: vec![],
             dirty: false,
+            opaque: false,
         }
+    }
+
+    // An alpha:false context backs onto opaque black: composite every
+    // existing pixel over black, and keep it that way across resizes.
+    fn set_opaque(&mut self) {
+        if self.opaque {
+            return;
+        }
+        self.opaque = true;
+        for pixel in &mut self.buffer {
+            *pixel |= 0xFF;
+        }
+    }
+
+    fn initial_pixel(&self) -> u32 {
+        if self.opaque { 0x00_00_00_FF } else { 0 }
     }
 
     fn resize_if_needed(&mut self, width: u32, height: u32) {
@@ -651,7 +669,7 @@ impl CanvasBuffer {
 
         self.width = width;
         self.height = height;
-        self.buffer = vec![0; width as usize * height as usize];
+        self.buffer = vec![self.initial_pixel(); width as usize * height as usize];
         self.commands.clear();
         self.current_path.clear();
         self.state = CanvasState::default();
@@ -710,6 +728,10 @@ impl CanvasBuffer {
     }
 
     fn clear_rect(&mut self, x: i32, y: i32, width: u32, height: u32) {
+        if self.opaque {
+            self.fill_rect(x, y, width, height, 0x00_00_00_FF);
+            return;
+        }
         let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
         let stride = self.width as usize;
         for py in start_y..end_y {
@@ -7846,6 +7868,31 @@ fn op_canvas_paint(
     Ok(())
 }
 
+#[op2(fast)]
+fn op_canvas_set_opaque(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> Result<(), JsErrorBox> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let (Some(width), Some(height)) = renderer
+        .nodes
+        .get(node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return Ok(());
+    };
+    let canvas = renderer
+        .canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(width, height));
+    canvas.resize_if_needed(width, height);
+    canvas.set_opaque();
+    Ok(())
+}
+
 #[op2]
 #[serde]
 fn op_collect_data_for_form(
@@ -8171,6 +8218,7 @@ extension!(
     op_canvas_path_fill,
     op_canvas_path_clip,
     op_canvas_paint,
+    op_canvas_set_opaque,
     op_canvas_get_image_data,
     op_canvas_fill_text,
     op_canvas_stroke_text,
