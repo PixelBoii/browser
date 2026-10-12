@@ -71,6 +71,18 @@ pub struct ClassName {
     pub parent: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Keyframes {
+    pub name: String,
+    pub parent: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Keyframe {
+    pub key_text: String,
+    pub parent: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchedCssRule {
     pub node_idx: usize,
@@ -203,6 +215,7 @@ pub enum PropertyValue {
 pub struct Property {
     pub property: String,
     pub value: PropertyValue,
+    pub css_text: String,
     pub parent: Option<usize>,
     pub important: bool,
 }
@@ -211,6 +224,7 @@ pub struct Property {
 pub struct Variable {
     pub variable: String,
     pub value: PropertyValue,
+    pub css_text: String,
     pub parent: Option<usize>,
 }
 
@@ -231,6 +245,8 @@ pub enum Node {
     MediaQuery(MediaQuery),
     Layer(Layer),
     ClassName(ClassName),
+    Keyframes(Keyframes),
+    Keyframe(Keyframe),
     Variable(Variable),
     Property(Property),
     PropertyDefinition(PropertyDefinition),
@@ -242,6 +258,8 @@ impl Node {
     pub fn get_parent(&self) -> Option<usize> {
         match self {
             Node::ClassName(element) => element.parent,
+            Node::Keyframes(element) => element.parent,
+            Node::Keyframe(element) => element.parent,
             Node::Variable(element) => element.parent,
             Node::Property(element) => element.parent,
             Node::MediaQuery(element) => element.parent,
@@ -255,6 +273,8 @@ impl Node {
     pub fn set_parent(&mut self, parent: Option<usize>) {
         match self {
             Node::ClassName(element) => element.parent = parent,
+            Node::Keyframes(element) => element.parent = parent,
+            Node::Keyframe(element) => element.parent = parent,
             Node::Variable(element) => element.parent = parent,
             Node::Property(element) => element.parent = parent,
             Node::MediaQuery(element) => element.parent = parent,
@@ -671,7 +691,17 @@ impl CssParser {
     }
 
     fn create_media_query_from_state(&mut self) {
-        if let Some(stripped) = self.label.trim().strip_prefix("@property") {
+        if let Some(stripped) = self
+            .label
+            .trim()
+            .strip_prefix("@keyframes")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+        {
+            self.nodes.push(Node::Keyframes(Keyframes {
+                name: stripped.trim().to_string(),
+                parent: self.node,
+            }));
+        } else if let Some(stripped) = self.label.trim().strip_prefix("@property") {
             self.nodes
                 .push(Node::PropertyDefinition(PropertyDefinition {
                     name: stripped.trim().to_string(),
@@ -713,6 +743,15 @@ impl CssParser {
     }
 
     fn create_class_name_from_state(&mut self) {
+        if matches!(self.node.map(|idx| &self.nodes[idx]), Some(Node::Keyframes(_))) {
+            self.nodes.push(Node::Keyframe(Keyframe {
+                key_text: self.label.trim().to_string(),
+                parent: self.node,
+            }));
+            self.node = Some(self.nodes.len() - 1);
+            self.label.clear();
+            return;
+        }
         let name: Vec<String> = split_ignoring_parentheses(self.label.clone(), ',', &[])
             .into_iter()
             .map(|l| l.trim().to_string())
@@ -749,16 +788,19 @@ impl CssParser {
 
         match parse_result {
             Ok((parsed, important)) => {
+                let css_text = format!("{}: {};", name, parts.1.trim());
                 if name.starts_with("--") {
                     self.nodes.push(Node::Variable(Variable {
                         variable: name,
                         value: parsed,
+                        css_text,
                         parent: self.node,
                     }));
                 } else {
                     self.nodes.push(Node::Property(Property {
                         property: name,
                         value: parsed,
+                        css_text,
                         parent: self.node,
                         important,
                     }));

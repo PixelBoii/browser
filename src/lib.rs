@@ -4085,7 +4085,9 @@ fn css_rules_to_resolve(css_nodes: &[CssNode]) -> HashSet<usize> {
     for node in css_nodes {
         if matches!(node, CssNode::Property(_) | CssNode::Variable(_)) {
             if let Some(parent) = node.get_parent() {
-                to_resolve.insert(parent);
+                if !matches!(css_nodes[parent], CssNode::Keyframe(_)) {
+                    to_resolve.insert(parent);
+                }
             }
         }
     }
@@ -6377,7 +6379,26 @@ fn op_get_stylesheet_nodes(
 #[derive(Serialize)]
 struct StyleSheetData {
     href: Option<String>,
-    selectors: Vec<Option<String>>,
+    rules: Vec<CssRuleData>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum CssRuleData {
+    Style {
+        selector_text: String,
+    },
+    Keyframes {
+        name: String,
+        rules: Vec<KeyframeRuleData>,
+    },
+    Other,
+}
+
+#[derive(Serialize)]
+struct KeyframeRuleData {
+    key_text: String,
+    declarations: String,
 }
 
 #[op2]
@@ -6431,7 +6452,7 @@ fn op_get_stylesheet(
     } else {
         return Ok(None);
     };
-    let mut selectors = vec![];
+    let mut rules = vec![];
     if include_rules {
         if !renderer.css_parse_cache.contains_key(&key) {
             renderer
@@ -6441,19 +6462,51 @@ fn op_get_stylesheet(
             let nodes = renderer.css_parser.drain_result();
             renderer.css_parse_cache.insert(key.clone(), nodes);
         }
-        for node in &renderer.css_parse_cache[&key] {
+        let nodes = &renderer.css_parse_cache[&key];
+        for (idx, node) in nodes.iter().enumerate() {
             if node.get_parent().is_some() {
                 continue;
             }
             match node {
-                CssNode::ClassName(rule) => selectors.push(Some(rule.name.join(", "))),
+                CssNode::ClassName(rule) => rules.push(CssRuleData::Style {
+                    selector_text: rule.name.join(", "),
+                }),
+                CssNode::Keyframes(rule) => rules.push(CssRuleData::Keyframes {
+                    name: crate::css::unquote(&rule.name).to_string(),
+                    rules: nodes
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(frame_idx, node)| match node {
+                            CssNode::Keyframe(frame) if frame.parent == Some(idx) => {
+                                Some(KeyframeRuleData {
+                                    key_text: frame.key_text.clone(),
+                                    declarations: nodes[frame_idx + 1..]
+                                        .iter()
+                                        .take_while(|node| node.get_parent() == Some(frame_idx))
+                                        .filter_map(|node| match node {
+                                            CssNode::Property(property) => {
+                                                Some(property.css_text.as_str())
+                                            }
+                                            CssNode::Variable(variable) => {
+                                                Some(variable.css_text.as_str())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" "),
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                }),
                 CssNode::Property(_) | CssNode::Variable(_) => {}
                 // Keep grouping/at-rules in order without presenting them as style rules.
-                _ => selectors.push(None),
+                _ => rules.push(CssRuleData::Other),
             }
         }
     }
-    Ok(Some(StyleSheetData { href, selectors }))
+    Ok(Some(StyleSheetData { href, rules }))
 }
 
 #[op2(nofast, reentrant)]

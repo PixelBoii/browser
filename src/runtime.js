@@ -2203,8 +2203,7 @@ Object.defineProperty(globalThis, "ResizeObserver", {
 
 const styleSheets = new WeakMap()
 
-// Basic CSSOM subset. Rule declarations and nested rules are not exposed yet;
-// selectors come from the same parser used for rendering.
+// Basic CSSOM subset, backed by the same parser used for rendering.
 class CSSRule {
     constructor(parentStyleSheet) {
         this.parentStyleSheet = parentStyleSheet
@@ -2214,6 +2213,10 @@ class CSSRule {
 
 CSSRule.STYLE_RULE = 1
 CSSRule.prototype.STYLE_RULE = 1
+CSSRule.KEYFRAMES_RULE = 7
+CSSRule.prototype.KEYFRAMES_RULE = 7
+CSSRule.KEYFRAME_RULE = 8
+CSSRule.prototype.KEYFRAME_RULE = 8
 
 class CSSStyleRule extends CSSRule {
     constructor(parentStyleSheet, selectorText) {
@@ -2223,6 +2226,47 @@ class CSSStyleRule extends CSSRule {
 
     get type() { return CSSRule.STYLE_RULE }
     get selectorText() { return this.__selectorText }
+}
+
+class CSSKeyframeRule extends CSSRule {
+    constructor(parentStyleSheet, parentRule, keyText, declarations) {
+        super(parentStyleSheet)
+        this.parentRule = parentRule
+        this.__keyText = keyText.split(",").map(key => {
+            key = key.trim()
+            if (key.toLowerCase() === "from") return "0%"
+            if (key.toLowerCase() === "to") return "100%"
+            return key
+        }).join(", ")
+        this.__declarations = declarations
+    }
+
+    get type() { return CSSRule.KEYFRAME_RULE }
+    get keyText() { return this.__keyText }
+    get cssText() {
+        return `${this.keyText} { ${this.__declarations}${this.__declarations ? " " : ""}}`
+    }
+}
+
+class CSSKeyframesRule extends CSSRule {
+    constructor(parentStyleSheet, name, rules) {
+        super(parentStyleSheet)
+        this.__name = name
+        this.__rules = rules.map(rule => new CSSKeyframeRule(parentStyleSheet, this, rule.key_text, rule.declarations))
+        this.__rules.item = index => this.__rules[index] ?? null
+        for (let index = 0; index < this.__rules.length; index++) {
+            this[index] = this.__rules[index]
+        }
+    }
+
+    get type() { return CSSRule.KEYFRAMES_RULE }
+    get name() { return this.__name }
+    get cssRules() { return this.__rules }
+    get length() { return this.__rules.length }
+    get cssText() {
+        const rules = this.__rules.map(rule => `  ${rule.cssText}`).join("\n")
+        return `@keyframes ${CSS.escape(this.name)} {\n${rules}${rules ? "\n" : ""}}`
+    }
 }
 
 class CSSStyleSheet {
@@ -2238,9 +2282,11 @@ class CSSStyleSheet {
         if (data?.href && new URL(data.href).origin !== new URL(this.ownerNode.ownerDocument.location.href).origin) {
             throw new DOMException.DOMException("Cannot read a cross-origin stylesheet", "SecurityError")
         }
-        const rules = (data?.selectors ?? []).map(selector => selector === null
-            ? new CSSRule(this)
-            : new CSSStyleRule(this, selector))
+        const rules = (data?.rules ?? []).map(rule => {
+            if (rule.type === "style") return new CSSStyleRule(this, rule.selector_text)
+            if (rule.type === "keyframes") return new CSSKeyframesRule(this, rule.name, rule.rules)
+            return new CSSRule(this)
+        })
         rules.item = index => rules[index] ?? null
         return rules
     }
@@ -2256,7 +2302,7 @@ class CSSStyleSheet {
     }
 }
 
-for (const type of [CSSRule, CSSStyleRule, CSSStyleSheet]) {
+for (const type of [CSSRule, CSSStyleRule, CSSKeyframeRule, CSSKeyframesRule, CSSStyleSheet]) {
     Object.defineProperty(globalThis, type.name, {
         value: type,
         configurable: true,
