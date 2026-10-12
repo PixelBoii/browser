@@ -1360,19 +1360,21 @@ const textMetricsToken = Symbol("TextMetrics")
 class TextMetrics {
     constructor(token, metrics = {}) {
         if (token !== textMetricsToken) throw new TypeError("Illegal constructor")
-        this.width = metrics.width ?? 0
-        this.actualBoundingBoxLeft = metrics.actualBoundingBoxLeft ?? 0
-        this.actualBoundingBoxRight = metrics.actualBoundingBoxRight ?? 0
-        this.actualBoundingBoxAscent = metrics.actualBoundingBoxAscent ?? 0
-        this.actualBoundingBoxDescent = metrics.actualBoundingBoxDescent ?? 0
-        this.fontBoundingBoxAscent = metrics.fontBoundingBoxAscent ?? 0
-        this.fontBoundingBoxDescent = metrics.fontBoundingBoxDescent ?? 0
-        this.emHeightAscent = metrics.emHeightAscent ?? 0
-        this.emHeightDescent = metrics.emHeightDescent ?? 0
-        this.hangingBaseline = metrics.hangingBaseline ?? 0
-        this.alphabeticBaseline = metrics.alphabeticBaseline ?? 0
-        this.ideographicBaseline = metrics.ideographicBaseline ?? 0
+        this.__metrics = metrics
     }
+
+    get width() { return this.__metrics.width ?? 0 }
+    get actualBoundingBoxLeft() { return this.__metrics.actualBoundingBoxLeft ?? 0 }
+    get actualBoundingBoxRight() { return this.__metrics.actualBoundingBoxRight ?? 0 }
+    get actualBoundingBoxAscent() { return this.__metrics.actualBoundingBoxAscent ?? 0 }
+    get actualBoundingBoxDescent() { return this.__metrics.actualBoundingBoxDescent ?? 0 }
+    get fontBoundingBoxAscent() { return this.__metrics.fontBoundingBoxAscent ?? 0 }
+    get fontBoundingBoxDescent() { return this.__metrics.fontBoundingBoxDescent ?? 0 }
+    get emHeightAscent() { return this.__metrics.emHeightAscent ?? 0 }
+    get emHeightDescent() { return this.__metrics.emHeightDescent ?? 0 }
+    get hangingBaseline() { return this.__metrics.hangingBaseline ?? 0 }
+    get alphabeticBaseline() { return this.__metrics.alphabeticBaseline ?? 0 }
+    get ideographicBaseline() { return this.__metrics.ideographicBaseline ?? 0 }
 }
 
 const canvasRenderingContext2DToken = Symbol("CanvasRenderingContext2D")
