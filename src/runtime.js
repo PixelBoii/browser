@@ -1358,15 +1358,27 @@ class CanvasGradient {
 const canvasRenderingContext2DToken = Symbol("CanvasRenderingContext2D")
 
 class CanvasRenderingContext2D {
-    constructor(token, canvas) {
+    constructor(token, canvas, settings = {}) {
         if (token !== canvasRenderingContext2DToken) throw new TypeError("Illegal constructor")
         this.canvas = canvas
+        this.__settings = settings
         this.lineWidth = 1
         this.fillStyle = "#000000"
         this.strokeStyle = "#000000"
         this.font = "10px sans-serif"
         this.textAlign = "start"
         this.textBaseline = "alphabetic"
+    }
+
+    // TODO: Apply alpha, desynchronized and willReadFrequently; colorSpace only
+    // sets the getImageData default, the canvas itself stays sRGB internally.
+    getContextAttributes() {
+        return {
+            alpha: this.__settings.alpha,
+            colorSpace: this.__settings.colorSpace,
+            desynchronized: this.__settings.desynchronized,
+            willReadFrequently: this.__settings.willReadFrequently,
+        }
     }
 
     measureText(text) {
@@ -1419,7 +1431,10 @@ class CanvasRenderingContext2D {
         if (!Number.isSafeInteger(byteLength) || byteLength > 0x7fffffff) {
             throw new RangeError("Requested image data is too large")
         }
-        const result = new imageData.ImageData(width, height, settings)
+        const result = new imageData.ImageData(width, height, {
+            ...settings,
+            colorSpace: settings?.colorSpace ?? this.__settings.colorSpace,
+        })
         core.ops.op_canvas_get_image_data(
             this.canvas.ownerDocument,
             this.canvas.__node_idx, sx, sy, sw, sh,
@@ -1692,10 +1707,27 @@ class HtmlCanvasElement extends HtmlElement {
         this.__contexts = {}
     }
 
-    getContext(type) {
+    getContext(type, options = {}) {
         if (type === "2d") {
             if (!this.__contexts["2d"]) {
-                this.__contexts["2d"] = new CanvasRenderingContext2D(canvasRenderingContext2DToken, this)
+                const settings = {
+                    alpha: true,
+                    colorSpace: "srgb",
+                    desynchronized: false,
+                    willReadFrequently: false,
+                }
+                if (options != null) {
+                    if (options.alpha !== undefined) settings.alpha = Boolean(options.alpha)
+                    if (options.colorSpace !== undefined) {
+                        if (options.colorSpace !== "srgb" && options.colorSpace !== "display-p3") {
+                            throw new TypeError("Invalid colorSpace")
+                        }
+                        settings.colorSpace = options.colorSpace
+                    }
+                    if (options.desynchronized !== undefined) settings.desynchronized = Boolean(options.desynchronized)
+                    if (options.willReadFrequently !== undefined) settings.willReadFrequently = Boolean(options.willReadFrequently)
+                }
+                this.__contexts["2d"] = new CanvasRenderingContext2D(canvasRenderingContext2DToken, this, settings)
             }
             return this.__contexts["2d"]
         } else {
