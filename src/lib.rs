@@ -6395,6 +6395,7 @@ struct StyleSheetData {
 enum CssRuleData {
     Style {
         selector_text: String,
+        declarations: String,
     },
     Keyframes {
         name: String,
@@ -6407,6 +6408,19 @@ enum CssRuleData {
 struct KeyframeRuleData {
     key_text: String,
     declarations: String,
+}
+
+fn css_rule_declarations(nodes: &[CssNode], rule_idx: usize) -> String {
+    nodes
+        .iter()
+        .filter(|node| node.get_parent() == Some(rule_idx))
+        .filter_map(|node| match node {
+            CssNode::Property(property) => Some(property.css_text.as_str()),
+            CssNode::Variable(variable) => Some(variable.css_text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[op2]
@@ -6478,6 +6492,7 @@ fn op_get_stylesheet(
             match node {
                 CssNode::ClassName(rule) => rules.push(CssRuleData::Style {
                     selector_text: rule.name.join(", "),
+                    declarations: css_rule_declarations(nodes, idx),
                 }),
                 CssNode::Keyframes(rule) => rules.push(CssRuleData::Keyframes {
                     name: crate::css::unquote(&rule.name).to_string(),
@@ -6488,20 +6503,7 @@ fn op_get_stylesheet(
                             CssNode::Keyframe(frame) if frame.parent == Some(idx) => {
                                 Some(KeyframeRuleData {
                                     key_text: frame.key_text.clone(),
-                                    declarations: nodes[frame_idx + 1..]
-                                        .iter()
-                                        .take_while(|node| node.get_parent() == Some(frame_idx))
-                                        .filter_map(|node| match node {
-                                            CssNode::Property(property) => {
-                                                Some(property.css_text.as_str())
-                                            }
-                                            CssNode::Variable(variable) => {
-                                                Some(variable.css_text.as_str())
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(" "),
+                                    declarations: css_rule_declarations(nodes, frame_idx),
                                 })
                             }
                             _ => None,

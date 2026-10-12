@@ -2238,13 +2238,17 @@ CSSRule.KEYFRAME_RULE = 8
 CSSRule.prototype.KEYFRAME_RULE = 8
 
 class CSSStyleRule extends CSSRule {
-    constructor(parentStyleSheet, selectorText) {
+    constructor(parentStyleSheet, selectorText, declarations) {
         super(parentStyleSheet)
         this.__selectorText = selectorText
+        this.__declarations = declarations
     }
 
     get type() { return CSSRule.STYLE_RULE }
     get selectorText() { return this.__selectorText }
+    get cssText() {
+        return `${this.selectorText} { ${this.__declarations}${this.__declarations ? " " : ""}}`
+    }
 }
 
 class CSSKeyframeRule extends CSSRule {
@@ -2302,7 +2306,7 @@ class CSSStyleSheet {
             throw new DOMException.DOMException("Cannot read a cross-origin stylesheet", "SecurityError")
         }
         const rules = (data?.rules ?? []).map(rule => {
-            if (rule.type === "style") return new CSSStyleRule(this, rule.selector_text)
+            if (rule.type === "style") return new CSSStyleRule(this, rule.selector_text, rule.declarations)
             if (rule.type === "keyframes") return new CSSKeyframesRule(this, rule.name, rule.rules)
             return new CSSRule(this)
         })
