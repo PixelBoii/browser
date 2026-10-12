@@ -948,6 +948,11 @@ class HtmlElement extends BaseNode {
         return this.tag
     }
 
+    get innerText() {
+        return core.ops.op_get_inner_text(this.ownerDocument, this.__node_idx)
+    }
+    set innerText(value) { this.textContent = String(value ?? "") }
+
     get attributes() {
         const attributeEntries = Object.entries(core.ops.op_get_attributes(this.ownerDocument, this.__node_idx))
         const attributes = attributeEntries.map(([name, value]) => ({
@@ -1855,12 +1860,26 @@ class HTMLInputElement extends HTMLFormControlElement {
     }
 
     set type(value) { this.setAttribute("type", value) }
+
+    get maxLength() {
+        const value = parseInt(this.getAttribute("maxlength"), 10)
+        return value >= 0 ? value : -1
+    }
+
+    set maxLength(value) { this.setAttribute("maxlength", value) }
 }
 
 class HTMLTextAreaElement extends HTMLFormControlElement {
     constructor() {
         super("textarea")
     }
+
+    get maxLength() {
+        const value = parseInt(this.getAttribute("maxlength"), 10)
+        return value >= 0 ? value : -1
+    }
+
+    set maxLength(value) { this.setAttribute("maxlength", value) }
 }
 
 class HTMLSelectElement extends HTMLFormControlElement {

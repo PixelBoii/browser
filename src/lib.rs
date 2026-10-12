@@ -6353,6 +6353,19 @@ fn op_get_text_content(
 }
 
 #[op2]
+#[string]
+fn op_get_inner_text(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> String {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    renderer.ensure_styles(StylesheetLoad::AvailableOnly);
+    renderer.get_inner_text(node_idx)
+}
+
+#[op2]
 #[serde]
 fn op_get_stylesheet_nodes(
     scope: &mut v8::PinScope,
@@ -7793,6 +7806,7 @@ extension!(
     op_remove_attribute,
     op_get_inner_html,
     op_get_text_content,
+    op_get_inner_text,
     op_tls_peer_certificate,
     op_canvas_record_command,
     op_canvas_draw_image,
@@ -10109,6 +10123,28 @@ impl Renderer {
             }
         };
         str
+    }
+
+    fn get_inner_text(&self, node_idx: usize) -> String {
+        if self
+            .node_styles
+            .get(&node_idx)
+            .is_some_and(|style| style.display == StyleDisplay::None)
+        {
+            return String::new();
+        }
+        match self.nodes.get(node_idx).unwrap() {
+            Node::Text(element) => element.text.clone(),
+            Node::Element(_) => self
+                .dom_indexes
+                .children_index
+                .get(&node_idx)
+                .unwrap()
+                .iter()
+                .map(|child_idx| self.get_inner_text(*child_idx))
+                .collect(),
+            _ => String::new(),
+        }
     }
 
     fn get_element_html(
@@ -17568,6 +17604,33 @@ mod tests {
         frame.pump_with_limit(&rx, Instant::now().add(Duration::from_secs(5)))?;
         frame.render_for_snapshot(&rx, &mut buffer, 1920, 2160, Duration::from_secs(5))?;
         ensure_snapshot_matches(&buffer, "mingolfgolfse", 1920, 2160)
+    }
+
+    #[test]
+    fn inner_text_ignores_display_none_subtrees() -> Result<()> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut frame = Frame::new(
+            "about:blank".to_string(),
+            false,
+            PhysicalSize::new(800, 600),
+        );
+        let params = frame.open()?;
+        frame.set_up_without_event_loop(params, RendererProxy::FrameLoop(tx))?;
+        frame.execute_host_script("innerText", r#"
+            const style = document.createElement('style')
+            style.textContent = '.hidden-text { display: none }'
+            document.head.appendChild(style)
+            const target = document.createElement('div')
+            target.innerHTML = 'one<span class="hidden-text">hidden<b style="display:block">nested</b></span><span>two</span><!--comment-->'
+            document.body.appendChild(target)
+            if (target.innerText !== 'onetwo') throw new Error('hidden subtree included')
+            if (target.textContent !== 'onehiddennestedtwo') throw new Error('textContent changed')
+            target.querySelector('.hidden-text').style.display = 'block'
+            if (target.innerText !== 'onehiddennestedtwo') throw new Error('styles not refreshed')
+            target.style.display = 'none'
+            if (target.innerText !== '') throw new Error('hidden element included')
+        "#.to_string())?;
+        Ok(())
     }
 
     #[test]
