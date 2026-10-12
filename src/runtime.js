@@ -1327,7 +1327,6 @@ const CANVAS_COMMAND_MOVE_TO = "moveTo"
 const CANVAS_COMMAND_CLOSE = "close"
 const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
 const CANVAS_COMMAND_QUADRATIC_CURVE = "quadraticCurve"
-const CANVAS_COMMAND_FILL_RECT = "fillRect"
 const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
 const CANVAS_COMMAND_TRANSFORM = "transform"
 const CANVAS_COMMAND_RESET_TRANSFORM = "resetTransform"
@@ -1468,13 +1467,8 @@ class CanvasRenderingContext2D {
     }
 
     fillRect(x, y, width, height) {
-        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
-            type: CANVAS_COMMAND_FILL_RECT,
-            x,
-            y,
-            width,
-            height
-        })
+        const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
+        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, fillStyle)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 

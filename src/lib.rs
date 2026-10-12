@@ -787,8 +787,9 @@ impl CanvasBuffer {
                     y,
                     width,
                     height,
+                    color,
                 } => {
-                    self.fill_rect(x, y, width, height, 0x00_00_00_FF);
+                    self.fill_rect(x, y, width, height, color);
                 }
                 CanvasPathCommand::StrokeRect {
                     x,
@@ -6861,6 +6862,7 @@ enum CanvasPathCommand {
         y: i32,
         width: u32,
         height: u32,
+        color: u32,
     },
     StrokeRect {
         x: i32,
@@ -7374,6 +7376,50 @@ fn op_canvas_path_stroke(
             .commands
             .push(CanvasPathCommand::Stroke { line_width, color }),
     }
+
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_canvas_fill_rect(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    #[string] fill_style: String,
+) -> Result<(), JsErrorBox> {
+    if ![x, y, width, height].iter().all(|value| value.is_finite()) {
+        return Ok(());
+    }
+    let color =
+        match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
+            StyleBackground::Hex(color) => color,
+            StyleBackground::Transparent => 0,
+            _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
+        };
+
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let node = renderer.nodes.get(node_idx).unwrap();
+    let (Some(node_width), Some(node_height)) = get_canvas_wh(node) else {
+        return Ok(());
+    };
+
+    let canvas = renderer
+        .canvas_buffers
+        .entry(node_idx)
+        .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
+    canvas.resize_if_needed(node_width, node_height);
+    canvas.commands.push(CanvasPathCommand::FillRect {
+        x: x.round() as i32,
+        y: y.round() as i32,
+        width: width.round().max(0.0) as u32,
+        height: height.round().max(0.0) as u32,
+        color,
+    });
 
     Ok(())
 }
@@ -8206,6 +8252,7 @@ extension!(
     op_get_inner_text,
     op_tls_peer_certificate,
     op_canvas_record_command,
+    op_canvas_fill_rect,
     op_canvas_draw_image,
     op_canvas_draw_image_bitmap,
     op_image_bitmap_from_image,
