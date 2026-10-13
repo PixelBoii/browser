@@ -7036,18 +7036,45 @@ impl CanvasGradient {
                     self.points[4],
                     self.points[5],
                 );
-                if r1 == r0 {
-                    return *last_color;
-                }
-                // TODO: Non-concentric circles need a quadratic solve; for
-                // now measure from the end circle as if they shared a center.
-                let (cx, cy) = if x0 == x1 && y0 == y1 {
-                    (x0, y0)
+                // The color at a point comes from the interpolated circle
+                // passing through it: center (x0 + t*dx, y0 + t*dy) with
+                // radius r0 + t*dr. Setting the point's distance to that
+                // center equal to the radius gives a quadratic in t.
+                let dx = x1 - x0;
+                let dy = y1 - y0;
+                let dr = r1 - r0;
+                let fx = x - x0;
+                let fy = y - y0;
+                let a = dx * dx + dy * dy - dr * dr;
+                let b = -2.0 * (fx * dx + fy * dy + r0 * dr);
+                let c = fx * fx + fy * fy - r0 * r0;
+                let mut best = None;
+                if a == 0.0 {
+                    if b != 0.0 {
+                        best = Some(-c / b);
+                    }
                 } else {
-                    (x1, y1)
+                    let discriminant = b * b - 4.0 * a * c;
+                    if discriminant < 0.0 {
+                        // Outside the cone of circles: use the closest one.
+                        best = Some(-b / (2.0 * a));
+                    } else {
+                        let root = discriminant.sqrt();
+                        for candidate in [(-b + root) / (2.0 * a), (-b - root) / (2.0 * a)] {
+                            // Both roots are circles through the point; the
+                            // one with the larger radius wins. Roots can lie
+                            // outside [0, 1], in which case the stop lookup
+                            // pads with the end colors.
+                            if best.is_none_or(|t| r0 + candidate * dr > r0 + t * dr) {
+                                best = Some(candidate);
+                            }
+                        }
+                    }
+                }
+                let Some(t) = best else {
+                    return *last_color;
                 };
-                let distance = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
-                (distance - r0) / (r1 - r0)
+                t
             }
         };
         if !t.is_finite() {
