@@ -934,27 +934,15 @@ impl CanvasBuffer {
                         | CanvasPathCommand::FillText { composite, .. } => *composite,
                         _ => unreachable!(),
                     };
+                    let shadow = match &cmd {
+                        CanvasPathCommand::DrawImage { shadow, .. }
+                        | CanvasPathCommand::DrawImageBitmap { shadow, .. }
+                        | CanvasPathCommand::FillText { shadow, .. } => *shadow,
+                        _ => unreachable!(),
+                    };
                     if let Some(image) = image {
                         let image_width = image.width() as usize;
                         let image_height = image.height() as usize;
-                        // The shadow of an image or text is its alpha
-                        // silhouette, blurred in image space and tinted.
-                        let shadow_mask = match &cmd {
-                            CanvasPathCommand::DrawImage { shadow, .. }
-                            | CanvasPathCommand::DrawImageBitmap { shadow, .. }
-                            | CanvasPathCommand::FillText { shadow, .. } => {
-                                shadow.map(|shadow| {
-                                    let mut mask: Vec<u8> = image
-                                        .pixels()
-                                        .iter()
-                                        .map(|pixel| pixel.alpha())
-                                        .collect();
-                                    blur_alpha_mask(&mut mask, image_width, image_height, shadow.blur);
-                                    (mask, shadow)
-                                })
-                            }
-                            _ => unreachable!(),
-                        };
                         let canvas_width = self.width as usize;
                         let pixels = image.pixels();
 
@@ -1015,6 +1003,66 @@ impl CanvasBuffer {
                         let end_x = max_x.min(self.width as i32);
                         let end_y = max_y.min(self.height as i32);
 
+                        // The shadow of an image or text is its alpha
+                        // silhouette in device space: the glyph/image alpha
+                        // is mapped onto a canvas-sized mask and blurred
+                        // there, so the halo has room beyond the bitmap and
+                        // shadowBlur is in device pixels, unaffected by the
+                        // transform that scales the bitmap itself.
+                        let shadow_mask = shadow.map(|shadow| {
+                            let mut mask = vec![0u8; self.buffer.len()];
+                            for destination_y in start_y..end_y {
+                                for destination_x in start_x..end_x {
+                                    let destination_point = [
+                                        destination_x as f64 + 0.5,
+                                        destination_y as f64 + 0.5,
+                                    ];
+                                    let user_point = match &inverse_transform {
+                                        Some(inverse) => self
+                                            .compute_point_transform(&destination_point, inverse)
+                                            .unwrap(),
+                                        None => destination_point,
+                                    };
+                                    let source_x = user_point[0] - x as f64;
+                                    let source_y = user_point[1] - y as f64;
+                                    if source_x < 0.0
+                                        || source_x >= image_width as f64
+                                        || source_y < 0.0
+                                        || source_y >= image_height as f64
+                                    {
+                                        continue;
+                                    }
+                                    let source = pixels[source_y.floor() as usize * image_width
+                                        + source_x.floor() as usize];
+                                    mask[destination_y as usize * canvas_width
+                                        + destination_x as usize] = source.alpha();
+                                }
+                            }
+                            blur_alpha_mask(
+                                &mut mask,
+                                canvas_width,
+                                self.height as usize,
+                                shadow.blur,
+                            );
+                            (mask, shadow)
+                        });
+
+                        // A shadow can land beyond the bitmap's bounds, so
+                        // its pass covers the image bounds grown by the blur
+                        // radius on each side.
+                        let (draw_start_x, draw_start_y, draw_end_x, draw_end_y) = match shadow {
+                            Some(shadow) => {
+                                let radius = shadow.blur.round() as i32;
+                                (
+                                    (min_x - radius).max(0),
+                                    (min_y - radius).max(0),
+                                    (max_x + radius).min(self.width as i32),
+                                    (max_y + radius).min(self.height as i32),
+                                )
+                            }
+                            None => (start_x, start_y, end_x, end_y),
+                        };
+
                         // With a shadow, shadow and image render into
                         // temporary pixels first (see draw_with_shadow);
                         // inside them the image blends source-over its shadow.
@@ -1029,8 +1077,8 @@ impl CanvasBuffer {
                             composite
                         };
 
-                        for destination_y in start_y..end_y {
-                            for destination_x in start_x..end_x {
+                        for destination_y in draw_start_y..draw_end_y {
+                            for destination_x in draw_start_x..draw_end_x {
                                 let destination_point =
                                     [destination_x as f64 + 0.5, destination_y as f64 + 0.5];
                                 let user_point = match &inverse_transform {
@@ -1042,6 +1090,26 @@ impl CanvasBuffer {
 
                                 let source_x = user_point[0] - x as f64;
                                 let source_y = user_point[1] - y as f64;
+
+                                let destination_idx =
+                                    destination_y as usize * canvas_width + destination_x as usize;
+                                let target: &mut [u32] = match &mut temp_pixels {
+                                    Some(pixels) => pixels,
+                                    None => &mut self.buffer,
+                                };
+                                if let Some((mask, shadow)) = &shadow_mask {
+                                    let shadow_alpha = mask[destination_idx];
+                                    if shadow_alpha > 0 {
+                                        blend_canvas_pixel(
+                                            &mut *target,
+                                            self.state.clip_mask.as_deref(),
+                                            destination_idx,
+                                            rgba_to_premul_tuple(shadow.color),
+                                            shadow_alpha,
+                                            CanvasCompositeOperation::SourceOver,
+                                        );
+                                    }
+                                }
 
                                 if source_x < 0.0
                                     || source_x >= image_width as f64
@@ -1055,25 +1123,6 @@ impl CanvasBuffer {
                                 let source_y = source_y.floor() as usize;
 
                                 let source = pixels[source_y * image_width + source_x];
-                                let destination_idx =
-                                    destination_y as usize * canvas_width + destination_x as usize;
-                                let target: &mut [u32] = match &mut temp_pixels {
-                                    Some(pixels) => pixels,
-                                    None => &mut self.buffer,
-                                };
-                                if let Some((mask, shadow)) = &shadow_mask {
-                                    let shadow_alpha = mask[source_y * image_width + source_x];
-                                    if shadow_alpha > 0 {
-                                        blend_canvas_pixel(
-                                            &mut *target,
-                                            self.state.clip_mask.as_deref(),
-                                            destination_idx,
-                                            rgba_to_premul_tuple(shadow.color),
-                                            shadow_alpha,
-                                            CanvasCompositeOperation::SourceOver,
-                                        );
-                                    }
-                                }
                                 let (source, coverage) = match fill_text_paint {
                                     Some(paint) => (
                                         rgba_to_premul_tuple(
