@@ -1506,8 +1506,6 @@ class CanvasRenderingContext2D {
         height = +height
         if (![x, y, width, height].every(Number.isFinite)) return
         const path = new Path2D()
-        // stroke() takes the line width from the supplied path.
-        path.lineWidth = this.lineWidth
         path.moveTo(x, y)
         path.lineTo(x + width, y)
         path.lineTo(x + width, y + height)
@@ -1685,7 +1683,7 @@ class CanvasRenderingContext2D {
 
     stroke(suppliedPath = null) {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
-        const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
+        const lineWidth = this.lineWidth
         const strokeStyle = canvasStyle(this.strokeStyle)
 
         core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle, this.globalCompositeOperation)
