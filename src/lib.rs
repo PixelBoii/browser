@@ -709,13 +709,14 @@ impl CanvasBuffer {
         );
     }
 
-    fn fill_rect(&mut self, x: i32, y: i32, width: u32, height: u32, color: u32) {
+    fn fill_rect(&mut self, x: i32, y: i32, width: u32, height: u32, paint: &CanvasPaint) {
         let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
         let stride = self.width as usize;
-        let source = rgba_to_premul_tuple(color);
         for py in start_y..end_y {
             for px in start_x..end_x {
                 let pixel_idx = py * stride + px;
+                let source =
+                    rgba_to_premul_tuple(paint.color_at(px as f64 + 0.5, py as f64 + 0.5));
                 blend_canvas_pixel(
                     &mut self.buffer,
                     self.state.clip_mask.as_deref(),
@@ -729,7 +730,7 @@ impl CanvasBuffer {
 
     fn clear_rect(&mut self, x: i32, y: i32, width: u32, height: u32) {
         if self.opaque {
-            self.fill_rect(x, y, width, height, 0x00_00_00_FF);
+            self.fill_rect(x, y, width, height, &CanvasPaint::Solid(0x00_00_00_FF));
             return;
         }
         let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
@@ -788,9 +789,9 @@ impl CanvasBuffer {
                     y,
                     width,
                     height,
-                    color,
+                    paint,
                 } => {
-                    self.fill_rect(x, y, width, height, color);
+                    self.fill_rect(x, y, width, height, &paint);
                 }
                 CanvasPathCommand::StrokeRect {
                     x,
@@ -799,22 +800,23 @@ impl CanvasBuffer {
                     height,
                     line_width,
                 } => {
+                    let black = CanvasPaint::Solid(0x00_00_00_FF);
                     let line_width = line_width as u32;
-                    self.fill_rect(x, y, line_width, height, 0x00_00_00_FF); // Left
-                    self.fill_rect(x, y, width, line_width, 0x00_00_00_FF); // Top
+                    self.fill_rect(x, y, line_width, height, &black); // Left
+                    self.fill_rect(x, y, width, line_width, &black); // Top
                     self.fill_rect(
                         x + width as i32 - line_width as i32,
                         y,
                         line_width,
                         height,
-                        0x00_00_00_FF,
+                        &black,
                     ); // Right
                     self.fill_rect(
                         x,
                         y + height as i32 - line_width as i32,
                         width,
                         line_width,
-                        0x00_00_00_FF,
+                        &black,
                     ); // Bottom
                 }
                 CanvasPathCommand::ClearRect {
@@ -943,39 +945,48 @@ impl CanvasBuffer {
                         }
                     }
                 }
-                CanvasPathCommand::Stroke { line_width, color } => {
+                CanvasPathCommand::Stroke { line_width, paint } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&current_path, line_width, &transform, color)
+                    self.apply_stroke(&current_path, line_width, &transform, &paint)
                         .unwrap();
                 }
                 CanvasPathCommand::StrokePath {
                     path,
                     line_width,
-                    color,
+                    paint,
+                } => {
+                    let transform = self.state.transform.clone();
+                    self.apply_stroke(&path, line_width, &transform, &paint)
+                        .unwrap();
                 }
-                | CanvasPathCommand::StrokeText {
+                CanvasPathCommand::StrokeText {
                     path,
                     line_width,
                     color,
                 } => {
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&path, line_width, &transform, color)
-                        .unwrap();
+                    self.apply_stroke(
+                        &path,
+                        line_width,
+                        &transform,
+                        &CanvasPaint::Solid(color),
+                    )
+                    .unwrap();
                 }
-                CanvasPathCommand::Fill { color, fill_rule } => {
+                CanvasPathCommand::Fill { paint, fill_rule } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    self.apply_fill(&current_path, &transform, color, &fill_rule)
+                    self.apply_fill(&current_path, &transform, &paint, &fill_rule)
                         .unwrap();
                 }
                 CanvasPathCommand::FillPath {
                     path,
-                    color,
+                    paint,
                     fill_rule,
                 } => {
                     let transform = self.state.transform.clone();
-                    self.apply_fill(&path, &transform, color, &fill_rule)
+                    self.apply_fill(&path, &transform, &paint, &fill_rule)
                         .unwrap();
                 }
                 CanvasPathCommand::Clip { fill_rule } => {
@@ -1274,14 +1285,15 @@ impl CanvasBuffer {
         &mut self,
         queued_commands: &[CanvasPathCommand],
         transform: &Option<Matrixf32>,
-        color: u32,
+        paint: &CanvasPaint,
         fill_rule: &CanvasFillRule,
     ) -> Result<()> {
         let spans = self.rasterize_path_spans(queued_commands, transform, fill_rule)?;
-        let source = rgba_to_premul_tuple(color);
         let stride = self.width as usize;
         for span in spans {
             for x in span.start_x..span.end_x {
+                let source =
+                    rgba_to_premul_tuple(paint.color_at(x as f64 + 0.5, span.y as f64 + 0.5));
                 blend_canvas_pixel(
                     &mut self.buffer,
                     self.state.clip_mask.as_deref(),
@@ -1322,11 +1334,10 @@ impl CanvasBuffer {
         queued_commands: &[CanvasPathCommand],
         line_width: f64,
         transform: &Option<Matrixf32>,
-        color: u32,
+        paint: &CanvasPaint,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
-        let color_tuple = rgba_to_premul_tuple(color);
         let line_width_offset = -line_width as i32 / 2;
         let line_width_end = (line_width / 2.0).ceil() as i32;
         for cmd in queued_commands {
@@ -1370,7 +1381,10 @@ impl CanvasBuffer {
                                         as i32;
                                     let py = (start_y + idx as f64 * y_ratio + wyidx as f64).round()
                                         as i32;
-                                    self.blend_pixel(px, py, color_tuple, u8::MAX);
+                                    let source = rgba_to_premul_tuple(
+                                        paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
+                                    );
+                                    self.blend_pixel(px, py, source, u8::MAX);
                                 }
                             }
                         }
@@ -1402,7 +1416,11 @@ impl CanvasBuffer {
                         let y = quadratic_bezier(t, cursor.y, cp[1] as i32, endpoint[1] as i32);
                         for wxidx in line_width_offset..line_width_end {
                             for wyidx in line_width_offset..line_width_end {
-                                self.blend_pixel(x + wxidx, y + wyidx, color_tuple, u8::MAX);
+                                let (px, py) = (x + wxidx, y + wyidx);
+                                let source = rgba_to_premul_tuple(
+                                    paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
+                                );
+                                self.blend_pixel(px, py, source, u8::MAX);
                             }
                         }
                     }
@@ -1447,7 +1465,11 @@ impl CanvasBuffer {
 
                         for wxidx in line_width_offset..line_width_end {
                             for wyidx in line_width_offset..line_width_end {
-                                self.blend_pixel(x + wxidx, y + wyidx, color_tuple, u8::MAX);
+                                let (px, py) = (x + wxidx, y + wyidx);
+                                let source = rgba_to_premul_tuple(
+                                    paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
+                                );
+                                self.blend_pixel(px, py, source, u8::MAX);
                             }
                         }
                     }
@@ -1500,7 +1522,10 @@ impl CanvasBuffer {
                                         let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
                                             .round()
                                             as i32;
-                                        self.blend_pixel(px, py, color_tuple, u8::MAX);
+                                        let source = rgba_to_premul_tuple(
+                                            paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
+                                        );
+                                        self.blend_pixel(px, py, source, u8::MAX);
                                     }
                                 }
                             }
@@ -1525,7 +1550,11 @@ impl CanvasBuffer {
                                 as i32;
                             for wxidx in line_width_offset..line_width_end {
                                 for wyidx in line_width_offset..line_width_end {
-                                    self.blend_pixel(x + wxidx, y + wyidx, color_tuple, u8::MAX);
+                                    let (px, py) = (x + wxidx, y + wyidx);
+                                    let source = rgba_to_premul_tuple(
+                                        paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
+                                    );
+                                    self.blend_pixel(px, py, source, u8::MAX);
                                 }
                             }
                         }
@@ -6920,6 +6949,178 @@ enum CanvasColorSpace {
     DisplayP3,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CanvasGradientKind {
+    Linear,
+    Radial,
+}
+
+// What a canvas paint operation draws with: a solid color, or a gradient
+// whose color depends on the pixel being painted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum CanvasPaint {
+    Solid(u32),
+    Gradient(CanvasGradient),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CanvasGradient {
+    kind: CanvasGradientKind,
+    // Linear: [x0, y0, x1, y1]. Radial: [x0, y0, r0, x1, y1, r1].
+    points: Vec<f64>,
+    // (offset, RGBA color), sorted by offset.
+    stops: Vec<(f64, u32)>,
+}
+
+impl CanvasPaint {
+    fn color_at(&self, x: f64, y: f64) -> u32 {
+        match self {
+            CanvasPaint::Solid(color) => *color,
+            CanvasPaint::Gradient(gradient) => gradient.color_at(x, y),
+        }
+    }
+}
+
+impl CanvasGradient {
+    fn color_at(&self, x: f64, y: f64) -> u32 {
+        let Some((_, last_color)) = self.stops.last() else {
+            return 0;
+        };
+        let t = match self.kind {
+            CanvasGradientKind::Linear => {
+                if self.points.len() != 4 {
+                    return *last_color;
+                }
+                let (x0, y0, x1, y1) = (
+                    self.points[0],
+                    self.points[1],
+                    self.points[2],
+                    self.points[3],
+                );
+                let dx = x1 - x0;
+                let dy = y1 - y0;
+                let length_squared = dx * dx + dy * dy;
+                if length_squared == 0.0 {
+                    return *last_color;
+                }
+                ((x - x0) * dx + (y - y0) * dy) / length_squared
+            }
+            CanvasGradientKind::Radial => {
+                if self.points.len() != 6 {
+                    return *last_color;
+                }
+                let (x0, y0, r0, x1, y1, r1) = (
+                    self.points[0],
+                    self.points[1],
+                    self.points[2],
+                    self.points[3],
+                    self.points[4],
+                    self.points[5],
+                );
+                if r1 == r0 {
+                    return *last_color;
+                }
+                // TODO: Non-concentric circles need a quadratic solve; for
+                // now measure from the end circle as if they shared a center.
+                let (cx, cy) = if x0 == x1 && y0 == y1 {
+                    (x0, y0)
+                } else {
+                    (x1, y1)
+                };
+                let distance = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
+                (distance - r0) / (r1 - r0)
+            }
+        };
+        if !t.is_finite() {
+            return *last_color;
+        }
+        let Some((first_offset, first_color)) = self.stops.first() else {
+            return 0;
+        };
+        if t <= *first_offset {
+            return *first_color;
+        }
+        if t >= self.stops.last().unwrap().0 {
+            return *last_color;
+        }
+        for stops in self.stops.windows(2) {
+            let (start_offset, start_color) = stops[0];
+            let (end_offset, end_color) = stops[1];
+            if t < start_offset || t > end_offset {
+                continue;
+            }
+            if end_offset == start_offset {
+                return end_color;
+            }
+            let mix = (t - start_offset) / (end_offset - start_offset);
+            let channel = |color: u32, shift: u32| f64::from((color >> shift) & 0xFF);
+            let mixed = |shift: u32| {
+                let start = channel(start_color, shift);
+                (start + (channel(end_color, shift) - start) * mix).round() as u32
+            };
+            return (mixed(24) << 24) | (mixed(16) << 16) | (mixed(8) << 8) | mixed(0);
+        }
+        *last_color
+    }
+}
+
+// A paint style as it arrives from JS: a CSS color string, or a gradient
+// whose stop colors still need parsing.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CanvasStyle {
+    Solid(String),
+    Gradient(CanvasGradientStyle),
+}
+
+#[derive(Deserialize)]
+struct CanvasGradientStyle {
+    kind: CanvasGradientKind,
+    points: Vec<f64>,
+    stops: Vec<(f64, String)>,
+}
+
+fn parse_canvas_paint(
+    style: CanvasStyle,
+    unsupported: &'static str,
+) -> Result<CanvasPaint, JsErrorBox> {
+    let parse_color = |style: String| match style::parse_color(style)
+        .map_err(|err| JsErrorBox::generic(err.to_string()))?
+    {
+        StyleBackground::Hex(color) => Ok(color),
+        StyleBackground::Transparent => Ok(0),
+        _ => Err(JsErrorBox::generic(unsupported)),
+    };
+    match style {
+        CanvasStyle::Solid(style) => Ok(CanvasPaint::Solid(parse_color(style)?)),
+        CanvasStyle::Gradient(gradient) => {
+            let expected_points = match gradient.kind {
+                CanvasGradientKind::Linear => 4,
+                CanvasGradientKind::Radial => 6,
+            };
+            if gradient.points.len() != expected_points
+                || !gradient.points.iter().all(|point| point.is_finite())
+            {
+                return Err(JsErrorBox::generic("Invalid canvas gradient"));
+            }
+            let mut stops = vec![];
+            for (offset, color) in gradient.stops {
+                if !offset.is_finite() {
+                    continue;
+                }
+                stops.push((offset.clamp(0.0, 1.0), parse_color(color)?));
+            }
+            stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            Ok(CanvasPaint::Gradient(CanvasGradient {
+                kind: gradient.kind,
+                points: gradient.points,
+                stops,
+            }))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CanvasPathCommand {
@@ -6947,21 +7148,21 @@ enum CanvasPathCommand {
     },
     Close,
     Fill {
-        color: u32,
+        paint: CanvasPaint,
         fill_rule: CanvasFillRule,
     },
     Stroke {
         line_width: f64,
-        color: u32,
+        paint: CanvasPaint,
     },
     StrokePath {
         path: Vec<CanvasPathCommand>,
         line_width: f64,
-        color: u32,
+        paint: CanvasPaint,
     },
     FillPath {
         path: Vec<CanvasPathCommand>,
-        color: u32,
+        paint: CanvasPaint,
         fill_rule: CanvasFillRule,
     },
     Clip {
@@ -6976,7 +7177,7 @@ enum CanvasPathCommand {
         y: i32,
         width: u32,
         height: u32,
-        color: u32,
+        paint: CanvasPaint,
     },
     StrokeRect {
         x: i32,
@@ -7493,15 +7694,9 @@ fn op_canvas_path_stroke(
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     line_width: f64,
-    #[string] stroke_style: String,
+    #[serde] stroke_style: CanvasStyle,
 ) -> Result<(), JsErrorBox> {
-    let color = match style::parse_color(stroke_style)
-        .map_err(|err| JsErrorBox::generic(err.to_string()))?
-    {
-        StyleBackground::Hex(color) => color,
-        StyleBackground::Transparent => 0,
-        _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
-    };
+    let paint = parse_canvas_paint(stroke_style, "Unsupported canvas strokeStyle")?;
 
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
@@ -7520,17 +7715,17 @@ fn op_canvas_path_stroke(
         Some(path) => canvas.commands.push(CanvasPathCommand::StrokePath {
             path,
             line_width,
-            color,
+            paint,
         }),
         None => canvas
             .commands
-            .push(CanvasPathCommand::Stroke { line_width, color }),
+            .push(CanvasPathCommand::Stroke { line_width, paint }),
     }
 
     Ok(())
 }
 
-#[op2(fast)]
+#[op2]
 fn op_canvas_fill_rect(
     scope: &mut v8::PinScope,
     document: v8::Local<v8::Object>,
@@ -7539,17 +7734,12 @@ fn op_canvas_fill_rect(
     y: f64,
     width: f64,
     height: f64,
-    #[string] fill_style: String,
+    #[serde] fill_style: CanvasStyle,
 ) -> Result<(), JsErrorBox> {
     if ![x, y, width, height].iter().all(|value| value.is_finite()) {
         return Ok(());
     }
-    let color =
-        match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
-            StyleBackground::Hex(color) => color,
-            StyleBackground::Transparent => 0,
-            _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
-        };
+    let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
 
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
@@ -7568,7 +7758,7 @@ fn op_canvas_fill_rect(
         y: y.round() as i32,
         width: width.round().max(0.0) as u32,
         height: height.round().max(0.0) as u32,
-        color,
+        paint,
     });
 
     Ok(())
@@ -7580,15 +7770,10 @@ fn op_canvas_path_fill(
     document: v8::Local<v8::Object>,
     #[number] node_idx: usize,
     #[serde] path: Option<Vec<CanvasPathCommand>>,
-    #[string] fill_style: String,
+    #[serde] fill_style: CanvasStyle,
     #[serde] fill_rule: CanvasFillRule,
 ) -> Result<(), JsErrorBox> {
-    let color =
-        match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
-            StyleBackground::Hex(color) => color,
-            StyleBackground::Transparent => 0,
-            _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
-        };
+    let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
 
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
@@ -7606,12 +7791,12 @@ fn op_canvas_path_fill(
     match path {
         Some(path) => canvas.commands.push(CanvasPathCommand::FillPath {
             path,
-            color,
+            paint,
             fill_rule,
         }),
         None => canvas
             .commands
-            .push(CanvasPathCommand::Fill { color, fill_rule }),
+            .push(CanvasPathCommand::Fill { paint, fill_rule }),
     }
 
     Ok(())

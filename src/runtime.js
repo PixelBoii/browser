@@ -1345,14 +1345,25 @@ Object.defineProperty(globalThis, "ImageData", {
 const canvasGradientToken = Symbol("CanvasGradient")
 
 class CanvasGradient {
-    constructor(token) {
+    constructor(token, kind, points) {
         if (token !== canvasGradientToken) throw new TypeError("Illegal constructor")
+        this.kind = kind
+        this.points = points
         this.colorStops = []
     }
 
     addColorStop(offset, color) {
         this.colorStops.push([offset, color])
     }
+}
+
+// Paint styles cross into Rust as a plain string for a solid color, or as
+// the gradient's recorded geometry and stops.
+function canvasStyle(style) {
+    if (style instanceof CanvasGradient) {
+        return { kind: style.kind, points: style.points, stops: style.colorStops }
+    }
+    return typeof style === "string" ? style : "#000000"
 }
 
 const textMetricsToken = Symbol("TextMetrics")
@@ -1473,8 +1484,7 @@ class CanvasRenderingContext2D {
     }
 
     fillRect(x, y, width, height) {
-        const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
-        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, fillStyle)
+        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, canvasStyle(this.fillStyle))
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
@@ -1528,14 +1538,21 @@ class CanvasRenderingContext2D {
         core.ops.op_canvas_path_clip(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillRule)
     }
 
-    // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
-    createLinearGradient() {
-        return new CanvasGradient(canvasGradientToken)
+    createLinearGradient(x0, y0, x1, y1) {
+        return new CanvasGradient(canvasGradientToken, "linear", [+x0, +y0, +x1, +y1])
     }
 
-    // TODO: Rasterize gradients instead of falling back to the existing solid canvas color.
-    createRadialGradient() {
-        return new CanvasGradient(canvasGradientToken)
+    createRadialGradient(x0, y0, r0, x1, y1, r1) {
+        x0 = +x0
+        y0 = +y0
+        r0 = +r0
+        x1 = +x1
+        y1 = +y1
+        r1 = +r1
+        if (r0 < 0 || r1 < 0) {
+            throw new DOMException.DOMException("The radius is negative", "IndexSizeError")
+        }
+        return new CanvasGradient(canvasGradientToken, "radial", [x0, y0, r0, x1, y1, r1])
     }
 
     drawImage(image, ...args) {
@@ -1653,7 +1670,7 @@ class CanvasRenderingContext2D {
     stroke(suppliedPath = null) {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
-        const strokeStyle = typeof this.strokeStyle === "string" ? this.strokeStyle : "#000000"
+        const strokeStyle = canvasStyle(this.strokeStyle)
 
         core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
@@ -1672,7 +1689,7 @@ class CanvasRenderingContext2D {
         }
 
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
-        const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
+        const fillStyle = canvasStyle(this.fillStyle)
 
         core.ops.op_canvas_path_fill(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillStyle, fillRule)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
