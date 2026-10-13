@@ -885,7 +885,20 @@ impl CanvasBuffer {
                     height,
                     paint,
                     composite,
+                    shadow,
                 } => {
+                    if let Some(shadow) = shadow {
+                        let mut scratch = self.shadow_scratch();
+                        scratch.fill_rect(
+                            x,
+                            y,
+                            width,
+                            height,
+                            &CanvasPaint::Solid(0xFFFF_FFFF),
+                            CanvasCompositeOperation::SourceOver,
+                        );
+                        self.blend_shadow(&scratch, shadow);
+                    }
                     self.fill_rect(x, y, width, height, &paint, composite);
                 }
                 CanvasPathCommand::ClearRect {
@@ -927,6 +940,24 @@ impl CanvasBuffer {
                     if let Some(image) = image {
                         let image_width = image.width() as usize;
                         let image_height = image.height() as usize;
+                        // The shadow of an image or text is its alpha
+                        // silhouette, blurred in image space and tinted.
+                        let shadow_mask = match &cmd {
+                            CanvasPathCommand::DrawImage { shadow, .. }
+                            | CanvasPathCommand::DrawImageBitmap { shadow, .. }
+                            | CanvasPathCommand::FillText { shadow, .. } => {
+                                shadow.map(|shadow| {
+                                    let mut mask: Vec<u8> = image
+                                        .pixels()
+                                        .iter()
+                                        .map(|pixel| pixel.alpha())
+                                        .collect();
+                                    blur_alpha_mask(&mut mask, image_width, image_height, shadow.blur);
+                                    (mask, shadow)
+                                })
+                            }
+                            _ => unreachable!(),
+                        };
                         let canvas_width = self.width as usize;
                         let pixels = image.pixels();
 
@@ -1015,6 +1046,19 @@ impl CanvasBuffer {
                                 let source = pixels[source_y * image_width + source_x];
                                 let destination_idx =
                                     destination_y as usize * canvas_width + destination_x as usize;
+                                if let Some((mask, shadow)) = &shadow_mask {
+                                    let shadow_alpha = mask[source_y * image_width + source_x];
+                                    if shadow_alpha > 0 {
+                                        blend_canvas_pixel(
+                                            &mut self.buffer,
+                                            self.state.clip_mask.as_deref(),
+                                            destination_idx,
+                                            rgba_to_premul_tuple(shadow.color),
+                                            shadow_alpha,
+                                            CanvasCompositeOperation::SourceOver,
+                                        );
+                                    }
+                                }
                                 let (source, coverage) = match fill_text_paint {
                                     Some(paint) => (
                                         rgba_to_premul_tuple(
@@ -1048,9 +1092,23 @@ impl CanvasBuffer {
                     line_width,
                     paint,
                     composite,
+                    shadow,
                 } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
+                    if let Some(shadow) = shadow {
+                        let mut scratch = self.shadow_scratch();
+                        scratch
+                            .apply_stroke(
+                                &current_path,
+                                line_width,
+                                &transform,
+                                &CanvasPaint::Solid(0xFFFF_FFFF),
+                                CanvasCompositeOperation::SourceOver,
+                            )
+                            .unwrap();
+                        self.blend_shadow(&scratch, shadow);
+                    }
                     self.apply_stroke(&current_path, line_width, &transform, &paint, composite)
                         .unwrap();
                 }
@@ -1059,8 +1117,22 @@ impl CanvasBuffer {
                     line_width,
                     paint,
                     composite,
+                    shadow,
                 } => {
                     let transform = self.state.transform.clone();
+                    if let Some(shadow) = shadow {
+                        let mut scratch = self.shadow_scratch();
+                        scratch
+                            .apply_stroke(
+                                &path,
+                                line_width,
+                                &transform,
+                                &CanvasPaint::Solid(0xFFFF_FFFF),
+                                CanvasCompositeOperation::SourceOver,
+                            )
+                            .unwrap();
+                        self.blend_shadow(&scratch, shadow);
+                    }
                     self.apply_stroke(&path, line_width, &transform, &paint, composite)
                         .unwrap();
                 }
@@ -1069,8 +1141,22 @@ impl CanvasBuffer {
                     line_width,
                     paint,
                     composite,
+                    shadow,
                 } => {
                     let transform = self.state.transform.clone();
+                    if let Some(shadow) = shadow {
+                        let mut scratch = self.shadow_scratch();
+                        scratch
+                            .apply_stroke(
+                                &path,
+                                line_width,
+                                &transform,
+                                &CanvasPaint::Solid(0xFFFF_FFFF),
+                                CanvasCompositeOperation::SourceOver,
+                            )
+                            .unwrap();
+                        self.blend_shadow(&scratch, shadow);
+                    }
                     self.apply_stroke(&path, line_width, &transform, &paint, composite)
                         .unwrap();
                 }
@@ -1078,9 +1164,23 @@ impl CanvasBuffer {
                     paint,
                     fill_rule,
                     composite,
+                    shadow,
                 } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
+                    if let Some(shadow) = shadow {
+                        let mut scratch = self.shadow_scratch();
+                        scratch
+                            .apply_fill(
+                                &current_path,
+                                &transform,
+                                &CanvasPaint::Solid(0xFFFF_FFFF),
+                                &fill_rule,
+                                CanvasCompositeOperation::SourceOver,
+                            )
+                            .unwrap();
+                        self.blend_shadow(&scratch, shadow);
+                    }
                     self.apply_fill(&current_path, &transform, &paint, &fill_rule, composite)
                         .unwrap();
                 }
@@ -1089,8 +1189,22 @@ impl CanvasBuffer {
                     paint,
                     fill_rule,
                     composite,
+                    shadow,
                 } => {
                     let transform = self.state.transform.clone();
+                    if let Some(shadow) = shadow {
+                        let mut scratch = self.shadow_scratch();
+                        scratch
+                            .apply_fill(
+                                &path,
+                                &transform,
+                                &CanvasPaint::Solid(0xFFFF_FFFF),
+                                &fill_rule,
+                                CanvasCompositeOperation::SourceOver,
+                            )
+                            .unwrap();
+                        self.blend_shadow(&scratch, shadow);
+                    }
                     self.apply_fill(&path, &transform, &paint, &fill_rule, composite)
                         .unwrap();
                 }
@@ -1128,6 +1242,42 @@ impl CanvasBuffer {
         Ok(rgba_to_premul_tuple(
             paint.color_at(user_point[0], user_point[1]),
         ))
+    }
+
+    fn shadow_scratch(&self) -> CanvasBuffer {
+        let mut scratch = CanvasBuffer::new(self.width, self.height);
+        scratch.state = self.state.clone();
+        scratch
+    }
+
+    // Blends a scratch buffer painted in white as this shape's shadow:
+    // its alpha is blurred and tinted with the shadow color.
+    fn blend_shadow(&mut self, scratch: &CanvasBuffer, shadow: CanvasShadow) {
+        let mut mask: Vec<u8> = scratch
+            .buffer
+            .iter()
+            .map(|pixel| (pixel & 0xFF) as u8)
+            .collect();
+        blur_alpha_mask(
+            &mut mask,
+            self.width as usize,
+            self.height as usize,
+            shadow.blur,
+        );
+        let source = rgba_to_premul_tuple(shadow.color);
+        for (pixel_idx, alpha) in mask.iter().enumerate() {
+            if *alpha == 0 {
+                continue;
+            }
+            blend_canvas_pixel(
+                &mut self.buffer,
+                self.state.clip_mask.as_deref(),
+                pixel_idx,
+                source,
+                *alpha,
+                CanvasCompositeOperation::SourceOver,
+            );
+        }
     }
 
     fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
@@ -2939,6 +3089,46 @@ fn blend_multiply_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
         | (channel(src.1, 16) << 16)
         | (channel(src.2, 8) << 8)
         | output_alpha
+}
+
+// One horizontal and one vertical box-blur pass over an alpha mask, with
+// edge pixels replicated. Two passes approximate the Gaussian falloff
+// browsers use for shadowBlur well enough at this scale.
+fn blur_alpha_mask(mask: &mut [u8], width: usize, height: usize, blur: f64) {
+    let radius = blur.round() as i32;
+    if radius <= 0 || width == 0 || height == 0 {
+        return;
+    }
+    let radius = radius as usize;
+    let count = (2 * radius + 1) as u32;
+    let max_x = width as i32 - 1;
+    let max_y = height as i32 - 1;
+    let mut pass = vec![0u8; mask.len()];
+    for y in 0..height {
+        let row = y * width;
+        let mut sum: u32 = (-(radius as i32)..=(radius as i32))
+            .map(|i| mask[row + i.clamp(0, max_x) as usize] as u32)
+            .sum();
+        for x in 0..width {
+            pass[row + x] = (sum / count) as u8;
+            let leave = (x as i32 - radius as i32).clamp(0, max_x) as usize;
+            let enter = (x as i32 + 1 + radius as i32).clamp(0, max_x) as usize;
+            sum -= mask[row + leave] as u32;
+            sum += mask[row + enter] as u32;
+        }
+    }
+    for x in 0..width {
+        let mut sum: u32 = (-(radius as i32)..=(radius as i32))
+            .map(|i| pass[i.clamp(0, max_y) as usize * width + x] as u32)
+            .sum();
+        for y in 0..height {
+            mask[y * width + x] = (sum / count) as u8;
+            let leave = (y as i32 - radius as i32).clamp(0, max_y) as usize;
+            let enter = (y as i32 + 1 + radius as i32).clamp(0, max_y) as usize;
+            sum -= pass[leave * width + x] as u32;
+            sum += pass[enter * width + x] as u32;
+        }
+    }
 }
 
 fn blend_rgb_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
@@ -7339,6 +7529,40 @@ fn parse_canvas_paint(
     }
 }
 
+// A parsed shadow: color as RGBA, blur in device pixels. Offsets are not
+// supported, so the shadow sits directly behind the shape.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct CanvasShadow {
+    color: u32,
+    blur: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanvasShadowStyle {
+    color: String,
+    blur: f64,
+}
+
+fn parse_canvas_shadow(style: CanvasShadowStyle) -> Result<Option<CanvasShadow>, JsErrorBox> {
+    if !style.blur.is_finite() || style.blur < 0.0 {
+        return Ok(None);
+    }
+    let color = match style::parse_color(style.color)
+        .map_err(|err| JsErrorBox::generic(err.to_string()))?
+    {
+        StyleBackground::Hex(color) => color,
+        StyleBackground::Transparent => 0,
+        _ => return Err(JsErrorBox::generic("Unsupported canvas shadowColor")),
+    };
+    if color & 0xFF == 0 {
+        return Ok(None);
+    }
+    Ok(Some(CanvasShadow {
+        color,
+        blur: style.blur,
+    }))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CanvasPathCommand {
@@ -7369,23 +7593,27 @@ enum CanvasPathCommand {
         paint: CanvasPaint,
         fill_rule: CanvasFillRule,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     Stroke {
         line_width: f64,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     StrokePath {
         path: Vec<CanvasPathCommand>,
         line_width: f64,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     FillPath {
         path: Vec<CanvasPathCommand>,
         paint: CanvasPaint,
         fill_rule: CanvasFillRule,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     Clip {
         fill_rule: CanvasFillRule,
@@ -7401,6 +7629,7 @@ enum CanvasPathCommand {
         height: u32,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     Transform {
         matrix: Matrixf32,
@@ -7422,6 +7651,7 @@ enum CanvasPathCommand {
         x: i32,
         y: i32,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     #[serde(skip)]
     DrawImageBitmap {
@@ -7429,6 +7659,7 @@ enum CanvasPathCommand {
         x: i32,
         y: i32,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     #[serde(skip)]
     FillText {
@@ -7437,6 +7668,7 @@ enum CanvasPathCommand {
         y: i32,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
     #[serde(skip)]
     StrokeText {
@@ -7444,6 +7676,7 @@ enum CanvasPathCommand {
         line_width: f64,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
+        shadow: Option<CanvasShadow>,
     },
 }
 
@@ -7517,6 +7750,8 @@ struct CanvasDrawImageRequest {
     height: Option<f64>,
     #[serde(default)]
     composite: CanvasCompositeOperation,
+    #[serde(default)]
+    shadow: Option<CanvasShadowStyle>,
 }
 
 fn quadratic_bezier(t: f32, p0: i32, p1: i32, p2: i32) -> i32 {
@@ -7625,6 +7860,10 @@ fn op_canvas_draw_image(
         .entry(canvas_node_idx)
         .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
     canvas.resize_if_needed(canvas_width, canvas_height);
+    let shadow = match request.shadow {
+        Some(shadow) => parse_canvas_shadow(shadow)?,
+        None => None,
+    };
     canvas.commands.push(CanvasPathCommand::DrawImage {
         image_node_idx,
         image_width: input_width,
@@ -7632,6 +7871,7 @@ fn op_canvas_draw_image(
         x: request.x.round() as i32,
         y: request.y.round() as i32,
         composite: request.composite,
+        shadow,
     });
 
     Ok(true)
@@ -7903,11 +8143,16 @@ fn op_canvas_draw_image_bitmap(
         .entry(canvas_node_idx)
         .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
     canvas.resize_if_needed(canvas_width, canvas_height);
+    let shadow = match request.shadow {
+        Some(shadow) => parse_canvas_shadow(shadow)?,
+        None => None,
+    };
     canvas.commands.push(CanvasPathCommand::DrawImageBitmap {
         image,
         x: request.x.round() as i32,
         y: request.y.round() as i32,
         composite: request.composite,
+        shadow,
     });
     Ok(true)
 }
@@ -7921,8 +8166,10 @@ fn op_canvas_path_stroke(
     line_width: f64,
     #[serde] stroke_style: CanvasStyle,
     #[serde] composite: CanvasCompositeOperation,
+    #[serde] shadow: CanvasShadowStyle,
 ) -> Result<(), JsErrorBox> {
     let paint = parse_canvas_paint(stroke_style, "Unsupported canvas strokeStyle")?;
+    let shadow = parse_canvas_shadow(shadow)?;
 
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
@@ -7943,11 +8190,13 @@ fn op_canvas_path_stroke(
             line_width,
             paint,
             composite,
+            shadow,
         }),
         None => canvas.commands.push(CanvasPathCommand::Stroke {
             line_width,
             paint,
             composite,
+            shadow,
         }),
     }
 
@@ -7965,11 +8214,13 @@ fn op_canvas_fill_rect(
     height: f64,
     #[serde] fill_style: CanvasStyle,
     #[serde] composite: CanvasCompositeOperation,
+    #[serde] shadow: CanvasShadowStyle,
 ) -> Result<(), JsErrorBox> {
     if ![x, y, width, height].iter().all(|value| value.is_finite()) {
         return Ok(());
     }
     let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
+    let shadow = parse_canvas_shadow(shadow)?;
 
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
@@ -7990,6 +8241,7 @@ fn op_canvas_fill_rect(
         height: height.round().max(0.0) as u32,
         paint,
         composite,
+        shadow,
     });
 
     Ok(())
@@ -8004,8 +8256,10 @@ fn op_canvas_path_fill(
     #[serde] fill_style: CanvasStyle,
     #[serde] fill_rule: CanvasFillRule,
     #[serde] composite: CanvasCompositeOperation,
+    #[serde] shadow: CanvasShadowStyle,
 ) -> Result<(), JsErrorBox> {
     let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
+    let shadow = parse_canvas_shadow(shadow)?;
 
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
@@ -8026,11 +8280,13 @@ fn op_canvas_path_fill(
             paint,
             fill_rule,
             composite,
+            shadow,
         }),
         None => canvas.commands.push(CanvasPathCommand::Fill {
             paint,
             fill_rule,
             composite,
+            shadow,
         }),
     }
 
@@ -8310,11 +8566,13 @@ fn op_canvas_fill_text(
     #[string] text_align: String,
     #[string] text_baseline: String,
     #[serde] composite: CanvasCompositeOperation,
+    #[serde] shadow: CanvasShadowStyle,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
     }
     let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
+    let shadow = parse_canvas_shadow(shadow)?;
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
@@ -8350,6 +8608,7 @@ fn op_canvas_fill_text(
         y: (y - f64::from(baseline)).round() as i32,
         paint,
         composite,
+        shadow,
     });
     Ok(true)
 }
@@ -8368,6 +8627,7 @@ fn op_canvas_stroke_text(
     #[string] text_align: String,
     #[string] text_baseline: String,
     #[serde] composite: CanvasCompositeOperation,
+    #[serde] shadow: CanvasShadowStyle,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite()
         || !y.is_finite()
@@ -8379,6 +8639,7 @@ fn op_canvas_stroke_text(
         return Ok(false);
     }
     let paint = parse_canvas_paint(stroke_style, "Unsupported canvas strokeStyle")?;
+    let shadow = parse_canvas_shadow(shadow)?;
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let (Some(width), Some(height)) = get_canvas_wh(renderer.nodes.get(node_idx).unwrap()) else {
@@ -8409,6 +8670,7 @@ fn op_canvas_stroke_text(
         line_width,
         paint,
         composite,
+        shadow,
     });
     Ok(true)
 }
@@ -17729,7 +17991,7 @@ pub fn run() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pixel/browser/pages/dom-parser.html".to_string(),
+        "file:///home/pixel/browser/pages/canvas-shadow.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
