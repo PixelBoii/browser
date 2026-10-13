@@ -1487,6 +1487,82 @@ fn parse_hsl_color(raw: &str) -> Result<StyleBackground> {
     ))))
 }
 
+// sRGB and Display P3 share a transfer function and white point, so
+// converting between them is a matrix in linear light. Both matrices are
+// the combined forms from
+// https://www.w3.org/TR/css-color-4/#color-conversion-code
+fn srgb_to_linear(channel: f64) -> f64 {
+    if channel.abs() <= 0.04045 {
+        channel / 12.92
+    } else {
+        channel.signum() * ((channel.abs() + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(channel: f64) -> f64 {
+    let channel = channel.clamp(0.0, 1.0);
+    if channel <= 0.0031308 {
+        channel * 12.92
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+pub(crate) fn srgb_to_display_p3(rgb: [f64; 3]) -> [f64; 3] {
+    let [r, g, b] = rgb.map(srgb_to_linear);
+    [
+        0.8224619687143623 * r + 0.17753803128563775 * g,
+        0.03319419885096162 * r + 0.9668058011490384 * g,
+        0.017082630721120033 * r + 0.07239744066396347 * g + 0.9105199286149165 * b,
+    ]
+    .map(linear_to_srgb)
+}
+
+fn display_p3_to_srgb(rgb: [f64; 3]) -> [f64; 3] {
+    let [r, g, b] = rgb.map(srgb_to_linear);
+    [
+        1.2249401762805598 * r - 0.22494017628055996 * g,
+        -0.04205685643863739 * r + 1.0420568564386376 * g,
+        -0.01963755459033415 * r - 0.07863584714693135 * g + 1.0982734017372655 * b,
+    ]
+    .map(linear_to_srgb)
+}
+
+// Parses a color() function. Only display-p3 is supported so far; other
+// spaces are an error, and new ones can dispatch here.
+// Components are converted to sRGB, which is what the renderer stores, so
+// colors outside the sRGB gamut are clipped channel by channel.
+fn parse_color_function(raw: &str) -> Result<StyleBackground> {
+    let cleaned = raw.strip_suffix(')').unwrap_or(raw).trim();
+    let Some(channels) = cleaned.strip_prefix("display-p3") else {
+        return Err(anyhow!("Unsupported color() space: {}", cleaned));
+    };
+    let (channels, alpha) = match channels.split_once('/') {
+        Some((channels, alpha)) => (channels.trim(), Some(alpha.trim())),
+        None => (channels.trim(), None),
+    };
+    let parts: Vec<&str> = channels.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Err(anyhow!("Invalid display-p3 color: {}", raw));
+    }
+    let mut p3 = [0.0f32; 3];
+    for (channel, part) in p3.iter_mut().zip(&parts) {
+        *channel = if *part == "none" {
+            0.0
+        } else if part.ends_with('%') {
+            parse_percent(part)?
+        } else {
+            part.parse::<f32>()?
+        };
+    }
+    let alpha = alpha.map(parse_alpha).transpose()?.unwrap_or(255);
+
+    let srgb = display_p3_to_srgb(p3.map(f64::from)).map(|channel| (channel * 255.0).round() as u8);
+    Ok(StyleBackground::Hex(rgba_to_hex((
+        srgb[0], srgb[1], srgb[2], alpha,
+    ))))
+}
+
 // TODO: Come back to this and add a more complete implementation
 fn parse_color_mix(raw: &str) -> Result<StyleBackground> {
     let cleaned = raw.strip_suffix(')').unwrap_or(raw).trim();
@@ -1588,6 +1664,8 @@ pub(crate) fn parse_color(value: String) -> Result<StyleBackground> {
         Ok(StyleBackground::Hex(hex))
     } else if let Some(raw) = value.strip_prefix("hsla(").or(value.strip_prefix("hsl(")) {
         parse_hsl_color(raw)
+    } else if let Some(raw) = value.strip_prefix("color(") {
+        parse_color_function(raw)
     } else if let Some(raw) = value.strip_prefix("color-mix(") {
         parse_color_mix(raw)
     } else {

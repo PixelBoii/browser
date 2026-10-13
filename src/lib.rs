@@ -7934,32 +7934,6 @@ fn op_canvas_stroke_text(
     Ok(true)
 }
 
-fn srgb_to_display_p3(rgb: [f64; 3]) -> [f64; 3] {
-    let [r, g, b] = rgb.map(|channel| {
-        if channel <= 0.04045 {
-            channel / 12.92
-        } else {
-            ((channel + 0.055) / 1.055).powf(2.4)
-        }
-    });
-    // Combined linear sRGB -> XYZ D65 -> linear Display P3 matrix from
-    // https://www.w3.org/TR/css-color-4/#color-conversion-code
-    let linear = [
-        0.8224619687143623 * r + 0.17753803128563775 * g,
-        0.03319419885096162 * r + 0.9668058011490384 * g,
-        0.017082630721120033 * r + 0.07239744066396347 * g + 0.9105199286149165 * b,
-    ];
-    linear.map(|channel| {
-        // sRGB is inside the P3 gamut; clamp only floating-point roundoff.
-        let channel = channel.clamp(0.0, 1.0);
-        if channel <= 0.0031308 {
-            channel * 12.92
-        } else {
-            1.055 * channel.powf(1.0 / 2.4) - 0.055
-        }
-    })
-}
-
 #[op2]
 fn op_canvas_get_image_data(
     scope: &mut v8::PinScope,
@@ -8021,7 +7995,7 @@ fn op_canvas_get_image_data(
             let mut channels = [unpremultiply(r), unpremultiply(g), unpremultiply(b), a]
                 .map(|channel| f64::from(channel) / 255.0);
             if let CanvasColorSpace::DisplayP3 = color_space {
-                let rgb = srgb_to_display_p3([channels[0], channels[1], channels[2]]);
+                let rgb = style::srgb_to_display_p3([channels[0], channels[1], channels[2]]);
                 channels[..3].copy_from_slice(&rgb);
             }
             match pixel_format {
