@@ -663,14 +663,10 @@ impl CanvasBuffer {
         if self.opaque { 0x00_00_00_FF } else { 0 }
     }
 
-    fn resize_if_needed(&mut self, width: u32, height: u32) {
-        if self.width == width
-            && self.height == height
-            && self.buffer.len() == width as usize * height as usize
-        {
-            return;
-        }
-
+    // Clears the bitmap and all drawing state at the given size. This is
+    // also what setting the canvas width/height attributes does, even when
+    // the size itself does not change.
+    fn reset(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
         self.buffer = vec![self.initial_pixel(); width as usize * height as usize];
@@ -679,6 +675,17 @@ impl CanvasBuffer {
         self.state = CanvasState::default();
         self.state_stack.clear();
         self.dirty = true;
+    }
+
+    fn resize_if_needed(&mut self, width: u32, height: u32) {
+        if self.width == width
+            && self.height == height
+            && self.buffer.len() == width as usize * height as usize
+        {
+            return;
+        }
+
+        self.reset(width, height);
     }
 
     fn update_if_needed(&mut self) {
@@ -8788,6 +8795,29 @@ fn op_canvas_paint(
 }
 
 #[op2(fast)]
+fn op_canvas_reset(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> Result<(), JsErrorBox> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let (Some(width), Some(height)) = renderer
+        .nodes
+        .get(node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return Ok(());
+    };
+    if let Some(canvas) = renderer.canvas_buffers.get_mut(&node_idx) {
+        canvas.reset(width, height);
+        renderer.schedule_canvas_update();
+    }
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_canvas_set_opaque(
     scope: &mut v8::PinScope,
     document: v8::Local<v8::Object>,
@@ -9138,6 +9168,7 @@ extension!(
     op_canvas_path_fill,
     op_canvas_path_clip,
     op_canvas_paint,
+    op_canvas_reset,
     op_canvas_set_opaque,
     op_canvas_get_image_data,
     op_canvas_fill_text,

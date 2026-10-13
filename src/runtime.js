@@ -1403,6 +1403,13 @@ class CanvasRenderingContext2D {
         if (token !== canvasRenderingContext2DToken) throw new TypeError("Illegal constructor")
         this.canvas = canvas
         this.__settings = settings
+        this.__stateStack = []
+        this.__resetState()
+    }
+
+    // The full drawing state, back to its initial values. Used by the
+    // constructor and when the canvas bitmap is reset.
+    __resetState() {
         this.lineWidth = 1
         this.fillStyle = "#000000"
         this.strokeStyle = "#000000"
@@ -1412,6 +1419,7 @@ class CanvasRenderingContext2D {
         this.font = "10px sans-serif"
         this.textAlign = "start"
         this.textBaseline = "alphabetic"
+        this.__stateStack = []
     }
 
     get globalCompositeOperation() {
@@ -1544,12 +1552,34 @@ class CanvasRenderingContext2D {
     }
 
     save() {
+        this.__stateStack.push({
+            lineWidth: this.lineWidth,
+            fillStyle: this.fillStyle,
+            strokeStyle: this.strokeStyle,
+            compositeOperation: this.__compositeOperation,
+            shadowColor: this.shadowColor,
+            shadowBlur: this.__shadowBlur,
+            font: this.font,
+            textAlign: this.textAlign,
+            textBaseline: this.textBaseline,
+        })
         core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_SAVE
         })
     }
 
     restore() {
+        const state = this.__stateStack.pop()
+        if (!state) return
+        this.lineWidth = state.lineWidth
+        this.fillStyle = state.fillStyle
+        this.strokeStyle = state.strokeStyle
+        this.__compositeOperation = state.compositeOperation
+        this.shadowColor = state.shadowColor
+        this.__shadowBlur = state.shadowBlur
+        this.font = state.font
+        this.textAlign = state.textAlign
+        this.textBaseline = state.textBaseline
         core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_RESTORE
         })
@@ -1829,6 +1859,21 @@ class HtmlCanvasElement extends HtmlElement {
         super(tag)
 
         this.__contexts = {}
+    }
+
+    // Setting the width or height content attribute (including through
+    // the width/height properties, which delegate here) resets the bitmap
+    // and every context's drawing state, even when the value is unchanged.
+    setAttribute(name, value) {
+        super.setAttribute(name, value)
+        if (name === "width" || name === "height") {
+            for (const context of Object.values(this.__contexts)) {
+                context.__resetState()
+            }
+            if (this.__node_idx != null) {
+                core.ops.op_canvas_reset(this.ownerDocument, this.__node_idx)
+            }
+        }
     }
 
     getContext(type, options = {}) {
