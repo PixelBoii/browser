@@ -843,6 +843,12 @@ impl CanvasBuffer {
                         CanvasPathCommand::FillText { image, .. } => Some(image),
                         _ => unreachable!(),
                     };
+                    // FillText images are white glyph coverage; their paint
+                    // supplies the actual color at each pixel.
+                    let fill_text_paint = match &cmd {
+                        CanvasPathCommand::FillText { paint, .. } => Some(paint),
+                        _ => None,
+                    };
                     if let Some(image) = image {
                         let image_width = image.width() as usize;
                         let image_height = image.height() as usize;
@@ -934,12 +940,29 @@ impl CanvasBuffer {
                                 let source = pixels[source_y * image_width + source_x];
                                 let destination_idx =
                                     destination_y as usize * canvas_width + destination_x as usize;
+                                let (source, coverage) = match fill_text_paint {
+                                    Some(paint) => (
+                                        rgba_to_premul_tuple(
+                                            paint.color_at(user_point[0], user_point[1]),
+                                        ),
+                                        source.alpha(),
+                                    ),
+                                    None => (
+                                        (
+                                            source.red(),
+                                            source.green(),
+                                            source.blue(),
+                                            source.alpha(),
+                                        ),
+                                        u8::MAX,
+                                    ),
+                                };
                                 blend_canvas_pixel(
                                     &mut self.buffer,
                                     self.state.clip_mask.as_deref(),
                                     destination_idx,
-                                    (source.red(), source.green(), source.blue(), source.alpha()),
-                                    u8::MAX,
+                                    source,
+                                    coverage,
                                 );
                             }
                         }
@@ -963,16 +986,11 @@ impl CanvasBuffer {
                 CanvasPathCommand::StrokeText {
                     path,
                     line_width,
-                    color,
+                    paint,
                 } => {
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(
-                        &path,
-                        line_width,
-                        &transform,
-                        &CanvasPaint::Solid(color),
-                    )
-                    .unwrap();
+                    self.apply_stroke(&path, line_width, &transform, &paint)
+                        .unwrap();
                 }
                 CanvasPathCommand::Fill { paint, fill_rule } => {
                     let current_path = self.current_path.clone();
@@ -7217,12 +7235,13 @@ enum CanvasPathCommand {
         image: Pixmap,
         x: i32,
         y: i32,
+        paint: CanvasPaint,
     },
     #[serde(skip)]
     StrokeText {
         path: Vec<CanvasPathCommand>,
         line_width: f64,
-        color: u32,
+        paint: CanvasPaint,
     },
 }
 
@@ -8062,7 +8081,7 @@ fn canvas_text_origin(
     (x, y)
 }
 
-#[op2(fast)]
+#[op2]
 fn op_canvas_fill_text(
     scope: &mut v8::PinScope,
     document: v8::Local<v8::Object>,
@@ -8071,19 +8090,14 @@ fn op_canvas_fill_text(
     x: f64,
     y: f64,
     font_size: f64,
-    #[string] fill_style: String,
+    #[serde] fill_style: CanvasStyle,
     #[string] text_align: String,
     #[string] text_baseline: String,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
     }
-    let color =
-        match style::parse_color(fill_style).map_err(|err| JsErrorBox::generic(err.to_string()))? {
-            StyleBackground::Hex(color) => color,
-            StyleBackground::Transparent => 0,
-            _ => return Err(JsErrorBox::generic("Unsupported canvas fillStyle")),
-        };
+    let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
@@ -8101,7 +8115,10 @@ fn op_canvas_fill_text(
         &text_align,
         &text_baseline,
     );
-    let Some((image, _, _)) = text_to_buffer(&renderer.font_handler, color, &text, font_px, None)
+    // Rasterize in white: only the glyph coverage is used, and the paint
+    // supplies the color when the image is drawn.
+    let Some((image, _, _)) =
+        text_to_buffer(&renderer.font_handler, 0xFF_FF_FF_FF, &text, font_px, None)
     else {
         return Ok(false);
     };
@@ -8114,11 +8131,12 @@ fn op_canvas_fill_text(
         image,
         x: x.round() as i32,
         y: (y - f64::from(baseline)).round() as i32,
+        paint,
     });
     Ok(true)
 }
 
-#[op2(fast)]
+#[op2]
 fn op_canvas_stroke_text(
     scope: &mut v8::PinScope,
     document: v8::Local<v8::Object>,
@@ -8128,7 +8146,7 @@ fn op_canvas_stroke_text(
     y: f64,
     font_size: f64,
     line_width: f64,
-    #[string] stroke_style: String,
+    #[serde] stroke_style: CanvasStyle,
     #[string] text_align: String,
     #[string] text_baseline: String,
 ) -> Result<bool, JsErrorBox> {
@@ -8141,13 +8159,7 @@ fn op_canvas_stroke_text(
     {
         return Ok(false);
     }
-    let color = match style::parse_color(stroke_style)
-        .map_err(|err| JsErrorBox::generic(err.to_string()))?
-    {
-        StyleBackground::Hex(color) => color,
-        StyleBackground::Transparent => 0,
-        _ => return Err(JsErrorBox::generic("Unsupported canvas strokeStyle")),
-    };
+    let paint = parse_canvas_paint(stroke_style, "Unsupported canvas strokeStyle")?;
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let (Some(width), Some(height)) = get_canvas_wh(renderer.nodes.get(node_idx).unwrap()) else {
@@ -8176,7 +8188,7 @@ fn op_canvas_stroke_text(
     canvas.commands.push(CanvasPathCommand::StrokeText {
         path,
         line_width,
-        color,
+        paint,
     });
     Ok(true)
 }

@@ -1436,7 +1436,7 @@ class CanvasRenderingContext2D {
         webidl.requiredArguments(arguments.length, 3, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
-        const fillStyle = typeof this.fillStyle === "string" ? this.fillStyle : "#000000"
+        const fillStyle = canvasStyle(this.fillStyle)
         if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle, this.textAlign, this.textBaseline)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
@@ -1447,7 +1447,7 @@ class CanvasRenderingContext2D {
         webidl.requiredArguments(arguments.length, 3, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
-        const strokeStyle = typeof this.strokeStyle === "string" ? this.strokeStyle : "#000000"
+        const strokeStyle = canvasStyle(this.strokeStyle)
         if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
