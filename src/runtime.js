@@ -1327,7 +1327,6 @@ const CANVAS_COMMAND_MOVE_TO = "moveTo"
 const CANVAS_COMMAND_CLOSE = "close"
 const CANVAS_COMMAND_BEZIER_CURVE = "bezierCurve"
 const CANVAS_COMMAND_QUADRATIC_CURVE = "quadraticCurve"
-const CANVAS_COMMAND_STROKE_RECT = "strokeRect"
 const CANVAS_COMMAND_TRANSFORM = "transform"
 const CANVAS_COMMAND_RESET_TRANSFORM = "resetTransform"
 const CANVAS_COMMAND_SAVE = "save"
@@ -1501,15 +1500,20 @@ class CanvasRenderingContext2D {
     }
 
     strokeRect(x, y, width, height) {
-        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
-            type: CANVAS_COMMAND_STROKE_RECT,
-            x,
-            y,
-            width,
-            height,
-            line_width: this.lineWidth
-        })
-        core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
+        x = +x
+        y = +y
+        width = +width
+        height = +height
+        if (![x, y, width, height].every(Number.isFinite)) return
+        const path = new Path2D()
+        // stroke() takes the line width from the supplied path.
+        path.lineWidth = this.lineWidth
+        path.moveTo(x, y)
+        path.lineTo(x + width, y)
+        path.lineTo(x + width, y + height)
+        path.lineTo(x, y + height)
+        path.closePath()
+        this.stroke(path)
     }
 
     clearRect(x, y, width, height) {

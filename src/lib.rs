@@ -888,37 +888,6 @@ impl CanvasBuffer {
                 } => {
                     self.fill_rect(x, y, width, height, &paint, composite);
                 }
-                CanvasPathCommand::StrokeRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    line_width,
-                } => {
-                    // strokeRect still paints hardcoded black bars; it only
-                    // gains the signature's SourceOver argument here.
-                    let black = CanvasPaint::Solid(0x00_00_00_FF);
-                    let composite = CanvasCompositeOperation::SourceOver;
-                    let line_width = line_width as u32;
-                    self.fill_rect(x, y, line_width, height, &black, composite); // Left
-                    self.fill_rect(x, y, width, line_width, &black, composite); // Top
-                    self.fill_rect(
-                        x + width as i32 - line_width as i32,
-                        y,
-                        line_width,
-                        height,
-                        &black,
-                        composite,
-                    ); // Right
-                    self.fill_rect(
-                        x,
-                        y + height as i32 - line_width as i32,
-                        width,
-                        line_width,
-                        &black,
-                        composite,
-                    ); // Bottom
-                }
                 CanvasPathCommand::ClearRect {
                     x,
                     y,
@@ -7432,13 +7401,6 @@ enum CanvasPathCommand {
         height: u32,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
-    },
-    StrokeRect {
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        line_width: f64,
     },
     Transform {
         matrix: Matrixf32,
