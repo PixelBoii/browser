@@ -736,6 +736,7 @@ impl CanvasBuffer {
         height: u32,
         paint: &CanvasPaint,
         composite: CanvasCompositeOperation,
+        filter: CanvasFilter,
     ) {
         if let Some(transform) = self.state.transform.clone() {
             // Paint the device pixels whose centers fall inside the rect
@@ -790,7 +791,9 @@ impl CanvasBuffer {
                     {
                         continue;
                     }
-                    let source = rgba_to_premul_tuple(paint.color_at(user_point[0], user_point[1]));
+                    let source = filter.apply(rgba_to_premul_tuple(
+                        paint.color_at(user_point[0], user_point[1]),
+                    ));
                     let pixel_idx = py as usize * self.width as usize + px as usize;
                     blend_canvas_pixel(
                         &mut self.buffer,
@@ -809,7 +812,9 @@ impl CanvasBuffer {
         for py in start_y..end_y {
             for px in start_x..end_x {
                 let pixel_idx = py * stride + px;
-                let source = rgba_to_premul_tuple(paint.color_at(px as f64 + 0.5, py as f64 + 0.5));
+                let source = filter.apply(rgba_to_premul_tuple(
+                    paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
+                ));
                 blend_canvas_pixel(
                     &mut self.buffer,
                     self.state.clip_mask.as_deref(),
@@ -831,6 +836,7 @@ impl CanvasBuffer {
                 height,
                 &CanvasPaint::Solid(0x00_00_00_FF),
                 CanvasCompositeOperation::SourceOver,
+                CanvasFilter::None,
             );
             return;
         }
@@ -893,9 +899,10 @@ impl CanvasBuffer {
                     paint,
                     composite,
                     shadow,
+                    filter,
                 } => {
                     self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
-                        buf.fill_rect(x, y, width, height, paint, composite);
+                        buf.fill_rect(x, y, width, height, paint, composite, filter);
                     });
                 }
                 CanvasPathCommand::ClearRect {
@@ -938,6 +945,12 @@ impl CanvasBuffer {
                         CanvasPathCommand::DrawImage { shadow, .. }
                         | CanvasPathCommand::DrawImageBitmap { shadow, .. }
                         | CanvasPathCommand::FillText { shadow, .. } => *shadow,
+                        _ => unreachable!(),
+                    };
+                    let filter = match &cmd {
+                        CanvasPathCommand::DrawImage { filter, .. }
+                        | CanvasPathCommand::DrawImageBitmap { filter, .. }
+                        | CanvasPathCommand::FillText { filter, .. } => *filter,
                         _ => unreachable!(),
                     };
                     if let Some(image) = image {
@@ -1125,18 +1138,18 @@ impl CanvasBuffer {
                                 let source = pixels[source_y * image_width + source_x];
                                 let (source, coverage) = match fill_text_paint {
                                     Some(paint) => (
-                                        rgba_to_premul_tuple(
+                                        filter.apply(rgba_to_premul_tuple(
                                             paint.color_at(user_point[0], user_point[1]),
-                                        ),
+                                        )),
                                         source.alpha(),
                                     ),
                                     None => (
-                                        (
+                                        filter.apply((
                                             source.red(),
                                             source.green(),
                                             source.blue(),
                                             source.alpha(),
-                                        ),
+                                        )),
                                         u8::MAX,
                                     ),
                                 };
@@ -1161,12 +1174,20 @@ impl CanvasBuffer {
                     paint,
                     composite,
                     shadow,
+                    filter,
                 } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
                     self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
-                        buf.apply_stroke(&current_path, line_width, &transform, paint, composite)
-                            .unwrap();
+                        buf.apply_stroke(
+                            &current_path,
+                            line_width,
+                            &transform,
+                            paint,
+                            composite,
+                            filter,
+                        )
+                        .unwrap();
                     });
                 }
                 CanvasPathCommand::StrokePath {
@@ -1175,10 +1196,11 @@ impl CanvasBuffer {
                     paint,
                     composite,
                     shadow,
+                    filter,
                 } => {
                     let transform = self.state.transform.clone();
                     self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
-                        buf.apply_stroke(&path, line_width, &transform, paint, composite)
+                        buf.apply_stroke(&path, line_width, &transform, paint, composite, filter)
                             .unwrap();
                     });
                 }
@@ -1188,10 +1210,11 @@ impl CanvasBuffer {
                     paint,
                     composite,
                     shadow,
+                    filter,
                 } => {
                     let transform = self.state.transform.clone();
                     self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
-                        buf.apply_stroke(&path, line_width, &transform, paint, composite)
+                        buf.apply_stroke(&path, line_width, &transform, paint, composite, filter)
                             .unwrap();
                     });
                 }
@@ -1200,12 +1223,20 @@ impl CanvasBuffer {
                     fill_rule,
                     composite,
                     shadow,
+                    filter,
                 } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
                     self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
-                        buf.apply_fill(&current_path, &transform, paint, &fill_rule, composite)
-                            .unwrap();
+                        buf.apply_fill(
+                            &current_path,
+                            &transform,
+                            paint,
+                            &fill_rule,
+                            composite,
+                            filter,
+                        )
+                        .unwrap();
                     });
                 }
                 CanvasPathCommand::FillPath {
@@ -1214,10 +1245,11 @@ impl CanvasBuffer {
                     fill_rule,
                     composite,
                     shadow,
+                    filter,
                 } => {
                     let transform = self.state.transform.clone();
                     self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
-                        buf.apply_fill(&path, &transform, paint, &fill_rule, composite)
+                        buf.apply_fill(&path, &transform, paint, &fill_rule, composite, filter)
                             .unwrap();
                     });
                 }
@@ -1240,21 +1272,22 @@ impl CanvasBuffer {
     fn paint_source(
         &self,
         paint: &CanvasPaint,
+        filter: CanvasFilter,
         inverse_transform: &Option<Matrixf32>,
         x: f64,
         y: f64,
     ) -> Result<(u8, u8, u8, u8)> {
         // Solid paint is the same everywhere, so skip the inverse mapping.
         if let CanvasPaint::Solid(color) = paint {
-            return Ok(rgba_to_premul_tuple(*color));
+            return Ok(filter.apply(rgba_to_premul_tuple(*color)));
         }
         let user_point = match inverse_transform {
             Some(inverse) => self.compute_point_transform(&[x, y], inverse)?,
             None => [x, y],
         };
-        Ok(rgba_to_premul_tuple(
+        Ok(filter.apply(rgba_to_premul_tuple(
             paint.color_at(user_point[0], user_point[1]),
-        ))
+        )))
     }
 
     fn shadow_scratch(&self) -> CanvasBuffer {
@@ -1629,6 +1662,7 @@ impl CanvasBuffer {
         paint: &CanvasPaint,
         fill_rule: &CanvasFillRule,
         composite: CanvasCompositeOperation,
+        filter: CanvasFilter,
     ) -> Result<()> {
         let spans = self.rasterize_path_spans(queued_commands, transform, fill_rule)?;
         // Only gradient paint is sampled per user-space point.
@@ -1642,6 +1676,7 @@ impl CanvasBuffer {
             for x in span.start_x..span.end_x {
                 let source = self.paint_source(
                     paint,
+                    filter,
                     &inverse_transform,
                     x as f64 + 0.5,
                     span.y as f64 + 0.5,
@@ -1689,6 +1724,7 @@ impl CanvasBuffer {
         transform: &Option<Matrixf32>,
         paint: &CanvasPaint,
         composite: CanvasCompositeOperation,
+        filter: CanvasFilter,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
@@ -1743,6 +1779,7 @@ impl CanvasBuffer {
                                         as i32;
                                     let source = self.paint_source(
                                         paint,
+                                        filter,
                                         &inverse_transform,
                                         px as f64 + 0.5,
                                         py as f64 + 0.5,
@@ -1782,6 +1819,7 @@ impl CanvasBuffer {
                                 let (px, py) = (x + wxidx, y + wyidx);
                                 let source = self.paint_source(
                                     paint,
+                                    filter,
                                     &inverse_transform,
                                     px as f64 + 0.5,
                                     py as f64 + 0.5,
@@ -1834,6 +1872,7 @@ impl CanvasBuffer {
                                 let (px, py) = (x + wxidx, y + wyidx);
                                 let source = self.paint_source(
                                     paint,
+                                    filter,
                                     &inverse_transform,
                                     px as f64 + 0.5,
                                     py as f64 + 0.5,
@@ -1893,6 +1932,7 @@ impl CanvasBuffer {
                                             as i32;
                                         let source = self.paint_source(
                                             paint,
+                                            filter,
                                             &inverse_transform,
                                             px as f64 + 0.5,
                                             py as f64 + 0.5,
@@ -1925,6 +1965,7 @@ impl CanvasBuffer {
                                     let (px, py) = (x + wxidx, y + wyidx);
                                     let source = self.paint_source(
                                         paint,
+                                        filter,
                                         &inverse_transform,
                                         px as f64 + 0.5,
                                         py as f64 + 0.5,
@@ -7380,6 +7421,63 @@ enum CanvasCompositeOperation {
     Multiply,
 }
 
+// The supported canvas filters. Any other filter value is ignored when
+// the property is set, so it never reaches Rust.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+enum CanvasFilter {
+    #[default]
+    None,
+    Grayscale(f64),
+}
+
+impl CanvasFilter {
+    // Grayscale works on premultiplied channels just as well: scaling
+    // every channel by the alpha scales the luminance by it too.
+    fn apply(self, source: (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
+        let CanvasFilter::Grayscale(amount) = self else {
+            return source;
+        };
+        let gray = 0.2126 * f64::from(source.0)
+            + 0.7152 * f64::from(source.1)
+            + 0.0722 * f64::from(source.2);
+        let mix = |channel: u8| {
+            (f64::from(channel) + (gray - f64::from(channel)) * amount).round() as u8
+        };
+        (mix(source.0), mix(source.1), mix(source.2), source.3)
+    }
+}
+
+fn parse_canvas_filter(filter: &str) -> CanvasFilter {
+    let filter = filter.trim().to_ascii_lowercase();
+    if filter == "none" {
+        return CanvasFilter::None;
+    }
+    let Some(amount) = filter
+        .strip_prefix("grayscale(")
+        .and_then(|filter| filter.strip_suffix(')'))
+    else {
+        return CanvasFilter::None;
+    };
+    let amount = amount.trim();
+    let amount = if amount.is_empty() {
+        1.0
+    } else if let Some(percent) = amount.strip_suffix('%') {
+        match percent.trim().parse::<f64>() {
+            Ok(amount) => amount / 100.0,
+            Err(_) => return CanvasFilter::None,
+        }
+    } else {
+        match amount.parse::<f64>() {
+            Ok(amount) => amount,
+            Err(_) => return CanvasFilter::None,
+        }
+    };
+    if !amount.is_finite() || amount < 0.0 {
+        return CanvasFilter::None;
+    }
+    CanvasFilter::Grayscale(amount.clamp(0.0, 1.0))
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum CanvasPixelFormat {
@@ -7658,12 +7756,14 @@ enum CanvasPathCommand {
         fill_rule: CanvasFillRule,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     Stroke {
         line_width: f64,
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     StrokePath {
         path: Vec<CanvasPathCommand>,
@@ -7671,6 +7771,7 @@ enum CanvasPathCommand {
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     FillPath {
         path: Vec<CanvasPathCommand>,
@@ -7678,6 +7779,7 @@ enum CanvasPathCommand {
         fill_rule: CanvasFillRule,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     Clip {
         fill_rule: CanvasFillRule,
@@ -7694,6 +7796,7 @@ enum CanvasPathCommand {
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     Transform {
         matrix: Matrixf32,
@@ -7716,6 +7819,7 @@ enum CanvasPathCommand {
         y: i32,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     #[serde(skip)]
     DrawImageBitmap {
@@ -7724,6 +7828,7 @@ enum CanvasPathCommand {
         y: i32,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     #[serde(skip)]
     FillText {
@@ -7733,6 +7838,7 @@ enum CanvasPathCommand {
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
     #[serde(skip)]
     StrokeText {
@@ -7741,6 +7847,7 @@ enum CanvasPathCommand {
         paint: CanvasPaint,
         composite: CanvasCompositeOperation,
         shadow: Option<CanvasShadow>,
+        filter: CanvasFilter,
     },
 }
 
@@ -7816,6 +7923,8 @@ struct CanvasDrawImageRequest {
     composite: CanvasCompositeOperation,
     #[serde(default)]
     shadow: Option<CanvasShadowStyle>,
+    #[serde(default)]
+    filter: String,
 }
 
 fn quadratic_bezier(t: f32, p0: i32, p1: i32, p2: i32) -> i32 {
@@ -7936,6 +8045,7 @@ fn op_canvas_draw_image(
         y: request.y.round() as i32,
         composite: request.composite,
         shadow,
+        filter: parse_canvas_filter(&request.filter),
     });
 
     Ok(true)
@@ -8217,6 +8327,7 @@ fn op_canvas_draw_image_bitmap(
         y: request.y.round() as i32,
         composite: request.composite,
         shadow,
+        filter: parse_canvas_filter(&request.filter),
     });
     Ok(true)
 }
@@ -8231,6 +8342,7 @@ fn op_canvas_path_stroke(
     #[serde] stroke_style: CanvasStyle,
     #[serde] composite: CanvasCompositeOperation,
     #[serde] shadow: CanvasShadowStyle,
+    #[string] filter: String,
 ) -> Result<(), JsErrorBox> {
     let paint = parse_canvas_paint(stroke_style, "Unsupported canvas strokeStyle")?;
     let shadow = parse_canvas_shadow(shadow)?;
@@ -8248,6 +8360,7 @@ fn op_canvas_path_stroke(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
     canvas.resize_if_needed(node_width, node_height);
 
+    let filter = parse_canvas_filter(&filter);
     match path {
         Some(path) => canvas.commands.push(CanvasPathCommand::StrokePath {
             path,
@@ -8255,12 +8368,14 @@ fn op_canvas_path_stroke(
             paint,
             composite,
             shadow,
+            filter,
         }),
         None => canvas.commands.push(CanvasPathCommand::Stroke {
             line_width,
             paint,
             composite,
             shadow,
+            filter,
         }),
     }
 
@@ -8279,6 +8394,7 @@ fn op_canvas_fill_rect(
     #[serde] fill_style: CanvasStyle,
     #[serde] composite: CanvasCompositeOperation,
     #[serde] shadow: CanvasShadowStyle,
+    #[string] filter: String,
 ) -> Result<(), JsErrorBox> {
     if ![x, y, width, height].iter().all(|value| value.is_finite()) {
         return Ok(());
@@ -8306,6 +8422,7 @@ fn op_canvas_fill_rect(
         paint,
         composite,
         shadow,
+        filter: parse_canvas_filter(&filter),
     });
 
     Ok(())
@@ -8321,6 +8438,7 @@ fn op_canvas_path_fill(
     #[serde] fill_rule: CanvasFillRule,
     #[serde] composite: CanvasCompositeOperation,
     #[serde] shadow: CanvasShadowStyle,
+    #[string] filter: String,
 ) -> Result<(), JsErrorBox> {
     let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
     let shadow = parse_canvas_shadow(shadow)?;
@@ -8338,6 +8456,7 @@ fn op_canvas_path_fill(
         .or_insert_with(|| CanvasBuffer::new(node_width, node_height));
     canvas.resize_if_needed(node_width, node_height);
 
+    let filter = parse_canvas_filter(&filter);
     match path {
         Some(path) => canvas.commands.push(CanvasPathCommand::FillPath {
             path,
@@ -8345,12 +8464,14 @@ fn op_canvas_path_fill(
             fill_rule,
             composite,
             shadow,
+            filter,
         }),
         None => canvas.commands.push(CanvasPathCommand::Fill {
             paint,
             fill_rule,
             composite,
             shadow,
+            filter,
         }),
     }
 
@@ -8631,6 +8752,7 @@ fn op_canvas_fill_text(
     #[string] text_baseline: String,
     #[serde] composite: CanvasCompositeOperation,
     #[serde] shadow: CanvasShadowStyle,
+    #[string] filter: String,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
@@ -8673,6 +8795,7 @@ fn op_canvas_fill_text(
         paint,
         composite,
         shadow,
+        filter: parse_canvas_filter(&filter),
     });
     Ok(true)
 }
@@ -8692,6 +8815,7 @@ fn op_canvas_stroke_text(
     #[string] text_baseline: String,
     #[serde] composite: CanvasCompositeOperation,
     #[serde] shadow: CanvasShadowStyle,
+    #[string] filter: String,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite()
         || !y.is_finite()
@@ -8735,6 +8859,7 @@ fn op_canvas_stroke_text(
         paint,
         composite,
         shadow,
+        filter: parse_canvas_filter(&filter),
     });
     Ok(true)
 }

@@ -1414,6 +1414,7 @@ class CanvasRenderingContext2D {
         this.fillStyle = "#000000"
         this.strokeStyle = "#000000"
         this.__compositeOperation = "source-over"
+        this.__filter = "none"
         this.shadowColor = "rgba(0, 0, 0, 0)"
         this.__shadowBlur = 0
         this.font = "10px sans-serif"
@@ -1430,6 +1431,19 @@ class CanvasRenderingContext2D {
         // Unsupported values are ignored, per spec.
         if (value === "source-over" || value === "multiply") {
             this.__compositeOperation = value
+        }
+    }
+
+    get filter() {
+        return this.__filter
+    }
+
+    set filter(value) {
+        // Only "none" and grayscale() are supported; unsupported or
+        // invalid values are ignored, per spec.
+        const filter = String(value).trim()
+        if (filter.toLowerCase() === "none" || /^grayscale\(\s*(\d+(?:\.\d+)?|\.\d+)?\s*%?\s*\)$/i.test(filter)) {
+            this.__filter = filter
         }
     }
 
@@ -1474,7 +1488,7 @@ class CanvasRenderingContext2D {
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const fillStyle = canvasStyle(this.fillStyle)
-        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this))) {
+        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this), this.filter)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
@@ -1485,7 +1499,7 @@ class CanvasRenderingContext2D {
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const strokeStyle = canvasStyle(this.strokeStyle)
-        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this))) {
+        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this), this.filter)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
@@ -1521,7 +1535,7 @@ class CanvasRenderingContext2D {
     }
 
     fillRect(x, y, width, height) {
-        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, canvasStyle(this.fillStyle), this.globalCompositeOperation, canvasShadow(this))
+        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, canvasStyle(this.fillStyle), this.globalCompositeOperation, canvasShadow(this), this.filter)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
@@ -1557,6 +1571,7 @@ class CanvasRenderingContext2D {
             fillStyle: this.fillStyle,
             strokeStyle: this.strokeStyle,
             compositeOperation: this.__compositeOperation,
+            filter: this.__filter,
             shadowColor: this.shadowColor,
             shadowBlur: this.__shadowBlur,
             font: this.font,
@@ -1575,6 +1590,7 @@ class CanvasRenderingContext2D {
         this.fillStyle = state.fillStyle
         this.strokeStyle = state.strokeStyle
         this.__compositeOperation = state.compositeOperation
+        this.__filter = state.filter
         this.shadowColor = state.shadowColor
         this.__shadowBlur = state.shadowBlur
         this.font = state.font
@@ -1644,13 +1660,13 @@ class CanvasRenderingContext2D {
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__bitmapId,
-                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this) },
+                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
             ) :
             core.ops.op_canvas_draw_image(
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__node_idx,
-                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this) },
+                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
             )
         if (queued) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
@@ -1734,7 +1750,7 @@ class CanvasRenderingContext2D {
         const lineWidth = this.lineWidth
         const strokeStyle = canvasStyle(this.strokeStyle)
 
-        core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle, this.globalCompositeOperation, canvasShadow(this))
+        core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle, this.globalCompositeOperation, canvasShadow(this), this.filter)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
@@ -1753,7 +1769,7 @@ class CanvasRenderingContext2D {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const fillStyle = canvasStyle(this.fillStyle)
 
-        core.ops.op_canvas_path_fill(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillStyle, fillRule, this.globalCompositeOperation, canvasShadow(this))
+        core.ops.op_canvas_path_fill(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillStyle, fillRule, this.globalCompositeOperation, canvasShadow(this), this.filter)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
