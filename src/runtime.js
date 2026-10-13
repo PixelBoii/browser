@@ -1403,9 +1403,21 @@ class CanvasRenderingContext2D {
         this.lineWidth = 1
         this.fillStyle = "#000000"
         this.strokeStyle = "#000000"
+        this.__compositeOperation = "source-over"
         this.font = "10px sans-serif"
         this.textAlign = "start"
         this.textBaseline = "alphabetic"
+    }
+
+    get globalCompositeOperation() {
+        return this.__compositeOperation
+    }
+
+    set globalCompositeOperation(value) {
+        // Unsupported values are ignored, per spec.
+        if (value === "source-over" || value === "multiply") {
+            this.__compositeOperation = value
+        }
     }
 
     // TODO: Apply desynchronized and willReadFrequently; colorSpace only
@@ -1437,7 +1449,7 @@ class CanvasRenderingContext2D {
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const fillStyle = canvasStyle(this.fillStyle)
-        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle, this.textAlign, this.textBaseline)) {
+        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
@@ -1448,7 +1460,7 @@ class CanvasRenderingContext2D {
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
         const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const strokeStyle = canvasStyle(this.strokeStyle)
-        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline)) {
+        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
@@ -1484,7 +1496,7 @@ class CanvasRenderingContext2D {
     }
 
     fillRect(x, y, width, height) {
-        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, canvasStyle(this.fillStyle))
+        core.ops.op_canvas_fill_rect(this.canvas.ownerDocument, this.canvas.__node_idx, x, y, width, height, canvasStyle(this.fillStyle), this.globalCompositeOperation)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
@@ -1582,13 +1594,13 @@ class CanvasRenderingContext2D {
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__bitmapId,
-                { x, y, width, height },
+                { x, y, width, height, composite: this.globalCompositeOperation },
             ) :
             core.ops.op_canvas_draw_image(
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__node_idx,
-                { x, y, width, height },
+                { x, y, width, height, composite: this.globalCompositeOperation },
             )
         if (queued) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
@@ -1672,7 +1684,7 @@ class CanvasRenderingContext2D {
         const lineWidth = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.lineWidth : this.lineWidth
         const strokeStyle = canvasStyle(this.strokeStyle)
 
-        core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle)
+        core.ops.op_canvas_path_stroke(this.canvas.ownerDocument, this.canvas.__node_idx, path, lineWidth, strokeStyle, this.globalCompositeOperation)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 
@@ -1691,7 +1703,7 @@ class CanvasRenderingContext2D {
         const path = suppliedPath && suppliedPath instanceof Path2D ? suppliedPath.path : null
         const fillStyle = canvasStyle(this.fillStyle)
 
-        core.ops.op_canvas_path_fill(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillStyle, fillRule)
+        core.ops.op_canvas_path_fill(this.canvas.ownerDocument, this.canvas.__node_idx, path, fillStyle, fillRule, this.globalCompositeOperation)
         core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
     }
 

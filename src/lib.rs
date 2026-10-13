@@ -569,6 +569,7 @@ fn blend_canvas_pixel(
     pixel_idx: usize,
     source: (u8, u8, u8, u8),
     coverage: u8,
+    composite: CanvasCompositeOperation,
 ) {
     let coverage = clipped_coverage(clip_mask, pixel_idx, coverage);
     if coverage == 0 {
@@ -585,7 +586,10 @@ fn blend_canvas_pixel(
             multiply_coverage(source.3, coverage),
         )
     };
-    buffer[pixel_idx] = blend_rgba_with_rgba(buffer[pixel_idx], source);
+    buffer[pixel_idx] = match composite {
+        CanvasCompositeOperation::SourceOver => blend_rgba_with_rgba(buffer[pixel_idx], source),
+        CanvasCompositeOperation::Multiply => blend_multiply_with_rgba(buffer[pixel_idx], source),
+    };
 }
 
 fn clear_canvas_pixel(
@@ -694,7 +698,14 @@ impl CanvasBuffer {
         (start_x, start_y, end_x, end_y)
     }
 
-    fn blend_pixel(&mut self, x: i32, y: i32, source: (u8, u8, u8, u8), coverage: u8) {
+    fn blend_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        source: (u8, u8, u8, u8),
+        coverage: u8,
+        composite: CanvasCompositeOperation,
+    ) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
@@ -706,10 +717,19 @@ impl CanvasBuffer {
             pixel_idx,
             source,
             coverage,
+            composite,
         );
     }
 
-    fn fill_rect(&mut self, x: i32, y: i32, width: u32, height: u32, paint: &CanvasPaint) {
+    fn fill_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        paint: &CanvasPaint,
+        composite: CanvasCompositeOperation,
+    ) {
         if let Some(transform) = self.state.transform.clone() {
             // Paint the device pixels whose centers fall inside the rect
             // in user space, so the transform applies to the geometry and
@@ -771,6 +791,7 @@ impl CanvasBuffer {
                         pixel_idx,
                         source,
                         u8::MAX,
+                        composite,
                     );
                 }
             }
@@ -788,6 +809,7 @@ impl CanvasBuffer {
                     pixel_idx,
                     source,
                     u8::MAX,
+                    composite,
                 );
             }
         }
@@ -795,7 +817,14 @@ impl CanvasBuffer {
 
     fn clear_rect(&mut self, x: i32, y: i32, width: u32, height: u32) {
         if self.opaque {
-            self.fill_rect(x, y, width, height, &CanvasPaint::Solid(0x00_00_00_FF));
+            self.fill_rect(
+                x,
+                y,
+                width,
+                height,
+                &CanvasPaint::Solid(0x00_00_00_FF),
+                CanvasCompositeOperation::SourceOver,
+            );
             return;
         }
         let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
@@ -855,8 +884,9 @@ impl CanvasBuffer {
                     width,
                     height,
                     paint,
+                    composite,
                 } => {
-                    self.fill_rect(x, y, width, height, &paint);
+                    self.fill_rect(x, y, width, height, &paint, composite);
                 }
                 CanvasPathCommand::StrokeRect {
                     x,
@@ -865,16 +895,20 @@ impl CanvasBuffer {
                     height,
                     line_width,
                 } => {
+                    // strokeRect still paints hardcoded black bars; it only
+                    // gains the signature's SourceOver argument here.
                     let black = CanvasPaint::Solid(0x00_00_00_FF);
+                    let composite = CanvasCompositeOperation::SourceOver;
                     let line_width = line_width as u32;
-                    self.fill_rect(x, y, line_width, height, &black); // Left
-                    self.fill_rect(x, y, width, line_width, &black); // Top
+                    self.fill_rect(x, y, line_width, height, &black, composite); // Left
+                    self.fill_rect(x, y, width, line_width, &black, composite); // Top
                     self.fill_rect(
                         x + width as i32 - line_width as i32,
                         y,
                         line_width,
                         height,
                         &black,
+                        composite,
                     ); // Right
                     self.fill_rect(
                         x,
@@ -882,6 +916,7 @@ impl CanvasBuffer {
                         width,
                         line_width,
                         &black,
+                        composite,
                     ); // Bottom
                 }
                 CanvasPathCommand::ClearRect {
@@ -913,6 +948,12 @@ impl CanvasBuffer {
                     let fill_text_paint = match &cmd {
                         CanvasPathCommand::FillText { paint, .. } => Some(paint),
                         _ => None,
+                    };
+                    let composite = match &cmd {
+                        CanvasPathCommand::DrawImage { composite, .. }
+                        | CanvasPathCommand::DrawImageBitmap { composite, .. }
+                        | CanvasPathCommand::FillText { composite, .. } => *composite,
+                        _ => unreachable!(),
                     };
                     if let Some(image) = image {
                         let image_width = image.width() as usize;
@@ -1028,48 +1069,60 @@ impl CanvasBuffer {
                                     destination_idx,
                                     source,
                                     coverage,
+                                    composite,
                                 );
                             }
                         }
                     }
                 }
-                CanvasPathCommand::Stroke { line_width, paint } => {
+                CanvasPathCommand::Stroke {
+                    line_width,
+                    paint,
+                    composite,
+                } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&current_path, line_width, &transform, &paint)
+                    self.apply_stroke(&current_path, line_width, &transform, &paint, composite)
                         .unwrap();
                 }
                 CanvasPathCommand::StrokePath {
                     path,
                     line_width,
                     paint,
+                    composite,
                 } => {
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&path, line_width, &transform, &paint)
+                    self.apply_stroke(&path, line_width, &transform, &paint, composite)
                         .unwrap();
                 }
                 CanvasPathCommand::StrokeText {
                     path,
                     line_width,
                     paint,
+                    composite,
                 } => {
                     let transform = self.state.transform.clone();
-                    self.apply_stroke(&path, line_width, &transform, &paint)
+                    self.apply_stroke(&path, line_width, &transform, &paint, composite)
                         .unwrap();
                 }
-                CanvasPathCommand::Fill { paint, fill_rule } => {
+                CanvasPathCommand::Fill {
+                    paint,
+                    fill_rule,
+                    composite,
+                } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    self.apply_fill(&current_path, &transform, &paint, &fill_rule)
+                    self.apply_fill(&current_path, &transform, &paint, &fill_rule, composite)
                         .unwrap();
                 }
                 CanvasPathCommand::FillPath {
                     path,
                     paint,
                     fill_rule,
+                    composite,
                 } => {
                     let transform = self.state.transform.clone();
-                    self.apply_fill(&path, &transform, &paint, &fill_rule)
+                    self.apply_fill(&path, &transform, &paint, &fill_rule, composite)
                         .unwrap();
                 }
                 CanvasPathCommand::Clip { fill_rule } => {
@@ -1392,6 +1445,7 @@ impl CanvasBuffer {
         transform: &Option<Matrixf32>,
         paint: &CanvasPaint,
         fill_rule: &CanvasFillRule,
+        composite: CanvasCompositeOperation,
     ) -> Result<()> {
         let spans = self.rasterize_path_spans(queued_commands, transform, fill_rule)?;
         // Only gradient paint is sampled per user-space point.
@@ -1415,6 +1469,7 @@ impl CanvasBuffer {
                     span.y * stride + x,
                     source,
                     u8::MAX,
+                    composite,
                 );
             }
         }
@@ -1450,6 +1505,7 @@ impl CanvasBuffer {
         line_width: f64,
         transform: &Option<Matrixf32>,
         paint: &CanvasPaint,
+        composite: CanvasCompositeOperation,
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
@@ -1508,7 +1564,7 @@ impl CanvasBuffer {
                                         px as f64 + 0.5,
                                         py as f64 + 0.5,
                                     )?;
-                                    self.blend_pixel(px, py, source, u8::MAX);
+                                    self.blend_pixel(px, py, source, u8::MAX, composite);
                                 }
                             }
                         }
@@ -1547,7 +1603,7 @@ impl CanvasBuffer {
                                     px as f64 + 0.5,
                                     py as f64 + 0.5,
                                 )?;
-                                self.blend_pixel(px, py, source, u8::MAX);
+                                self.blend_pixel(px, py, source, u8::MAX, composite);
                             }
                         }
                     }
@@ -1599,7 +1655,7 @@ impl CanvasBuffer {
                                     px as f64 + 0.5,
                                     py as f64 + 0.5,
                                 )?;
-                                self.blend_pixel(px, py, source, u8::MAX);
+                                self.blend_pixel(px, py, source, u8::MAX, composite);
                             }
                         }
                     }
@@ -1658,7 +1714,7 @@ impl CanvasBuffer {
                                             px as f64 + 0.5,
                                             py as f64 + 0.5,
                                         )?;
-                                        self.blend_pixel(px, py, source, u8::MAX);
+                                        self.blend_pixel(px, py, source, u8::MAX, composite);
                                     }
                                 }
                             }
@@ -1690,7 +1746,7 @@ impl CanvasBuffer {
                                         px as f64 + 0.5,
                                         py as f64 + 0.5,
                                     )?;
-                                    self.blend_pixel(px, py, source, u8::MAX);
+                                    self.blend_pixel(px, py, source, u8::MAX, composite);
                                 }
                             }
                         }
@@ -2892,6 +2948,28 @@ fn blend_rgba_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
     let output_alpha = a + (da * inv_a + 127) / 255;
 
     (r << 24) | (g << 16) | (b << 8) | output_alpha
+}
+
+// Multiply blending in premultiplied space: each channel is
+// src + dst combined as src*(1-dst_alpha) + src*dst + dst*(1-src_alpha),
+// which is the spec formula with blend B(cb, cs) = cb * cs. Over a
+// transparent backdrop it reduces to the source, as source-over does.
+fn blend_multiply_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
+    let a = src.3 as u32;
+    if a == 0 {
+        return dst;
+    }
+    let da = dst & 0xFF;
+    let channel = |s: u8, shift: u32| {
+        let s = s as u32;
+        let d = (dst >> shift) & 0xFF;
+        (s * (255 - da) + d * s + d * (255 - a) + 127) / 255
+    };
+    let output_alpha = a + (da * (255 - a) + 127) / 255;
+    (channel(src.0, 24) << 24)
+        | (channel(src.1, 16) << 16)
+        | (channel(src.2, 8) << 8)
+        | output_alpha
 }
 
 fn blend_rgb_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
@@ -7071,6 +7149,14 @@ enum CanvasFillRule {
     EvenOdd,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CanvasCompositeOperation {
+    #[default]
+    SourceOver,
+    Multiply,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum CanvasPixelFormat {
@@ -7313,20 +7399,24 @@ enum CanvasPathCommand {
     Fill {
         paint: CanvasPaint,
         fill_rule: CanvasFillRule,
+        composite: CanvasCompositeOperation,
     },
     Stroke {
         line_width: f64,
         paint: CanvasPaint,
+        composite: CanvasCompositeOperation,
     },
     StrokePath {
         path: Vec<CanvasPathCommand>,
         line_width: f64,
         paint: CanvasPaint,
+        composite: CanvasCompositeOperation,
     },
     FillPath {
         path: Vec<CanvasPathCommand>,
         paint: CanvasPaint,
         fill_rule: CanvasFillRule,
+        composite: CanvasCompositeOperation,
     },
     Clip {
         fill_rule: CanvasFillRule,
@@ -7341,6 +7431,7 @@ enum CanvasPathCommand {
         width: u32,
         height: u32,
         paint: CanvasPaint,
+        composite: CanvasCompositeOperation,
     },
     StrokeRect {
         x: i32,
@@ -7368,12 +7459,14 @@ enum CanvasPathCommand {
         image_height: Option<u32>,
         x: i32,
         y: i32,
+        composite: CanvasCompositeOperation,
     },
     #[serde(skip)]
     DrawImageBitmap {
         image: Pixmap,
         x: i32,
         y: i32,
+        composite: CanvasCompositeOperation,
     },
     #[serde(skip)]
     FillText {
@@ -7381,12 +7474,14 @@ enum CanvasPathCommand {
         x: i32,
         y: i32,
         paint: CanvasPaint,
+        composite: CanvasCompositeOperation,
     },
     #[serde(skip)]
     StrokeText {
         path: Vec<CanvasPathCommand>,
         line_width: f64,
         paint: CanvasPaint,
+        composite: CanvasCompositeOperation,
     },
 }
 
@@ -7458,6 +7553,8 @@ struct CanvasDrawImageRequest {
     y: f64,
     width: Option<f64>,
     height: Option<f64>,
+    #[serde(default)]
+    composite: CanvasCompositeOperation,
 }
 
 fn quadratic_bezier(t: f32, p0: i32, p1: i32, p2: i32) -> i32 {
@@ -7572,6 +7669,7 @@ fn op_canvas_draw_image(
         image_height: input_height,
         x: request.x.round() as i32,
         y: request.y.round() as i32,
+        composite: request.composite,
     });
 
     Ok(true)
@@ -7847,6 +7945,7 @@ fn op_canvas_draw_image_bitmap(
         image,
         x: request.x.round() as i32,
         y: request.y.round() as i32,
+        composite: request.composite,
     });
     Ok(true)
 }
@@ -7859,6 +7958,7 @@ fn op_canvas_path_stroke(
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     line_width: f64,
     #[serde] stroke_style: CanvasStyle,
+    #[serde] composite: CanvasCompositeOperation,
 ) -> Result<(), JsErrorBox> {
     let paint = parse_canvas_paint(stroke_style, "Unsupported canvas strokeStyle")?;
 
@@ -7880,10 +7980,13 @@ fn op_canvas_path_stroke(
             path,
             line_width,
             paint,
+            composite,
         }),
-        None => canvas
-            .commands
-            .push(CanvasPathCommand::Stroke { line_width, paint }),
+        None => canvas.commands.push(CanvasPathCommand::Stroke {
+            line_width,
+            paint,
+            composite,
+        }),
     }
 
     Ok(())
@@ -7899,6 +8002,7 @@ fn op_canvas_fill_rect(
     width: f64,
     height: f64,
     #[serde] fill_style: CanvasStyle,
+    #[serde] composite: CanvasCompositeOperation,
 ) -> Result<(), JsErrorBox> {
     if ![x, y, width, height].iter().all(|value| value.is_finite()) {
         return Ok(());
@@ -7923,6 +8027,7 @@ fn op_canvas_fill_rect(
         width: width.round().max(0.0) as u32,
         height: height.round().max(0.0) as u32,
         paint,
+        composite,
     });
 
     Ok(())
@@ -7936,6 +8041,7 @@ fn op_canvas_path_fill(
     #[serde] path: Option<Vec<CanvasPathCommand>>,
     #[serde] fill_style: CanvasStyle,
     #[serde] fill_rule: CanvasFillRule,
+    #[serde] composite: CanvasCompositeOperation,
 ) -> Result<(), JsErrorBox> {
     let paint = parse_canvas_paint(fill_style, "Unsupported canvas fillStyle")?;
 
@@ -7957,10 +8063,13 @@ fn op_canvas_path_fill(
             path,
             paint,
             fill_rule,
+            composite,
         }),
-        None => canvas
-            .commands
-            .push(CanvasPathCommand::Fill { paint, fill_rule }),
+        None => canvas.commands.push(CanvasPathCommand::Fill {
+            paint,
+            fill_rule,
+            composite,
+        }),
     }
 
     Ok(())
@@ -8238,6 +8347,7 @@ fn op_canvas_fill_text(
     #[serde] fill_style: CanvasStyle,
     #[string] text_align: String,
     #[string] text_baseline: String,
+    #[serde] composite: CanvasCompositeOperation,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
@@ -8277,6 +8387,7 @@ fn op_canvas_fill_text(
         x: x.round() as i32,
         y: (y - f64::from(baseline)).round() as i32,
         paint,
+        composite,
     });
     Ok(true)
 }
@@ -8294,6 +8405,7 @@ fn op_canvas_stroke_text(
     #[serde] stroke_style: CanvasStyle,
     #[string] text_align: String,
     #[string] text_baseline: String,
+    #[serde] composite: CanvasCompositeOperation,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite()
         || !y.is_finite()
@@ -8334,6 +8446,7 @@ fn op_canvas_stroke_text(
         path,
         line_width,
         paint,
+        composite,
     });
     Ok(true)
 }
