@@ -1334,6 +1334,7 @@ const CANVAS_COMMAND_SAVE = "save"
 const CANVAS_COMMAND_RESTORE = "restore"
 const CANVAS_COMMAND_CLEAR_RECT = "clearRect"
 const CANVAS_COMMAND_BEGIN_PATH = "beginPath"
+const CANVAS_COMMAND_ARC = "arc"
 
 Object.defineProperty(globalThis, "ImageData", {
     value: imageData.ImageData,
@@ -1597,8 +1598,26 @@ class CanvasRenderingContext2D {
         })
     }
 
-    arc() {
-        // TODO: Implement this
+    arc(x, y, radius, startAngle, endAngle, counterclockwise = false) {
+        const prefix = "Failed to execute 'arc' on 'CanvasRenderingContext2D'"
+        webidl.requiredArguments(arguments.length, 5, prefix)
+        x = +x
+        y = +y
+        radius = +radius
+        startAngle = +startAngle
+        endAngle = +endAngle
+        if (![x, y, radius, startAngle, endAngle].every(Number.isFinite)) return
+        if (radius < 0) {
+            throw new DOMException.DOMException("The radius is negative", "IndexSizeError")
+        }
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_ARC,
+            center: [x, y],
+            radius,
+            start_angle: startAngle,
+            end_angle: endAngle,
+            counterclockwise: Boolean(counterclockwise)
+        })
     }
 
     closePath() {
@@ -1702,6 +1721,28 @@ class Path2D {
         this.path.push({
             type: CANVAS_COMMAND_POINT,
             point: [x, y]
+        })
+    }
+
+    arc(x, y, radius, startAngle, endAngle, counterclockwise = false) {
+        const prefix = "Failed to execute 'arc' on 'Path2D'"
+        webidl.requiredArguments(arguments.length, 5, prefix)
+        x = +x
+        y = +y
+        radius = +radius
+        startAngle = +startAngle
+        endAngle = +endAngle
+        if (![x, y, radius, startAngle, endAngle].every(Number.isFinite)) return
+        if (radius < 0) {
+            throw new DOMException.DOMException("The radius is negative", "IndexSizeError")
+        }
+        this.path.push({
+            type: CANVAS_COMMAND_ARC,
+            center: [x, y],
+            radius,
+            start_angle: startAngle,
+            end_angle: endAngle,
+            counterclockwise: Boolean(counterclockwise)
         })
     }
 

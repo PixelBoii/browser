@@ -779,6 +779,7 @@ impl CanvasBuffer {
                     endpoint: _,
                 }
                 | CanvasPathCommand::QuadraticCurve { cp: _, endpoint: _ }
+                | CanvasPathCommand::Arc { .. }
                 | CanvasPathCommand::Close => {
                     self.current_path.push(cmd);
                 }
@@ -1148,6 +1149,57 @@ impl CanvasBuffer {
                     cursor.x = endpoint[0].round() as i32;
                     cursor.y = endpoint[1].round() as i32;
                 }
+                &CanvasPathCommand::Arc {
+                    center,
+                    radius,
+                    start_angle,
+                    end_angle,
+                    counterclockwise,
+                } => {
+                    // Each point joins the previous one exactly like a Point,
+                    // which also draws the line from the current point to
+                    // the start of the arc.
+                    for mut point in
+                        arc_points(center, radius, start_angle, end_angle, counterclockwise)
+                    {
+                        if let Some(transform) = transform {
+                            point = self.compute_point_transform(&point, transform)?;
+                        }
+                        let x = point[0];
+                        let y = point[1];
+
+                        if subpath_start.is_none() {
+                            cursor.x = x as i32;
+                            cursor.y = y as i32;
+                            subpath_start = Some(point);
+                            continue;
+                        }
+
+                        let start_x = cursor.x as f64;
+                        let start_y = cursor.y as f64;
+                        let x_delta = x - cursor.x as f64;
+                        let y_delta = y - cursor.y as f64;
+
+                        let steps = y_delta.abs().ceil().max(1.) as usize;
+
+                        let x_ratio = x_delta / steps as f64;
+                        let y_ratio = y_delta / steps as f64;
+
+                        for idx in 0..steps {
+                            let px = (start_x + idx as f64 * x_ratio).round() as i32;
+                            let py = (start_y + idx as f64 * y_ratio).round() as i32;
+
+                            if px < 0 || py < 0 || py >= self.height as i32 {
+                                continue;
+                            }
+
+                            y_pixels[py as usize].push(px as usize);
+                        }
+
+                        cursor.x = x.round() as i32;
+                        cursor.y = y.round() as i32;
+                    }
+                }
                 CanvasPathCommand::Close => {
                     let Some([x, y]) = subpath_start else {
                         continue;
@@ -1402,6 +1454,61 @@ impl CanvasBuffer {
 
                     cursor.x = endpoint[0].round() as i32;
                     cursor.y = endpoint[1].round() as i32;
+                }
+                &CanvasPathCommand::Arc {
+                    center,
+                    radius,
+                    start_angle,
+                    end_angle,
+                    counterclockwise,
+                } => {
+                    // Each point joins the previous one exactly like a Point,
+                    // which also draws the line from the current point to
+                    // the start of the arc.
+                    for mut point in
+                        arc_points(center, radius, start_angle, end_angle, counterclockwise)
+                    {
+                        if let Some(transform) = transform {
+                            point = self.compute_point_transform(&point, transform)?;
+                        }
+                        let x = point[0];
+                        let y = point[1];
+
+                        if subpath_start.is_none() {
+                            cursor.x = x as i32;
+                            cursor.y = y as i32;
+                            subpath_start = Some(point);
+                            continue;
+                        }
+
+                        let start_x = cursor.x as f64;
+                        let start_y = cursor.y as f64;
+                        let x_delta = x - cursor.x as f64;
+                        let y_delta = y - cursor.y as f64;
+
+                        let hyp = (x_delta.powi(2) + y_delta.powi(2)).sqrt().round() as i32;
+                        if hyp > 0 {
+                            let x_ratio = x_delta / hyp as f64;
+                            let y_ratio = y_delta / hyp as f64;
+
+                            for idx in 0..hyp {
+                                for wxidx in line_width_offset..line_width_end {
+                                    for wyidx in line_width_offset..line_width_end {
+                                        let px = (start_x + idx as f64 * x_ratio + wxidx as f64)
+                                            .round()
+                                            as i32;
+                                        let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
+                                            .round()
+                                            as i32;
+                                        self.blend_pixel(px, py, color_tuple, u8::MAX);
+                                    }
+                                }
+                            }
+                        }
+
+                        cursor.x = x.round() as i32;
+                        cursor.y = y.round() as i32;
+                    }
                 }
                 CanvasPathCommand::Close => {
                     let Some([x, y]) = subpath_start else {
@@ -6831,6 +6938,13 @@ enum CanvasPathCommand {
         cp2: [f64; 2],
         endpoint: [f64; 2],
     },
+    Arc {
+        center: [f64; 2],
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+        counterclockwise: bool,
+    },
     Close,
     Fill {
         color: u32,
@@ -6994,6 +7108,42 @@ fn cubic_bezier(t: f32, p0: i32, p1: i32, p2: i32, p3: i32) -> i32 {
         + 3. * (1. - t) * t.powi(2) * p2 as f32
         + t.powi(3) * p3 as f32;
     result.round() as i32
+}
+
+// Points along an arc, roughly one per pixel. A sweep of a full turn or
+// more is a full circle; otherwise the sweep wraps in the given direction.
+fn arc_points(
+    center: [f64; 2],
+    radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+    counterclockwise: bool,
+) -> Vec<[f64; 2]> {
+    let tau = std::f64::consts::TAU;
+    let mut delta = end_angle - start_angle;
+    if !counterclockwise && delta >= tau {
+        delta = tau;
+    } else if counterclockwise && delta <= -tau {
+        delta = -tau;
+    } else {
+        delta %= tau;
+        if !counterclockwise && delta < 0. {
+            delta += tau;
+        }
+        if counterclockwise && delta > 0. {
+            delta -= tau;
+        }
+    }
+    let steps = (delta.abs() * radius).ceil().max(1.) as usize;
+    (0..=steps)
+        .map(|i| {
+            let angle = start_angle + delta * i as f64 / steps as f64;
+            [
+                center[0] + radius * angle.cos(),
+                center[1] + radius * angle.sin(),
+            ]
+        })
+        .collect()
 }
 
 fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
