@@ -887,19 +887,9 @@ impl CanvasBuffer {
                     composite,
                     shadow,
                 } => {
-                    if let Some(shadow) = shadow {
-                        let mut scratch = self.shadow_scratch();
-                        scratch.fill_rect(
-                            x,
-                            y,
-                            width,
-                            height,
-                            &CanvasPaint::Solid(0xFFFF_FFFF),
-                            CanvasCompositeOperation::SourceOver,
-                        );
-                        self.blend_shadow(&scratch, shadow);
-                    }
-                    self.fill_rect(x, y, width, height, &paint, composite);
+                    self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
+                        buf.fill_rect(x, y, width, height, paint, composite);
+                    });
                 }
                 CanvasPathCommand::ClearRect {
                     x,
@@ -1018,6 +1008,20 @@ impl CanvasBuffer {
                         let end_x = max_x.min(self.width as i32);
                         let end_y = max_y.min(self.height as i32);
 
+                        // With a shadow, shadow and image render into
+                        // temporary pixels first (see draw_with_shadow);
+                        // inside them the image blends source-over its shadow.
+                        let mut temp_pixels = if shadow_mask.is_some() {
+                            Some(vec![0u32; self.buffer.len()])
+                        } else {
+                            None
+                        };
+                        let draw_composite = if temp_pixels.is_some() {
+                            CanvasCompositeOperation::SourceOver
+                        } else {
+                            composite
+                        };
+
                         for destination_y in start_y..end_y {
                             for destination_x in start_x..end_x {
                                 let destination_point =
@@ -1046,11 +1050,15 @@ impl CanvasBuffer {
                                 let source = pixels[source_y * image_width + source_x];
                                 let destination_idx =
                                     destination_y as usize * canvas_width + destination_x as usize;
+                                let target: &mut [u32] = match &mut temp_pixels {
+                                    Some(pixels) => pixels,
+                                    None => &mut self.buffer,
+                                };
                                 if let Some((mask, shadow)) = &shadow_mask {
                                     let shadow_alpha = mask[source_y * image_width + source_x];
                                     if shadow_alpha > 0 {
                                         blend_canvas_pixel(
-                                            &mut self.buffer,
+                                            &mut *target,
                                             self.state.clip_mask.as_deref(),
                                             destination_idx,
                                             rgba_to_premul_tuple(shadow.color),
@@ -1077,14 +1085,18 @@ impl CanvasBuffer {
                                     ),
                                 };
                                 blend_canvas_pixel(
-                                    &mut self.buffer,
+                                    &mut *target,
                                     self.state.clip_mask.as_deref(),
                                     destination_idx,
                                     source,
                                     coverage,
-                                    composite,
+                                    draw_composite,
                                 );
                             }
+                        }
+
+                        if let Some(pixels) = &temp_pixels {
+                            self.blend_buffer(pixels, composite);
                         }
                     }
                 }
@@ -1096,21 +1108,10 @@ impl CanvasBuffer {
                 } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    if let Some(shadow) = shadow {
-                        let mut scratch = self.shadow_scratch();
-                        scratch
-                            .apply_stroke(
-                                &current_path,
-                                line_width,
-                                &transform,
-                                &CanvasPaint::Solid(0xFFFF_FFFF),
-                                CanvasCompositeOperation::SourceOver,
-                            )
+                    self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
+                        buf.apply_stroke(&current_path, line_width, &transform, paint, composite)
                             .unwrap();
-                        self.blend_shadow(&scratch, shadow);
-                    }
-                    self.apply_stroke(&current_path, line_width, &transform, &paint, composite)
-                        .unwrap();
+                    });
                 }
                 CanvasPathCommand::StrokePath {
                     path,
@@ -1120,21 +1121,10 @@ impl CanvasBuffer {
                     shadow,
                 } => {
                     let transform = self.state.transform.clone();
-                    if let Some(shadow) = shadow {
-                        let mut scratch = self.shadow_scratch();
-                        scratch
-                            .apply_stroke(
-                                &path,
-                                line_width,
-                                &transform,
-                                &CanvasPaint::Solid(0xFFFF_FFFF),
-                                CanvasCompositeOperation::SourceOver,
-                            )
+                    self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
+                        buf.apply_stroke(&path, line_width, &transform, paint, composite)
                             .unwrap();
-                        self.blend_shadow(&scratch, shadow);
-                    }
-                    self.apply_stroke(&path, line_width, &transform, &paint, composite)
-                        .unwrap();
+                    });
                 }
                 CanvasPathCommand::StrokeText {
                     path,
@@ -1144,21 +1134,10 @@ impl CanvasBuffer {
                     shadow,
                 } => {
                     let transform = self.state.transform.clone();
-                    if let Some(shadow) = shadow {
-                        let mut scratch = self.shadow_scratch();
-                        scratch
-                            .apply_stroke(
-                                &path,
-                                line_width,
-                                &transform,
-                                &CanvasPaint::Solid(0xFFFF_FFFF),
-                                CanvasCompositeOperation::SourceOver,
-                            )
+                    self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
+                        buf.apply_stroke(&path, line_width, &transform, paint, composite)
                             .unwrap();
-                        self.blend_shadow(&scratch, shadow);
-                    }
-                    self.apply_stroke(&path, line_width, &transform, &paint, composite)
-                        .unwrap();
+                    });
                 }
                 CanvasPathCommand::Fill {
                     paint,
@@ -1168,21 +1147,10 @@ impl CanvasBuffer {
                 } => {
                     let current_path = self.current_path.clone();
                     let transform = self.state.transform.clone();
-                    if let Some(shadow) = shadow {
-                        let mut scratch = self.shadow_scratch();
-                        scratch
-                            .apply_fill(
-                                &current_path,
-                                &transform,
-                                &CanvasPaint::Solid(0xFFFF_FFFF),
-                                &fill_rule,
-                                CanvasCompositeOperation::SourceOver,
-                            )
+                    self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
+                        buf.apply_fill(&current_path, &transform, paint, &fill_rule, composite)
                             .unwrap();
-                        self.blend_shadow(&scratch, shadow);
-                    }
-                    self.apply_fill(&current_path, &transform, &paint, &fill_rule, composite)
-                        .unwrap();
+                    });
                 }
                 CanvasPathCommand::FillPath {
                     path,
@@ -1192,21 +1160,10 @@ impl CanvasBuffer {
                     shadow,
                 } => {
                     let transform = self.state.transform.clone();
-                    if let Some(shadow) = shadow {
-                        let mut scratch = self.shadow_scratch();
-                        scratch
-                            .apply_fill(
-                                &path,
-                                &transform,
-                                &CanvasPaint::Solid(0xFFFF_FFFF),
-                                &fill_rule,
-                                CanvasCompositeOperation::SourceOver,
-                            )
+                    self.draw_with_shadow(shadow, composite, &paint, |buf, paint, composite| {
+                        buf.apply_fill(&path, &transform, paint, &fill_rule, composite)
                             .unwrap();
-                        self.blend_shadow(&scratch, shadow);
-                    }
-                    self.apply_fill(&path, &transform, &paint, &fill_rule, composite)
-                        .unwrap();
+                    });
                 }
                 CanvasPathCommand::Clip { fill_rule } => {
                     let current_path = self.current_path.clone();
@@ -1278,6 +1235,57 @@ impl CanvasBuffer {
                 CanvasCompositeOperation::SourceOver,
             );
         }
+    }
+
+    // Composites a fully rendered temporary buffer onto this one with the
+    // given operation, skipping transparent pixels.
+    fn blend_buffer(&mut self, temp: &[u32], composite: CanvasCompositeOperation) {
+        for (pixel_idx, pixel) in temp.iter().enumerate() {
+            if pixel & 0xFF == 0 {
+                continue;
+            }
+            blend_canvas_pixel(
+                &mut self.buffer,
+                self.state.clip_mask.as_deref(),
+                pixel_idx,
+                (
+                    ((pixel >> 24) & 0xFF) as u8,
+                    ((pixel >> 16) & 0xFF) as u8,
+                    ((pixel >> 8) & 0xFF) as u8,
+                    (pixel & 0xFF) as u8,
+                ),
+                u8::MAX,
+                composite,
+            );
+        }
+    }
+
+    // Draws a shape following the canvas drawing model for shadows: the
+    // shadow and the shape are rendered together into a temporary buffer
+    // (shape over shadow, source-over), and that combined result is
+    // composited onto this buffer with the selected operation. Without a
+    // shadow the shape draws directly.
+    fn draw_with_shadow(
+        &mut self,
+        shadow: Option<CanvasShadow>,
+        composite: CanvasCompositeOperation,
+        paint: &CanvasPaint,
+        draw: impl Fn(&mut CanvasBuffer, &CanvasPaint, CanvasCompositeOperation),
+    ) {
+        let Some(shadow) = shadow else {
+            draw(self, paint, composite);
+            return;
+        };
+        let mut silhouette = self.shadow_scratch();
+        draw(
+            &mut silhouette,
+            &CanvasPaint::Solid(0xFFFF_FFFF),
+            CanvasCompositeOperation::SourceOver,
+        );
+        let mut temp = self.shadow_scratch();
+        temp.blend_shadow(&silhouette, shadow);
+        draw(&mut temp, paint, CanvasCompositeOperation::SourceOver);
+        self.blend_buffer(&temp.buffer, composite);
     }
 
     fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
