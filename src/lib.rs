@@ -710,13 +710,78 @@ impl CanvasBuffer {
     }
 
     fn fill_rect(&mut self, x: i32, y: i32, width: u32, height: u32, paint: &CanvasPaint) {
+        if let Some(transform) = self.state.transform.clone() {
+            // Paint the device pixels whose centers fall inside the rect
+            // in user space, so the transform applies to the geometry and
+            // the paint is sampled in user space.
+            let Some(inverse) = transform.inverse_affine() else {
+                return;
+            };
+            let corners = [
+                [f64::from(x), f64::from(y)],
+                [f64::from(x) + f64::from(width), f64::from(y)],
+                [f64::from(x), f64::from(y) + f64::from(height)],
+                [
+                    f64::from(x) + f64::from(width),
+                    f64::from(y) + f64::from(height),
+                ],
+            ]
+            .map(|point| self.compute_point_transform(&point, &transform).unwrap());
+            let min_x = corners
+                .iter()
+                .map(|point| point[0])
+                .fold(f64::INFINITY, f64::min);
+            let max_x = corners
+                .iter()
+                .map(|point| point[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = corners
+                .iter()
+                .map(|point| point[1])
+                .fold(f64::INFINITY, f64::min);
+            let max_y = corners
+                .iter()
+                .map(|point| point[1])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let start_x = (min_x.floor() as i32).max(0);
+            let start_y = (min_y.floor() as i32).max(0);
+            let end_x = (max_x.ceil() as i32).min(self.width as i32);
+            let end_y = (max_y.ceil() as i32).min(self.height as i32);
+            let (right, bottom) = (
+                f64::from(x) + f64::from(width),
+                f64::from(y) + f64::from(height),
+            );
+            for py in start_y..end_y {
+                for px in start_x..end_x {
+                    let user_point = self
+                        .compute_point_transform(&[px as f64 + 0.5, py as f64 + 0.5], &inverse)
+                        .unwrap();
+                    if user_point[0] < f64::from(x)
+                        || user_point[0] >= right
+                        || user_point[1] < f64::from(y)
+                        || user_point[1] >= bottom
+                    {
+                        continue;
+                    }
+                    let source = rgba_to_premul_tuple(paint.color_at(user_point[0], user_point[1]));
+                    let pixel_idx = py as usize * self.width as usize + px as usize;
+                    blend_canvas_pixel(
+                        &mut self.buffer,
+                        self.state.clip_mask.as_deref(),
+                        pixel_idx,
+                        source,
+                        u8::MAX,
+                    );
+                }
+            }
+            return;
+        }
         let (start_x, start_y, end_x, end_y) = self.rect_bounds(x, y, width, height);
         let stride = self.width as usize;
         for py in start_y..end_y {
             for px in start_x..end_x {
                 let pixel_idx = py * stride + px;
-                let source =
-                    rgba_to_premul_tuple(paint.color_at(px as f64 + 0.5, py as f64 + 0.5));
+                let source = rgba_to_premul_tuple(paint.color_at(px as f64 + 0.5, py as f64 + 0.5));
                 blend_canvas_pixel(
                     &mut self.buffer,
                     self.state.clip_mask.as_deref(),
@@ -1021,6 +1086,28 @@ impl CanvasBuffer {
         }
     }
 
+    // Paint is sampled in user space, so a device pixel is mapped back
+    // through the inverse of the transform the path geometry went through.
+    fn paint_source(
+        &self,
+        paint: &CanvasPaint,
+        inverse_transform: &Option<Matrixf32>,
+        x: f64,
+        y: f64,
+    ) -> Result<(u8, u8, u8, u8)> {
+        // Solid paint is the same everywhere, so skip the inverse mapping.
+        if let CanvasPaint::Solid(color) = paint {
+            return Ok(rgba_to_premul_tuple(*color));
+        }
+        let user_point = match inverse_transform {
+            Some(inverse) => self.compute_point_transform(&[x, y], inverse)?,
+            None => [x, y],
+        };
+        Ok(rgba_to_premul_tuple(
+            paint.color_at(user_point[0], user_point[1]),
+        ))
+    }
+
     fn compute_point_transform(&self, point: &[f64; 2], transform: &Matrixf32) -> Result<[f64; 2]> {
         Ok([
             (transform.get(0, 0) * point[0] as f32
@@ -1307,11 +1394,21 @@ impl CanvasBuffer {
         fill_rule: &CanvasFillRule,
     ) -> Result<()> {
         let spans = self.rasterize_path_spans(queued_commands, transform, fill_rule)?;
+        // Only gradient paint is sampled per user-space point.
+        let inverse_transform = if matches!(paint, CanvasPaint::Gradient(_)) {
+            transform.as_ref().and_then(|t| t.inverse_affine())
+        } else {
+            None
+        };
         let stride = self.width as usize;
         for span in spans {
             for x in span.start_x..span.end_x {
-                let source =
-                    rgba_to_premul_tuple(paint.color_at(x as f64 + 0.5, span.y as f64 + 0.5));
+                let source = self.paint_source(
+                    paint,
+                    &inverse_transform,
+                    x as f64 + 0.5,
+                    span.y as f64 + 0.5,
+                )?;
                 blend_canvas_pixel(
                     &mut self.buffer,
                     self.state.clip_mask.as_deref(),
@@ -1356,6 +1453,12 @@ impl CanvasBuffer {
     ) -> Result<()> {
         let mut cursor = Position { x: 0, y: 0 };
         let mut subpath_start: Option<[f64; 2]> = None;
+        // Only gradient paint is sampled per user-space point.
+        let inverse_transform = if matches!(paint, CanvasPaint::Gradient(_)) {
+            transform.as_ref().and_then(|t| t.inverse_affine())
+        } else {
+            None
+        };
         let line_width_offset = -line_width as i32 / 2;
         let line_width_end = (line_width / 2.0).ceil() as i32;
         for cmd in queued_commands {
@@ -1399,9 +1502,12 @@ impl CanvasBuffer {
                                         as i32;
                                     let py = (start_y + idx as f64 * y_ratio + wyidx as f64).round()
                                         as i32;
-                                    let source = rgba_to_premul_tuple(
-                                        paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
-                                    );
+                                    let source = self.paint_source(
+                                        paint,
+                                        &inverse_transform,
+                                        px as f64 + 0.5,
+                                        py as f64 + 0.5,
+                                    )?;
                                     self.blend_pixel(px, py, source, u8::MAX);
                                 }
                             }
@@ -1435,9 +1541,12 @@ impl CanvasBuffer {
                         for wxidx in line_width_offset..line_width_end {
                             for wyidx in line_width_offset..line_width_end {
                                 let (px, py) = (x + wxidx, y + wyidx);
-                                let source = rgba_to_premul_tuple(
-                                    paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
-                                );
+                                let source = self.paint_source(
+                                    paint,
+                                    &inverse_transform,
+                                    px as f64 + 0.5,
+                                    py as f64 + 0.5,
+                                )?;
                                 self.blend_pixel(px, py, source, u8::MAX);
                             }
                         }
@@ -1484,9 +1593,12 @@ impl CanvasBuffer {
                         for wxidx in line_width_offset..line_width_end {
                             for wyidx in line_width_offset..line_width_end {
                                 let (px, py) = (x + wxidx, y + wyidx);
-                                let source = rgba_to_premul_tuple(
-                                    paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
-                                );
+                                let source = self.paint_source(
+                                    paint,
+                                    &inverse_transform,
+                                    px as f64 + 0.5,
+                                    py as f64 + 0.5,
+                                )?;
                                 self.blend_pixel(px, py, source, u8::MAX);
                             }
                         }
@@ -1540,9 +1652,12 @@ impl CanvasBuffer {
                                         let py = (start_y + idx as f64 * y_ratio + wyidx as f64)
                                             .round()
                                             as i32;
-                                        let source = rgba_to_premul_tuple(
-                                            paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
-                                        );
+                                        let source = self.paint_source(
+                                            paint,
+                                            &inverse_transform,
+                                            px as f64 + 0.5,
+                                            py as f64 + 0.5,
+                                        )?;
                                         self.blend_pixel(px, py, source, u8::MAX);
                                     }
                                 }
@@ -1569,9 +1684,12 @@ impl CanvasBuffer {
                             for wxidx in line_width_offset..line_width_end {
                                 for wyidx in line_width_offset..line_width_end {
                                     let (px, py) = (x + wxidx, y + wyidx);
-                                    let source = rgba_to_premul_tuple(
-                                        paint.color_at(px as f64 + 0.5, py as f64 + 0.5),
-                                    );
+                                    let source = self.paint_source(
+                                        paint,
+                                        &inverse_transform,
+                                        px as f64 + 0.5,
+                                        py as f64 + 0.5,
+                                    )?;
                                     self.blend_pixel(px, py, source, u8::MAX);
                                 }
                             }
