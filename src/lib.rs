@@ -7837,6 +7837,46 @@ fn op_svg_get_extent_of_char(
     Ok(bounds)
 }
 
+// Resolves the textAlign/textBaseline anchor at (x, y) to the alphabetic
+// origin that the text rasterizers draw from. "start" and "end" follow
+// measureText and mean left and right, as there is no direction support.
+fn canvas_text_origin(
+    font_handler: &FontHandler,
+    text: &str,
+    font_px: u32,
+    x: f64,
+    y: f64,
+    text_align: &str,
+    text_baseline: &str,
+) -> (f64, f64) {
+    let font = font_handler.font.as_scaled(font_px as f32);
+    let mut width = 0.0;
+    let mut previous = None;
+    for ch in text.chars() {
+        let glyph_id = font.glyph_id(ch);
+        if let Some(previous_id) = previous {
+            width += font.kern(previous_id, glyph_id);
+        }
+        width += font.h_advance(glyph_id);
+        previous = Some(glyph_id);
+    }
+    let ascent = f64::from(font.ascent());
+    let descent = -f64::from(font.descent());
+    let x = match text_align {
+        "center" => x - f64::from(width) / 2.0,
+        "right" | "end" => x - f64::from(width),
+        _ => x,
+    };
+    let y = match text_baseline {
+        "top" => y + ascent,
+        "hanging" => y + f64::from(font_px) * 0.6,
+        "middle" => y + (ascent - descent) / 2.0,
+        "ideographic" | "bottom" => y - descent,
+        _ => y,
+    };
+    (x, y)
+}
+
 #[op2(fast)]
 fn op_canvas_fill_text(
     scope: &mut v8::PinScope,
@@ -7847,6 +7887,8 @@ fn op_canvas_fill_text(
     y: f64,
     font_size: f64,
     #[string] fill_style: String,
+    #[string] text_align: String,
+    #[string] text_baseline: String,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
@@ -7865,6 +7907,15 @@ fn op_canvas_fill_text(
     let font = &renderer.font_handler.font;
     let font_px = font_size as u32;
     let baseline = font.as_scaled(font_px as f32).ascent();
+    let (x, y) = canvas_text_origin(
+        &renderer.font_handler,
+        &text,
+        font_px,
+        x,
+        y,
+        &text_align,
+        &text_baseline,
+    );
     let Some((image, _, _)) = text_to_buffer(&renderer.font_handler, color, &text, font_px, None)
     else {
         return Ok(false);
@@ -7893,6 +7944,8 @@ fn op_canvas_stroke_text(
     font_size: f64,
     line_width: f64,
     #[string] stroke_style: String,
+    #[string] text_align: String,
+    #[string] text_baseline: String,
 ) -> Result<bool, JsErrorBox> {
     if !x.is_finite()
         || !y.is_finite()
@@ -7915,6 +7968,15 @@ fn op_canvas_stroke_text(
     let (Some(width), Some(height)) = get_canvas_wh(renderer.nodes.get(node_idx).unwrap()) else {
         return Ok(false);
     };
+    let (x, y) = canvas_text_origin(
+        &renderer.font_handler,
+        &text,
+        font_size as u32,
+        x,
+        y,
+        &text_align,
+        &text_baseline,
+    );
     let path = renderer
         .font_handler
         .text_path(&text, font_size as u32, x, y);
