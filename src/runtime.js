@@ -1650,33 +1650,52 @@ class CanvasRenderingContext2D {
         let y
         let width = null
         let height = null
+        let source = {}
         if (args.length === 2) {
             [x, y] = args
         } else if (args.length === 4) {
             [x, y, width, height] = args
+        } else if (args.length === 8) {
+            const [sourceX, sourceY, sourceWidth, sourceHeight, destX, destY, destWidth, destHeight] = args
+            x = destX
+            y = destY
+            width = destWidth
+            height = destHeight
+            source = {
+                source_x: sourceX,
+                source_y: sourceY,
+                source_width: sourceWidth,
+                source_height: sourceHeight,
+            }
         } else {
-            // TODO: Support the source-cropping drawImage overload.
             return
         }
 
+        const request = {
+            x, y, width, height,
+            composite: this.globalCompositeOperation,
+            shadow: canvasShadow(this),
+            filter: this.filter,
+            ...source,
+        }
         const queued = isBitmap ?
             core.ops.op_canvas_draw_image_bitmap(
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__bitmapId,
-                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
+                request,
             ) : isCanvas ?
             core.ops.op_canvas_draw_image_canvas(
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__node_idx,
-                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
+                request,
             ) :
             core.ops.op_canvas_draw_image(
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__node_idx,
-                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
+                request,
             )
         if (queued) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)

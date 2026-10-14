@@ -535,7 +535,7 @@ impl DomIndexes {
     }
 }
 
-type CanvasImageKey = (usize, Option<u32>, Option<u32>);
+type CanvasImageKey = (usize, Option<u32>, Option<u32>, Option<(i32, i32, u32, u32)>);
 
 type CanvasClipMask = Rc<[u8]>;
 
@@ -924,10 +924,14 @@ impl CanvasBuffer {
                             image_node_idx,
                             image_width,
                             image_height,
+                            source_rect,
                             ..
-                        } => self
-                            .images
-                            .get(&(*image_node_idx, *image_width, *image_height)),
+                        } => self.images.get(&(
+                            *image_node_idx,
+                            *image_width,
+                            *image_height,
+                            *source_rect,
+                        )),
                         CanvasPathCommand::DrawImageBitmap { image, .. } => Some(image),
                         CanvasPathCommand::FillText { image, .. } => Some(image),
                         _ => unreachable!(),
@@ -7842,6 +7846,7 @@ enum CanvasPathCommand {
         image_node_idx: usize,
         image_width: Option<u32>,
         image_height: Option<u32>,
+        source_rect: Option<(i32, i32, u32, u32)>,
         x: i32,
         y: i32,
         composite: CanvasCompositeOperation,
@@ -7947,11 +7952,154 @@ struct CanvasDrawImageRequest {
     width: Option<f64>,
     height: Option<f64>,
     #[serde(default)]
+    source_x: Option<f64>,
+    #[serde(default)]
+    source_y: Option<f64>,
+    #[serde(default)]
+    source_width: Option<f64>,
+    #[serde(default)]
+    source_height: Option<f64>,
+    #[serde(default)]
     composite: CanvasCompositeOperation,
     #[serde(default)]
     shadow: Option<CanvasShadowStyle>,
     #[serde(default)]
     filter: String,
+}
+
+// Parses a drawImage request into its destination size and source
+// rectangle, either of which is None when the overload does not give it.
+// A negative source width or height flips the rectangle, as in the spec;
+// invalid sizes make the whole request invalid.
+fn parse_draw_image_request(
+    request: &CanvasDrawImageRequest,
+) -> Option<(Option<(u32, u32)>, Option<(i32, i32, u32, u32)>)> {
+    let destination = match (request.width, request.height) {
+        (None, None) => None,
+        (Some(width), Some(height))
+            if width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0
+                && width <= u32::MAX as f64
+                && height <= u32::MAX as f64 =>
+        {
+            Some((
+                width.round().max(1.0) as u32,
+                height.round().max(1.0) as u32,
+            ))
+        }
+        _ => return None,
+    };
+    let source = match (
+        request.source_x,
+        request.source_y,
+        request.source_width,
+        request.source_height,
+    ) {
+        (None, None, None, None) => None,
+        (Some(mut x), Some(mut y), Some(mut width), Some(mut height))
+            if x.is_finite()
+                && y.is_finite()
+                && width.is_finite()
+                && height.is_finite()
+                && width != 0.0
+                && height != 0.0
+                && width.abs() <= u32::MAX as f64
+                && height.abs() <= u32::MAX as f64 =>
+        {
+            if width < 0.0 {
+                x += width;
+                width = -width;
+            }
+            if height < 0.0 {
+                y += height;
+                height = -height;
+            }
+            Some((
+                x.round() as i32,
+                y.round() as i32,
+                width.round().max(1.0) as u32,
+                height.round().max(1.0) as u32,
+            ))
+        }
+        _ => return None,
+    };
+    Some((destination, source))
+}
+
+// Crops the source rectangle (the whole source by default) and scales it
+// to the destination size (the cropped size by default), ready to blit.
+// Downscaling averages each destination pixel's whole source footprint,
+// so shrinking an image to a few pixels gives their overall colour
+// instead of whichever single pixel happens to land in the middle.
+fn crop_draw_image_pixmap(
+    source: &Pixmap,
+    source_rect: Option<(i32, i32, u32, u32)>,
+    destination: Option<(u32, u32)>,
+) -> Option<Pixmap> {
+    let (sx, sy, sw, sh) = source_rect.unwrap_or((0, 0, source.width(), source.height()));
+    let (width, height) = destination.unwrap_or((sw, sh));
+    if width <= sw && height <= sh {
+        let source_width = source.width() as i32;
+        let source_height = source.height() as i32;
+        let pixels = source.pixels();
+        let mut bytes = vec![0u8; width as usize * height as usize * 4];
+        for dest_y in 0..height {
+            let top = f64::from(sy) + f64::from(dest_y) * f64::from(sh) / f64::from(height);
+            let bottom = f64::from(sy) + f64::from(dest_y + 1) * f64::from(sh) / f64::from(height);
+            for dest_x in 0..width {
+                let left = f64::from(sx) + f64::from(dest_x) * f64::from(sw) / f64::from(width);
+                let right =
+                    f64::from(sx) + f64::from(dest_x + 1) * f64::from(sw) / f64::from(width);
+                let mut sums = [0.0f64; 4];
+                for source_y in
+                    (top.floor() as i32).max(0)..(bottom.ceil() as i32).min(source_height)
+                {
+                    let overlap_y =
+                        bottom.min(f64::from(source_y + 1)) - top.max(f64::from(source_y));
+                    if overlap_y <= 0.0 {
+                        continue;
+                    }
+                    for source_x in
+                        (left.floor() as i32).max(0)..(right.ceil() as i32).min(source_width)
+                    {
+                        let overlap_x =
+                            right.min(f64::from(source_x + 1)) - left.max(f64::from(source_x));
+                        if overlap_x <= 0.0 {
+                            continue;
+                        }
+                        let weight = overlap_x * overlap_y;
+                        let pixel = pixels[source_y as usize * source.width() as usize + source_x as usize];
+                        sums[0] += weight * f64::from(pixel.red());
+                        sums[1] += weight * f64::from(pixel.green());
+                        sums[2] += weight * f64::from(pixel.blue());
+                        sums[3] += weight * f64::from(pixel.alpha());
+                    }
+                }
+                // Areas outside the source count as transparent, so the
+                // sums are divided by the whole footprint, not just the
+                // part that landed inside the source.
+                let footprint = (right - left) * (bottom - top);
+                let offset = (dest_y as usize * width as usize + dest_x as usize) * 4;
+                for (channel, sum) in sums.iter().enumerate() {
+                    bytes[offset + channel] = (sum / footprint).round() as u8;
+                }
+            }
+        }
+        return Pixmap::from_vec(bytes, IntSize::from_wh(width, height)?);
+    }
+    crop_image_bitmap(
+        source,
+        &ImageBitmapCrop {
+            sx,
+            sy,
+            sw: Some(sw),
+            sh: Some(sh),
+            resize_width: Some(width),
+            resize_height: Some(height),
+        },
+    )
 }
 
 fn quadratic_bezier(t: f32, p0: i32, p1: i32, p2: i32) -> i32 {
@@ -8023,22 +8171,12 @@ fn op_canvas_draw_image(
         return Ok(false);
     }
 
-    let (input_width, input_height) = match (request.width, request.height) {
-        (None, None) => (None, None),
-        (Some(width), Some(height))
-            if width.is_finite()
-                && height.is_finite()
-                && width > 0.0
-                && height > 0.0
-                && width <= u32::MAX as f64
-                && height <= u32::MAX as f64 =>
-        {
-            (
-                Some(width.round().max(1.0) as u32),
-                Some(height.round().max(1.0) as u32),
-            )
-        }
-        _ => return Ok(false),
+    let Some((destination, source_rect)) = parse_draw_image_request(&request) else {
+        return Ok(false);
+    };
+    let (input_width, input_height) = match destination {
+        Some((width, height)) => (Some(width), Some(height)),
+        None => (None, None),
     };
 
     let host = document_state(scope, document);
@@ -8068,6 +8206,7 @@ fn op_canvas_draw_image(
         image_node_idx,
         image_width: input_width,
         image_height: input_height,
+        source_rect,
         x: request.x.round() as i32,
         y: request.y.round() as i32,
         composite: request.composite,
@@ -8297,22 +8436,8 @@ fn op_canvas_draw_image_bitmap(
     if !request.x.is_finite() || !request.y.is_finite() {
         return Ok(false);
     }
-    let (input_width, input_height) = match (request.width, request.height) {
-        (None, None) => (None, None),
-        (Some(width), Some(height))
-            if width.is_finite()
-                && height.is_finite()
-                && width > 0.0
-                && height > 0.0
-                && width <= u32::MAX as f64
-                && height <= u32::MAX as f64 =>
-        {
-            (
-                Some(width.round().max(1.0) as u32),
-                Some(height.round().max(1.0) as u32),
-            )
-        }
-        _ => return Ok(false),
+    let Some((destination, source_rect)) = parse_draw_image_request(&request) else {
+        return Ok(false);
     };
 
     let host = document_state(scope, document);
@@ -8320,22 +8445,8 @@ fn op_canvas_draw_image_bitmap(
     let Some(bitmap) = renderer.image_bitmaps.get(&bitmap_id).cloned() else {
         return Ok(false);
     };
-    let image = match (input_width, input_height) {
-        (Some(width), Some(height)) if width != bitmap.width() || height != bitmap.height() => {
-            let crop = ImageBitmapCrop {
-                sx: 0,
-                sy: 0,
-                sw: None,
-                sh: None,
-                resize_width: Some(width),
-                resize_height: Some(height),
-            };
-            match crop_image_bitmap(&bitmap, &crop) {
-                Some(image) => image,
-                None => return Ok(false),
-            }
-        }
-        _ => bitmap,
+    let Some(image) = crop_draw_image_pixmap(&bitmap, source_rect, destination) else {
+        return Ok(false);
     };
     let (Some(canvas_width), Some(canvas_height)) = renderer
         .nodes
@@ -8376,22 +8487,8 @@ fn op_canvas_draw_image_canvas(
     if !request.x.is_finite() || !request.y.is_finite() {
         return Ok(false);
     }
-    let (input_width, input_height) = match (request.width, request.height) {
-        (None, None) => (None, None),
-        (Some(width), Some(height))
-            if width.is_finite()
-                && height.is_finite()
-                && width > 0.0
-                && height > 0.0
-                && width <= u32::MAX as f64
-                && height <= u32::MAX as f64 =>
-        {
-            (
-                Some(width.round().max(1.0) as u32),
-                Some(height.round().max(1.0) as u32),
-            )
-        }
-        _ => return Ok(false),
+    let Some((destination, source_rect)) = parse_draw_image_request(&request) else {
+        return Ok(false);
     };
 
     let host = document_state(scope, document);
@@ -8402,22 +8499,8 @@ fn op_canvas_draw_image_canvas(
     let Some(bitmap) = canvas_pixmap(&mut renderer, source_canvas_node_idx) else {
         return Ok(false);
     };
-    let image = match (input_width, input_height) {
-        (Some(width), Some(height)) if width != bitmap.width() || height != bitmap.height() => {
-            let crop = ImageBitmapCrop {
-                sx: 0,
-                sy: 0,
-                sw: None,
-                sh: None,
-                resize_width: Some(width),
-                resize_height: Some(height),
-            };
-            match crop_image_bitmap(&bitmap, &crop) {
-                Some(image) => image,
-                None => return Ok(false),
-            }
-        }
-        _ => bitmap,
+    let Some(image) = crop_draw_image_pixmap(&bitmap, source_rect, destination) else {
+        return Ok(false);
     };
     let (Some(canvas_width), Some(canvas_height)) = renderer
         .nodes
@@ -10979,8 +11062,14 @@ impl Renderer {
                                 image_node_idx,
                                 image_width,
                                 image_height,
+                                source_rect,
                                 ..
-                            } => Some((*image_node_idx, *image_width, *image_height)),
+                            } => Some((
+                                *image_node_idx,
+                                *image_width,
+                                *image_height,
+                                *source_rect,
+                            )),
                             _ => None,
                         })
                         .collect::<HashSet<CanvasImageKey>>()
@@ -10989,19 +11078,44 @@ impl Renderer {
 
             let resolved_images = image_keys
                 .into_iter()
-                .map(|image_key @ (image_node_idx, image_width, image_height)| {
-                    let image = self
-                        .decode_and_rasterize_img(
-                            image_node_idx,
-                            &LayoutMode::Complete,
-                            image_height,
-                            image_width,
-                            None,
-                            None,
-                        )
-                        .map(|(image, _, _, _)| image);
-                    (image_key, image)
-                })
+                .map(
+                    |image_key @ (image_node_idx, image_width, image_height, source_rect)| {
+                        let image = match source_rect {
+                            // A cropped draw is decoded at natural size
+                            // first, then cropped and scaled to fit.
+                            Some(source_rect) => self
+                                .decode_and_rasterize_img(
+                                    image_node_idx,
+                                    &LayoutMode::Complete,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .and_then(|(image, _, _, _)| {
+                                    crop_draw_image_pixmap(
+                                        &image,
+                                        Some(source_rect),
+                                        match (image_width, image_height) {
+                                            (Some(width), Some(height)) => Some((width, height)),
+                                            _ => None,
+                                        },
+                                    )
+                                }),
+                            None => self
+                                .decode_and_rasterize_img(
+                                    image_node_idx,
+                                    &LayoutMode::Complete,
+                                    image_height,
+                                    image_width,
+                                    None,
+                                    None,
+                                )
+                                .map(|(image, _, _, _)| image),
+                        };
+                        (image_key, image)
+                    },
+                )
                 .collect::<Vec<_>>();
 
             if let Some(canvas) = self.canvas_buffers.get_mut(&canvas_idx) {
