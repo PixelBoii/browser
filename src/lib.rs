@@ -15591,6 +15591,7 @@ impl Renderer {
 enum FontFaceId {
     Inter,
     Arial,
+    Serif,
 }
 
 // One laid-out glyph from a string's selected face: its glyph in that
@@ -15611,9 +15612,9 @@ fn is_variation_selector(ch: char) -> bool {
 #[derive(Debug)]
 struct FontHandler {
     font: Rc<FontVec>,
-    // Loaded on first use; the outer None means Arial has not been
-    // looked for yet, the inner None means it is not installed.
-    arial: RefCell<Option<Option<Rc<FontVec>>>>,
+    // System faces loaded so far. A present key with a None value
+    // means "already looked, not installed", so misses are cached too.
+    system_faces: RefCell<HashMap<FontFaceId, Option<Rc<FontVec>>>>,
     glyphs: RefCell<HashMap<(FontFaceId, ab_glyph::GlyphId, u32), Option<Rc<RasterizedGlyph>>>>,
 }
 
@@ -15628,27 +15629,40 @@ impl FontHandler {
         let font = FontVec::try_from_vec(include_bytes!("./InterVariable.ttf").to_vec())?;
         Ok(Self {
             font: Rc::new(font),
-            arial: RefCell::new(None),
+            system_faces: RefCell::new(HashMap::new()),
             glyphs: RefCell::new(HashMap::new()),
         })
     }
 
-    // Arial itself is rarely installed on this platform, so Liberation
-    // Sans, its metric-compatible substitute, is accepted in its place.
-    // Adding another supported family later means another face like this
-    // one plus a match arm in face_for_families below.
-    fn arial_font(&self) -> Option<Rc<FontVec>> {
-        if let Some(arial) = self.arial.borrow().as_ref() {
-            return arial.clone();
+    // The installed families each system face can be satisfied by, in
+    // preference order. Adding another supported family later means a
+    // FontFaceId variant, a row here, and a match arm in
+    // face_for_families below.
+    fn system_families(face: FontFaceId) -> &'static [&'static str] {
+        match face {
+            FontFaceId::Inter => &[],
+            FontFaceId::Arial => &["Arial", "Liberation Sans"],
+            FontFaceId::Serif => &[
+                "Liberation Serif",
+                "Noto Serif",
+                "DejaVu Serif",
+                "Times New Roman",
+            ],
         }
+    }
+
+    // Finds and loads the best installed face for a family list, in
+    // preference order.
+    fn load_system_font(families: &[&str]) -> Option<Rc<FontVec>> {
         let mut database = usvg::fontdb::Database::new();
         database.load_system_fonts();
-        let loaded = database
+        let families: Vec<usvg::fontdb::Family> = families
+            .iter()
+            .map(|family| usvg::fontdb::Family::Name(family))
+            .collect();
+        database
             .query(&usvg::fontdb::Query {
-                families: &[
-                    usvg::fontdb::Family::Name("Arial"),
-                    usvg::fontdb::Family::Name("Liberation Sans"),
-                ],
+                families: &families,
                 ..Default::default()
             })
             .and_then(|id| {
@@ -15657,16 +15671,26 @@ impl FontHandler {
                 })
             })
             .flatten()
-            .map(Rc::new);
-        *self.arial.borrow_mut() = Some(loaded.clone());
+            .map(Rc::new)
+    }
+
+    // Loads a system face on first use and caches the outcome,
+    // including a miss, so each face is only ever looked for once.
+    fn system_face(&self, face: FontFaceId) -> Option<Rc<FontVec>> {
+        if let Some(loaded) = self.system_faces.borrow().get(&face) {
+            return loaded.clone();
+        }
+        let loaded = Self::load_system_font(Self::system_families(face));
+        self.system_faces.borrow_mut().insert(face, loaded.clone());
         loaded
     }
 
     fn face_font(&self, face: FontFaceId) -> Rc<FontVec> {
-        match face {
-            FontFaceId::Inter => self.font.clone(),
-            FontFaceId::Arial => self.arial_font().unwrap_or_else(|| self.font.clone()),
+        if face == FontFaceId::Inter {
+            return self.font.clone();
         }
+        self.system_face(face)
+            .unwrap_or_else(|| self.font.clone())
     }
 
     // The face for a whole string, chosen from its family list: the
@@ -15675,7 +15699,14 @@ impl FontHandler {
     fn face_for_families(&self, families: &[String]) -> FontFaceId {
         for family in families {
             match family.trim().to_ascii_lowercase().as_str() {
-                "arial" if self.arial_font().is_some() => return FontFaceId::Arial,
+                "arial" if self.system_face(FontFaceId::Arial).is_some() => {
+                    return FontFaceId::Arial;
+                }
+                "serif" | "times new roman" | "times"
+                    if self.system_face(FontFaceId::Serif).is_some() =>
+                {
+                    return FontFaceId::Serif;
+                }
                 "inter" | "inter variable" | "sans-serif" => return FontFaceId::Inter,
                 _ => {}
             }
