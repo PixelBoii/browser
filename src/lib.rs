@@ -589,6 +589,9 @@ fn blend_canvas_pixel(
     buffer[pixel_idx] = match composite {
         CanvasCompositeOperation::SourceOver => blend_rgba_with_rgba(buffer[pixel_idx], source),
         CanvasCompositeOperation::Multiply => blend_multiply_with_rgba(buffer[pixel_idx], source),
+        CanvasCompositeOperation::Difference => {
+            blend_difference_with_rgba(buffer[pixel_idx], source)
+        }
     };
 }
 
@@ -3188,6 +3191,29 @@ fn blend_multiply_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
         let s = s as u32;
         let d = (dst >> shift) & 0xFF;
         (s * (255 - da) + d * s + d * (255 - a) + 127) / 255
+    };
+    let output_alpha = a + (da * (255 - a) + 127) / 255;
+    (channel(src.0, 24) << 24)
+        | (channel(src.1, 16) << 16)
+        | (channel(src.2, 8) << 8)
+        | output_alpha
+}
+
+// Difference blending in premultiplied space: same compositing formula
+// as multiply, with blend B(cb, cs) = |cb - cs|. Written in premultiplied
+// channels the blended term is |src_alpha * dst - dst_alpha * src|, and
+// over a transparent backdrop it reduces to the source.
+fn blend_difference_with_rgba(dst: u32, src: (u8, u8, u8, u8)) -> u32 {
+    let a = src.3 as u32;
+    if a == 0 {
+        return dst;
+    }
+    let da = dst & 0xFF;
+    let channel = |s: u8, shift: u32| {
+        let s = s as u32;
+        let d = (dst >> shift) & 0xFF;
+        let blended = (a as i32 * d as i32 - da as i32 * s as i32).unsigned_abs();
+        (s * (255 - da) + d * (255 - a) + blended + 127) / 255
     };
     let output_alpha = a + (da * (255 - a) + 127) / 255;
     (channel(src.0, 24) << 24)
@@ -7419,6 +7445,7 @@ enum CanvasCompositeOperation {
     #[default]
     SourceOver,
     Multiply,
+    Difference,
 }
 
 // The supported canvas filters. Any other filter value is ignored when

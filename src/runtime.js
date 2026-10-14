@@ -1429,7 +1429,7 @@ class CanvasRenderingContext2D {
 
     set globalCompositeOperation(value) {
         // Unsupported values are ignored, per spec.
-        if (value === "source-over" || value === "multiply") {
+        if (value === "source-over" || value === "multiply" || value === "difference") {
             this.__compositeOperation = value
         }
     }
