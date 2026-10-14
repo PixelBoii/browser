@@ -1635,10 +1635,14 @@ class CanvasRenderingContext2D {
 
     drawImage(image, ...args) {
         const isBitmap = image instanceof ImageBitmap
-        if (!isBitmap && (!(image instanceof HTMLImageElement) || image.__node_idx == null)) {
+        const isCanvas = image instanceof HtmlCanvasElement
+        if (!isBitmap && !isCanvas && (!(image instanceof HTMLImageElement) || image.__node_idx == null)) {
             return
         }
         if (isBitmap && image.__bitmapId == null) {
+            return
+        }
+        if (isCanvas && image.__node_idx == null) {
             return
         }
 
@@ -1660,6 +1664,12 @@ class CanvasRenderingContext2D {
                 this.canvas.ownerDocument,
                 this.canvas.__node_idx,
                 image.__bitmapId,
+                { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
+            ) : isCanvas ?
+            core.ops.op_canvas_draw_image_canvas(
+                this.canvas.ownerDocument,
+                this.canvas.__node_idx,
+                image.__node_idx,
                 { x, y, width, height, composite: this.globalCompositeOperation, shadow: canvasShadow(this), filter: this.filter },
             ) :
             core.ops.op_canvas_draw_image(

@@ -8194,15 +8194,9 @@ fn op_image_bitmap_from_image(
     store_image_bitmap(&mut renderer, &pixmap, &crop)
 }
 
-#[op2]
-fn op_image_bitmap_from_canvas(
-    scope: &mut v8::PinScope,
-    document: v8::Local<v8::Object>,
-    #[number] canvas_node_idx: usize,
-    #[serde] crop: ImageBitmapCrop,
-) -> Option<(u32, u32, u32)> {
-    let host = document_state(scope, document);
-    let mut renderer = host.renderer.borrow_mut();
+// Snapshots a canvas element's current bitmap as a pixmap, rendering
+// any queued commands first. A canvas nobody drew into is transparent.
+fn canvas_pixmap(renderer: &mut Renderer, canvas_node_idx: usize) -> Option<Pixmap> {
     renderer.resolve_pending_canvas_images(Some(canvas_node_idx));
     let (Some(width), Some(height)) = renderer
         .nodes
@@ -8212,17 +8206,29 @@ fn op_image_bitmap_from_canvas(
     else {
         return None;
     };
-    let pixmap = match renderer.canvas_buffers.get_mut(&canvas_node_idx) {
+    match renderer.canvas_buffers.get_mut(&canvas_node_idx) {
         Some(canvas) => {
             canvas.resize_if_needed(width, height);
             canvas.update_if_needed();
             Pixmap::from_vec(
                 premul_rgba_buffer_to_bytes(&canvas.buffer),
                 IntSize::from_wh(canvas.width, canvas.height)?,
-            )?
+            )
         }
-        None => Pixmap::new(width, height)?,
-    };
+        None => Pixmap::new(width, height),
+    }
+}
+
+#[op2]
+fn op_image_bitmap_from_canvas(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] canvas_node_idx: usize,
+    #[serde] crop: ImageBitmapCrop,
+) -> Option<(u32, u32, u32)> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let pixmap = canvas_pixmap(&mut renderer, canvas_node_idx)?;
     store_image_bitmap(&mut renderer, &pixmap, &crop)
 }
 
@@ -8312,6 +8318,88 @@ fn op_canvas_draw_image_bitmap(
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     let Some(bitmap) = renderer.image_bitmaps.get(&bitmap_id).cloned() else {
+        return Ok(false);
+    };
+    let image = match (input_width, input_height) {
+        (Some(width), Some(height)) if width != bitmap.width() || height != bitmap.height() => {
+            let crop = ImageBitmapCrop {
+                sx: 0,
+                sy: 0,
+                sw: None,
+                sh: None,
+                resize_width: Some(width),
+                resize_height: Some(height),
+            };
+            match crop_image_bitmap(&bitmap, &crop) {
+                Some(image) => image,
+                None => return Ok(false),
+            }
+        }
+        _ => bitmap,
+    };
+    let (Some(canvas_width), Some(canvas_height)) = renderer
+        .nodes
+        .get(canvas_node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return Ok(false);
+    };
+    let canvas = renderer
+        .canvas_buffers
+        .entry(canvas_node_idx)
+        .or_insert_with(|| CanvasBuffer::new(canvas_width, canvas_height));
+    canvas.resize_if_needed(canvas_width, canvas_height);
+    let shadow = match request.shadow {
+        Some(shadow) => parse_canvas_shadow(shadow)?,
+        None => None,
+    };
+    canvas.commands.push(CanvasPathCommand::DrawImageBitmap {
+        image,
+        x: request.x.round() as i32,
+        y: request.y.round() as i32,
+        composite: request.composite,
+        shadow,
+        filter: parse_canvas_filter(&request.filter),
+    });
+    Ok(true)
+}
+
+#[op2]
+fn op_canvas_draw_image_canvas(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] canvas_node_idx: usize,
+    #[number] source_canvas_node_idx: usize,
+    #[serde] request: CanvasDrawImageRequest,
+) -> Result<bool, JsErrorBox> {
+    if !request.x.is_finite() || !request.y.is_finite() {
+        return Ok(false);
+    }
+    let (input_width, input_height) = match (request.width, request.height) {
+        (None, None) => (None, None),
+        (Some(width), Some(height))
+            if width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0
+                && width <= u32::MAX as f64
+                && height <= u32::MAX as f64 =>
+        {
+            (
+                Some(width.round().max(1.0) as u32),
+                Some(height.round().max(1.0) as u32),
+            )
+        }
+        _ => return Ok(false),
+    };
+
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    // The source is snapshotted now, so later drawing into the source
+    // canvas (or the destination being the source itself) cannot change
+    // what this drawImage paints.
+    let Some(bitmap) = canvas_pixmap(&mut renderer, source_canvas_node_idx) else {
         return Ok(false);
     };
     let image = match (input_width, input_height) {
@@ -9359,6 +9447,7 @@ extension!(
     op_canvas_fill_rect,
     op_canvas_draw_image,
     op_canvas_draw_image_bitmap,
+    op_canvas_draw_image_canvas,
     op_image_bitmap_from_image,
     op_image_bitmap_from_canvas,
     op_image_bitmap_from_pixels,
