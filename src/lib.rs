@@ -8787,12 +8787,15 @@ fn op_canvas_measure_text(
     let face = font_handler.face_for_families(&families);
     let primary_font = font_handler.face_font(face);
     let font = primary_font.as_scaled(font_px as f32);
-    let scale = font.scale_factor();
     let mut width = 0.0f32;
     let mut bounds: Option<ab_glyph::Rect> = None;
     for glyph in font_handler.layout_text(&text, face, font_px) {
         width += glyph.kern_before;
-        if let Some(outline) = primary_font.outline(glyph.glyph_id) {
+        // A fallback glyph's bounds come from its own face, not the
+        // string's primary face.
+        let glyph_font = font_handler.face_font(glyph.face);
+        let scale = glyph_font.as_scaled(font_px as f32).scale_factor();
+        if let Some(outline) = glyph_font.outline(glyph.glyph_id) {
             // Use outline bounds rather than the rounded rasterization bounds.
             let mut glyph_bounds = outline.bounds;
             glyph_bounds.min.x = width + glyph_bounds.min.x * scale.horizontal;
@@ -15592,6 +15595,7 @@ enum FontFaceId {
     Inter,
     Arial,
     Serif,
+    Emoji,
 }
 
 // One laid-out glyph from a string's selected face: its glyph in that
@@ -15650,6 +15654,11 @@ impl FontHandler {
                 "Noto Serif",
                 "DejaVu Serif",
                 "Times New Roman",
+            ],
+            FontFaceId::Emoji => &[
+                "Noto Color Emoji",
+                "Noto Sans Symbols 2",
+                "Noto Sans Symbols",
             ],
         }
     }
@@ -15730,31 +15739,56 @@ impl FontHandler {
         FontFaceId::Inter
     }
 
-    // Lays out a whole string in the given face. Variation selectors
-    // belong to the preceding character: they produce no glyph, advance,
-    // or kern.
+    // Resolves one character to a glyph: in the string's face where it
+    // has one, otherwise in the emoji face, otherwise the string face's
+    // missing glyph.
+    fn resolve_glyph(
+        &self,
+        face: FontFaceId,
+        font: &FontVec,
+        ch: char,
+    ) -> (FontFaceId, ab_glyph::GlyphId) {
+        let glyph_id = font.glyph_id(ch);
+        if glyph_id.0 != 0 || face == FontFaceId::Emoji {
+            return (face, glyph_id);
+        }
+        let emoji_font = self.face_font(FontFaceId::Emoji);
+        let emoji_glyph = emoji_font.glyph_id(ch);
+        if emoji_glyph.0 != 0 {
+            (FontFaceId::Emoji, emoji_glyph)
+        } else {
+            (face, glyph_id)
+        }
+    }
+
+    // Lays out a whole string in the given face, with per-character
+    // emoji fallback from resolve_glyph. Variation selectors belong to
+    // the preceding character: they produce no glyph, advance, or kern.
     fn layout_text(&self, text: &str, face: FontFaceId, font_px: u32) -> Vec<TextGlyph> {
         let font = self.face_font(face);
-        let scaled = font.as_scaled(font_px as f32);
         let mut glyphs = vec![];
-        let mut previous = None;
+        let mut previous: Option<(FontFaceId, ab_glyph::GlyphId)> = None;
         for ch in text.chars() {
             if is_variation_selector(ch) {
                 continue;
             }
-            let glyph_id = font.glyph_id(ch);
+            let (glyph_face, glyph_id) = self.resolve_glyph(face, &font, ch);
+            let glyph_font = self.face_font(glyph_face);
+            let glyph_scaled = glyph_font.as_scaled(font_px as f32);
             let kern_before = match previous {
-                Some(previous_glyph) => scaled.kern(previous_glyph, glyph_id),
-                None => 0.0,
+                Some((previous_face, previous_glyph)) if previous_face == glyph_face => {
+                    glyph_scaled.kern(previous_glyph, glyph_id)
+                }
+                _ => 0.0,
             };
             glyphs.push(TextGlyph {
                 ch,
-                face,
+                face: glyph_face,
                 glyph_id,
-                advance: scaled.h_advance(glyph_id),
+                advance: glyph_scaled.h_advance(glyph_id),
                 kern_before,
             });
-            previous = Some(glyph_id);
+            previous = Some((glyph_face, glyph_id));
         }
         glyphs
     }
@@ -15767,12 +15801,12 @@ impl FontHandler {
         x: f64,
         y: f64,
     ) -> Vec<CanvasPathCommand> {
-        let font = self.face_font(face);
-        let scaled = font.as_scaled(font_px as f32);
         let mut path = vec![];
         let mut pen_x = 0.0;
         for glyph in self.layout_text(text, face, font_px) {
             pen_x += f64::from(glyph.kern_before);
+            let font = self.face_font(glyph.face);
+            let scaled = font.as_scaled(font_px as f32);
             if let Some(outline) = font.outline(glyph.glyph_id) {
                 path.extend(CanvasPathCommand::from_ab_glyph(
                     outline,
