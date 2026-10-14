@@ -15612,8 +15612,10 @@ fn is_variation_selector(ch: char) -> bool {
 #[derive(Debug)]
 struct FontHandler {
     font: Rc<FontVec>,
-    // System faces loaded so far. A present key with a None value
+    // The system font database, scanned lazily on first use, and the
+    // faces loaded from it so far. A present key with a None value
     // means "already looked, not installed", so misses are cached too.
+    fontdb: RefCell<Option<usvg::fontdb::Database>>,
     system_faces: RefCell<HashMap<FontFaceId, Option<Rc<FontVec>>>>,
     glyphs: RefCell<HashMap<(FontFaceId, ab_glyph::GlyphId, u32), Option<Rc<RasterizedGlyph>>>>,
 }
@@ -15629,6 +15631,7 @@ impl FontHandler {
         let font = FontVec::try_from_vec(include_bytes!("./InterVariable.ttf").to_vec())?;
         Ok(Self {
             font: Rc::new(font),
+            fontdb: RefCell::new(None),
             system_faces: RefCell::new(HashMap::new()),
             glyphs: RefCell::new(HashMap::new()),
         })
@@ -15651,15 +15654,28 @@ impl FontHandler {
         }
     }
 
+    // The system font database is scanned once, the first time any
+    // system face is needed, and reused for every face after that.
+    fn ensure_fontdb(&self) {
+        let mut database = self.fontdb.borrow_mut();
+        if database.is_some() {
+            return;
+        }
+        let mut loaded = usvg::fontdb::Database::new();
+        loaded.load_system_fonts();
+        *database = Some(loaded);
+    }
+
     // Finds and loads the best installed face for a family list, in
     // preference order.
-    fn load_system_font(families: &[&str]) -> Option<Rc<FontVec>> {
-        let mut database = usvg::fontdb::Database::new();
-        database.load_system_fonts();
+    fn load_system_font(&self, families: &[&str]) -> Option<Rc<FontVec>> {
+        self.ensure_fontdb();
         let families: Vec<usvg::fontdb::Family> = families
             .iter()
             .map(|family| usvg::fontdb::Family::Name(family))
             .collect();
+        let database = self.fontdb.borrow();
+        let database = database.as_ref()?;
         database
             .query(&usvg::fontdb::Query {
                 families: &families,
@@ -15680,7 +15696,7 @@ impl FontHandler {
         if let Some(loaded) = self.system_faces.borrow().get(&face) {
             return loaded.clone();
         }
-        let loaded = Self::load_system_font(Self::system_families(face));
+        let loaded = self.load_system_font(Self::system_families(face));
         self.system_faces.borrow_mut().insert(face, loaded.clone());
         loaded
     }
