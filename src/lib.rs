@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, u32};
 
-use ab_glyph::{Font, FontRef, OutlineCurve, ScaleFont};
+use ab_glyph::{Font, FontVec, OutlineCurve, ScaleFont};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use deno_core::error::JsError;
@@ -7478,6 +7478,48 @@ impl CanvasFilter {
     }
 }
 
+// Parses the parts of a canvas font shorthand this engine uses: the
+// pixel size and the family list that follows it. Style and weight words
+// before the size are skipped, as is a line-height after the size. An
+// unparseable font falls back to the initial 10px sans-serif.
+fn parse_canvas_font(font: &str) -> (f64, Vec<String>) {
+    let fallback = || (10.0, vec!["sans-serif".to_string()]);
+    let lower = font.to_ascii_lowercase();
+    let Some(px) = lower.find("px") else {
+        return fallback();
+    };
+    let number_start = lower[..px]
+        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map_or(0, |index| index + 1);
+    let Ok(size) = lower[number_start..px].parse::<f64>() else {
+        return fallback();
+    };
+    let size_end = px + 2;
+    let mut families_text = font[size_end..].trim_start();
+    // Skip an optional "/line-height" between the size and the families.
+    if let Some(after_slash) = families_text.strip_prefix('/') {
+        let line_height_end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
+        families_text = after_slash[line_height_end..].trim_start();
+    }
+    let families: Vec<String> = families_text
+        .split(',')
+        .map(|family| {
+            family
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .trim()
+                .to_string()
+        })
+        .filter(|family| !family.is_empty())
+        .collect();
+    if families.is_empty() {
+        return (size, vec!["sans-serif".to_string()]);
+    }
+    (size, families)
+}
+
 fn parse_canvas_filter(filter: &str) -> CanvasFilter {
     let filter = filter.trim().to_ascii_lowercase();
     if filter == "none" {
@@ -8730,27 +8772,27 @@ fn op_canvas_measure_text(
     scope: &mut v8::PinScope,
     document: v8::Local<v8::Object>,
     #[string] text: String,
-    font_size: f64,
+    #[string] font: String,
     #[string] text_align: String,
     #[string] text_baseline: String,
 ) -> CanvasTextMetrics {
+    let (font_size, families) = parse_canvas_font(&font);
     if !font_size.is_finite() || font_size <= 0.0 {
         return CanvasTextMetrics::default();
     }
     let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
     let font_px = font_size as u32;
-    let font = renderer.font_handler.font.as_scaled(font_px as f32);
+    let font_handler = &renderer.font_handler;
+    let face = font_handler.face_for_families(&families);
+    let primary_font = font_handler.face_font(face);
+    let font = primary_font.as_scaled(font_px as f32);
     let scale = font.scale_factor();
-    let mut width = 0.0;
-    let mut previous = None;
+    let mut width = 0.0f32;
     let mut bounds: Option<ab_glyph::Rect> = None;
-    for ch in text.chars() {
-        let glyph_id = font.glyph_id(ch);
-        if let Some(previous_id) = previous {
-            width += font.kern(previous_id, glyph_id);
-        }
-        if let Some(outline) = font.font().outline(glyph_id) {
+    for glyph in font_handler.layout_text(&text, face, font_px) {
+        width += glyph.kern_before;
+        if let Some(outline) = primary_font.outline(glyph.glyph_id) {
             // Use outline bounds rather than the rounded rasterization bounds.
             let mut glyph_bounds = outline.bounds;
             glyph_bounds.min.x = width + glyph_bounds.min.x * scale.horizontal;
@@ -8766,8 +8808,7 @@ fn op_canvas_measure_text(
                 bounds = Some(glyph_bounds);
             }
         }
-        width += font.h_advance(glyph_id);
-        previous = Some(glyph_id);
+        width += glyph.advance;
     }
     // Approximate the em box with the existing height-based font scale. Baseline
     // tables are not exposed by ab_glyph; synthesize hanging and ideographic.
@@ -8902,22 +8943,19 @@ fn op_svg_get_extent_of_char(
 fn canvas_text_origin(
     font_handler: &FontHandler,
     text: &str,
+    families: &[String],
     font_px: u32,
     x: f64,
     y: f64,
     text_align: &str,
     text_baseline: &str,
 ) -> (f64, f64) {
-    let font = font_handler.font.as_scaled(font_px as f32);
-    let mut width = 0.0;
-    let mut previous = None;
-    for ch in text.chars() {
-        let glyph_id = font.glyph_id(ch);
-        if let Some(previous_id) = previous {
-            width += font.kern(previous_id, glyph_id);
-        }
-        width += font.h_advance(glyph_id);
-        previous = Some(glyph_id);
+    let face = font_handler.face_for_families(families);
+    let primary_font = font_handler.face_font(face);
+    let font = primary_font.as_scaled(font_px as f32);
+    let mut width = 0.0f32;
+    for glyph in font_handler.layout_text(text, face, font_px) {
+        width += glyph.kern_before + glyph.advance;
     }
     let ascent = f64::from(font.ascent());
     let descent = -f64::from(font.descent());
@@ -8944,7 +8982,7 @@ fn op_canvas_fill_text(
     #[string] text: String,
     x: f64,
     y: f64,
-    font_size: f64,
+    #[string] font: String,
     #[serde] fill_style: CanvasStyle,
     #[string] text_align: String,
     #[string] text_baseline: String,
@@ -8952,6 +8990,7 @@ fn op_canvas_fill_text(
     #[serde] shadow: CanvasShadowStyle,
     #[string] filter: String,
 ) -> Result<bool, JsErrorBox> {
+    let (font_size, families) = parse_canvas_font(&font);
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
     }
@@ -8962,12 +9001,16 @@ fn op_canvas_fill_text(
     let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
         return Ok(false);
     };
-    let font = &renderer.font_handler.font;
     let font_px = font_size as u32;
-    let baseline = font.as_scaled(font_px as f32).ascent();
+    let primary_font =
+        renderer
+            .font_handler
+            .face_font(renderer.font_handler.face_for_families(&families));
+    let baseline = primary_font.as_scaled(font_px as f32).ascent();
     let (x, y) = canvas_text_origin(
         &renderer.font_handler,
         &text,
+        &families,
         font_px,
         x,
         y,
@@ -8976,9 +9019,16 @@ fn op_canvas_fill_text(
     );
     // Rasterize in white: only the glyph coverage is used, and the paint
     // supplies the color when the image is drawn.
-    let Some((image, _, _)) =
-        text_to_buffer(&renderer.font_handler, 0xFF_FF_FF_FF, &text, font_px, None)
-    else {
+    let Some((image, _, _)) = text_to_buffer_with_line_height(
+        &renderer.font_handler,
+        0xFF_FF_FF_FF,
+        &text,
+        font_px,
+        &families,
+        None,
+        None,
+        StyleAlign::Left,
+    ) else {
         return Ok(false);
     };
     let canvas = renderer
@@ -9006,7 +9056,7 @@ fn op_canvas_stroke_text(
     #[string] text: String,
     x: f64,
     y: f64,
-    font_size: f64,
+    #[string] font: String,
     line_width: f64,
     #[serde] stroke_style: CanvasStyle,
     #[string] text_align: String,
@@ -9015,6 +9065,7 @@ fn op_canvas_stroke_text(
     #[serde] shadow: CanvasShadowStyle,
     #[string] filter: String,
 ) -> Result<bool, JsErrorBox> {
+    let (font_size, families) = parse_canvas_font(&font);
     if !x.is_finite()
         || !y.is_finite()
         || !font_size.is_finite()
@@ -9034,15 +9085,17 @@ fn op_canvas_stroke_text(
     let (x, y) = canvas_text_origin(
         &renderer.font_handler,
         &text,
+        &families,
         font_size as u32,
         x,
         y,
         &text_align,
         &text_baseline,
     );
+    let face = renderer.font_handler.face_for_families(&families);
     let path = renderer
         .font_handler
-        .text_path(&text, font_size as u32, x, y);
+        .text_path(&text, face, font_size as u32, x, y);
     if path.is_empty() {
         return Ok(false);
     }
@@ -12105,6 +12158,7 @@ impl Renderer {
                             text_hex,
                             &text,
                             resolved_font_size,
+                            &[],
                             max_width,
                             line_height,
                             style.text_align,
@@ -15533,10 +15587,34 @@ impl Renderer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FontFaceId {
+    Inter,
+    Arial,
+}
+
+// One laid-out glyph from a string's selected face: its glyph in that
+// face and its scaled advance, with kerning from the previous glyph.
+#[derive(Clone, Copy, Debug)]
+struct TextGlyph {
+    ch: char,
+    face: FontFaceId,
+    glyph_id: ab_glyph::GlyphId,
+    advance: f32,
+    kern_before: f32,
+}
+
+fn is_variation_selector(ch: char) -> bool {
+    matches!(ch, '\u{fe0e}' | '\u{fe0f}')
+}
+
 #[derive(Debug)]
 struct FontHandler {
-    font: FontRef<'static>,
-    glyphs: RefCell<HashMap<(char, u32), Option<Rc<RasterizedGlyph>>>>,
+    font: Rc<FontVec>,
+    // Loaded on first use; the outer None means Arial has not been
+    // looked for yet, the inner None means it is not installed.
+    arial: RefCell<Option<Option<Rc<FontVec>>>>,
+    glyphs: RefCell<HashMap<(FontFaceId, ab_glyph::GlyphId, u32), Option<Rc<RasterizedGlyph>>>>,
 }
 
 #[derive(Debug)]
@@ -15547,47 +15625,133 @@ struct RasterizedGlyph {
 
 impl FontHandler {
     pub fn new() -> Result<Self> {
-        let font = FontRef::try_from_slice(include_bytes!("./InterVariable.ttf"))?;
+        let font = FontVec::try_from_vec(include_bytes!("./InterVariable.ttf").to_vec())?;
         Ok(Self {
-            font,
+            font: Rc::new(font),
+            arial: RefCell::new(None),
             glyphs: RefCell::new(HashMap::new()),
         })
     }
 
-    fn text_path(&self, text: &str, font_px: u32, x: f64, y: f64) -> Vec<CanvasPathCommand> {
-        let font = self.font.as_scaled(font_px as f32);
-        let scale = font.scale_factor();
-        let mut path = vec![];
-        let mut pen_x = 0.0;
+    // Arial itself is rarely installed on this platform, so Liberation
+    // Sans, its metric-compatible substitute, is accepted in its place.
+    // Adding another supported family later means another face like this
+    // one plus a match arm in face_for_families below.
+    fn arial_font(&self) -> Option<Rc<FontVec>> {
+        if let Some(arial) = self.arial.borrow().as_ref() {
+            return arial.clone();
+        }
+        let mut database = usvg::fontdb::Database::new();
+        database.load_system_fonts();
+        let loaded = database
+            .query(&usvg::fontdb::Query {
+                families: &[
+                    usvg::fontdb::Family::Name("Arial"),
+                    usvg::fontdb::Family::Name("Liberation Sans"),
+                ],
+                ..Default::default()
+            })
+            .and_then(|id| {
+                database.with_face_data(id, |data, index| {
+                    FontVec::try_from_vec_and_index(data.to_vec(), index).ok()
+                })
+            })
+            .flatten()
+            .map(Rc::new);
+        *self.arial.borrow_mut() = Some(loaded.clone());
+        loaded
+    }
+
+    fn face_font(&self, face: FontFaceId) -> Rc<FontVec> {
+        match face {
+            FontFaceId::Inter => self.font.clone(),
+            FontFaceId::Arial => self.arial_font().unwrap_or_else(|| self.font.clone()),
+        }
+    }
+
+    // The face for a whole string, chosen from its family list: the
+    // first supported family wins, and anything else uses Inter. This
+    // face also provides the string's ascent and descent.
+    fn face_for_families(&self, families: &[String]) -> FontFaceId {
+        for family in families {
+            match family.trim().to_ascii_lowercase().as_str() {
+                "arial" if self.arial_font().is_some() => return FontFaceId::Arial,
+                "inter" | "inter variable" | "sans-serif" => return FontFaceId::Inter,
+                _ => {}
+            }
+        }
+        FontFaceId::Inter
+    }
+
+    // Lays out a whole string in the given face. Variation selectors
+    // belong to the preceding character: they produce no glyph, advance,
+    // or kern.
+    fn layout_text(&self, text: &str, face: FontFaceId, font_px: u32) -> Vec<TextGlyph> {
+        let font = self.face_font(face);
+        let scaled = font.as_scaled(font_px as f32);
+        let mut glyphs = vec![];
         let mut previous = None;
         for ch in text.chars() {
-            let glyph_id = self.font.glyph_id(ch);
-            if let Some(previous_id) = previous {
-                pen_x += font.kern(previous_id, glyph_id);
+            if is_variation_selector(ch) {
+                continue;
             }
-            if let Some(outline) = self.font.outline(glyph_id) {
+            let glyph_id = font.glyph_id(ch);
+            let kern_before = match previous {
+                Some(previous_glyph) => scaled.kern(previous_glyph, glyph_id),
+                None => 0.0,
+            };
+            glyphs.push(TextGlyph {
+                ch,
+                face,
+                glyph_id,
+                advance: scaled.h_advance(glyph_id),
+                kern_before,
+            });
+            previous = Some(glyph_id);
+        }
+        glyphs
+    }
+
+    fn text_path(
+        &self,
+        text: &str,
+        face: FontFaceId,
+        font_px: u32,
+        x: f64,
+        y: f64,
+    ) -> Vec<CanvasPathCommand> {
+        let font = self.face_font(face);
+        let scaled = font.as_scaled(font_px as f32);
+        let mut path = vec![];
+        let mut pen_x = 0.0;
+        for glyph in self.layout_text(text, face, font_px) {
+            pen_x += f64::from(glyph.kern_before);
+            if let Some(outline) = font.outline(glyph.glyph_id) {
                 path.extend(CanvasPathCommand::from_ab_glyph(
                     outline,
-                    scale,
-                    x + f64::from(pen_x),
+                    scaled.scale_factor(),
+                    x + pen_x,
                     y,
                 ));
             }
-            pen_x += font.h_advance(glyph_id);
-            previous = Some(glyph_id);
+            pen_x += f64::from(glyph.advance);
         }
         path
     }
 
     // Coverage can be shared across strings and colors; placement and blending happen later.
-    fn rasterized_glyph_for(&self, char: char, size: u32) -> Option<Rc<RasterizedGlyph>> {
+    fn rasterized_glyph_for(
+        &self,
+        face: FontFaceId,
+        glyph_id: ab_glyph::GlyphId,
+        size: u32,
+    ) -> Option<Rc<RasterizedGlyph>> {
+        let font = self.face_font(face);
         self.glyphs
             .borrow_mut()
-            .entry((char, size))
+            .entry((face, glyph_id, size))
             .or_insert_with(|| {
-                let glyph = self
-                    .font
-                    .outline_glyph(self.font.glyph_id(char).with_scale(size as f32))?;
+                let glyph = font.outline_glyph(glyph_id.with_scale(size as f32))?;
                 let mut pixels = Vec::new();
                 glyph.draw(|x, y, coverage| pixels.push((x, y, coverage)));
                 Some(Rc::new(RasterizedGlyph {
@@ -18552,6 +18716,7 @@ fn text_to_buffer(
         color,
         text,
         font_px,
+        &[],
         max_width,
         None,
         StyleAlign::Left,
@@ -18563,17 +18728,19 @@ fn text_to_buffer_with_line_height(
     color: u32,
     text: &String,
     font_px: u32,
+    families: &[String],
     max_width: Option<u32>,
     line_height_px: Option<u32>,
     text_align: StyleAlign,
 ) -> Option<(Pixmap, u32, u32)> {
-    let scaled_font = font_handler.font.as_scaled(font_px as f32);
+    let face = font_handler.face_for_families(families);
+    let primary_font = font_handler.face_font(face);
+    let scaled_font = primary_font.as_scaled(font_px as f32);
     let mut width = 0f32;
     let x = 0;
     let y = 0;
     let mut pen_x: f32 = x as f32;
     let mut pen_y: f32 = y as f32;
-    let mut previous = None;
 
     let mut glyph_positions = vec![];
     let mut lines = vec![];
@@ -18584,21 +18751,22 @@ fn text_to_buffer_with_line_height(
         .map(|line_height| line_height as f32)
         .unwrap_or(default_line_height);
     let leading = ((line_height - default_line_height) / 2.).max(0.);
-    for ch in text.chars() {
-        let glyph_id = font_handler.font.glyph_id(ch);
-        if let Some(previous_id) = previous {
-            pen_x += scaled_font.kern(previous_id, glyph_id);
-        }
-        if let Some(glyph) = font_handler.rasterized_glyph_for(ch, font_px) {
+    for glyph in font_handler.layout_text(text, face, font_px) {
+        pen_x += glyph.kern_before;
+        if let Some(rasterized) =
+            font_handler.rasterized_glyph_for(glyph.face, glyph.glyph_id, font_px)
+        {
             glyph_positions.push(GlyphPosition {
                 x: pen_x,
                 y: pen_y,
-                glyph,
+                glyph: rasterized,
             });
         }
-        let advance = scaled_font.h_advance(glyph_id);
+        let advance = glyph.advance;
         // Line break
-        if max_width.is_some_and(|max_width| pen_x + advance >= max_width as f32) && ch == ' ' {
+        if max_width.is_some_and(|max_width| pen_x + advance >= max_width as f32)
+            && glyph.ch == ' '
+        {
             lines.push((line_start, glyph_positions.len(), pen_x));
             line_start = glyph_positions.len();
             pen_x = x as f32;
@@ -18607,7 +18775,6 @@ fn text_to_buffer_with_line_height(
             pen_x += advance;
             width = width.max(pen_x)
         }
-        previous = Some(glyph_id);
     }
     lines.push((line_start, glyph_positions.len(), pen_x));
     // Align each wrapped line inside the text box; its parent positions the box itself.

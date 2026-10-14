@@ -1476,9 +1476,8 @@ class CanvasRenderingContext2D {
         const prefix = "Failed to execute 'measureText' on 'CanvasRenderingContext2D'"
         webidl.requiredArguments(arguments.length, 1, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
-        const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         return new TextMetrics(textMetricsToken, core.ops.op_canvas_measure_text(
-            this.canvas.ownerDocument, text, fontSize, this.textAlign, this.textBaseline,
+            this.canvas.ownerDocument, text, String(this.font), this.textAlign, this.textBaseline,
         ))
     }
 
@@ -1486,9 +1485,8 @@ class CanvasRenderingContext2D {
         const prefix = "Failed to execute 'fillText' on 'CanvasRenderingContext2D'"
         webidl.requiredArguments(arguments.length, 3, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
-        const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const fillStyle = canvasStyle(this.fillStyle)
-        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, fillStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this), this.filter)) {
+        if (core.ops.op_canvas_fill_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, String(this.font), fillStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this), this.filter)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
@@ -1497,9 +1495,8 @@ class CanvasRenderingContext2D {
         const prefix = "Failed to execute 'strokeText' on 'CanvasRenderingContext2D'"
         webidl.requiredArguments(arguments.length, 3, prefix)
         text = webidl.converters.DOMString(text, prefix, "Argument 1").replace(/[\t\n\f\r]/g, " ")
-        const fontSize = Number(/(?:^|\s)(\d+(?:\.\d+)?|\.\d+)px(?:\s|$)/i.exec(String(this.font))?.[1] ?? 10)
         const strokeStyle = canvasStyle(this.strokeStyle)
-        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, fontSize, +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this), this.filter)) {
+        if (core.ops.op_canvas_stroke_text(this.canvas.ownerDocument, this.canvas.__node_idx, text, +x, +y, String(this.font), +this.lineWidth, strokeStyle, this.textAlign, this.textBaseline, this.globalCompositeOperation, canvasShadow(this), this.filter)) {
             core.ops.op_canvas_paint(this.canvas.ownerDocument, this.canvas.__node_idx)
         }
     }
@@ -2847,7 +2844,7 @@ class SVGTextContentElement extends SVGGraphicsElement {
         if (style.display === "none") return 0
         const text = this.textContent.replace(/[ \t\r\n]+/g, " ").replace(/^ | $/g, "")
         return core.ops.op_canvas_measure_text(
-            this.ownerDocument, text, parseFloat(style.fontSize), "left", "alphabetic",
+            this.ownerDocument, text, `${parseFloat(style.fontSize)}px`, "left", "alphabetic",
         ).width
     }
 }
