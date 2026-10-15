@@ -232,10 +232,44 @@ class BaseNode extends EventTarget {
     }
 
     compareDocumentPosition(other) {
+        const prefix = "Failed to execute 'compareDocumentPosition' on 'Node'"
+        webidl.requiredArguments(arguments.length, 1, prefix)
+        if (!(other instanceof BaseNode)) {
+            throw new TypeError(`${prefix}: parameter 1 is not of type 'Node'.`)
+        }
         if (other === this) {
             return 0
         }
-        return Node.DOCUMENT_POSITION_FOLLOWING
+        if (this.getRootNode() !== other.getRootNode()) {
+            const position = other.__node_idx < this.__node_idx
+                ? Node.DOCUMENT_POSITION_PRECEDING
+                : Node.DOCUMENT_POSITION_FOLLOWING
+            return Node.DOCUMENT_POSITION_DISCONNECTED
+                | Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC
+                | position
+        }
+        if (this.contains(other)) {
+            return Node.DOCUMENT_POSITION_CONTAINED_BY | Node.DOCUMENT_POSITION_FOLLOWING
+        }
+        if (other.contains(this)) {
+            return Node.DOCUMENT_POSITION_CONTAINS | Node.DOCUMENT_POSITION_PRECEDING
+        }
+        const thisChain = []
+        for (let node = this; node; node = node.parentNode) {
+            thisChain.unshift(node)
+        }
+        const otherChain = []
+        for (let node = other; node; node = node.parentNode) {
+            otherChain.unshift(node)
+        }
+        let index = 0
+        while (thisChain[index] === otherChain[index]) {
+            index++
+        }
+        const siblings = thisChain[index - 1].childNodes
+        return siblings.indexOf(otherChain[index]) < siblings.indexOf(thisChain[index])
+            ? Node.DOCUMENT_POSITION_PRECEDING
+            : Node.DOCUMENT_POSITION_FOLLOWING
     }
 
     isEqualNode(other) {
@@ -453,8 +487,17 @@ BaseNode.TEXT_NODE = 3
 BaseNode.COMMENT_NODE = 8
 BaseNode.DOCUMENT_NODE = 9
 BaseNode.DOCUMENT_FRAGMENT_NODE = 11
-BaseNode.DOCUMENT_POSITION_PRECEDING = 2
-BaseNode.DOCUMENT_POSITION_FOLLOWING = 4
+for (const [name, value] of Object.entries({
+    DOCUMENT_POSITION_DISCONNECTED: 1,
+    DOCUMENT_POSITION_PRECEDING: 2,
+    DOCUMENT_POSITION_FOLLOWING: 4,
+    DOCUMENT_POSITION_CONTAINS: 8,
+    DOCUMENT_POSITION_CONTAINED_BY: 16,
+    DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
+})) {
+    BaseNode[name] = value
+    BaseNode.prototype[name] = value
+}
 
 Object.defineProperty(globalThis, "Node", {
     value: BaseNode,
