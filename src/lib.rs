@@ -556,6 +556,33 @@ fn multiply_coverage(first: u8, second: u8) -> u8 {
     ((u16::from(first) * u16::from(second) + 127) / 255) as u8
 }
 
+// Adds the straight edge back to a subpath's start that filling and
+// clipping imply for an open subpath. A subpath already at its start
+// needs no edge.
+fn close_canvas_subpath(
+    y_pixels: &mut [Vec<usize>],
+    width: usize,
+    cursor: Position,
+    subpath_start: [f64; 2],
+) {
+    if cursor.x == subpath_start[0].round() as i32
+        && cursor.y == subpath_start[1].round() as i32
+    {
+        return;
+    }
+    let [x, y] = subpath_start;
+    let x_delta = x - cursor.x as f64;
+    let y_delta = y - cursor.y as f64;
+    let steps = y_delta.abs().max(1.) as usize;
+    for step in 0..=steps {
+        let px = (cursor.x as f64 + x_delta * step as f64 / steps as f64).round() as usize;
+        let py = (cursor.y as f64 + y_delta * step as f64 / steps as f64).round() as usize;
+        if px < width && py < y_pixels.len() {
+            y_pixels[py].push(px);
+        }
+    }
+}
+
 fn clipped_coverage(clip_mask: Option<&[u8]>, pixel_idx: usize, coverage: u8) -> u8 {
     match clip_mask {
         Some(mask) => multiply_coverage(coverage, mask[pixel_idx]),
@@ -1432,6 +1459,9 @@ impl CanvasBuffer {
                     if let Some(transform) = transform {
                         point = self.compute_point_transform(&point, transform)?;
                     }
+                    if let Some(start) = subpath_start {
+                        close_canvas_subpath(&mut y_pixels, self.width as usize, cursor, start);
+                    }
                     cursor.x = point[0].round() as i32;
                     cursor.y = point[1].round() as i32;
                     subpath_start = Some(point);
@@ -1634,28 +1664,19 @@ impl CanvasBuffer {
                     }
                 }
                 CanvasPathCommand::Close => {
-                    let Some([x, y]) = subpath_start else {
+                    let Some(start) = subpath_start else {
                         continue;
                     };
-                    let x_delta = x - cursor.x as f64;
-                    let y_delta = y - cursor.y as f64;
-                    let steps = y_delta.abs().max(1.) as usize;
-                    if steps > 0 {
-                        for step in 0..=steps {
-                            let px = (cursor.x as f64 + x_delta * step as f64 / steps as f64)
-                                .round() as usize;
-                            let py = (cursor.y as f64 + y_delta * step as f64 / steps as f64)
-                                .round() as usize;
-                            if px < self.width as usize && py < self.height as usize {
-                                y_pixels[py].push(px);
-                            }
-                        }
-                    }
-                    cursor.x = x.round() as i32;
-                    cursor.y = y.round() as i32;
+                    close_canvas_subpath(&mut y_pixels, self.width as usize, cursor, start);
+                    cursor.x = start[0].round() as i32;
+                    cursor.y = start[1].round() as i32;
                 }
                 _ => {}
             };
+        }
+
+        if let Some(start) = subpath_start {
+            close_canvas_subpath(&mut y_pixels, self.width as usize, cursor, start);
         }
 
         let width = self.width as usize;
