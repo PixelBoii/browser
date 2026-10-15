@@ -644,6 +644,7 @@ dependencies = [
  "softbuffer",
  "sys_traits",
  "tokio",
+ "ttf-parser",
  "url",
  "winit",
  "x11rb",

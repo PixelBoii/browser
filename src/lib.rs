@@ -942,6 +942,12 @@ impl CanvasBuffer {
                         CanvasPathCommand::FillText { paint, .. } => Some(paint),
                         _ => None,
                     };
+                    let fill_text_color = match &cmd {
+                        CanvasPathCommand::FillText { color_image, .. } => {
+                            color_image.as_ref()
+                        }
+                        _ => None,
+                    };
                     let composite = match &cmd {
                         CanvasPathCommand::DrawImage { composite, .. }
                         | CanvasPathCommand::DrawImageBitmap { composite, .. }
@@ -1143,22 +1149,37 @@ impl CanvasBuffer {
                                 let source_y = source_y.floor() as usize;
 
                                 let source = pixels[source_y * image_width + source_x];
-                                let (source, coverage) = match fill_text_paint {
-                                    Some(paint) => (
-                                        filter.apply(rgba_to_premul_tuple(
-                                            paint.color_at(user_point[0], user_point[1]),
-                                        )),
-                                        source.alpha(),
-                                    ),
-                                    None => (
-                                        filter.apply((
-                                            source.red(),
-                                            source.green(),
-                                            source.blue(),
+                                // Colour glyph pixels carry their own
+                                // premultiplied colour and replace the paint.
+                                let color_source = fill_text_color.and_then(|color_image| {
+                                    let pixel = color_image.pixels()
+                                        [source_y * image_width + source_x];
+                                    (pixel.alpha() > 0).then_some(filter.apply((
+                                        pixel.red(),
+                                        pixel.green(),
+                                        pixel.blue(),
+                                        pixel.alpha(),
+                                    )))
+                                });
+                                let (source, coverage) = match color_source {
+                                    Some(color) => (color, u8::MAX),
+                                    None => match fill_text_paint {
+                                        Some(paint) => (
+                                            filter.apply(rgba_to_premul_tuple(
+                                                paint.color_at(user_point[0], user_point[1]),
+                                            )),
                                             source.alpha(),
-                                        )),
-                                        u8::MAX,
-                                    ),
+                                        ),
+                                        None => (
+                                            filter.apply((
+                                                source.red(),
+                                                source.green(),
+                                                source.blue(),
+                                                source.alpha(),
+                                            )),
+                                            u8::MAX,
+                                        ),
+                                    },
                                 };
                                 blend_canvas_pixel(
                                     &mut *target,
@@ -7907,6 +7928,9 @@ enum CanvasPathCommand {
     #[serde(skip)]
     FillText {
         image: Pixmap,
+        // Colour glyph images (emoji) aligned with the coverage image;
+        // their pixels replace the paint where present.
+        color_image: Option<Pixmap>,
         x: i32,
         y: i32,
         paint: CanvasPaint,
@@ -9022,7 +9046,7 @@ fn op_canvas_fill_text(
     );
     // Rasterize in white: only the glyph coverage is used, and the paint
     // supplies the color when the image is drawn.
-    let Some((image, _, _)) = text_to_buffer_with_line_height(
+    let Some((image, color_image, _, _)) = text_to_buffer_with_line_height(
         &renderer.font_handler,
         0xFF_FF_FF_FF,
         &text,
@@ -9041,6 +9065,7 @@ fn op_canvas_fill_text(
     canvas.resize_if_needed(width, height);
     canvas.commands.push(CanvasPathCommand::FillText {
         image,
+        color_image,
         x: x.round() as i32,
         y: (y - f64::from(baseline)).round() as i32,
         paint,
@@ -12156,7 +12181,7 @@ impl Renderer {
                     if let Some(cached) = self.cached_text_buffers.get(&cache_key) {
                         cached
                     } else {
-                        let (buffer, width, height) = text_to_buffer_with_line_height(
+                        let (buffer, _, width, height) = text_to_buffer_with_line_height(
                             &self.font_handler,
                             text_hex,
                             &text,
@@ -15625,9 +15650,17 @@ struct FontHandler {
 }
 
 #[derive(Debug)]
+enum RasterizedGlyphPixels {
+    Coverage(Vec<(u32, u32, f32)>),
+    // Colour glyphs (emoji bitmaps) carry a ready-made image and a
+    // horizontal bearing instead of coverage pixels.
+    Color { left: f32, image: Rc<Pixmap> },
+}
+
+#[derive(Debug)]
 struct RasterizedGlyph {
     top: f32,
-    pixels: Vec<(u32, u32, f32)>,
+    pixels: RasterizedGlyphPixels,
 }
 
 impl FontHandler {
@@ -15675,28 +15708,31 @@ impl FontHandler {
         *database = Some(loaded);
     }
 
-    // Finds and loads the best installed face for a family list, in
-    // preference order.
+    // Finds and loads the best installed face for a family list. The
+    // families are tried one at a time so the list order really is the
+    // preference order, which a single multi-family query does not
+    // guarantee.
     fn load_system_font(&self, families: &[&str]) -> Option<Rc<FontVec>> {
         self.ensure_fontdb();
-        let families: Vec<usvg::fontdb::Family> = families
-            .iter()
-            .map(|family| usvg::fontdb::Family::Name(family))
-            .collect();
         let database = self.fontdb.borrow();
         let database = database.as_ref()?;
-        database
-            .query(&usvg::fontdb::Query {
-                families: &families,
+        for family in families {
+            let Some(id) = database.query(&usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Name(family)],
                 ..Default::default()
-            })
-            .and_then(|id| {
-                database.with_face_data(id, |data, index| {
+            }) else {
+                continue;
+            };
+            let loaded = database
+                .with_face_data(id, |data, index| {
                     FontVec::try_from_vec_and_index(data.to_vec(), index).ok()
                 })
-            })
-            .flatten()
-            .map(Rc::new)
+                .flatten();
+            if loaded.is_some() {
+                return loaded.map(Rc::new);
+            }
+        }
+        None
     }
 
     // Loads a system face on first use and caches the outcome,
@@ -15820,6 +15856,68 @@ impl FontHandler {
         path
     }
 
+    // Extracts a colour bitmap glyph (the emoji face's CBDT strikes) at
+    // the requested size. Offsets follow the CBDT metrics: x is the left
+    // bearing, and the parser reports y as the image's bottom edge, so
+    // the top relative to the baseline is -(y + height).
+    fn color_glyph(
+        &self,
+        glyph_id: ab_glyph::GlyphId,
+        size: u32,
+    ) -> Option<RasterizedGlyph> {
+        self.ensure_fontdb();
+        let database = self.fontdb.borrow();
+        let database = database.as_ref()?;
+        for family in Self::system_families(FontFaceId::Emoji) {
+            let Some(id) = database.query(&usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Name(family)],
+                ..Default::default()
+            }) else {
+                continue;
+            };
+            let glyph = database.with_face_data(id, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let image = face.glyph_raster_image(
+                ttf_parser::GlyphId(glyph_id.0),
+                size.clamp(1, u16::MAX as u32) as u16,
+            )?;
+            let decoded = match image.format {
+                ttf_parser::RasterImageFormat::PNG => {
+                    let decoded = image::load_from_memory(image.data).ok()?.to_rgba8();
+                    pixmap_from_rgba(decoded.width(), decoded.height(), &decoded)?
+                }
+                ttf_parser::RasterImageFormat::BitmapPremulBgra32 => {
+                    let mut rgba = Vec::with_capacity(image.data.len());
+                    for pixel in image.data.chunks_exact(4) {
+                        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    }
+                    Pixmap::from_vec(
+                        rgba,
+                        IntSize::from_wh(u32::from(image.width), u32::from(image.height))?,
+                    )?
+                }
+                _ => return None,
+            };
+            let scale = size as f32 / f32::from(image.pixels_per_em);
+            let width = ((f32::from(image.width) * scale).round() as u32).max(1);
+            let height = ((f32::from(image.height) * scale).round() as u32).max(1);
+            let pixmap = crop_draw_image_pixmap(&decoded, None, Some((width, height)))?;
+                Some(RasterizedGlyph {
+                    top: -(f32::from(image.y) + f32::from(image.height)) * scale,
+                    pixels: RasterizedGlyphPixels::Color {
+                        left: f32::from(image.x) * scale,
+                        image: Rc::new(pixmap),
+                    },
+                })
+            })
+            .flatten();
+            if glyph.is_some() {
+                return glyph;
+            }
+        }
+        None
+    }
+
     // Coverage can be shared across strings and colors; placement and blending happen later.
     fn rasterized_glyph_for(
         &self,
@@ -15827,20 +15925,29 @@ impl FontHandler {
         glyph_id: ab_glyph::GlyphId,
         size: u32,
     ) -> Option<Rc<RasterizedGlyph>> {
-        let font = self.face_font(face);
+        if let Some(glyph) = self.glyphs.borrow().get(&(face, glyph_id, size)) {
+            return glyph.clone();
+        }
+        let color = if face == FontFaceId::Emoji {
+            self.color_glyph(glyph_id, size)
+        } else {
+            None
+        };
+        let rasterized = color.or_else(|| {
+            let font = self.face_font(face);
+            let glyph = font.outline_glyph(glyph_id.with_scale(size as f32))?;
+            let mut pixels = Vec::new();
+            glyph.draw(|x, y, coverage| pixels.push((x, y, coverage)));
+            Some(RasterizedGlyph {
+                top: glyph.px_bounds().min.y,
+                pixels: RasterizedGlyphPixels::Coverage(pixels),
+            })
+        });
+        let rasterized = rasterized.map(Rc::new);
         self.glyphs
             .borrow_mut()
-            .entry((face, glyph_id, size))
-            .or_insert_with(|| {
-                let glyph = font.outline_glyph(glyph_id.with_scale(size as f32))?;
-                let mut pixels = Vec::new();
-                glyph.draw(|x, y, coverage| pixels.push((x, y, coverage)));
-                Some(Rc::new(RasterizedGlyph {
-                    top: glyph.px_bounds().min.y,
-                    pixels,
-                }))
-            })
-            .clone()
+            .insert((face, glyph_id, size), rasterized.clone());
+        rasterized
     }
 }
 
@@ -18679,7 +18786,7 @@ pub fn run() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pixel/browser/pages/canvas-shadow.html".to_string(),
+        "file:///home/pixel/browser/pages/dom-parser.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
@@ -18792,7 +18899,7 @@ fn text_to_buffer(
     font_px: u32,
     max_width: Option<u32>,
 ) -> Option<(Pixmap, u32, u32)> {
-    text_to_buffer_with_line_height(
+    let (pixmap, _, width, height) = text_to_buffer_with_line_height(
         font_handler,
         color,
         text,
@@ -18801,7 +18908,8 @@ fn text_to_buffer(
         max_width,
         None,
         StyleAlign::Left,
-    )
+    )?;
+    Some((pixmap, width, height))
 }
 
 fn text_to_buffer_with_line_height(
@@ -18813,7 +18921,7 @@ fn text_to_buffer_with_line_height(
     max_width: Option<u32>,
     line_height_px: Option<u32>,
     text_align: StyleAlign,
-) -> Option<(Pixmap, u32, u32)> {
+) -> Option<(Pixmap, Option<Pixmap>, u32, u32)> {
     let face = font_handler.face_for_families(families);
     let primary_font = font_handler.face_font(face);
     let scaled_font = primary_font.as_scaled(font_px as f32);
@@ -18873,22 +18981,48 @@ fn text_to_buffer_with_line_height(
     let width = width as u32;
     let height = (pen_y + line_height) as u32;
     let mut buffer = vec![0x00_00_00_00; (width * height) as usize];
-    for glyph_pos in glyph_positions {
+    // Colour glyphs are also stamped into a parallel image so callers
+    // that treat the main image as coverage (canvas fillText) can use
+    // the glyphs' own colours instead of the paint.
+    let mut color_buffer: Option<Vec<u32>> = None;
+    for glyph_pos in &glyph_positions {
+        let draw_y =
+            (glyph_pos.y + leading + scaled_font.ascent() + glyph_pos.glyph.top) as i32;
         draw_glyph(
             &mut buffer,
             width,
             height,
             glyph_pos.x as i32,
-            (glyph_pos.y + leading + scaled_font.ascent() + glyph_pos.glyph.top) as i32,
+            draw_y,
             &glyph_pos.glyph,
             color,
         );
+        if matches!(glyph_pos.glyph.pixels, RasterizedGlyphPixels::Color { .. }) {
+            let color_buffer = color_buffer.get_or_insert_with(|| {
+                vec![0x00_00_00_00; (width * height) as usize]
+            });
+            draw_glyph(
+                color_buffer,
+                width,
+                height,
+                glyph_pos.x as i32,
+                draw_y,
+                &glyph_pos.glyph,
+                color,
+            );
+        }
     }
     let pixmap = Pixmap::from_vec(
         premul_rgba_buffer_to_bytes(&buffer),
         IntSize::from_wh(width, height)?,
     )?;
-    Some((pixmap, width, height))
+    let color_pixmap = color_buffer.and_then(|color_buffer| {
+        Pixmap::from_vec(
+            premul_rgba_buffer_to_bytes(&color_buffer),
+            IntSize::from_wh(width, height)?,
+        )
+    });
+    Some((pixmap, color_pixmap, width, height))
 }
 
 fn with_coverage(color: u32, c: f32) -> u32 {
@@ -18907,14 +19041,40 @@ fn draw_glyph(
     glyph: &RasterizedGlyph,
     color: u32,
 ) {
-    for &(glyph_x, glyph_y, c) in &glyph.pixels {
-        let px = x + glyph_x as i32;
-        let py = y + glyph_y as i32;
-        if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
-            continue;
+    match &glyph.pixels {
+        // Colour glyphs stamp their own premultiplied image; the text
+        // colour does not apply to them. The caller's y already includes
+        // the glyph's top, so only the left bearing is added here.
+        RasterizedGlyphPixels::Color { left, image } => {
+            let image_width = image.width() as usize;
+            for (index, pixel) in image.pixels().iter().enumerate() {
+                if pixel.alpha() == 0 {
+                    continue;
+                }
+                let px = x + left.round() as i32 + (index % image_width) as i32;
+                let py = y + (index / image_width) as i32;
+                if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
+                    continue;
+                }
+                let target = &mut buffer[py as usize * width as usize + px as usize];
+                *target = blend_rgba_with_rgba(
+                    *target,
+                    (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()),
+                );
+            }
         }
-        let pixel = &mut buffer[py as usize * width as usize + px as usize];
-        *pixel = blend_rgba_with_rgba(*pixel, rgba_to_premul_tuple(with_coverage(color, c)));
+        RasterizedGlyphPixels::Coverage(pixels) => {
+            for &(glyph_x, glyph_y, c) in pixels {
+                let px = x + glyph_x as i32;
+                let py = y + glyph_y as i32;
+                if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
+                    continue;
+                }
+                let pixel = &mut buffer[py as usize * width as usize + px as usize];
+                *pixel =
+                    blend_rgba_with_rgba(*pixel, rgba_to_premul_tuple(with_coverage(color, c)));
+            }
+        }
     }
 }
 

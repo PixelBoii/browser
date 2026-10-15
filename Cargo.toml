@@ -20,6 +20,7 @@ deno_web = { path = "../deno/ext/web" }
 percent-encoding = "2.3.2"
 psl = "2"
 ab_glyph = "0.2.32"
+ttf-parser = "0.25.1"
 deno_fetch = { path = "../deno/ext/fetch" }
 deno_net = { path = "../deno/ext/net" }
 deno_permissions = { path = "../deno/runtime/permissions" }
