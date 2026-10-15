@@ -1334,6 +1334,7 @@ const CANVAS_COMMAND_RESTORE = "restore"
 const CANVAS_COMMAND_CLEAR_RECT = "clearRect"
 const CANVAS_COMMAND_BEGIN_PATH = "beginPath"
 const CANVAS_COMMAND_ARC = "arc"
+const CANVAS_COMMAND_ELLIPSE = "ellipse"
 
 Object.defineProperty(globalThis, "ImageData", {
     value: imageData.ImageData,
@@ -1741,6 +1742,32 @@ class CanvasRenderingContext2D {
         })
     }
 
+    ellipse(x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise = false) {
+        const prefix = "Failed to execute 'ellipse' on 'CanvasRenderingContext2D'"
+        webidl.requiredArguments(arguments.length, 7, prefix)
+        x = +x
+        y = +y
+        radiusX = +radiusX
+        radiusY = +radiusY
+        rotation = +rotation
+        startAngle = +startAngle
+        endAngle = +endAngle
+        if (![x, y, radiusX, radiusY, rotation, startAngle, endAngle].every(Number.isFinite)) return
+        if (radiusX < 0 || radiusY < 0) {
+            throw new DOMException.DOMException("The radius is negative", "IndexSizeError")
+        }
+        core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
+            type: CANVAS_COMMAND_ELLIPSE,
+            center: [x, y],
+            radius_x: radiusX,
+            radius_y: radiusY,
+            rotation,
+            start_angle: startAngle,
+            end_angle: endAngle,
+            counterclockwise: Boolean(counterclockwise)
+        })
+    }
+
     closePath() {
         core.ops.op_canvas_record_command(this.canvas.ownerDocument, this.canvas.__node_idx, {
             type: CANVAS_COMMAND_CLOSE
@@ -1861,6 +1888,32 @@ class Path2D {
             type: CANVAS_COMMAND_ARC,
             center: [x, y],
             radius,
+            start_angle: startAngle,
+            end_angle: endAngle,
+            counterclockwise: Boolean(counterclockwise)
+        })
+    }
+
+    ellipse(x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise = false) {
+        const prefix = "Failed to execute 'ellipse' on 'Path2D'"
+        webidl.requiredArguments(arguments.length, 7, prefix)
+        x = +x
+        y = +y
+        radiusX = +radiusX
+        radiusY = +radiusY
+        rotation = +rotation
+        startAngle = +startAngle
+        endAngle = +endAngle
+        if (![x, y, radiusX, radiusY, rotation, startAngle, endAngle].every(Number.isFinite)) return
+        if (radiusX < 0 || radiusY < 0) {
+            throw new DOMException.DOMException("The radius is negative", "IndexSizeError")
+        }
+        this.path.push({
+            type: CANVAS_COMMAND_ELLIPSE,
+            center: [x, y],
+            radius_x: radiusX,
+            radius_y: radiusY,
+            rotation,
             start_angle: startAngle,
             end_angle: endAngle,
             counterclockwise: Boolean(counterclockwise)

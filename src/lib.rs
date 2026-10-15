@@ -891,6 +891,7 @@ impl CanvasBuffer {
                 }
                 | CanvasPathCommand::QuadraticCurve { cp: _, endpoint: _ }
                 | CanvasPathCommand::Arc { .. }
+                | CanvasPathCommand::Ellipse { .. }
                 | CanvasPathCommand::Close => {
                     self.current_path.push(cmd);
                 }
@@ -1562,19 +1563,38 @@ impl CanvasBuffer {
                     cursor.x = endpoint[0].round() as i32;
                     cursor.y = endpoint[1].round() as i32;
                 }
-                &CanvasPathCommand::Arc {
-                    center,
-                    radius,
-                    start_angle,
-                    end_angle,
-                    counterclockwise,
-                } => {
+                &CanvasPathCommand::Arc { .. } | &CanvasPathCommand::Ellipse { .. } => {
                     // Each point joins the previous one exactly like a Point,
                     // which also draws the line from the current point to
                     // the start of the arc.
-                    for mut point in
-                        arc_points(center, radius, start_angle, end_angle, counterclockwise)
-                    {
+                    let points = match cmd {
+                        &CanvasPathCommand::Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            end_angle,
+                            counterclockwise,
+                        } => arc_points(center, radius, start_angle, end_angle, counterclockwise),
+                        &CanvasPathCommand::Ellipse {
+                            center,
+                            radius_x,
+                            radius_y,
+                            rotation,
+                            start_angle,
+                            end_angle,
+                            counterclockwise,
+                        } => ellipse_points(
+                            center,
+                            radius_x,
+                            radius_y,
+                            rotation,
+                            start_angle,
+                            end_angle,
+                            counterclockwise,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    for mut point in points {
                         if let Some(transform) = transform {
                             point = self.compute_point_transform(&point, transform)?;
                         }
@@ -1913,19 +1933,38 @@ impl CanvasBuffer {
                     cursor.x = endpoint[0].round() as i32;
                     cursor.y = endpoint[1].round() as i32;
                 }
-                &CanvasPathCommand::Arc {
-                    center,
-                    radius,
-                    start_angle,
-                    end_angle,
-                    counterclockwise,
-                } => {
+                &CanvasPathCommand::Arc { .. } | &CanvasPathCommand::Ellipse { .. } => {
                     // Each point joins the previous one exactly like a Point,
                     // which also draws the line from the current point to
                     // the start of the arc.
-                    for mut point in
-                        arc_points(center, radius, start_angle, end_angle, counterclockwise)
-                    {
+                    let points = match cmd {
+                        &CanvasPathCommand::Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            end_angle,
+                            counterclockwise,
+                        } => arc_points(center, radius, start_angle, end_angle, counterclockwise),
+                        &CanvasPathCommand::Ellipse {
+                            center,
+                            radius_x,
+                            radius_y,
+                            rotation,
+                            start_angle,
+                            end_angle,
+                            counterclockwise,
+                        } => ellipse_points(
+                            center,
+                            radius_x,
+                            radius_y,
+                            rotation,
+                            start_angle,
+                            end_angle,
+                            counterclockwise,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    for mut point in points {
                         if let Some(transform) = transform {
                             point = self.compute_point_transform(&point, transform)?;
                         }
@@ -7847,6 +7886,15 @@ enum CanvasPathCommand {
         end_angle: f64,
         counterclockwise: bool,
     },
+    Ellipse {
+        center: [f64; 2],
+        radius_x: f64,
+        radius_y: f64,
+        rotation: f64,
+        start_angle: f64,
+        end_angle: f64,
+        counterclockwise: bool,
+    },
     Close,
     Fill {
         paint: CanvasPaint,
@@ -8195,6 +8243,26 @@ fn arc_points(
     end_angle: f64,
     counterclockwise: bool,
 ) -> Vec<[f64; 2]> {
+    ellipse_points(
+        center,
+        radius,
+        radius,
+        0.,
+        start_angle,
+        end_angle,
+        counterclockwise,
+    )
+}
+
+fn ellipse_points(
+    center: [f64; 2],
+    radius_x: f64,
+    radius_y: f64,
+    rotation: f64,
+    start_angle: f64,
+    end_angle: f64,
+    counterclockwise: bool,
+) -> Vec<[f64; 2]> {
     let tau = std::f64::consts::TAU;
     let mut delta = end_angle - start_angle;
     if !counterclockwise && delta >= tau {
@@ -8210,13 +8278,16 @@ fn arc_points(
             delta -= tau;
         }
     }
-    let steps = (delta.abs() * radius).ceil().max(1.) as usize;
+    let steps = (delta.abs() * radius_x.max(radius_y)).ceil().max(1.) as usize;
+    let (rotation_sin, rotation_cos) = rotation.sin_cos();
     (0..=steps)
         .map(|i| {
             let angle = start_angle + delta * i as f64 / steps as f64;
+            let x = radius_x * angle.cos();
+            let y = radius_y * angle.sin();
             [
-                center[0] + radius * angle.cos(),
-                center[1] + radius * angle.sin(),
+                center[0] + x * rotation_cos - y * rotation_sin,
+                center[1] + x * rotation_sin + y * rotation_cos,
             ]
         })
         .collect()
