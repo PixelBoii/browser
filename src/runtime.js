@@ -232,44 +232,7 @@ class BaseNode extends EventTarget {
     }
 
     compareDocumentPosition(other) {
-        const prefix = "Failed to execute 'compareDocumentPosition' on 'Node'"
-        webidl.requiredArguments(arguments.length, 1, prefix)
-        if (!(other instanceof BaseNode)) {
-            throw new TypeError(`${prefix}: parameter 1 is not of type 'Node'.`)
-        }
-        if (other === this) {
-            return 0
-        }
-        if (this.getRootNode() !== other.getRootNode()) {
-            const position = other.__node_idx < this.__node_idx
-                ? Node.DOCUMENT_POSITION_PRECEDING
-                : Node.DOCUMENT_POSITION_FOLLOWING
-            return Node.DOCUMENT_POSITION_DISCONNECTED
-                | Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC
-                | position
-        }
-        if (this.contains(other)) {
-            return Node.DOCUMENT_POSITION_CONTAINED_BY | Node.DOCUMENT_POSITION_FOLLOWING
-        }
-        if (other.contains(this)) {
-            return Node.DOCUMENT_POSITION_CONTAINS | Node.DOCUMENT_POSITION_PRECEDING
-        }
-        const thisChain = []
-        for (let node = this; node; node = node.parentNode) {
-            thisChain.unshift(node)
-        }
-        const otherChain = []
-        for (let node = other; node; node = node.parentNode) {
-            otherChain.unshift(node)
-        }
-        let index = 0
-        while (thisChain[index] === otherChain[index]) {
-            index++
-        }
-        const siblings = thisChain[index - 1].childNodes
-        return siblings.indexOf(otherChain[index]) < siblings.indexOf(thisChain[index])
-            ? Node.DOCUMENT_POSITION_PRECEDING
-            : Node.DOCUMENT_POSITION_FOLLOWING
+        return compareNodeDocumentPosition(this, other, arguments.length)
     }
 
     isEqualNode(other) {
@@ -480,6 +443,66 @@ function nodesAreEqual(left, right) {
     }
 
     return leftChildren.every((child, index) => nodesAreEqual(child, rightChildren[index]))
+}
+
+function nodePositionChain(node) {
+    if (node instanceof Document) {
+        return [node]
+    }
+    const chain = []
+    for (let current = node; current; current = current.parentNode) {
+        chain.unshift(current)
+    }
+    if (node.getRootNode() === node.ownerDocument) {
+        chain.unshift(node.ownerDocument)
+    }
+    return chain
+}
+
+function nodePositionKey(node) {
+    if (node instanceof Document) {
+        return [node.__documentSequence ?? 0, -1]
+    }
+    return [node.ownerDocument.__documentSequence ?? 0, node.__node_idx ?? -1]
+}
+
+function compareNodeDocumentPosition(node, other, argumentCount) {
+    const prefix = "Failed to execute 'compareDocumentPosition' on 'Node'"
+    webidl.requiredArguments(argumentCount, 1, prefix)
+    if (!(other instanceof BaseNode) && !(other instanceof Document)) {
+        throw new TypeError(`${prefix}: parameter 1 is not of type 'Node'.`)
+    }
+    if (other === node) {
+        return 0
+    }
+    const nodeChain = nodePositionChain(node)
+    const otherChain = nodePositionChain(other)
+    if (nodeChain[0] !== otherChain[0]) {
+        const nodeKey = nodePositionKey(node)
+        const otherKey = nodePositionKey(other)
+        const position = otherKey[0] < nodeKey[0]
+            || (otherKey[0] === nodeKey[0] && otherKey[1] < nodeKey[1])
+            ? Node.DOCUMENT_POSITION_PRECEDING
+            : Node.DOCUMENT_POSITION_FOLLOWING
+        return Node.DOCUMENT_POSITION_DISCONNECTED
+            | Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC
+            | position
+    }
+    if (nodeChain.includes(other)) {
+        return Node.DOCUMENT_POSITION_CONTAINS | Node.DOCUMENT_POSITION_PRECEDING
+    }
+    if (otherChain.includes(node)) {
+        return Node.DOCUMENT_POSITION_CONTAINED_BY | Node.DOCUMENT_POSITION_FOLLOWING
+    }
+    let index = 0
+    while (nodeChain[index] === otherChain[index]) {
+        index++
+    }
+    const parent = nodeChain[index - 1]
+    const siblings = parent instanceof Document ? [parent.documentElement] : parent.childNodes
+    return siblings.indexOf(otherChain[index]) < siblings.indexOf(nodeChain[index])
+        ? Node.DOCUMENT_POSITION_PRECEDING
+        : Node.DOCUMENT_POSITION_FOLLOWING
 }
 
 BaseNode.ELEMENT_NODE = 1
@@ -3227,11 +3250,13 @@ function tagToElement(tag, namespaceURI) {
 }
 
 const documentToken = Symbol()
+let nextDocumentSequence = 0
 
 class Document extends EventTarget {
     constructor(token) {
         super()
         if (token !== documentToken) throw new TypeError("new Document() is not implemented")
+        this.__documentSequence = nextDocumentSequence++
         this.__activeElement = null
         this.__currentScript = null
         this.__writing = false
@@ -3261,6 +3286,9 @@ class Document extends EventTarget {
     }
     contains(node) {
         return node?.getRootNode() === this
+    }
+    compareDocumentPosition(other) {
+        return compareNodeDocumentPosition(this, other, arguments.length)
     }
     get hidden() {
         return false
