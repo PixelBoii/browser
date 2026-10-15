@@ -1,4 +1,6 @@
 import { core } from "ext:core/mod.js";
+const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
 const { EventTarget, Event, defineEventHandler } = core.loadExtScript("ext:deno_web/02_event.js");
 
 function resolveBrowserUrl(value) {
@@ -68,6 +70,11 @@ class XMLHttpRequest extends EventTarget {
     }
 
     send(body = null) {
+        webidl.assertBranded(this, XMLHttpRequest.prototype)
+        if (this.readyState !== XMLHttpRequest.OPENED || this.__sendFlag) {
+            throw new DOMException("XMLHttpRequest is not opened or is already sending", "InvalidStateError")
+        }
+
         const run = async () => {
             const abortController = new AbortController()
             this.__abortController = abortController

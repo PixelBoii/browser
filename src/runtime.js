@@ -3213,6 +3213,20 @@ class Document extends EventTarget {
         if (this.__detached) throw new DOMException.DOMException("Document has no browsing context", "InvalidStateError")
         core.ops.op_set_cookie(globalThis.location.href, String(newValue))
     }
+    get title() {
+        const title = this.getElementsByTagName("title").find(element => element.namespaceURI === HTML_NAMESPACE)
+        return (title?.textContent ?? "").replace(/[\t\n\f\r ]+/g, " ").replace(/^ | $/g, "")
+    }
+    set title(value) {
+        value = webidl.converters.DOMString(value)
+        let title = this.getElementsByTagName("title").find(element => element.namespaceURI === HTML_NAMESPACE)
+        if (!title) {
+            if (!this.head) return
+            title = this.createElement("title")
+            this.head.appendChild(title)
+        }
+        title.textContent = value
+    }
     get styleSheets() {
         const root = this.documentElement
         const sheets = root ? core.ops.op_get_stylesheet_nodes(this, root.__node_idx)
@@ -4483,6 +4497,7 @@ Object.defineProperty(globalThis, "top", {
 })
 
 function postMessage(message, targetOrigin, transfer) {
+    webidl.requiredArguments(arguments.length, 1, "Failed to execute 'postMessage' on 'Window'")
     const options = windowMessageOptions(targetOrigin, transfer)
     core.ops.op_window_post_message(serializeWorkerMessage(message, options), options.targetOrigin)
 }
