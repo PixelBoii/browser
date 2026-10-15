@@ -536,6 +536,7 @@ pub struct Style {
     pub white_space: StyleWhiteSpace,
     pub variables: Rc<StyleVariables>,
     pub font_size: StyleSize,
+    pub font_family: Vec<String>,
     pub line_height: StyleSize,
     pub align_self: StyleJustifyContent,
     pub border_left: StyleSizeAndColor,
@@ -597,6 +598,7 @@ impl Style {
             white_space: self.white_space,
             variables: Rc::new(StyleVariables::default()),
             font_size: self.font_size.clone(),
+            font_family: self.font_family.clone(),
             line_height: self.line_height.clone(),
             align_self: self.align_self,
             border_left: self.border_left.clone(),
@@ -793,6 +795,16 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         }
         .or_else(|| parent_style.map(|style| style.font_size.clone()))
         .unwrap_or(StyleSize::Px(16.)),
+        font_family: match node {
+            HtmlNode::Element(element)
+                if matches!(element.tag.as_str(), "code" | "pre" | "kbd" | "samp" | "tt") =>
+            {
+                vec!["monospace".to_string()]
+            }
+            _ => parent_style
+                .map(|style| style.font_family.clone())
+                .unwrap_or_default(),
+        },
         line_height: parent_style
             .clone()
             .and_then(|v| Some(v.line_height.clone()))
@@ -2441,6 +2453,14 @@ fn apply_parsed_border_side(side: &mut StyleSizeAndColor, value: BorderSideValue
     }
 }
 
+fn parse_font_family(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|family| unquote(family.trim()).trim().to_string())
+        .filter(|family| !family.is_empty())
+        .collect()
+}
+
 pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()> {
     match (property.property.as_str(), property.value.clone()) {
         ("width", PropertyValue::Size(value)) => {
@@ -2515,6 +2535,9 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         }
         ("font-size", PropertyValue::Size(value)) => {
             style.font_size = value;
+        }
+        ("font-family", PropertyValue::Raw(value)) => {
+            style.font_family = parse_font_family(&value);
         }
         ("line-height", PropertyValue::Size(value)) => {
             style.line_height = value;

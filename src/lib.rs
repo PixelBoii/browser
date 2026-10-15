@@ -2537,8 +2537,10 @@ struct Renderer {
     network_fetch: Rc<RefCell<NetworkFetch>>,
     cached_rasterizations: CachedRasterizations,
     animations: Vec<Animation>,
-    cached_text_buffers:
-        HashMap<(String, u32, Option<u32>, Option<u32>, u32, StyleAlign), (Rc<Pixmap>, u32, u32)>,
+    cached_text_buffers: HashMap<
+        (String, u32, Vec<String>, Option<u32>, Option<u32>, u32, StyleAlign),
+        (Rc<Pixmap>, u32, u32),
+    >,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
     flattened_css_cache: Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
     variable_definitions: VariableDefinitions,
@@ -6431,6 +6433,7 @@ fn computed_style_properties(renderer: &mut Renderer, node_idx: usize) -> HashMa
         ("text-anchor".to_string(), style.text_anchor.to_string()),
         ("white-space".to_string(), style.white_space.to_string()),
         ("font-size".to_string(), style.font_size.to_string()),
+        ("font-family".to_string(), style.font_family.join(", ")),
         (
             "line-height".to_string(),
             match style.line_height {
@@ -12172,6 +12175,7 @@ impl Renderer {
                 let cache_key = (
                     text.clone(),
                     resolved_font_size,
+                    style.font_family.clone(),
                     max_width,
                     line_height,
                     text_hex,
@@ -12186,7 +12190,7 @@ impl Renderer {
                             text_hex,
                             &text,
                             resolved_font_size,
-                            &[],
+                            &style.font_family,
                             max_width,
                             line_height,
                             style.text_align,
@@ -12901,7 +12905,15 @@ impl Renderer {
             _ => None,
         }
         .with_context(|| "No color was specified for text")?;
-        let cache_key = (text.clone(), font_size, None, None, text_hex, StyleAlign::Left);
+        let cache_key = (
+            text.clone(),
+            font_size,
+            Vec::new(),
+            None,
+            None,
+            text_hex,
+            StyleAlign::Left,
+        );
         let (buffer, width, height) = if let Some(cached) = self.cached_text_buffers.get(&cache_key)
         {
             cached
@@ -15620,6 +15632,7 @@ enum FontFaceId {
     Inter,
     Arial,
     Serif,
+    Monospace,
     Emoji,
 }
 
@@ -15687,6 +15700,13 @@ impl FontHandler {
                 "Noto Serif",
                 "DejaVu Serif",
                 "Times New Roman",
+            ],
+            FontFaceId::Monospace => &[
+                "Liberation Mono",
+                "DejaVu Sans Mono",
+                "Noto Sans Mono",
+                "Courier New",
+                "Courier",
             ],
             FontFaceId::Emoji => &[
                 "Noto Color Emoji",
@@ -15767,6 +15787,11 @@ impl FontHandler {
                     if self.system_face(FontFaceId::Serif).is_some() =>
                 {
                     return FontFaceId::Serif;
+                }
+                "monospace" | "ui-monospace" | "courier new" | "courier"
+                    if self.system_face(FontFaceId::Monospace).is_some() =>
+                {
+                    return FontFaceId::Monospace;
                 }
                 "inter" | "inter variable" | "sans-serif" => return FontFaceId::Inter,
                 _ => {}
