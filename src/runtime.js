@@ -4458,6 +4458,14 @@ Object.defineProperty(globalThis, "__dispatchWindowMessage", {
     writable: true,
 })
 
+Object.defineProperty(globalThis, "frameElement", {
+    get() {
+        return globalThis.__frameElement ?? null
+    },
+    enumerable: true,
+    configurable: true,
+})
+
 Object.defineProperty(globalThis, "parent", {
     get() {
         return globalThis.__parentWindow ?? globalThis
