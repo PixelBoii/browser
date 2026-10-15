@@ -2074,6 +2074,16 @@ class HtmlCanvasElement extends HtmlElement {
             return null
         }
     }
+
+    toDataURL(type = "image/png", quality) {
+        const mime = String(type).trim().toLowerCase() === "image/jpeg" ? "image/jpeg" : "image/png"
+        quality = Number(quality)
+        const validQuality = Number.isFinite(quality) && quality >= 0 && quality <= 1 ? quality : null
+        if (this.__node_idx == null) {
+            return "data:,"
+        }
+        return core.ops.op_canvas_to_data_url(this.ownerDocument, this.__node_idx, mime, validQuality)
+    }
 }
 
 function windowMessageOptions(targetOrigin, transfer) {

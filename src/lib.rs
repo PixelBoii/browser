@@ -8519,6 +8519,76 @@ fn canvas_pixmap(renderer: &mut Renderer, canvas_node_idx: usize) -> Option<Pixm
     }
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = chunk.iter().fold(0u32, |value, byte| (value << 8) | u32::from(*byte))
+            << (8 * (3 - chunk.len()));
+        encoded.push(ALPHABET[(value >> 18) as usize & 63] as char);
+        encoded.push(ALPHABET[(value >> 12) as usize & 63] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(value >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[value as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+#[op2]
+#[string]
+fn op_canvas_to_data_url(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] canvas_node_idx: usize,
+    #[string] mime: String,
+    quality: Option<f64>,
+) -> Result<String, JsErrorBox> {
+    let host = document_state(scope, document);
+    let mut renderer = host.renderer.borrow_mut();
+    let (Some(width), Some(height)) = renderer
+        .nodes
+        .get(canvas_node_idx)
+        .map(get_canvas_wh)
+        .unwrap_or((None, None))
+    else {
+        return Ok("data:,".to_string());
+    };
+    if width == 0 || height == 0 {
+        return Ok("data:,".to_string());
+    }
+    let Some(pixmap) = canvas_pixmap(&mut renderer, canvas_node_idx) else {
+        return Ok("data:,".to_string());
+    };
+    let bytes = if mime == "image/jpeg" {
+        let rgb = pixmap
+            .data()
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect::<Vec<u8>>();
+        let Some(image) = image::RgbImage::from_vec(width, height, rgb) else {
+            return Ok("data:,".to_string());
+        };
+        let quality = quality.map_or(92, |quality| (quality * 100.0) as u8);
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(&image)
+            .map_err(|err| JsErrorBox::generic(err.to_string()))?;
+        bytes
+    } else {
+        pixmap
+            .encode_png()
+            .map_err(|err| JsErrorBox::generic(err.to_string()))?
+    };
+    Ok(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
 #[op2]
 fn op_image_bitmap_from_canvas(
     scope: &mut v8::PinScope,
@@ -9739,6 +9809,7 @@ extension!(
     op_canvas_reset,
     op_canvas_set_opaque,
     op_canvas_get_image_data,
+    op_canvas_to_data_url,
     op_canvas_fill_text,
     op_canvas_stroke_text,
     op_canvas_measure_text,
