@@ -8822,13 +8822,32 @@ fn op_canvas_measure_text(
         // string's primary face.
         let glyph_font = font_handler.face_font(glyph.face);
         let scale = glyph_font.as_scaled(font_px as f32).scale_factor();
-        if let Some(outline) = glyph_font.outline(glyph.glyph_id) {
-            // Use outline bounds rather than the rounded rasterization bounds.
+        // Use outline bounds rather than the rounded rasterization bounds.
+        // Colour glyphs (emoji) have no outline, so their bounds come from
+        // the raster image that drawing stamps, placed by its bearing and
+        // its top relative to the baseline.
+        let glyph_bounds = if let Some(outline) = glyph_font.outline(glyph.glyph_id) {
             let mut glyph_bounds = outline.bounds;
             glyph_bounds.min.x = width + glyph_bounds.min.x * scale.horizontal;
             glyph_bounds.max.x = width + glyph_bounds.max.x * scale.horizontal;
             glyph_bounds.min.y *= -scale.vertical;
             glyph_bounds.max.y *= -scale.vertical;
+            Some(glyph_bounds)
+        } else if let Some(rasterized) =
+            font_handler.rasterized_glyph_for(glyph.face, glyph.glyph_id, font_px)
+            && let RasterizedGlyphPixels::Color { left, image } = &rasterized.pixels
+        {
+            Some(ab_glyph::Rect {
+                min: ab_glyph::point(width + left, rasterized.top),
+                max: ab_glyph::point(
+                    width + left + image.width() as f32,
+                    rasterized.top + image.height() as f32,
+                ),
+            })
+        } else {
+            None
+        };
+        if let Some(glyph_bounds) = glyph_bounds {
             if let Some(bounds) = &mut bounds {
                 bounds.min.x = bounds.min.x.min(glyph_bounds.min.x);
                 bounds.min.y = bounds.min.y.min(glyph_bounds.min.y);
