@@ -2022,6 +2022,24 @@ class HtmlCanvasElement extends HtmlElement {
         this.__contexts = {}
     }
 
+    get width() {
+        const width = Number.parseInt(this.getAttribute('width'), 10)
+        return Number.isNaN(width) || width < 0 ? 300 : width
+    }
+
+    set width(value) {
+        this.setAttribute('width', value)
+    }
+
+    get height() {
+        const height = Number.parseInt(this.getAttribute('height'), 10)
+        return Number.isNaN(height) || height < 0 ? 150 : height
+    }
+
+    set height(value) {
+        this.setAttribute('height', value)
+    }
+
     // Setting the width or height content attribute (including through
     // the width/height properties, which delegate here) resets the bitmap
     // and every context's drawing state, even when the value is unchanged.

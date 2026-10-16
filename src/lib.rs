@@ -7484,7 +7484,7 @@ fn get_canvas_wh(node: &Node) -> (Option<u32>, Option<u32>) {
                 .attributes
                 .get_str("width")
                 .and_then(|v| v.parse::<u32>().ok())
-                .or(Some(150)),
+                .or(Some(300)),
             element
                 .attributes
                 .get_str("height")
@@ -12459,7 +12459,7 @@ impl Renderer {
                                             .attributes
                                             .get_str("width")
                                             .and_then(|v| v.parse::<u32>().ok())
-                                            .or(Some(150)),
+                                            .or(Some(300)),
                                         element
                                             .attributes
                                             .get_str("height")
