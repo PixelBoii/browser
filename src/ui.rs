@@ -354,7 +354,7 @@ impl UiBuilder {
                         &self.font_handler,
                         typeable.color,
                         &typeable.text,
-                        14,
+                        14.0,
                         None,
                     )
                     .with_context(|| "Failed to convert text to buffer")?;
@@ -373,7 +373,7 @@ impl UiBuilder {
             }
             Node::Text(el) => {
                 let (pixmap, width, height) =
-                    text_to_buffer(&self.font_handler, el.color, &el.text, el.font_px, None)
+                    text_to_buffer(&self.font_handler, el.color, &el.text, el.font_px as f32, None)
                         .with_context(|| "Failed to convert text to buffer")?;
 
                 layouts.push(LayoutBox {

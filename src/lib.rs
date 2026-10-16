@@ -8971,11 +8971,11 @@ fn op_canvas_measure_text(
     }
     let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
-    let font_px = font_size as u32;
+    let font_px = font_size as f32;
     let font_handler = &renderer.font_handler;
     let face = font_handler.face_for_families(&families);
     let primary_font = font_handler.face_font(face);
-    let font = primary_font.as_scaled(font_px as f32);
+    let font = primary_font.as_scaled(font_px);
     let mut width = 0.0f32;
     let mut bounds: Option<ab_glyph::Rect> = None;
     for glyph in font_handler.layout_text(&text, face, font_px) {
@@ -8983,7 +8983,7 @@ fn op_canvas_measure_text(
         // A fallback glyph's bounds come from its own face, not the
         // string's primary face.
         let glyph_font = font_handler.face_font(glyph.face);
-        let scale = glyph_font.as_scaled(font_px as f32).scale_factor();
+        let scale = glyph_font.as_scaled(font_px).scale_factor();
         // Use outline bounds rather than the rounded rasterization bounds.
         // Colour glyphs (emoji) have no outline, so their bounds come from
         // the raster image that drawing stamps, placed by its bearing and
@@ -9155,7 +9155,7 @@ fn canvas_text_origin(
     font_handler: &FontHandler,
     text: &str,
     families: &[String],
-    font_px: u32,
+    font_px: f32,
     x: f64,
     y: f64,
     text_align: &str,
@@ -9163,7 +9163,7 @@ fn canvas_text_origin(
 ) -> (f64, f64) {
     let face = font_handler.face_for_families(families);
     let primary_font = font_handler.face_font(face);
-    let font = primary_font.as_scaled(font_px as f32);
+    let font = primary_font.as_scaled(font_px);
     let mut width = 0.0f32;
     for glyph in font_handler.layout_text(text, face, font_px) {
         width += glyph.kern_before + glyph.advance;
@@ -9212,12 +9212,12 @@ fn op_canvas_fill_text(
     let Some((Some(width), Some(height))) = renderer.nodes.get(node_idx).map(get_canvas_wh) else {
         return Ok(false);
     };
-    let font_px = font_size as u32;
+    let font_px = font_size as f32;
     let primary_font =
         renderer
             .font_handler
             .face_font(renderer.font_handler.face_for_families(&families));
-    let baseline = primary_font.as_scaled(font_px as f32).ascent();
+    let baseline = primary_font.as_scaled(font_px).ascent();
     let (x, y) = canvas_text_origin(
         &renderer.font_handler,
         &text,
@@ -9298,7 +9298,7 @@ fn op_canvas_stroke_text(
         &renderer.font_handler,
         &text,
         &families,
-        font_size as u32,
+        font_size as f32,
         x,
         y,
         &text_align,
@@ -9307,7 +9307,7 @@ fn op_canvas_stroke_text(
     let face = renderer.font_handler.face_for_families(&families);
     let path = renderer
         .font_handler
-        .text_path(&text, face, font_size as u32, x, y);
+        .text_path(&text, face, font_size as f32, x, y);
     if path.is_empty() {
         return Ok(false);
     }
@@ -12430,7 +12430,7 @@ impl Renderer {
                             &self.font_handler,
                             text_hex,
                             &text,
-                            resolved_font_size,
+                            resolved_font_size as f32,
                             &style.font_family,
                             max_width,
                             line_height,
@@ -13160,7 +13160,7 @@ impl Renderer {
             cached
         } else {
             let (buffer, width, height) =
-                text_to_buffer(&self.font_handler, text_hex, &text, font_size, None)
+                text_to_buffer(&self.font_handler, text_hex, &text, font_size as f32, None)
                     .with_context(|| "Failed to build pixmap for input text")?;
             let result = (Rc::new(buffer), width, height);
             self.cached_text_buffers.insert(cache_key.clone(), result);
@@ -16066,7 +16066,7 @@ impl FontHandler {
     // Lays out a whole string in the given face, with per-character
     // emoji fallback from resolve_glyph. Variation selectors belong to
     // the preceding character: they produce no glyph, advance, or kern.
-    fn layout_text(&self, text: &str, face: FontFaceId, font_px: u32) -> Vec<TextGlyph> {
+    fn layout_text(&self, text: &str, face: FontFaceId, font_px: f32) -> Vec<TextGlyph> {
         let font = self.face_font(face);
         let mut glyphs = vec![];
         let mut previous: Option<(FontFaceId, ab_glyph::GlyphId)> = None;
@@ -16076,7 +16076,7 @@ impl FontHandler {
             }
             let (glyph_face, glyph_id) = self.resolve_glyph(face, &font, ch);
             let glyph_font = self.face_font(glyph_face);
-            let glyph_scaled = glyph_font.as_scaled(font_px as f32);
+            let glyph_scaled = glyph_font.as_scaled(font_px);
             let kern_before = match previous {
                 Some((previous_face, previous_glyph)) if previous_face == glyph_face => {
                     glyph_scaled.kern(previous_glyph, glyph_id)
@@ -16099,7 +16099,7 @@ impl FontHandler {
         &self,
         text: &str,
         face: FontFaceId,
-        font_px: u32,
+        font_px: f32,
         x: f64,
         y: f64,
     ) -> Vec<CanvasPathCommand> {
@@ -16108,7 +16108,7 @@ impl FontHandler {
         for glyph in self.layout_text(text, face, font_px) {
             pen_x += f64::from(glyph.kern_before);
             let font = self.face_font(glyph.face);
-            let scaled = font.as_scaled(font_px as f32);
+            let scaled = font.as_scaled(font_px);
             if let Some(outline) = font.outline(glyph.glyph_id) {
                 path.extend(CanvasPathCommand::from_ab_glyph(
                     outline,
@@ -16189,19 +16189,22 @@ impl FontHandler {
         &self,
         face: FontFaceId,
         glyph_id: ab_glyph::GlyphId,
-        size: u32,
+        size: f32,
     ) -> Option<Rc<RasterizedGlyph>> {
-        if let Some(glyph) = self.glyphs.borrow().get(&(face, glyph_id, size)) {
+        // Colour strikes are only available at integer sizes; outline glyphs
+        // below use the exact fractional size.
+        let cache_key = (face, glyph_id, size.to_bits());
+        if let Some(glyph) = self.glyphs.borrow().get(&cache_key) {
             return glyph.clone();
         }
         let color = if face == FontFaceId::Emoji {
-            self.color_glyph(glyph_id, size)
+            self.color_glyph(glyph_id, size.round() as u32)
         } else {
             None
         };
         let rasterized = color.or_else(|| {
             let font = self.face_font(face);
-            let glyph = font.outline_glyph(glyph_id.with_scale(size as f32))?;
+            let glyph = font.outline_glyph(glyph_id.with_scale(size))?;
             let mut pixels = Vec::new();
             glyph.draw(|x, y, coverage| pixels.push((x, y, coverage)));
             Some(RasterizedGlyph {
@@ -16212,7 +16215,7 @@ impl FontHandler {
         let rasterized = rasterized.map(Rc::new);
         self.glyphs
             .borrow_mut()
-            .insert((face, glyph_id, size), rasterized.clone());
+            .insert(cache_key, rasterized.clone());
         rasterized
     }
 }
@@ -19184,7 +19187,7 @@ fn text_to_buffer(
     font_handler: &Rc<FontHandler>,
     color: u32,
     text: &String,
-    font_px: u32,
+    font_px: f32,
     max_width: Option<u32>,
 ) -> Option<(Pixmap, u32, u32)> {
     let (pixmap, _, width, height) = text_to_buffer_with_line_height(
@@ -19204,7 +19207,7 @@ fn text_to_buffer_with_line_height(
     font_handler: &Rc<FontHandler>,
     color: u32,
     text: &String,
-    font_px: u32,
+    font_px: f32,
     families: &[String],
     max_width: Option<u32>,
     line_height_px: Option<u32>,
@@ -19212,7 +19215,7 @@ fn text_to_buffer_with_line_height(
 ) -> Option<(Pixmap, Option<Pixmap>, u32, u32)> {
     let face = font_handler.face_for_families(families);
     let primary_font = font_handler.face_font(face);
-    let scaled_font = primary_font.as_scaled(font_px as f32);
+    let scaled_font = primary_font.as_scaled(font_px);
     let mut width = 0f32;
     let x = 0;
     let y = 0;
