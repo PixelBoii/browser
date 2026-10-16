@@ -1526,9 +1526,7 @@ class CanvasRenderingContext2D {
         }
     }
 
-    // TODO: Apply desynchronized and willReadFrequently; colorSpace only
-    // sets the getImageData default, and colorType is only reported here; the
-    // canvas itself stays sRGB unorm8 internally.
+    // TODO: Apply desynchronized and willReadFrequently.
     getContextAttributes() {
         return {
             alpha: this.__settings.alpha,
@@ -2058,6 +2056,7 @@ class HtmlCanvasElement extends HtmlElement {
     getContext(type, options = {}) {
         if (type === "2d") {
             if (!this.__contexts["2d"]) {
+                // Extended formats fall back to the renderer's sRGB/unorm8 backing.
                 const settings = {
                     alpha: true,
                     colorSpace: "srgb",
@@ -2071,13 +2070,11 @@ class HtmlCanvasElement extends HtmlElement {
                         if (options.colorSpace !== "srgb" && options.colorSpace !== "display-p3") {
                             throw new TypeError("Invalid colorSpace")
                         }
-                        settings.colorSpace = options.colorSpace
                     }
                     if (options.colorType !== undefined) {
                         if (options.colorType !== "unorm8" && options.colorType !== "float16") {
                             throw new TypeError("Invalid colorType")
                         }
-                        settings.colorType = options.colorType
                     }
                     if (options.desynchronized !== undefined) settings.desynchronized = Boolean(options.desynchronized)
                     if (options.willReadFrequently !== undefined) settings.willReadFrequently = Boolean(options.willReadFrequently)
@@ -4092,6 +4089,7 @@ const navigatorToken = Symbol("Navigator")
 class Navigator {
     // This is set by setup_js_dom in rust
     #userAgent = null
+    #hardwareConcurrency = core.ops.op_hardware_concurrency()
     #languages = Object.freeze(["en-US", "en"])
     #plugins = new PluginArray(pluginArrayToken)
     #mediaDevices = {
@@ -4135,6 +4133,7 @@ class Navigator {
     }
 
     get userAgent() { return this.#userAgent }
+    get hardwareConcurrency() { return this.#hardwareConcurrency }
     get platform() { return "Linux x86_64" }
     get language() { return "en-US" }
     get languages() { return this.#languages }

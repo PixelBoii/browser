@@ -9616,6 +9616,19 @@ fn op_worker_get_location_href(state: &mut OpState) -> String {
 }
 
 #[op2]
+#[string]
+fn op_worker_get_user_agent() -> String {
+    USER_AGENT.to_string()
+}
+
+#[op2(fast)]
+fn op_hardware_concurrency() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(1)
+}
+
+#[op2]
 #[serde]
 fn op_worker_resolve_script_urls(
     state: &mut OpState,
@@ -9720,6 +9733,8 @@ extension!(
     op_worker_post_message,
     op_worker_receive_message,
     op_worker_get_location_href,
+    op_worker_get_user_agent,
+    op_hardware_concurrency,
     op_worker_resolve_script_urls,
     op_worker_fetch_script,
   ],
@@ -9741,6 +9756,7 @@ extension!(
   browser,
   ops = [
     op_fetch_site,
+    op_hardware_concurrency,
     op_custom_element_define,
     op_custom_element_create,
     op_custom_element_get,

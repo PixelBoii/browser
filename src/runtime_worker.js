@@ -189,8 +189,8 @@ Object.defineProperty(globalThis, "CustomEvent", {
 })
 
 const navigator = {
-    // This is set by setup_js_dom in rust
-    userAgent: null,
+    userAgent: core.ops.op_worker_get_user_agent(),
+    hardwareConcurrency: core.ops.op_hardware_concurrency(),
     platform: "Linux x86_64",
     language: "en-US",
     languages: ["en-US", "en"],
