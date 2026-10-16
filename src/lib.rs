@@ -9615,6 +9615,22 @@ fn op_worker_get_location_href(state: &mut OpState) -> String {
     state.borrow::<WorkerHostState>().url.to_string()
 }
 
+// Secure context follows the realm's origin, not its visible URL: an
+// `about:blank` frame inherits its creator's origin, and a blob worker's
+// origin is the origin inside its `blob:` URL. Both are already resolved
+// by `caller_origin` / `WorkerHostState`, so check trust against that.
+#[op2(fast)]
+fn op_is_secure_context(scope: &mut v8::PinScope, state: &mut OpState) -> bool {
+    let origin = if let Some(host) = state.try_borrow::<WorkerHostState>() {
+        host.url.origin()
+    } else {
+        caller_origin(scope)
+    };
+    ReqwestUrl::parse(&format!("{}/", origin.ascii_serialization()))
+        .map(|url| is_trustworthy_http_url(&url))
+        .unwrap_or(false)
+}
+
 // Deno's blob creation reads a single `Location` from the shared OpState, but
 // frames with different origins share that state. Sync it from the creating
 // realm (or worker) immediately before each `createObjectURL` call.
@@ -9754,6 +9770,7 @@ extension!(
     op_fetch_site,
     op_tls_peer_certificate,
     op_sync_blob_location,
+    op_is_secure_context,
     op_worker_post_message,
     op_worker_receive_message,
     op_worker_get_location_href,
@@ -9781,6 +9798,7 @@ extension!(
   ops = [
     op_fetch_site,
     op_sync_blob_location,
+    op_is_secure_context,
     op_hardware_concurrency,
     op_custom_element_define,
     op_custom_element_create,

@@ -168,7 +168,7 @@ function resolveBrowserUrl(value) {
 
 Object.defineProperty(globalThis, "isSecureContext", {
     get() {
-        return globalThis.location?.protocol === "https:" || globalThis.location?.hostname === "localhost"
+        return core.ops.op_is_secure_context()
     },
     enumerable: true,
     configurable: true,
