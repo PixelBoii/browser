@@ -3894,6 +3894,12 @@ browserPerformance.timing = {
     navigationStart: Date.now(),
 }
 
+const createObjectURL = url.URL.createObjectURL;
+url.URL.createObjectURL = function (...args) {
+    core.ops.op_sync_blob_location();
+    return createObjectURL.apply(this, args);
+};
+
 Object.defineProperties(globalThis, {
     URL: { value: url.URL, configurable: true, writable: true },
     URLSearchParams: { value: url.URLSearchParams, configurable: true, writable: true },

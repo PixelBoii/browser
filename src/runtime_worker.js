@@ -40,6 +40,11 @@ globalThis.console = new Console((message, level) => core.print(message, level >
 core.wrapConsole(globalThis.console, core.v8Console)
 
 location.setLocationHref(core.ops.op_worker_get_location_href())
+const createObjectURL = url.URL.createObjectURL;
+url.URL.createObjectURL = function (...args) {
+    core.ops.op_sync_blob_location();
+    return createObjectURL.apply(this, args);
+};
 Object.defineProperties(globalThis, {
     URL: { value: url.URL, configurable: true, writable: true },
     URLSearchParams: { value: url.URLSearchParams, configurable: true, writable: true },

@@ -9615,6 +9615,29 @@ fn op_worker_get_location_href(state: &mut OpState) -> String {
     state.borrow::<WorkerHostState>().url.to_string()
 }
 
+// Deno's blob creation reads a single `Location` from the shared OpState, but
+// frames with different origins share that state. Sync it from the creating
+// realm (or worker) immediately before each `createObjectURL` call.
+#[op2(fast)]
+fn op_sync_blob_location(scope: &mut v8::PinScope, state: &mut OpState) {
+    let origin = if let Some(host) = state.try_borrow::<WorkerHostState>() {
+        host.url.origin()
+    } else {
+        caller_origin(scope)
+    };
+    match origin {
+        url::Origin::Tuple(..) => {
+            if let Ok(location) = ReqwestUrl::parse(&format!("{}/", origin.ascii_serialization()))
+            {
+                state.put(deno_web::Location(location));
+            }
+        }
+        url::Origin::Opaque(_) => {
+            state.try_take::<deno_web::Location>();
+        }
+    }
+}
+
 #[op2]
 #[string]
 fn op_worker_get_user_agent() -> String {
@@ -9730,6 +9753,7 @@ extension!(
     op_realm_is_active,
     op_fetch_site,
     op_tls_peer_certificate,
+    op_sync_blob_location,
     op_worker_post_message,
     op_worker_receive_message,
     op_worker_get_location_href,
@@ -9756,6 +9780,7 @@ extension!(
   browser,
   ops = [
     op_fetch_site,
+    op_sync_blob_location,
     op_hardware_concurrency,
     op_custom_element_define,
     op_custom_element_create,
