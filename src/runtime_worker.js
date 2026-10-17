@@ -248,6 +248,16 @@ performance.Performance.prototype.now = function () {
     return Math.floor(performanceNow.call(this) * 10) / 10
 }
 
+// `timeOrigin` is a timestamp from the same clock, so it gets the same coarsening.
+const timeOriginDescriptor = Object.getOwnPropertyDescriptor(performance.Performance.prototype, "timeOrigin")
+Object.defineProperty(performance.Performance.prototype, "timeOrigin", {
+    get() {
+        return Math.floor(timeOriginDescriptor.get.call(this) * 10) / 10
+    },
+    enumerable: true,
+    configurable: true,
+})
+
 Object.defineProperty(globalThis, "crossOriginIsolated", {
     get() {
         return false
