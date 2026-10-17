@@ -1306,6 +1306,45 @@ class HtmlElement extends BaseNode {
         }
     }
 
+    // `translate` and `spellcheck` inherit: the nearest ancestor (or this
+    // element) with a recognised attribute value decides, defaulting to true.
+    get translate() {
+        for (let element = this; element; element = element.parentElement) {
+            const value = element.getAttribute('translate')?.toLowerCase()
+            if (value === '' || value === 'yes') return true
+            if (value === 'no') return false
+        }
+        return true
+    }
+
+    set translate(value) {
+        this.setAttribute('translate', value ? 'yes' : 'no')
+    }
+
+    get spellcheck() {
+        for (let element = this; element; element = element.parentElement) {
+            const value = element.getAttribute('spellcheck')?.toLowerCase()
+            if (value === '' || value === 'true') return true
+            if (value === 'false') return false
+        }
+        return true
+    }
+
+    set spellcheck(value) {
+        this.setAttribute('spellcheck', value ? 'true' : 'false')
+    }
+
+    get draggable() {
+        const value = this.getAttribute('draggable')?.toLowerCase()
+        if (value === 'true') return true
+        if (value === 'false') return false
+        return this.tag === 'img' || ((this.tag === 'a' || this.tag === 'area') && this.hasAttribute('href'))
+    }
+
+    set draggable(value) {
+        this.setAttribute('draggable', value ? 'true' : 'false')
+    }
+
     get height() {
         return Number.parseFloat(this.getAttribute('height')) || 0
     }
@@ -2381,6 +2420,9 @@ class HTMLInputElement extends HTMLFormControlElement {
         super("input")
     }
 
+    get dirName() { return this.getAttribute("dirname") ?? "" }
+    set dirName(value) { this.setAttribute("dirname", value) }
+
     get type() {
         const type = this.getAttribute("type")?.toLowerCase()
         return inputTypes.has(type) ? type : "text"
@@ -2401,6 +2443,9 @@ class HTMLTextAreaElement extends HTMLFormControlElement {
         super("textarea")
     }
 
+    get dirName() { return this.getAttribute("dirname") ?? "" }
+    set dirName(value) { this.setAttribute("dirname", value) }
+
     get maxLength() {
         const value = parseInt(this.getAttribute("maxlength"), 10)
         return value >= 0 ? value : -1
@@ -2417,6 +2462,30 @@ class HTMLSelectElement extends HTMLFormControlElement {
     get options() {
         return this.getElementsByTagName("option")
     }
+}
+
+class HTMLOptionElement extends HtmlElement {
+    constructor() {
+        super("option")
+    }
+
+    get defaultSelected() {
+        return this.hasAttribute('selected')
+    }
+
+    set defaultSelected(value) {
+        if (value) {
+            this.setAttribute('selected', '')
+        } else {
+            this.removeAttribute('selected')
+        }
+    }
+
+    get label() {
+        return this.getAttribute('label') ?? this.textContent.replace(/[\t\n\f\r ]+/g, " ").replace(/^ | $/g, "")
+    }
+
+    set label(value) { this.setAttribute("label", value) }
 }
 
 class HTMLButtonElement extends HTMLFormControlElement {
@@ -2601,6 +2670,12 @@ Object.defineProperty(globalThis, "HTMLTextAreaElement", {
 });
 Object.defineProperty(globalThis, "HTMLSelectElement", {
     value: HTMLSelectElement,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});
+Object.defineProperty(globalThis, "HTMLOptionElement", {
+    value: HTMLOptionElement,
     enumerable: true,
     configurable: true,
     writable: true,
@@ -3004,6 +3079,12 @@ class Image extends HTMLElement {
         super("img")
     }
 
+    get naturalWidth() { return core.ops.op_get_image_state(this.ownerDocument, this.__node_idx).naturalWidth }
+
+    get naturalHeight() { return core.ops.op_get_image_state(this.ownerDocument, this.__node_idx).naturalHeight }
+
+    get complete() { return core.ops.op_get_image_state(this.ownerDocument, this.__node_idx).complete }
+
     get width() {
         return super.width || this.naturalWidth || 0
     }
@@ -3261,6 +3342,10 @@ function tagToElement(tag, namespaceURI) {
                         HTMLTextAreaElement :
                     tag === "select" ?
                         HTMLSelectElement :
+                    tag === "option" ?
+                        HTMLOptionElement :
+                    tag === "img" ?
+                        Image :
                     tag === "button" ?
                         HTMLButtonElement :
                     tag === "form" ?
@@ -4162,6 +4247,13 @@ Object.defineProperty(globalThis, "Navigator", {
 const navigator = new Navigator(navigatorToken)
 
 Object.defineProperty(globalThis, "navigator", {
+    value: navigator,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "clientInformation", {
     value: navigator,
     enumerable: true,
     configurable: true,

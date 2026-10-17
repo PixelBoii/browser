@@ -6555,6 +6555,42 @@ fn op_get_computed_style(
     computed_style_properties(&mut renderer, node_idx)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageState {
+    natural_width: u32,
+    natural_height: u32,
+    complete: bool,
+}
+
+#[op2]
+#[serde]
+fn op_get_image_state(
+    scope: &mut v8::PinScope,
+    document: v8::Local<v8::Object>,
+    #[number] node_idx: usize,
+) -> ImageState {
+    let host = document_state(scope, document);
+    let renderer = host.renderer.borrow();
+    // The loaded map stores (height, width) of the decoded image.
+    let loaded = renderer.images_nodes_loaded.get(&node_idx).copied();
+    let has_source = match renderer.nodes.get(node_idx) {
+        Some(Node::Element(element)) => {
+            element.attributes.get_str("src").is_some_and(|value| !value.is_empty())
+                || element
+                    .attributes
+                    .get_str("srcset")
+                    .is_some_and(|value| !value.is_empty())
+        }
+        _ => false,
+    };
+    ImageState {
+        natural_width: loaded.map_or(0, |(_, width)| width),
+        natural_height: loaded.map_or(0, |(height, _)| height),
+        complete: loaded.is_some() || !has_source,
+    }
+}
+
 #[op2]
 #[serde]
 fn op_measure_element(
@@ -9882,6 +9918,7 @@ extension!(
     op_get_attribute,
     op_get_attributes,
     op_get_computed_style,
+    op_get_image_state,
     op_measure_element,
     op_svg_get_bbox,
     op_window_post_message,
@@ -10940,6 +10977,9 @@ impl Renderer {
             return;
         };
 
+        if attribute == "src" || attribute == "srcset" {
+            self.images_nodes_loaded.remove(&node_idx);
+        }
         if attribute == "id" {
             self.dom_indexes.remove_id_node(&removed, node_idx);
         } else if attribute == "class" {
@@ -10968,6 +11008,7 @@ impl Renderer {
             }
         }
         let mut attribute_changes = vec![];
+        let mut image_source_changed = false;
         match self
             .nodes
             .get_mut(node_idx)
@@ -10984,6 +11025,9 @@ impl Renderer {
                         continue;
                     }
                     let old_value = element.attributes.values.get(&key).cloned();
+                    if key == "src" || key == "srcset" {
+                        image_source_changed = true;
+                    }
                     if key == "id" {
                         if let Some(existing_id) = element.attributes.get_str("id") {
                             self.dom_indexes
@@ -11019,6 +11063,9 @@ impl Renderer {
             }
             _ => {}
         };
+        if image_source_changed {
+            self.images_nodes_loaded.remove(&node_idx);
+        }
         if !attribute_changes.is_empty() {
             for change in attribute_changes {
                 self.selector_changes.attribute_changed(
@@ -17950,9 +17997,6 @@ impl Frame {
             const nodes = {}
             for (const [idx, imageSize] of nodes) {{
                 const node = __elementFromNodeIdx(idx)
-                if (imageSize) {{
-                    [node.naturalHeight, node.naturalWidth] = imageSize
-                }}
                 node.dispatchEvent(new Event("load", {{
                     bubbles: false,
                     cancelable: false,
