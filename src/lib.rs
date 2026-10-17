@@ -9011,7 +9011,7 @@ fn op_canvas_measure_text(
     let font_handler = &renderer.font_handler;
     let face = font_handler.face_for_families(&families);
     let primary_font = font_handler.face_font(face);
-    let font = primary_font.as_scaled(font_px);
+    let font = primary_font.as_scaled(font_scale(&primary_font, font_px));
     let mut width = 0.0f32;
     let mut bounds: Option<ab_glyph::Rect> = None;
     for glyph in font_handler.layout_text(&text, face, font_px) {
@@ -9019,7 +9019,7 @@ fn op_canvas_measure_text(
         // A fallback glyph's bounds come from its own face, not the
         // string's primary face.
         let glyph_font = font_handler.face_font(glyph.face);
-        let scale = glyph_font.as_scaled(font_px).scale_factor();
+        let scale = glyph_font.as_scaled(font_scale(&glyph_font, font_px)).scale_factor();
         // Use outline bounds rather than the rounded rasterization bounds.
         // Colour glyphs (emoji) have no outline, so their bounds come from
         // the raster image that drawing stamps, placed by its bearing and
@@ -9057,8 +9057,7 @@ fn op_canvas_measure_text(
         }
         width += glyph.advance;
     }
-    // Approximate the em box with the existing height-based font scale. Baseline
-    // tables are not exposed by ab_glyph; synthesize hanging and ideographic.
+    // Baseline tables are not exposed by ab_glyph; synthesize hanging and ideographic.
     let ascent = f64::from(font.ascent());
     let descent = -f64::from(font.descent());
     let hanging_baseline = f64::from(font_px) * 0.6;
@@ -9148,7 +9147,8 @@ fn op_svg_get_extent_of_char(
         .collect::<Vec<_>>()
         .join(" ");
     let font_px = renderer.resolved_font_sizes[&node_idx];
-    let font = renderer.font_handler.font.as_scaled(font_px as f32);
+    let primary_font = &renderer.font_handler.font;
+    let font = primary_font.as_scaled(font_scale(primary_font, font_px as f32));
     let mut x = 0.0;
     let mut previous = None;
     let mut utf16_start = 0;
@@ -9199,7 +9199,7 @@ fn canvas_text_origin(
 ) -> (f64, f64) {
     let face = font_handler.face_for_families(families);
     let primary_font = font_handler.face_font(face);
-    let font = primary_font.as_scaled(font_px);
+    let font = primary_font.as_scaled(font_scale(&primary_font, font_px));
     let mut width = 0.0f32;
     for glyph in font_handler.layout_text(text, face, font_px) {
         width += glyph.kern_before + glyph.advance;
@@ -9253,7 +9253,7 @@ fn op_canvas_fill_text(
         renderer
             .font_handler
             .face_font(renderer.font_handler.face_for_families(&families));
-    let baseline = primary_font.as_scaled(font_px).ascent();
+    let baseline = primary_font.as_scaled(font_scale(&primary_font, font_px)).ascent();
     let (x, y) = canvas_text_origin(
         &renderer.font_handler,
         &text,
@@ -12074,19 +12074,25 @@ impl Renderer {
         } else {
             self.get_img_src_data(&src)
         };
-        let result = match entry {
-            Some(RequestCacheEntry::PngData(bytes)) => rasterize_png(
-                &mut self.cached_rasterizations,
-                &src,
-                &bytes,
-                input_w,
-                input_h,
-                max_w,
-                max_h,
-                mode,
-            )
-            .inspect_err(|err| println!("Failed to rasterize PNG: {}", err))
-            .ok()?,
+        // `images_nodes_loaded` records the intrinsic size, not the size the
+        // image happened to be rasterized at for its current layout.
+        let (result, intrinsic_size) = match entry {
+            Some(RequestCacheEntry::PngData(bytes)) => {
+                let result = rasterize_png(
+                    &mut self.cached_rasterizations,
+                    &src,
+                    &bytes,
+                    input_w,
+                    input_h,
+                    max_w,
+                    max_h,
+                    mode,
+                )
+                .inspect_err(|err| println!("Failed to rasterize PNG: {}", err))
+                .ok()?;
+                let pixmap = self.cached_rasterizations.decoded_pngs.get(&*src)?;
+                (result, (pixmap.height(), pixmap.width()))
+            }
             Some(RequestCacheEntry::JpegData(bytes)) => {
                 let (target_h, target_w) = prepare_jpeg(
                     &mut self.cached_rasterizations,
@@ -12100,7 +12106,7 @@ impl Renderer {
                 .inspect_err(|err| println!("Failed to rasterize JPEG: {}", err))
                 .ok()?;
                 let (target_h, target_w) = (target_h.max(1), target_w.max(1));
-                if *mode == LayoutMode::Complete {
+                let result = if *mode == LayoutMode::Complete {
                     let pixmap =
                         rasterize_jpeg(&mut self.cached_rasterizations, &src, target_w, target_h)
                             .unwrap();
@@ -12112,7 +12118,9 @@ impl Renderer {
                         target_w,
                         true,
                     )
-                }
+                };
+                let image = self.cached_rasterizations.decoded_jpegs.get(&*src)?;
+                (result, (image.height(), image.width()))
             }
             Some(RequestCacheEntry::SvgData(svg_data)) => {
                 let mut injected = svg_data.clone();
@@ -12127,13 +12135,23 @@ impl Renderer {
                     &style,
                     mode,
                 );
-                match result {
+                let result = match result {
                     Err(err) => {
                         println!("Failed to rasterize SVG data: {}", err);
                         return None;
                     }
                     Ok(res) => res,
-                }
+                };
+                let intrinsic_size = self
+                    .cached_rasterizations
+                    .decoded_svgs
+                    .get(&svg_cache_key(&injected, &style))
+                    .map(|tree| {
+                        let size = tree.size().to_int_size();
+                        (size.height(), size.width())
+                    })
+                    .unwrap_or((result.1, result.2));
+                (result, intrinsic_size)
             }
             Some(RequestCacheEntry::GifData(bytes)) => {
                 let (target_h, target_w) = prepare_gif(
@@ -12147,7 +12165,7 @@ impl Renderer {
                 )
                 .unwrap();
                 let (target_h, target_w) = (target_h.max(1), target_w.max(1));
-                if *mode == LayoutMode::Complete {
+                let result = if *mode == LayoutMode::Complete {
                     let pixmap =
                         rasterize_gif(&mut self.cached_rasterizations, &src, target_w, target_h)
                             .unwrap();
@@ -12159,7 +12177,9 @@ impl Renderer {
                         target_w,
                         true,
                     )
-                }
+                };
+                let image = self.cached_rasterizations.decoded_gifs.get(&*src)?;
+                (result, (image.height(), image.width()))
             }
             Some(RequestCacheEntry::WebpData(bytes)) => {
                 let (target_h, target_w) = prepare_webp(
@@ -12174,7 +12194,7 @@ impl Renderer {
                 .inspect_err(|err| println!("Failed to decode WebP: {}", err))
                 .ok()?;
                 let (target_h, target_w) = (target_h.max(1), target_w.max(1));
-                if *mode == LayoutMode::Complete {
+                let result = if *mode == LayoutMode::Complete {
                     let pixmap =
                         rasterize_webp(&mut self.cached_rasterizations, &src, target_w, target_h)
                             .inspect_err(|err| println!("Failed to rasterize WebP: {}", err))
@@ -12188,12 +12208,13 @@ impl Renderer {
                         target_w,
                         false,
                     )
-                }
+                };
+                let image = self.cached_rasterizations.decoded_webps.get(&*src)?;
+                (result, (image.height(), image.width()))
             }
             _ => return None,
         };
-        self.images_nodes_loaded
-            .insert(node_idx, (result.1, result.2));
+        self.images_nodes_loaded.insert(node_idx, intrinsic_size);
         Some(result)
     }
 
@@ -15939,6 +15960,11 @@ fn is_variation_selector(ch: char) -> bool {
     matches!(ch, '\u{fe0e}' | '\u{fe0f}')
 }
 
+// CSS sizes are pixels per em; ab_glyph scales to the ascent-to-descent height.
+fn font_scale(font: &FontVec, font_px: f32) -> ab_glyph::PxScale {
+    (font_px * font.height_unscaled() / font.units_per_em().unwrap()).into()
+}
+
 #[derive(Debug)]
 struct FontHandler {
     font: Rc<FontVec>,
@@ -16123,7 +16149,7 @@ impl FontHandler {
             }
             let (glyph_face, glyph_id) = self.resolve_glyph(face, &font, ch);
             let glyph_font = self.face_font(glyph_face);
-            let glyph_scaled = glyph_font.as_scaled(font_px);
+            let glyph_scaled = glyph_font.as_scaled(font_scale(&glyph_font, font_px));
             let kern_before = match previous {
                 Some((previous_face, previous_glyph)) if previous_face == glyph_face => {
                     glyph_scaled.kern(previous_glyph, glyph_id)
@@ -16155,7 +16181,7 @@ impl FontHandler {
         for glyph in self.layout_text(text, face, font_px) {
             pen_x += f64::from(glyph.kern_before);
             let font = self.face_font(glyph.face);
-            let scaled = font.as_scaled(font_px);
+            let scaled = font.as_scaled(font_scale(&font, font_px));
             if let Some(outline) = font.outline(glyph.glyph_id) {
                 path.extend(CanvasPathCommand::from_ab_glyph(
                     outline,
@@ -16251,7 +16277,7 @@ impl FontHandler {
         };
         let rasterized = color.or_else(|| {
             let font = self.face_font(face);
-            let glyph = font.outline_glyph(glyph_id.with_scale(size))?;
+            let glyph = font.outline_glyph(glyph_id.with_scale(font_scale(&font, size)))?;
             let mut pixels = Vec::new();
             glyph.draw(|x, y, coverage| pixels.push((x, y, coverage)));
             Some(RasterizedGlyph {
@@ -19259,7 +19285,7 @@ fn text_to_buffer_with_line_height(
 ) -> Option<(Pixmap, Option<Pixmap>, u32, u32)> {
     let face = font_handler.face_for_families(families);
     let primary_font = font_handler.face_font(face);
-    let scaled_font = primary_font.as_scaled(font_px);
+    let scaled_font = primary_font.as_scaled(font_scale(&primary_font, font_px));
     let mut width = 0f32;
     let x = 0;
     let y = 0;
