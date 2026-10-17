@@ -3974,6 +3974,23 @@ Object.defineProperty(globalThis, "CSS", {
     writable: true,
 })
 
+performance.setTimeOrigin()
+
+// Contexts here are never cross-origin isolated, so `performance.now` is
+// coarsened to 0.1ms rather than exposing the raw monotonic clock.
+const performanceNow = performance.Performance.prototype.now
+performance.Performance.prototype.now = function () {
+    return Math.floor(performanceNow.call(this) * 10) / 10
+}
+
+Object.defineProperty(globalThis, "crossOriginIsolated", {
+    get() {
+        return false
+    },
+    enumerable: true,
+    configurable: true,
+})
+
 const browserPerformance = performance.performance
 browserPerformance.timing = {
     navigationStart: Date.now(),
