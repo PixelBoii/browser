@@ -11731,52 +11731,36 @@ impl Renderer {
         }
     }
 
-    fn img_src_extension(src: &str) -> Option<&'static str> {
-        if src.ends_with(".png") {
-            Some("image/png")
-        } else if src.ends_with(".svg") {
-            Some("image/svg+xml")
-        } else if src.ends_with(".jpg") || src.ends_with(".jpeg") {
-            Some("image/jpeg")
-        } else if src.ends_with(".gif") {
-            Some("image/gif")
-        } else if src.ends_with(".webp") {
-            Some("image/webp")
-        } else {
-            None
-        }
-    }
-
     async fn fetch_img_src_data_url(
         client: reqwest::Client,
         url: ReqwestUrl,
-        src_extension: &'static str,
     ) -> (ReqwestUrl, Result<RequestCacheEntry>) {
         println!("Fetching img src: {}", url);
         let fetch_url = url.clone();
         let cache_entry = async move {
             let resp = client
                 .get(fetch_url)
-                .header(reqwest::header::ACCEPT, src_extension)
+                .header(reqwest::header::ACCEPT, "image/*")
                 .send()
                 .await?;
             let content_type = resp
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
-                // TODO: Consider whether this is a sane production default
-                .or(Some(src_extension))
-                .with_context(|| "Failed to get content-type for image")?;
-            match content_type {
+                .unwrap_or_default()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            match content_type.as_str() {
                 "image/png" => Ok(RequestCacheEntry::PngData(resp.bytes().await?)),
                 "image/svg+xml" => Ok(RequestCacheEntry::SvgData(resp.text().await?)),
                 "image/jpeg" => Ok(RequestCacheEntry::JpegData(resp.bytes().await?)),
                 "image/gif" => Ok(RequestCacheEntry::GifData(resp.bytes().await?)),
                 "image/webp" => Ok(RequestCacheEntry::WebpData(resp.bytes().await?)),
-                content_type => Err(anyhow!(
-                    "Failed to handle image content-type: {}",
-                    content_type
-                )),
+                _ => sniff_image_data(resp.bytes().await?.to_vec())
+                    .context("Unsupported image data"),
             }
         }
         .await;
@@ -11792,16 +11776,17 @@ impl Renderer {
                 return;
             }
         };
-        let requests: Vec<(ReqwestUrl, &'static str)> = self
+        let requests: Vec<ReqwestUrl> = self
             .nodes
             .iter()
             .filter_map(|(idx, n)| match n {
                 Node::Element(element)
-                    if (element.tag == "img" || element.tag == "video")
-                        && self
-                            .node_styles
-                            .get(&idx)
-                            .is_some_and(|v| v.display != StyleDisplay::None) =>
+                    if element.tag == "img"
+                        || (element.tag == "video"
+                            && self
+                                .node_styles
+                                .get(&idx)
+                                .is_some_and(|v| v.display != StyleDisplay::None)) =>
                 {
                     let attribute = if element.tag == "video" { "poster" } else { "src" };
                     element
@@ -11811,9 +11796,8 @@ impl Renderer {
                 }
                 _ => None,
             })
-            .filter(|src| !src.starts_with("data:"))
+            .filter(|src| !src.trim().is_empty())
             .filter_map(|src| {
-                let src_extension = Self::img_src_extension(&src)?;
                 let url = match resolve_url(&src, Some(&base)) {
                     Ok(url) => url,
                     Err(err) => {
@@ -11821,13 +11805,14 @@ impl Renderer {
                         return None;
                     }
                 };
-                if self.request_cache.contains_key(&url)
+                if !matches!(url.scheme(), "http" | "https")
+                    || self.request_cache.contains_key(&url)
                     || !self.pending_image_fetches.insert(url.clone())
                 {
                     return None;
                 }
 
-                Some((url, src_extension))
+                Some(url)
             })
             .collect();
 
@@ -11852,9 +11837,9 @@ impl Renderer {
 
             let entries = runtime.block_on(async move {
                 let mut join_set = tokio::task::JoinSet::new();
-                for (url, src_extension) in requests {
+                for url in requests {
                     let client = client.clone();
-                    join_set.spawn(Self::fetch_img_src_data_url(client, url, src_extension));
+                    join_set.spawn(Self::fetch_img_src_data_url(client, url));
                 }
 
                 let mut entries = Vec::new();
@@ -16828,6 +16813,7 @@ impl Frame {
             size.height,
         );
         *surface.borrow_mut() = FrameSurface { size, pixels };
+        self.decode_pending_images();
         self.update_newly_loaded_images();
         let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
     }
@@ -18061,20 +18047,20 @@ impl Frame {
         Ok(())
     }
 
-    fn decode_detached_images(&mut self) {
+    fn decode_pending_images(&mut self) {
         let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
-        let mut detached_images = vec![];
+        let mut pending_images = vec![];
 
         for (idx, node) in renderer.nodes.iter() {
             let Node::Element(element) = node else {
                 continue;
             };
-            if element.tag == "img" && node.get_parent().is_none() {
-                detached_images.push(idx);
+            if element.tag == "img" && !renderer.images_nodes_loaded.contains_key(&idx) {
+                pending_images.push(idx);
             }
         }
 
-        for idx in detached_images {
+        for idx in pending_images {
             renderer.decode_and_rasterize_img(idx, &LayoutMode::Complete, None, None, None, None);
         }
     }
@@ -18112,7 +18098,7 @@ impl Frame {
         self.render(&mut buffer);
         self.refresh_hover_after_render();
         let _ = self.refresh_intersections();
-        self.decode_detached_images();
+        self.decode_pending_images();
         self.update_newly_loaded_images();
 
         // If there are animations, continue re-rendering until there aren't
