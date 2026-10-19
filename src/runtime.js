@@ -4419,6 +4419,9 @@ function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clien
         const overEvent = new PointerEvent("pointerover", { ...eventOptions, relatedTarget: previousTarget })
         denoEvent.setIsTrusted(overEvent, true)
         denoEvent.dispatch(target, overEvent)
+        const mouseOverEvent = new MouseEvent("mouseover", { ...eventOptions, relatedTarget: previousTarget })
+        denoEvent.setIsTrusted(mouseOverEvent, true)
+        denoEvent.dispatch(target, mouseOverEvent)
     }
     const pointerMoveEvent = new PointerEvent("pointermove", eventOptions)
     denoEvent.setIsTrusted(pointerMoveEvent, true)
@@ -4435,7 +4438,7 @@ globalThis[webidl.brand] = webidl.brand
 denoEvent.setEventTargetData(globalThis)
 
 for (const prototype of [HtmlElement.prototype, Document.prototype, Window.prototype]) {
-    for (const type of ["click", "pointerover", "pointermove", "mousemove", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
+    for (const type of ["click", "pointerover", "mouseover", "pointermove", "mousemove", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
         denoEvent.defineEventHandler(prototype, type)
     }
 }
