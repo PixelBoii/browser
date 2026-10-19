@@ -3388,16 +3388,11 @@ fn svg_cache_key(svg_str: &String, style: &Style) -> (String, u32) {
     (svg_str.clone(), color_hex)
 }
 
-fn rasterize_svg(
+fn prepare_svg(
     cached_rasterizations: &mut CachedRasterizations,
     svg_str: &String,
-    input_w: Option<u32>,
-    input_h: Option<u32>,
-    max_w: Option<u32>,
-    max_h: Option<u32>,
     style: &Style,
-    mode: &LayoutMode,
-) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
+) -> Result<IntSize> {
     let key = svg_cache_key(svg_str, style);
     let color_hex = key.1;
     let tree = if let Some(cached) = cached_rasterizations.decoded_svgs.get(&key) {
@@ -3426,7 +3421,23 @@ fn rasterize_svg(
         cached_rasterizations.decoded_svgs.insert(key.clone(), tree);
         cached_rasterizations.decoded_svgs.get(&key).unwrap()
     };
-    let svg_size = tree.size().to_int_size();
+    Ok(tree.size().to_int_size())
+}
+
+fn rasterize_svg(
+    cached_rasterizations: &mut CachedRasterizations,
+    svg_str: &String,
+    input_w: Option<u32>,
+    input_h: Option<u32>,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
+    style: &Style,
+    mode: &LayoutMode,
+) -> Result<(tiny_skia::Pixmap, u32, u32, bool)> {
+    let svg_size = prepare_svg(cached_rasterizations, svg_str, style)?;
+    let key = svg_cache_key(svg_str, style);
+    let color_hex = key.1;
+    let tree = cached_rasterizations.decoded_svgs.get(&key).unwrap();
 
     let (mut target_h, mut target_w) = infer_image_size(
         Size {
@@ -6572,7 +6583,7 @@ fn op_get_image_state(
 ) -> ImageState {
     let host = document_state(scope, document);
     let renderer = host.renderer.borrow();
-    // The loaded map stores (height, width) of the decoded image.
+    // Intrinsic dimensions are available independently of pixel decoding.
     let loaded = renderer.images_nodes_loaded.get(&node_idx).copied();
     let has_source = match renderer.nodes.get(node_idx) {
         Some(Node::Element(element)) => {
@@ -12013,15 +12024,7 @@ impl Renderer {
         layout_roots
     }
 
-    fn decode_and_rasterize_img(
-        &mut self,
-        node_idx: usize,
-        mode: &LayoutMode,
-        input_h: Option<u32>,
-        input_w: Option<u32>,
-        max_h: Option<u32>,
-        max_w: Option<u32>,
-    ) -> Option<(Pixmap, u32, u32, bool)> {
+    fn load_img(&mut self, node_idx: usize) -> Option<(String, RequestCacheEntry)> {
         let Some(node) = self.nodes.get(node_idx) else {
             return None;
         };
@@ -12058,12 +12061,58 @@ impl Renderer {
             sniff_image_data(bytes)
         } else {
             self.get_img_src_data(&src)
-        };
-        // `images_nodes_loaded` records the intrinsic size, not the size the
-        // image happened to be rasterized at for its current layout.
-        let (result, intrinsic_size) = match entry {
-            Some(RequestCacheEntry::PngData(bytes)) => {
-                let result = rasterize_png(
+        }?;
+        if !self.images_nodes_loaded.contains_key(&node_idx) {
+            // Dimensions come from the image header, without decoding pixels.
+            let header_dimensions = |bytes: &[u8], format: image::ImageFormat| {
+                ImageReader::with_format(Cursor::new(bytes), format)
+                    .into_dimensions()
+                    .inspect_err(|err| println!("Failed to read image dimensions: {}", err))
+                    .ok()
+            };
+            let (width, height) = match &entry {
+                RequestCacheEntry::SvgData(svg_data) => {
+                    let mut injected = svg_data.clone();
+                    self.inject_css_variables_into_str(&mut injected, &style.variables);
+                    let size = prepare_svg(&mut self.cached_rasterizations, &injected, &style)
+                        .inspect_err(|err| println!("Failed to parse SVG image: {}", err))
+                        .ok()?;
+                    (size.width(), size.height())
+                }
+                RequestCacheEntry::PngData(bytes) => {
+                    header_dimensions(bytes, image::ImageFormat::Png)?
+                }
+                RequestCacheEntry::JpegData(bytes) => {
+                    header_dimensions(bytes, image::ImageFormat::Jpeg)?
+                }
+                RequestCacheEntry::GifData(bytes) => {
+                    header_dimensions(bytes, image::ImageFormat::Gif)?
+                }
+                RequestCacheEntry::WebpData(bytes) => {
+                    header_dimensions(bytes, image::ImageFormat::WebP)?
+                }
+                _ => return None,
+            };
+            // Source bytes are complete before entering the cache. Pixel decoding
+            // may happen later, and its failure must not leave the load pending.
+            self.images_nodes_loaded.insert(node_idx, (height, width));
+        }
+        Some((src.into_owned(), entry))
+    }
+
+    fn decode_and_rasterize_img(
+        &mut self,
+        node_idx: usize,
+        mode: &LayoutMode,
+        input_h: Option<u32>,
+        input_w: Option<u32>,
+        max_h: Option<u32>,
+        max_w: Option<u32>,
+    ) -> Option<(Pixmap, u32, u32, bool)> {
+        let (src, entry) = self.load_img(node_idx)?;
+        match entry {
+            RequestCacheEntry::PngData(bytes) => {
+                rasterize_png(
                     &mut self.cached_rasterizations,
                     &src,
                     &bytes,
@@ -12074,11 +12123,9 @@ impl Renderer {
                     mode,
                 )
                 .inspect_err(|err| println!("Failed to rasterize PNG: {}", err))
-                .ok()?;
-                let pixmap = self.cached_rasterizations.decoded_pngs.get(&*src)?;
-                (result, (pixmap.height(), pixmap.width()))
+                .ok()
             }
-            Some(RequestCacheEntry::JpegData(bytes)) => {
+            RequestCacheEntry::JpegData(bytes) => {
                 let (target_h, target_w) = prepare_jpeg(
                     &mut self.cached_rasterizations,
                     &src,
@@ -12104,10 +12151,15 @@ impl Renderer {
                         true,
                     )
                 };
-                let image = self.cached_rasterizations.decoded_jpegs.get(&*src)?;
-                (result, (image.height(), image.width()))
+                Some(result)
             }
-            Some(RequestCacheEntry::SvgData(svg_data)) => {
+            RequestCacheEntry::SvgData(svg_data) => {
+                let node = self.nodes.get(node_idx)?;
+                let style = self
+                    .node_styles
+                    .get(&node_idx)
+                    .map(|style| Cow::Borrowed(style))
+                    .unwrap_or_else(|| Cow::Owned(get_base_style(node, None)));
                 let mut injected = svg_data.clone();
                 self.inject_css_variables_into_str(&mut injected, &style.variables);
                 let result = rasterize_svg(
@@ -12127,18 +12179,9 @@ impl Renderer {
                     }
                     Ok(res) => res,
                 };
-                let intrinsic_size = self
-                    .cached_rasterizations
-                    .decoded_svgs
-                    .get(&svg_cache_key(&injected, &style))
-                    .map(|tree| {
-                        let size = tree.size().to_int_size();
-                        (size.height(), size.width())
-                    })
-                    .unwrap_or((result.1, result.2));
-                (result, intrinsic_size)
+                Some(result)
             }
-            Some(RequestCacheEntry::GifData(bytes)) => {
+            RequestCacheEntry::GifData(bytes) => {
                 let (target_h, target_w) = prepare_gif(
                     &mut self.cached_rasterizations,
                     &src,
@@ -12148,7 +12191,8 @@ impl Renderer {
                     max_w,
                     max_h,
                 )
-                .unwrap();
+                .inspect_err(|err| println!("Failed to decode GIF: {}", err))
+                .ok()?;
                 let (target_h, target_w) = (target_h.max(1), target_w.max(1));
                 let result = if *mode == LayoutMode::Complete {
                     let pixmap =
@@ -12163,10 +12207,9 @@ impl Renderer {
                         true,
                     )
                 };
-                let image = self.cached_rasterizations.decoded_gifs.get(&*src)?;
-                (result, (image.height(), image.width()))
+                Some(result)
             }
-            Some(RequestCacheEntry::WebpData(bytes)) => {
+            RequestCacheEntry::WebpData(bytes) => {
                 let (target_h, target_w) = prepare_webp(
                     &mut self.cached_rasterizations,
                     &src,
@@ -12194,13 +12237,10 @@ impl Renderer {
                         false,
                     )
                 };
-                let image = self.cached_rasterizations.decoded_webps.get(&*src)?;
-                (result, (image.height(), image.width()))
+                Some(result)
             }
-            _ => return None,
-        };
-        self.images_nodes_loaded.insert(node_idx, intrinsic_size);
-        Some(result)
+            _ => None,
+        }
     }
 
     fn inject_css_variables_into_str(&self, str: &mut String, variables: &StyleVariables) {
@@ -16813,7 +16853,7 @@ impl Frame {
             size.height,
         );
         *surface.borrow_mut() = FrameSurface { size, pixels };
-        self.decode_pending_images();
+        self.load_pending_images();
         self.update_newly_loaded_images();
         let _ = parent_proxy.fire_user_event(UserEvent::FrameUpdated);
     }
@@ -18047,7 +18087,7 @@ impl Frame {
         Ok(())
     }
 
-    fn decode_pending_images(&mut self) {
+    fn load_pending_images(&mut self) {
         let mut renderer = self.renderer.as_mut().unwrap().borrow_mut();
         let mut pending_images = vec![];
 
@@ -18061,12 +18101,12 @@ impl Frame {
         }
 
         for idx in pending_images {
-            renderer.decode_and_rasterize_img(idx, &LayoutMode::Complete, None, None, None, None);
+            renderer.load_img(idx);
         }
     }
 
     fn update_newly_loaded_images(&mut self) {
-        // Measurements can decode images before a paint. The load phase tracks
+        // Measurements can load image metadata before a paint. The load phase tracks
         // delivery and publishes dimensions before invoking each handler.
         let image_nodes = self
             .renderer
@@ -18098,7 +18138,7 @@ impl Frame {
         self.render(&mut buffer);
         self.refresh_hover_after_render();
         let _ = self.refresh_intersections();
-        self.decode_pending_images();
+        self.load_pending_images();
         self.update_newly_loaded_images();
 
         // If there are animations, continue re-rendering until there aren't
