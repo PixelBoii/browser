@@ -850,7 +850,11 @@ class MouseEvent extends UIEvent {
         if (!target || typeof target.getBoundingClientRect !== "function") {
             return this.pageX
         }
-        return this.clientX - target.getBoundingClientRect().left
+        const style = getComputedStyle(target)
+        const borderLeft = style.borderLeftStyle === "none" || style.borderLeftStyle === "hidden"
+            ? 0
+            : parseFloat(style.borderLeftWidth) || 0
+        return this.clientX - target.getBoundingClientRect().left - borderLeft
     }
 
     get offsetY() {
@@ -858,7 +862,11 @@ class MouseEvent extends UIEvent {
         if (!target || typeof target.getBoundingClientRect !== "function") {
             return this.pageY
         }
-        return this.clientY - target.getBoundingClientRect().top
+        const style = getComputedStyle(target)
+        const borderTop = style.borderTopStyle === "none" || style.borderTopStyle === "hidden"
+            ? 0
+            : parseFloat(style.borderTopWidth) || 0
+        return this.clientY - target.getBoundingClientRect().top - borderTop
     }
 }
 
@@ -931,7 +939,7 @@ Object.defineProperty(globalThis, "KeyboardEvent", {
 class PointerEvent extends MouseEvent {
     constructor(type, options = {}) {
         super(type, options)
-        this.pointerId = options.pointerId ?? 1
+        this.pointerId = options.pointerId ?? 0
         this.width = options.width ?? 1
         this.height = options.height ?? 1
         this.pressure = options.pressure ?? 0
@@ -941,7 +949,7 @@ class PointerEvent extends MouseEvent {
         this.twist = options.twist ?? 0
         this.altitudeAngle = options.altitudeAngle ?? Math.PI / 2
         this.azimuthAngle = options.azimuthAngle ?? 0
-        this.pointerType = options.pointerType ?? "mouse"
+        this.pointerType = options.pointerType ?? ""
         this.isPrimary = options.isPrimary ?? false
     }
 }
@@ -1036,6 +1044,8 @@ class HtmlElement extends BaseNode {
             cancelable: true,
             composed: true,
             detail: 1,
+            pointerId: -1,
+            pointerType: "",
         }))
     }
 
@@ -4337,11 +4347,13 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
             view: globalThis,
             clientX,
             clientY,
-            detail: 1,
+            detail: eventType.startsWith("pointer") ? 0 : 1,
             button: 0,
             buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
             pressure: eventType === "pointerdown" ? 0.5 : 0,
             isPrimary: eventType === "pointerdown" || eventType === "pointerup",
+            pointerId: 1,
+            pointerType: "mouse",
         }
         const event = eventType.startsWith("pointer") || eventType === "click"
             ? new PointerEvent(eventType, eventOptions)
@@ -4378,6 +4390,8 @@ function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clien
         movementX,
         movementY,
         isPrimary: true,
+        pointerId: 1,
+        pointerType: "mouse",
     }
     if (target !== previousTarget) {
         const overEvent = new PointerEvent("pointerover", { ...eventOptions, relatedTarget: previousTarget })
