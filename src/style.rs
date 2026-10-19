@@ -1419,6 +1419,7 @@ pub fn media_query_matches(query: &MediaQuery, window_size: &PhysicalSize<u32>) 
             MediaQueryCriteria::NotAllAnd(criterias) => !media_query_matches(
                 &MediaQuery {
                     criterias: criterias.clone(),
+                    text: String::new(),
                     parent: None,
                 },
                 window_size,

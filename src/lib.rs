@@ -7204,6 +7204,10 @@ enum CssRuleData {
         name: String,
         rules: Vec<KeyframeRuleData>,
     },
+    Media {
+        condition_text: String,
+        rules: Vec<CssRuleData>,
+    },
     Other,
 }
 
@@ -7211,6 +7215,42 @@ enum CssRuleData {
 struct KeyframeRuleData {
     key_text: String,
     declarations: String,
+}
+
+fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
+    match nodes.get(idx)? {
+        CssNode::ClassName(rule) => Some(CssRuleData::Style {
+            selector_text: rule.name.join(", "),
+            declarations: css_rule_declarations(nodes, idx),
+        }),
+        CssNode::Keyframes(rule) => Some(CssRuleData::Keyframes {
+            name: crate::css::unquote(&rule.name).to_string(),
+            rules: nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(frame_idx, node)| match node {
+                    CssNode::Keyframe(frame) if frame.parent == Some(idx) => {
+                        Some(KeyframeRuleData {
+                            key_text: frame.key_text.clone(),
+                            declarations: css_rule_declarations(nodes, frame_idx),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect(),
+        }),
+        CssNode::MediaQuery(query) if !query.text.is_empty() => Some(CssRuleData::Media {
+            condition_text: query.text.clone(),
+            rules: nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.get_parent() == Some(idx))
+                .filter_map(|(child_idx, _)| css_rule_data(nodes, child_idx))
+                .collect(),
+        }),
+        CssNode::Property(_) | CssNode::Variable(_) | CssNode::Keyframe(_) => None,
+        _ => Some(CssRuleData::Other),
+    }
 }
 
 fn css_rule_declarations(nodes: &[CssNode], rule_idx: usize) -> String {
@@ -7292,30 +7332,9 @@ fn op_get_stylesheet(
             if node.get_parent().is_some() {
                 continue;
             }
-            match node {
-                CssNode::ClassName(rule) => rules.push(CssRuleData::Style {
-                    selector_text: rule.name.join(", "),
-                    declarations: css_rule_declarations(nodes, idx),
-                }),
-                CssNode::Keyframes(rule) => rules.push(CssRuleData::Keyframes {
-                    name: crate::css::unquote(&rule.name).to_string(),
-                    rules: nodes
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(frame_idx, node)| match node {
-                            CssNode::Keyframe(frame) if frame.parent == Some(idx) => {
-                                Some(KeyframeRuleData {
-                                    key_text: frame.key_text.clone(),
-                                    declarations: css_rule_declarations(nodes, frame_idx),
-                                })
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                }),
-                CssNode::Property(_) | CssNode::Variable(_) => {}
-                // Keep grouping/at-rules in order without presenting them as style rules.
-                _ => rules.push(CssRuleData::Other),
+            // Keep unknown grouping/at-rules in order without presenting them as style rules.
+            if let Some(rule) = css_rule_data(nodes, idx) {
+                rules.push(rule);
             }
         }
     }
@@ -7382,6 +7401,7 @@ fn op_media_query_matches(
     let matches = media_query_matches(
         &MediaQuery {
             criterias: parse_media_query_parts(query.as_str()),
+            text: query.clone(),
             parent: None,
         },
         &renderer.window_size,

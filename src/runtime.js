@@ -2952,6 +2952,8 @@ class CSSRule {
 
 CSSRule.STYLE_RULE = 1
 CSSRule.prototype.STYLE_RULE = 1
+CSSRule.MEDIA_RULE = 4
+CSSRule.prototype.MEDIA_RULE = 4
 CSSRule.KEYFRAMES_RULE = 7
 CSSRule.prototype.KEYFRAMES_RULE = 7
 CSSRule.KEYFRAME_RULE = 8
@@ -3012,6 +3014,53 @@ class CSSKeyframesRule extends CSSRule {
     }
 }
 
+function cssRuleFromData(parentStyleSheet, rule, parentRule = null) {
+    let result
+    if (rule.type === "style") {
+        result = new CSSStyleRule(parentStyleSheet, rule.selector_text, rule.declarations)
+    } else if (rule.type === "keyframes") {
+        result = new CSSKeyframesRule(parentStyleSheet, rule.name, rule.rules)
+    } else if (rule.type === "media") {
+        result = new CSSMediaRule(parentStyleSheet, rule.condition_text, rule.rules, parentRule)
+    } else {
+        result = new CSSRule(parentStyleSheet)
+    }
+    result.parentRule = parentRule
+    return result
+}
+
+class CSSMediaRule extends CSSRule {
+    constructor(parentStyleSheet, conditionText, rules, parentRule = null) {
+        super(parentStyleSheet)
+        this.parentRule = parentRule
+        this.__conditionText = conditionText
+        this.__rules = rules.map(rule => cssRuleFromData(parentStyleSheet, rule, this))
+        this.__rules.item = index => this.__rules[index] ?? null
+        for (let index = 0; index < this.__rules.length; index++) {
+            this[index] = this.__rules[index]
+        }
+        const queries = conditionText.split(",").map(query => query.trim()).filter(Boolean)
+        this.__media = {
+            mediaText: conditionText,
+            length: queries.length,
+            item: index => queries[index] ?? null,
+        }
+        for (let index = 0; index < queries.length; index++) {
+            this.__media[index] = queries[index]
+        }
+    }
+
+    get type() { return CSSRule.MEDIA_RULE }
+    get conditionText() { return this.__conditionText }
+    get media() { return this.__media }
+    get cssRules() { return this.__rules }
+    get length() { return this.__rules.length }
+    get cssText() {
+        const rules = this.__rules.map(rule => `  ${rule.cssText}`).join("\n")
+        return `@media ${this.conditionText} {\n${rules}${rules ? "\n" : ""}}`
+    }
+}
+
 class CSSStyleSheet {
     constructor(ownerNode, href = null) {
         if (!ownerNode) throw new TypeError("Constructed stylesheets are not implemented")
@@ -3025,11 +3074,7 @@ class CSSStyleSheet {
         if (data?.href && new URL(data.href).origin !== new URL(this.ownerNode.ownerDocument.location.href).origin) {
             throw new DOMException.DOMException("Cannot read a cross-origin stylesheet", "SecurityError")
         }
-        const rules = (data?.rules ?? []).map(rule => {
-            if (rule.type === "style") return new CSSStyleRule(this, rule.selector_text, rule.declarations)
-            if (rule.type === "keyframes") return new CSSKeyframesRule(this, rule.name, rule.rules)
-            return new CSSRule(this)
-        })
+        const rules = (data?.rules ?? []).map(rule => cssRuleFromData(this, rule))
         rules.item = index => rules[index] ?? null
         return rules
     }
@@ -3045,7 +3090,7 @@ class CSSStyleSheet {
     }
 }
 
-for (const type of [CSSRule, CSSStyleRule, CSSKeyframeRule, CSSKeyframesRule, CSSStyleSheet]) {
+for (const type of [CSSRule, CSSStyleRule, CSSKeyframeRule, CSSKeyframesRule, CSSMediaRule, CSSStyleSheet]) {
     Object.defineProperty(globalThis, type.name, {
         value: type,
         configurable: true,

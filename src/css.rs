@@ -92,6 +92,7 @@ pub struct MatchedCssRule {
 #[derive(Debug, Clone)]
 pub struct MediaQuery {
     pub criterias: Vec<MediaQueryCriteria>,
+    pub text: String,
     pub parent: Option<usize>,
 }
 
@@ -730,11 +731,13 @@ impl CssParser {
 
             self.nodes.push(Node::MediaQuery(MediaQuery {
                 criterias,
+                text: name.to_string(),
                 parent: self.node,
             }));
         } else {
             self.nodes.push(Node::MediaQuery(MediaQuery {
                 criterias: vec![MediaQueryCriteria::Unsupported],
+                text: String::new(),
                 parent: self.node,
             }));
         }
@@ -941,11 +944,17 @@ impl CssParser {
                             self.in_url = true;
                         }
                     }
+                    CssBuildPhase::MediaQuery => {
+                        self.label.push(char);
+                    }
                     _ => {}
                 },
                 ')' => match self.stage {
                     CssBuildPhase::Specifier => {
                         self.in_url = false;
+                        self.label.push(char);
+                    }
+                    CssBuildPhase::MediaQuery => {
                         self.label.push(char);
                     }
                     _ => {}
