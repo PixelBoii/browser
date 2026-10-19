@@ -3503,6 +3503,12 @@ class Document extends EventTarget {
     get links() {
         return this.querySelectorAll("a[href], area[href]")
     }
+    get images() {
+        return this.querySelectorAll("img")
+    }
+    get forms() {
+        return this.querySelectorAll("form")
+    }
     get currentScript() {
         return this.__currentScript
     }
