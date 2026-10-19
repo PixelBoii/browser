@@ -18363,6 +18363,30 @@ impl Frame {
                     .execute_host_script("move handler", code)
                     .inspect_err(|err| eprintln!("Script move handler failed with err: {err}"));
             }
+        } else if hovering.is_none()
+            && self.js_runtime.is_some()
+            && let Some((previous_node, previous_position)) = self.last_pointer_move.take()
+        {
+            let parents = self
+                .renderer
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .get_parents(previous_node);
+            let parents_strs: Vec<String> =
+                parents.iter().map(|idx| idx.to_string()).collect();
+            let code = format!(
+                "__dispatchOutFromNodeIdx({}, [{}], {}, {}, {}, {})",
+                previous_node,
+                parents_strs.join(", "),
+                cursor.x,
+                cursor.y,
+                cursor.x - previous_position.x,
+                cursor.y - previous_position.y
+            );
+            let _ = self
+                .execute_host_script("out handler", code)
+                .inspect_err(|err| eprintln!("Script out handler failed with err: {err}"));
         }
         needs_repaint
     }

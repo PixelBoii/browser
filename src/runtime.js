@@ -4416,6 +4416,9 @@ function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clien
         pointerType: "mouse",
     }
     if (target !== previousTarget) {
+        if (previousTarget) {
+            dispatchOutEvents(previousTarget, target, eventOptions)
+        }
         const overEvent = new PointerEvent("pointerover", { ...eventOptions, relatedTarget: previousTarget })
         denoEvent.setIsTrusted(overEvent, true)
         denoEvent.dispatch(target, overEvent)
@@ -4431,6 +4434,42 @@ function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clien
     denoEvent.dispatch(target, mouseMoveEvent)
 }
 
+function dispatchOutEvents(target, relatedTarget, eventOptions) {
+    const options = { ...eventOptions, relatedTarget }
+    const pointerOutEvent = new PointerEvent("pointerout", options)
+    denoEvent.setIsTrusted(pointerOutEvent, true)
+    denoEvent.dispatch(target, pointerOutEvent)
+    const mouseOutEvent = new MouseEvent("mouseout", options)
+    denoEvent.setIsTrusted(mouseOutEvent, true)
+    denoEvent.dispatch(target, mouseOutEvent)
+}
+
+function dispatchOutFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, movementX = 0, movementY = 0) {
+    const path = pathNodeIdxs
+        .map(idx => __elementFromNodeIdx(idx))
+        .filter(Boolean)
+
+    const target = path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? __elementFromNodeIdx(targetNodeIdx)
+    if (!target) return
+
+    dispatchOutEvents(target, null, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: globalThis,
+        clientX,
+        clientY,
+        detail: 0,
+        button: 0,
+        buttons: 0,
+        movementX,
+        movementY,
+        isPrimary: true,
+        pointerId: 1,
+        pointerType: "mouse",
+    })
+}
+
 class Window extends EventTarget {}
 
 // The existing global object becomes the Window instance.
@@ -4438,7 +4477,7 @@ globalThis[webidl.brand] = webidl.brand
 denoEvent.setEventTargetData(globalThis)
 
 for (const prototype of [HtmlElement.prototype, Document.prototype, Window.prototype]) {
-    for (const type of ["click", "pointerover", "mouseover", "pointermove", "mousemove", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
+    for (const type of ["click", "pointerover", "mouseover", "pointerout", "mouseout", "pointermove", "mousemove", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
         denoEvent.defineEventHandler(prototype, type)
     }
 }
@@ -4461,6 +4500,13 @@ Object.defineProperty(globalThis, "__dispatchClickFromNodeIdx", {
 
 Object.defineProperty(globalThis, "__dispatchMoveFromNodeIdx", {
     value: dispatchMoveFromNodeIdx,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "__dispatchOutFromNodeIdx", {
+    value: dispatchOutFromNodeIdx,
     enumerable: true,
     configurable: true,
     writable: true,
