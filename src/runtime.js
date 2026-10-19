@@ -3458,6 +3458,52 @@ function tagToElement(tag, namespaceURI) {
                                 HtmlElement
 }
 
+class HTMLCollection {
+    constructor(getElements) {
+        this.__getElements = getElements
+        return new Proxy(this, {
+            get(target, property, receiver) {
+                if (typeof property === "string" && /^\d+$/.test(property)) {
+                    return target.__getElements()[Number(property)]
+                }
+                if (Reflect.has(target, property)) {
+                    return Reflect.get(target, property, receiver)
+                }
+                if (typeof property === "string") {
+                    return target.namedItem(property) ?? undefined
+                }
+                return undefined
+            },
+        })
+    }
+
+    get length() {
+        return this.__getElements().length
+    }
+
+    item(index) {
+        return this.__getElements()[index >>> 0] ?? null
+    }
+
+    namedItem(name) {
+        const elements = this.__getElements()
+        return elements.find(element => element.id === name)
+            ?? elements.find(element => element.getAttribute?.("name") === name)
+            ?? null
+    }
+
+    [Symbol.iterator]() {
+        return this.__getElements()[Symbol.iterator]()
+    }
+}
+
+Object.defineProperty(globalThis, "HTMLCollection", {
+    value: HTMLCollection,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
 const documentToken = Symbol()
 let nextDocumentSequence = 0
 
@@ -3472,6 +3518,8 @@ class Document extends EventTarget {
         this.__detached = false
         this.__url = null
         this.__nodeMap = new Map()
+        this.__imagesCollection = null
+        this.__formsCollection = null
         this.__nodeToElement = pair => nodeToElement(pair, this)
         this.__elementFromNodeIdx = idx => elementFromNodeIdx(idx, this)
     }
@@ -3574,10 +3622,12 @@ class Document extends EventTarget {
         return this.querySelectorAll("a[href], area[href]")
     }
     get images() {
-        return this.querySelectorAll("img")
+        this.__imagesCollection ??= new HTMLCollection(() => this.querySelectorAll("img"))
+        return this.__imagesCollection
     }
     get forms() {
-        return this.querySelectorAll("form")
+        this.__formsCollection ??= new HTMLCollection(() => this.querySelectorAll("form"))
+        return this.__formsCollection
     }
     get currentScript() {
         return this.__currentScript
