@@ -833,6 +833,30 @@ class MouseEvent extends UIEvent {
         this.altKey = options.altKey ?? false
         this.metaKey = options.metaKey ?? false
     }
+
+    get pageX() {
+        return this.clientX + (this.view?.scrollX ?? 0)
+    }
+
+    get pageY() {
+        return this.clientY + (this.view?.scrollY ?? 0)
+    }
+
+    get offsetX() {
+        const target = this.target
+        if (!target || typeof target.getBoundingClientRect !== "function") {
+            return this.pageX
+        }
+        return this.clientX - target.getBoundingClientRect().left
+    }
+
+    get offsetY() {
+        const target = this.target
+        if (!target || typeof target.getBoundingClientRect !== "function") {
+            return this.pageY
+        }
+        return this.clientY - target.getBoundingClientRect().top
+    }
 }
 
 Object.defineProperty(globalThis, "MouseEvent", {
@@ -1002,7 +1026,7 @@ class HtmlElement extends BaseNode {
     }
 
     click() {
-        return this.dispatchEvent(new MouseEvent("click", {
+        return this.dispatchEvent(new PointerEvent("click", {
             bubbles: true,
             cancelable: true,
             composed: true,
@@ -4306,7 +4330,7 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
             button: 0,
             buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
         }
-        const event = eventType.startsWith("pointer")
+        const event = eventType.startsWith("pointer") || eventType === "click"
             ? new PointerEvent(eventType, eventOptions)
             : new MouseEvent(eventType, eventOptions)
         denoEvent.setIsTrusted(event, true)
