@@ -868,6 +868,44 @@ class MouseEvent extends UIEvent {
             : parseFloat(style.borderTopWidth) || 0
         return this.clientY - target.getBoundingClientRect().top - borderTop
     }
+
+    get x() {
+        return this.clientX
+    }
+
+    get y() {
+        return this.clientY
+    }
+
+    __layerOrigin() {
+        let node = this.target
+        while (node && typeof node.getBoundingClientRect === "function") {
+            const style = getComputedStyle(node)
+            if (style.position !== "static") {
+                const rect = node.getBoundingClientRect()
+                const borderLeft = style.borderLeftStyle === "none" || style.borderLeftStyle === "hidden"
+                    ? 0
+                    : parseFloat(style.borderLeftWidth) || 0
+                const borderTop = style.borderTopStyle === "none" || style.borderTopStyle === "hidden"
+                    ? 0
+                    : parseFloat(style.borderTopWidth) || 0
+                return {
+                    x: rect.left + (this.view?.scrollX ?? 0) + borderLeft,
+                    y: rect.top + (this.view?.scrollY ?? 0) + borderTop,
+                }
+            }
+            node = node.parentElement
+        }
+        return { x: 0, y: 0 }
+    }
+
+    get layerX() {
+        return this.pageX - this.__layerOrigin().x
+    }
+
+    get layerY() {
+        return this.pageY - this.__layerOrigin().y
+    }
 }
 
 Object.defineProperty(globalThis, "MouseEvent", {
@@ -4354,7 +4392,7 @@ Object.defineProperty(globalThis, "clientInformation", {
     writable: true,
 })
 
-function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0) {
+function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, screenX = clientX, screenY = clientY) {
     const path = pathNodeIdxs
         .map(idx => __elementFromNodeIdx(idx))
         .filter(Boolean)
@@ -4369,6 +4407,8 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
             view: globalThis,
             clientX,
             clientY,
+            screenX,
+            screenY,
             detail: eventType.startsWith("pointer") ? 0 : 1,
             button: 0,
             buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
@@ -4389,7 +4429,7 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
     return clickEvent?.defaultPrevented ?? false
 }
 
-function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, previousTargetNodeIdx = null, movementX = 0, movementY = 0) {
+function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, previousTargetNodeIdx = null, movementX = 0, movementY = 0, screenX = clientX, screenY = clientY) {
     const path = pathNodeIdxs
         .map(idx => __elementFromNodeIdx(idx))
         .filter(Boolean)
@@ -4414,6 +4454,8 @@ function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clien
         isPrimary: true,
         pointerId: 1,
         pointerType: "mouse",
+        screenX,
+        screenY,
     }
     if (target !== previousTarget) {
         if (previousTarget) {
@@ -4444,7 +4486,7 @@ function dispatchOutEvents(target, relatedTarget, eventOptions) {
     denoEvent.dispatch(target, mouseOutEvent)
 }
 
-function dispatchOutFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, movementX = 0, movementY = 0) {
+function dispatchOutFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, movementX = 0, movementY = 0, screenX = clientX, screenY = clientY) {
     const path = pathNodeIdxs
         .map(idx => __elementFromNodeIdx(idx))
         .filter(Boolean)
@@ -4467,6 +4509,8 @@ function dispatchOutFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, client
         isPrimary: true,
         pointerId: 1,
         pointerType: "mouse",
+        screenX,
+        screenY,
     })
 }
 

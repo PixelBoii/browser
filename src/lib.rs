@@ -2582,6 +2582,7 @@ struct Renderer {
     pending_dom_update: bool,
     event_loop_notify: Rc<tokio::sync::Notify>,
     scroll_y: HashMap<usize, i32>,
+    screen_offset: Position,
     layout_roots: Vec<usize>,
     resolved_specified_heights: NodeMap<Option<u32>>,
     resolved_specified_widths: NodeMap<Option<u32>>,
@@ -10529,6 +10530,7 @@ impl Renderer {
             pending_dom_update: false,
             event_loop_notify: Rc::new(tokio::sync::Notify::new()),
             scroll_y: HashMap::new(),
+            screen_offset: Position { x: 0, y: 0 },
             layout_roots: vec![],
             resolved_specified_heights: NodeMap::default(),
             resolved_specified_widths: NodeMap::default(),
@@ -15358,10 +15360,17 @@ impl Renderer {
                 }
             }
             LayoutKind::Iframe => {
+                let parent_screen_offset = self.screen_offset;
                 if let Some(handle) = self
                     .frames
                     .get_mut(&self.layout_to_node_idx(&layout_box_idx))
                 {
+                    if let Some(child_renderer) = handle.frame.borrow().renderer.as_ref() {
+                        child_renderer.borrow_mut().screen_offset = Position {
+                            x: parent_screen_offset.x + container_start_x,
+                            y: parent_screen_offset.y + container_start_y,
+                        };
+                    }
                     let surface = handle.surface.borrow();
                     let clip = clip
                         .intersect_x(
@@ -17804,19 +17813,19 @@ impl Frame {
                 y: rect.y + (rect.height / 2) as i32,
             }
         });
-        let parents = self
-            .renderer
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .get_parents(node_idx);
+        let (parents, screen_offset) = {
+            let renderer = self.renderer.as_ref().unwrap().borrow();
+            (renderer.get_parents(node_idx), renderer.screen_offset)
+        };
         let parents_strs: Vec<String> = parents.iter().map(|idx| idx.to_string()).collect();
         let code = format!(
-            "__dispatchClickFromNodeIdx({}, [{}], {}, {})",
+            "__dispatchClickFromNodeIdx({}, [{}], {}, {}, {}, {})",
             node_idx,
             parents_strs.join(", "),
             position.x,
-            position.y
+            position.y,
+            position.x + screen_offset.x,
+            position.y + screen_offset.y
         );
 
         let default_prevented = {
@@ -18327,11 +18336,11 @@ impl Frame {
         if let Some(hovering_layout_idx) = hovering
             && self.js_runtime.is_some()
         {
-            let (node_idx, parents) = {
+            let (node_idx, parents, screen_offset) = {
                 let renderer = self.renderer.as_ref().unwrap().borrow();
                 let node_idx = renderer.layout_to_node_idx(&hovering_layout_idx);
                 let parents = renderer.get_parents(node_idx);
-                (node_idx, parents)
+                (node_idx, parents, renderer.screen_offset)
             };
             if self.last_pointer_move != Some((node_idx, *cursor)) {
                 let (previous_target, movement_x, movement_y) =
@@ -18350,14 +18359,16 @@ impl Frame {
                     .map(|idx| idx.to_string())
                     .unwrap_or_else(|| "null".to_string());
                 let code = format!(
-                    "__dispatchMoveFromNodeIdx({}, [{}], {}, {}, {}, {}, {})",
+                    "__dispatchMoveFromNodeIdx({}, [{}], {}, {}, {}, {}, {}, {}, {})",
                     node_idx,
                     parents_strs.join(", "),
                     cursor.x,
                     cursor.y,
                     previous_target,
                     movement_x,
-                    movement_y
+                    movement_y,
+                    cursor.x + screen_offset.x,
+                    cursor.y + screen_offset.y
                 );
                 let _ = self
                     .execute_host_script("move handler", code)
@@ -18367,22 +18378,22 @@ impl Frame {
             && self.js_runtime.is_some()
             && let Some((previous_node, previous_position)) = self.last_pointer_move.take()
         {
-            let parents = self
-                .renderer
-                .as_ref()
-                .unwrap()
-                .borrow()
-                .get_parents(previous_node);
+            let (parents, screen_offset) = {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                (renderer.get_parents(previous_node), renderer.screen_offset)
+            };
             let parents_strs: Vec<String> =
                 parents.iter().map(|idx| idx.to_string()).collect();
             let code = format!(
-                "__dispatchOutFromNodeIdx({}, [{}], {}, {}, {}, {})",
+                "__dispatchOutFromNodeIdx({}, [{}], {}, {}, {}, {}, {}, {})",
                 previous_node,
                 parents_strs.join(", "),
                 cursor.x,
                 cursor.y,
                 cursor.x - previous_position.x,
-                cursor.y - previous_position.y
+                cursor.y - previous_position.y,
+                cursor.x + screen_offset.x,
+                cursor.y + screen_offset.y
             );
             let _ = self
                 .execute_host_script("out handler", code)

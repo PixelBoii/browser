@@ -164,7 +164,7 @@ class Event {
       currentTarget: null,
       eventPhase: Event.NONE,
       target: null,
-      timeStamp: 0,
+      timeStamp: globalThis_?.performance?.now() ?? 0,
     };
   }
 
