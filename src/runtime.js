@@ -832,6 +832,8 @@ class MouseEvent extends UIEvent {
         this.shiftKey = options.shiftKey ?? false
         this.altKey = options.altKey ?? false
         this.metaKey = options.metaKey ?? false
+        this.movementX = options.movementX ?? 0
+        this.movementY = options.movementY ?? 0
     }
 
     get pageX() {
