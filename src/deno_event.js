@@ -200,7 +200,7 @@ class Event {
   }
 
   get srcElement() {
-    return null;
+    return this[_attributes].target;
   }
 
   set srcElement(_) {

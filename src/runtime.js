@@ -191,9 +191,21 @@ class BaseNode extends EventTarget {
         return sibling ? this.ownerDocument.__nodeToElement(sibling) : null
     }
 
+    get previousElementSibling() {
+        let sibling = this.previousSibling
+        while (sibling && sibling.nodeType !== Node.ELEMENT_NODE) {
+            sibling = sibling.previousSibling
+        }
+        return sibling
+    }
+
     get firstChild() {
         const child = core.ops.op_get_edge_child(this.ownerDocument, this.__node_idx, false)
         return child ? this.ownerDocument.__nodeToElement(child) : null
+    }
+
+    get firstElementChild() {
+        return this.children[0] ?? null
     }
 
     getRootNode(options = {}) {
