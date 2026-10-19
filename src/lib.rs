@@ -16434,6 +16434,7 @@ pub struct Frame {
     render_size: PhysicalSize<u32>,
     loaded_nodes: HashSet<usize>,
     last_hover_position: Option<Position>,
+    last_pointer_move: Option<(usize, Position)>,
     last_forwarded_iframe_hover: Option<(usize, Position)>,
     animation_frame_requested: bool,
     last_animation_frame: Instant,
@@ -16545,6 +16546,7 @@ impl Frame {
             render_size,
             loaded_nodes: HashSet::new(),
             last_hover_position: None,
+            last_pointer_move: None,
             last_forwarded_iframe_hover: None,
             animation_frame_requested: false,
             last_animation_frame: Instant::now(),
@@ -18007,6 +18009,7 @@ impl Frame {
             Arc::clone(&self.blob_store),
             false,
         ))));
+        self.last_pointer_move = None;
     }
 
     fn tick_animations(&mut self) -> bool {
@@ -18319,6 +18322,46 @@ impl Frame {
                 if let Some(window) = self.window.as_mut() {
                     window.request_redraw();
                 }
+            }
+        }
+        if let Some(hovering_layout_idx) = hovering
+            && self.js_runtime.is_some()
+        {
+            let (node_idx, parents) = {
+                let renderer = self.renderer.as_ref().unwrap().borrow();
+                let node_idx = renderer.layout_to_node_idx(&hovering_layout_idx);
+                let parents = renderer.get_parents(node_idx);
+                (node_idx, parents)
+            };
+            if self.last_pointer_move != Some((node_idx, *cursor)) {
+                let (previous_target, movement_x, movement_y) =
+                    match self.last_pointer_move {
+                        Some((previous, previous_position)) => (
+                            Some(previous),
+                            cursor.x - previous_position.x,
+                            cursor.y - previous_position.y,
+                        ),
+                        None => (None, 0, 0),
+                    };
+                self.last_pointer_move = Some((node_idx, *cursor));
+                let parents_strs: Vec<String> =
+                    parents.iter().map(|idx| idx.to_string()).collect();
+                let previous_target = previous_target
+                    .map(|idx| idx.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let code = format!(
+                    "__dispatchMoveFromNodeIdx({}, [{}], {}, {}, {}, {}, {})",
+                    node_idx,
+                    parents_strs.join(", "),
+                    cursor.x,
+                    cursor.y,
+                    previous_target,
+                    movement_x,
+                    movement_y
+                );
+                let _ = self
+                    .execute_host_script("move handler", code)
+                    .inspect_err(|err| eprintln!("Script move handler failed with err: {err}"));
             }
         }
         needs_repaint

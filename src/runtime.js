@@ -4349,6 +4349,43 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
     return clickEvent?.defaultPrevented ?? false
 }
 
+function dispatchMoveFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clientY = 0, previousTargetNodeIdx = null, movementX = 0, movementY = 0) {
+    const path = pathNodeIdxs
+        .map(idx => __elementFromNodeIdx(idx))
+        .filter(Boolean)
+
+    const target = path.find(node => node?.nodeType === Node.ELEMENT_NODE) ?? __elementFromNodeIdx(targetNodeIdx)
+    if (!target) return
+
+    const previousTarget = previousTargetNodeIdx == null ? null : __elementFromNodeIdx(previousTargetNodeIdx)
+
+    const eventOptions = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: globalThis,
+        clientX,
+        clientY,
+        detail: 0,
+        button: 0,
+        buttons: 0,
+        movementX,
+        movementY,
+        isPrimary: true,
+    }
+    if (target !== previousTarget) {
+        const overEvent = new PointerEvent("pointerover", { ...eventOptions, relatedTarget: previousTarget })
+        denoEvent.setIsTrusted(overEvent, true)
+        denoEvent.dispatch(target, overEvent)
+    }
+    const pointerMoveEvent = new PointerEvent("pointermove", eventOptions)
+    denoEvent.setIsTrusted(pointerMoveEvent, true)
+    denoEvent.dispatch(target, pointerMoveEvent)
+    const mouseMoveEvent = new MouseEvent("mousemove", eventOptions)
+    denoEvent.setIsTrusted(mouseMoveEvent, true)
+    denoEvent.dispatch(target, mouseMoveEvent)
+}
+
 class Window extends EventTarget {}
 
 // The existing global object becomes the Window instance.
@@ -4356,7 +4393,7 @@ globalThis[webidl.brand] = webidl.brand
 denoEvent.setEventTargetData(globalThis)
 
 for (const prototype of [HtmlElement.prototype, Document.prototype, Window.prototype]) {
-    for (const type of ["click", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
+    for (const type of ["click", "pointerover", "pointermove", "mousemove", "load", "error", "input", "change", "keydown", "keyup", "focus", "blur", "scroll", "message"]) {
         denoEvent.defineEventHandler(prototype, type)
     }
 }
@@ -4372,6 +4409,13 @@ Object.defineProperty(globalThis, "Window", {
 
 Object.defineProperty(globalThis, "__dispatchClickFromNodeIdx", {
     value: dispatchClickFromNodeIdx,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+})
+
+Object.defineProperty(globalThis, "__dispatchMoveFromNodeIdx", {
+    value: dispatchMoveFromNodeIdx,
     enumerable: true,
     configurable: true,
     writable: true,
