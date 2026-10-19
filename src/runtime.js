@@ -2501,6 +2501,28 @@ class HTMLSelectElement extends HTMLFormControlElement {
     get options() {
         return this.getElementsByTagName("option")
     }
+
+    get selectedIndex() {
+        const options = this.options
+        const index = options.findIndex(option => option.selected)
+        if (index !== -1 || options.length === 0 || this.hasAttribute("multiple")) {
+            return index
+        }
+        const size = parseInt(this.getAttribute("size"), 10)
+        if (size > 1 || this.__nothingSelected) {
+            return -1
+        }
+        return 0
+    }
+
+    set selectedIndex(value) {
+        const index = Number(value)
+        const options = this.options
+        for (const [optionIndex, option] of options.entries()) {
+            option.selected = optionIndex === index
+        }
+        this.__nothingSelected = !options.some(option => option.selected)
+    }
 }
 
 class HTMLOptionElement extends HtmlElement {
