@@ -939,8 +939,10 @@ class PointerEvent extends MouseEvent {
         this.tiltX = options.tiltX ?? 0
         this.tiltY = options.tiltY ?? 0
         this.twist = options.twist ?? 0
+        this.altitudeAngle = options.altitudeAngle ?? Math.PI / 2
+        this.azimuthAngle = options.azimuthAngle ?? 0
         this.pointerType = options.pointerType ?? "mouse"
-        this.isPrimary = options.isPrimary ?? true
+        this.isPrimary = options.isPrimary ?? false
     }
 }
 
@@ -4333,6 +4335,7 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
             button: 0,
             buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
             pressure: eventType === "pointerdown" ? 0.5 : 0,
+            isPrimary: eventType === "pointerdown" || eventType === "pointerup",
         }
         const event = eventType.startsWith("pointer") || eventType === "click"
             ? new PointerEvent(eventType, eventOptions)
