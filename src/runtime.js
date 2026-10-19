@@ -832,6 +832,7 @@ class MouseEvent extends UIEvent {
         this.shiftKey = options.shiftKey ?? false
         this.altKey = options.altKey ?? false
         this.metaKey = options.metaKey ?? false
+        this.relatedTarget = options.relatedTarget ?? null
         this.movementX = options.movementX ?? 0
         this.movementY = options.movementY ?? 0
     }
@@ -4328,9 +4329,10 @@ function dispatchClickFromNodeIdx(targetNodeIdx, pathNodeIdxs, clientX = 0, clie
             view: globalThis,
             clientX,
             clientY,
-            detail: eventType === "click" ? 1 : 0,
+            detail: 1,
             button: 0,
             buttons: eventType === "pointerdown" || eventType === "mousedown" ? 1 : 0,
+            pressure: eventType === "pointerdown" ? 0.5 : 0,
         }
         const event = eventType.startsWith("pointer") || eventType === "click"
             ? new PointerEvent(eventType, eventOptions)
