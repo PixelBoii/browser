@@ -7193,12 +7193,6 @@ struct StyleSheetData {
     rules: Vec<CssRuleData>,
 }
 
-struct StyleDeclarationData {
-    name: String,
-    value: String,
-    important: bool,
-}
-
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CssRuleData {
@@ -7234,25 +7228,6 @@ impl CssRuleData {
 struct KeyframeRuleData {
     key_text: String,
     css_text: String,
-}
-
-fn declarations_to_css(declarations: &[StyleDeclarationData]) -> String {
-    declarations
-        .iter()
-        .map(|declaration| {
-            format!(
-                "{}: {}{};",
-                declaration.name,
-                declaration.value,
-                if declaration.important {
-                    " !important"
-                } else {
-                    ""
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn rule_block_css(prelude: &str, declarations: &str) -> String {
@@ -7313,7 +7288,7 @@ fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
     match nodes.get(idx)? {
         CssNode::ClassName(rule) => {
             let selector_text = rule.name.join(", ");
-            let declarations = declarations_to_css(&css_rule_declarations(nodes, idx));
+            let declarations = css_rule_declarations(nodes, idx);
             Some(CssRuleData::Style {
                 css_text: rule_block_css(&selector_text, &declarations),
                 selector_text,
@@ -7327,8 +7302,7 @@ fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
                 .filter_map(|(frame_idx, node)| match node {
                     CssNode::Keyframe(frame) if frame.parent == Some(idx) => {
                         let key_text = serialize_key_text(&frame.key_text);
-                        let declarations =
-                            declarations_to_css(&css_rule_declarations(nodes, frame_idx));
+                        let declarations = css_rule_declarations(nodes, frame_idx);
                         Some(KeyframeRuleData {
                             css_text: rule_block_css(&key_text, &declarations),
                             key_text,
@@ -7384,24 +7358,17 @@ fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
     }
 }
 
-fn css_rule_declarations(nodes: &[CssNode], rule_idx: usize) -> Vec<StyleDeclarationData> {
+fn css_rule_declarations(nodes: &[CssNode], rule_idx: usize) -> String {
     nodes
         .iter()
         .filter(|node| node.get_parent() == Some(rule_idx))
         .filter_map(|node| match node {
-            CssNode::Property(property) => Some(StyleDeclarationData {
-                name: property.property.clone(),
-                value: property.value.to_string(),
-                important: property.important,
-            }),
-            CssNode::Variable(variable) => Some(StyleDeclarationData {
-                name: variable.variable.clone(),
-                value: variable.value.to_string(),
-                important: variable.important,
-            }),
+            CssNode::Property(property) => Some(property.css_declaration()),
+            CssNode::Variable(variable) => Some(variable.css_declaration()),
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[op2]

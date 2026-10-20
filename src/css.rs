@@ -228,6 +228,27 @@ pub struct Variable {
     pub important: bool,
 }
 
+fn declaration_to_css(name: &str, value: &PropertyValue, important: bool) -> String {
+    format!(
+        "{}: {}{};",
+        name,
+        value,
+        if important { " !important" } else { "" }
+    )
+}
+
+impl Property {
+    pub fn css_declaration(&self) -> String {
+        declaration_to_css(&self.property, &self.value, self.important)
+    }
+}
+
+impl Variable {
+    pub fn css_declaration(&self) -> String {
+        declaration_to_css(&self.variable, &self.value, self.important)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub name: String,
