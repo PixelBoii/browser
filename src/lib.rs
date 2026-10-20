@@ -152,7 +152,6 @@ impl RectBorderSide {
                     Some(available_size.width),
                     None,
                     window_size,
-                    &SizeUnit::Px,
                 )? as u32,
                 color: match style.color {
                     StyleBackground::Hex(hex) => hex,
@@ -2823,7 +2822,6 @@ impl Renderer {
                 Some(resolved_parent_font_size),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             )
             .with_context(|| "Failed to get specific size")? as u32;
             self.resolved_font_sizes
@@ -2835,7 +2833,6 @@ impl Renderer {
                 Some(positioning_height),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             );
             let right = get_specified_size(
                 font_size,
@@ -2844,7 +2841,6 @@ impl Renderer {
                 Some(positioning_width),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             );
             let bottom = get_specified_size(
                 font_size,
@@ -2853,7 +2849,6 @@ impl Renderer {
                 Some(positioning_height),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             );
             let left = get_specified_size(
                 font_size,
@@ -2862,7 +2857,6 @@ impl Renderer {
                 Some(positioning_width),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             );
             let auto_left = left.is_none() && right.is_none();
             let auto_top = top.is_none() && bottom.is_none();
@@ -2888,7 +2882,6 @@ impl Renderer {
                 Some(positioning_width),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             );
             let margin_left = get_specified_size(
                 font_size,
@@ -2897,7 +2890,6 @@ impl Renderer {
                 Some(positioning_width),
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             );
 
             if style.position.is_free()
@@ -3001,11 +2993,6 @@ impl Renderer {
     }
 }
 
-enum SizeUnit {
-    Px,
-    Em,
-}
-
 fn get_specified_size(
     font_size: u32,
     root_font_size: u32,
@@ -3013,52 +3000,76 @@ fn get_specified_size(
     available_size: Option<u32>,
     auto_size: Option<i32>,
     window_size: &PhysicalSize<u32>,
-    default_unit: &SizeUnit,
 ) -> Option<i32> {
+    match resolve_size(
+        font_size,
+        root_font_size,
+        value,
+        available_size,
+        auto_size,
+        window_size,
+    )? {
+        StyleSize::Px(value) | StyleSize::Unitless(value) => Some(value as i32),
+        _ => None,
+    }
+}
+
+fn resolve_size(
+    font_size: u32,
+    root_font_size: u32,
+    value: &StyleSize,
+    available_size: Option<u32>,
+    auto_size: Option<i32>,
+    window_size: &PhysicalSize<u32>,
+) -> Option<StyleSize> {
     match value {
-        StyleSize::Auto => auto_size,
+        StyleSize::Auto => auto_size.map(|value| StyleSize::Px(value as f32)),
         StyleSize::Percent(percentage) => {
             if let Some(available_size) = available_size {
                 let computed = available_size as f32 * (*percentage as f32 / 100f32);
-                Some(computed as i32)
+                Some(StyleSize::Px(computed))
             } else {
                 None
             }
         }
-        StyleSize::Px(px) => Some(*px as i32),
-        StyleSize::Unitless(value) => Some(unit_to_px(*value, default_unit, font_size) as i32),
-        StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
-        StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
-        StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
+        StyleSize::Px(_) | StyleSize::Unitless(_) => Some(value.clone()),
+        StyleSize::Vh(vh) => Some(StyleSize::Px(window_size.height as f32 * *vh as f32 / 100.)),
+        StyleSize::Svh(vh) => Some(StyleSize::Px(window_size.height as f32 * *vh as f32 / 100.)),
+        StyleSize::Vw(vw) => Some(StyleSize::Px(window_size.width as f32 * *vw as f32 / 100.)),
         StyleSize::Clamp { min, value, max } => {
-            let min = get_specified_size(
+            let min = resolve_size(
                 font_size,
                 root_font_size,
                 min,
                 available_size,
                 auto_size,
                 window_size,
-                default_unit,
             )?;
-            let value = get_specified_size(
+            let value = resolve_size(
                 font_size,
                 root_font_size,
                 value,
                 available_size,
                 auto_size,
                 window_size,
-                default_unit,
             )?;
-            let max = get_specified_size(
+            let max = resolve_size(
                 font_size,
                 root_font_size,
                 max,
                 available_size,
                 auto_size,
                 window_size,
-                default_unit,
             )?;
-            Some(value.min(max).max(min))
+            match (min, value, max) {
+                (StyleSize::Px(min), StyleSize::Px(value), StyleSize::Px(max)) => {
+                    Some(StyleSize::Px(value.min(max).max(min)))
+                }
+                (StyleSize::Unitless(min), StyleSize::Unitless(value), StyleSize::Unitless(max)) => {
+                    Some(StyleSize::Unitless(value.min(max).max(min)))
+                }
+                _ => None,
+            }
         }
         StyleSize::Calc(calc) => solve_calc(
             calc,
@@ -3067,10 +3078,9 @@ fn get_specified_size(
             available_size,
             auto_size,
             window_size,
-            default_unit,
         ),
-        StyleSize::Em(em) => Some(unit_to_px(*em, &SizeUnit::Em, font_size) as i32),
-        StyleSize::Rem(rem) => Some((*rem * root_font_size as f32) as i32),
+        StyleSize::Em(em) => Some(StyleSize::Px(*em * font_size as f32)),
+        StyleSize::Rem(rem) => Some(StyleSize::Px(*rem * root_font_size as f32)),
         StyleSize::FitContent | StyleSize::MinContent | StyleSize::MaxContent => None,
     }
 }
@@ -3082,17 +3092,15 @@ fn get_calc_exp_value(
     available_size: Option<u32>,
     auto_size: Option<i32>,
     window_size: &PhysicalSize<u32>,
-    default_unit: &SizeUnit,
-) -> Option<i32> {
+) -> Option<StyleSize> {
     match exp {
-        CalcExpression::Size(size) => get_specified_size(
+        CalcExpression::Size(size) => resolve_size(
             font_size,
             root_font_size,
-            &size,
+            size,
             available_size,
             auto_size,
             window_size,
-            default_unit,
         ),
         CalcExpression::Nesting(nesting) => solve_calc(
             nesting,
@@ -3101,10 +3109,7 @@ fn get_calc_exp_value(
             available_size,
             auto_size,
             window_size,
-            // Apply unitless line-height scaling only to the outer expression.
-            &SizeUnit::Px,
         ),
-        CalcExpression::Solved(value) => Some(*value as i32),
         _ => panic!("Expected calc expression to be value"),
     }
 }
@@ -3116,17 +3121,11 @@ fn solve_calc(
     available_size: Option<u32>,
     auto_size: Option<i32>,
     window_size: &PhysicalSize<u32>,
-    default_unit: &SizeUnit,
-) -> Option<i32> {
+) -> Option<StyleSize> {
+    use StyleCalcOperator::{Divide, Minus, Multiply, Plus};
+    use StyleSize::{Px, Unitless};
+
     let mut calc = calc.clone();
-    fn has_unit(calc: &[CalcExpression]) -> bool {
-        calc.iter().any(|exp| match exp {
-            CalcExpression::Size(_) => true,
-            CalcExpression::Nesting(nested) => has_unit(nested),
-            CalcExpression::Operator(_) | CalcExpression::Solved(_) => false,
-        })
-    }
-    let has_unit = has_unit(&calc);
     while calc.len() > 1 {
         let exp = calc
             .iter()
@@ -3164,7 +3163,6 @@ fn solve_calc(
                 available_size,
                 auto_size,
                 window_size,
-                default_unit,
             )?;
             let next_value = get_calc_exp_value(
                 next,
@@ -3173,27 +3171,34 @@ fn solve_calc(
                 available_size,
                 auto_size,
                 window_size,
-                default_unit,
             )?;
 
             let CalcExpression::Operator(operator) = curr else {
                 unreachable!();
             };
 
-            let value = match operator {
-                StyleCalcOperator::Plus => prev_value + next_value,
-                StyleCalcOperator::Minus => prev_value - next_value,
-                StyleCalcOperator::Divide => prev_value / next_value.max(1),
-                StyleCalcOperator::Multiply => prev_value * next_value,
+            let value = match (operator, prev_value, next_value) {
+                (Plus, Px(prev), Px(next)) => Px(prev + next),
+                (Plus, Unitless(prev), Unitless(next)) => Unitless(prev + next),
+                (Minus, Px(prev), Px(next)) => Px(prev - next),
+                (Minus, Unitless(prev), Unitless(next)) => Unitless(prev - next),
+                (Multiply, Unitless(prev), Unitless(next)) => Unitless(prev * next),
+                (Multiply, Px(prev), Unitless(next)) | (Multiply, Unitless(prev), Px(next)) => {
+                    Px(prev * next)
+                }
+                (Divide, Unitless(prev), Unitless(next)) => Unitless(prev / next),
+                (Divide, Px(prev), Unitless(next)) => Px(prev / next),
+                (Divide, Px(prev), Px(next)) => Unitless(prev / next),
+                _ => return None,
             };
 
-            calc.splice(exp - 1..=exp + 1, [CalcExpression::Solved(value as f32)]);
+            calc.splice(exp - 1..=exp + 1, [CalcExpression::Size(value)]);
         } else {
             break;
         }
     }
 
-    let mut value = if calc.len() == 1 {
+    if calc.len() == 1 {
         get_calc_exp_value(
             &calc[0],
             font_size,
@@ -3201,23 +3206,9 @@ fn solve_calc(
             available_size,
             auto_size,
             window_size,
-            default_unit,
         )
     } else {
         None
-    };
-
-    if !has_unit && let Some(inner) = &mut value {
-        *inner = unit_to_px(*inner as f32, default_unit, font_size) as i32;
-    }
-
-    value
-}
-
-fn unit_to_px(value: f32, unit: &SizeUnit, font_size: u32) -> f32 {
-    match unit {
-        SizeUnit::Px => value,
-        SizeUnit::Em => value * font_size as f32,
     }
 }
 
@@ -3981,7 +3972,6 @@ fn compute_node_style(
             Some(parent_font_size.unwrap_or(16)),
             None,
             window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or_else(|| {
             println!("Failed to get font size for node idx {}", node_idx);
@@ -12542,16 +12532,19 @@ impl Renderer {
     }
 
     fn get_line_height(&self, style: &Style, font_size: u32) -> Option<u32> {
-        get_specified_size(
+        let value = match resolve_size(
             font_size,
             self.get_root_font_size(),
             &style.line_height,
             Some(font_size),
             None,
             &self.window_size,
-            &SizeUnit::Em,
-        )
-        .and_then(|value| (value > 0).then_some(value as u32))
+        )? {
+            StyleSize::Unitless(value) => value * font_size as f32,
+            StyleSize::Px(value) => value,
+            _ => return None,
+        } as i32;
+        (value > 0).then_some(value as u32)
     }
 
     fn resolve_transform_offset(&self, style: &Style, layout_box: &LayoutBox) -> (i32, i32) {
@@ -12576,7 +12569,6 @@ impl Renderer {
                         Some(layout_box.rect.width),
                         Some(0),
                         &self.window_size,
-                        &SizeUnit::Px,
                     )
                     .unwrap_or(0);
                     offset_y += get_specified_size(
@@ -12586,7 +12578,6 @@ impl Renderer {
                         Some(layout_box.rect.height),
                         Some(0),
                         &self.window_size,
-                        &SizeUnit::Px,
                     )
                     .unwrap_or(0);
                 }
@@ -12707,7 +12698,6 @@ impl Renderer {
                         containing_block_height,
                         None,
                         &self.window_size,
-                        &SizeUnit::Px,
                     )
                     .map(|height| height.max(0) as u32)
                     .unwrap_or(
@@ -12722,7 +12712,6 @@ impl Renderer {
                         containing_block_width,
                         None,
                         &self.window_size,
-                        &SizeUnit::Px,
                     )
                     .map(|width| width.max(0) as u32)
                     .unwrap_or(
@@ -12992,7 +12981,6 @@ impl Renderer {
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                                &SizeUnit::Px,
                             )
                             .unwrap_or(0)
                             .max(0) as u32,
@@ -13003,7 +12991,6 @@ impl Renderer {
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                                &SizeUnit::Px,
                             )
                             .unwrap_or(0)
                             .max(0) as u32,
@@ -13014,7 +13001,6 @@ impl Renderer {
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                                &SizeUnit::Px,
                             )
                             .unwrap_or(0)
                             .max(0) as u32,
@@ -13025,7 +13011,6 @@ impl Renderer {
                                 Some(available_size.width),
                                 None,
                                 &self.window_size,
-                                &SizeUnit::Px,
                             )
                             .unwrap_or(0)
                             .max(0) as u32,
@@ -13257,7 +13242,6 @@ impl Renderer {
             containing_block_height,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32);
         let max_height = get_specified_size(
@@ -13267,7 +13251,6 @@ impl Renderer {
             containing_block_height,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32);
         let min_width = get_specified_size(
@@ -13277,7 +13260,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32);
         let max_width = get_specified_size(
@@ -13287,7 +13269,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32);
 
@@ -13298,7 +13279,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         let specified_height = forced_size.height.or(get_specified_size(
@@ -13308,7 +13288,6 @@ impl Renderer {
             containing_block_height,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         let container_width_non_filling = specified_width.and_then(|v| {
@@ -13529,7 +13508,6 @@ impl Renderer {
             Some(container_sizes.inner_width),
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0) as u32;
         let (containing_block_height, containing_block_width) =
@@ -13541,7 +13519,6 @@ impl Renderer {
             containing_block_height,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         let specified_width = forced_size.width.or(get_specified_size(
@@ -13551,7 +13528,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         self.resolved_specified_heights
@@ -14056,7 +14032,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         let specified_height = forced_size.height.or(get_specified_size(
@@ -14066,7 +14041,6 @@ impl Renderer {
             containing_block_height,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
 
@@ -14415,7 +14389,6 @@ impl Renderer {
             available_size,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .and_then(|v| if v >= 0 { Some(v as u32) } else { None })
     }
@@ -14514,7 +14487,6 @@ impl Renderer {
             containing_block_height,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         let specified_width = forced_size.width.or(get_specified_size(
@@ -14524,7 +14496,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .map(|v| v.max(0) as u32));
         let has_definite_height = forced_size.height.is_some() || specified_height.is_some();
@@ -14634,7 +14605,6 @@ impl Renderer {
                     Some(container_sizes.inner_width),
                     None,
                     &self.window_size,
-                    &SizeUnit::Px,
                 )
                 .unwrap_or(i32::MAX);
                 let max_height = get_specified_size(
@@ -14644,7 +14614,6 @@ impl Renderer {
                     Some(container_sizes.inner_height),
                     None,
                     &self.window_size,
-                    &SizeUnit::Px,
                 )
                 .unwrap_or(i32::MAX);
                 let (max_size, max_cross_size) = match style.flex_direction {
@@ -14710,7 +14679,6 @@ impl Renderer {
             }),
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let gap_total = authored_gap.saturating_mul(base_items.len().saturating_sub(1) as i32);
@@ -15798,7 +15766,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let padding_right_size = get_specified_size(
@@ -15808,7 +15775,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let padding_top_size = get_specified_size(
@@ -15818,7 +15784,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let padding_bottom_size = get_specified_size(
@@ -15828,7 +15793,6 @@ impl Renderer {
             containing_block_width,
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
 
@@ -15857,7 +15821,6 @@ impl Renderer {
                 containing_block_width,
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             )
             .unwrap_or(0)
         } else {
@@ -15871,7 +15834,6 @@ impl Renderer {
                 containing_block_width,
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             )
             .unwrap_or(0)
         } else {
@@ -15885,7 +15847,6 @@ impl Renderer {
                 containing_block_height,
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             )
             .unwrap_or(0)
         } else {
@@ -15899,7 +15860,6 @@ impl Renderer {
                 containing_block_height,
                 None,
                 &self.window_size,
-                &SizeUnit::Px,
             )
             .unwrap_or(0)
         } else {
@@ -15923,7 +15883,6 @@ impl Renderer {
             Some(available_size.width),
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let margin_right_size = get_specified_size(
@@ -15933,7 +15892,6 @@ impl Renderer {
             Some(available_size.width),
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let margin_top_size = get_specified_size(
@@ -15943,7 +15901,6 @@ impl Renderer {
             Some(available_size.height),
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
         let margin_bottom_size = get_specified_size(
@@ -15953,7 +15910,6 @@ impl Renderer {
             Some(available_size.height),
             None,
             &self.window_size,
-            &SizeUnit::Px,
         )
         .unwrap_or(0);
 
@@ -19911,7 +19867,7 @@ mod tests {
     use winit::dpi::PhysicalSize;
 
     use crate::{
-        Frame, FrameCommand, Position, RendererProxy, SizeUnit, UserEvent,
+        Frame, FrameCommand, Position, RendererProxy, UserEvent,
         ensure_snapshot_matches,
         style::{
             CalcExpression, StyleCalcOperator, StyleSize, parse_calc, split_ignoring_parentheses,
@@ -20393,16 +20349,15 @@ mod tests {
                 None,
                 None,
                 &PhysicalSize::new(100, 100),
-                &SizeUnit::Px
             ),
-            Some(2)
+            Some(StyleSize::Px(2.))
         );
         Ok(())
     }
 
     #[test]
     fn solve_calc_uses_order_of_operations() -> Result<()> {
-        let StyleSize::Calc(calc) = parse_calc("2px + 3px * 4px")? else {
+        let StyleSize::Calc(calc) = parse_calc("2px + 3 * 4px")? else {
             unreachable!();
         };
 
@@ -20414,9 +20369,8 @@ mod tests {
                 None,
                 None,
                 &PhysicalSize::new(100, 100),
-                &SizeUnit::Px
             ),
-            Some(14)
+            Some(StyleSize::Px(14.))
         );
         Ok(())
     }

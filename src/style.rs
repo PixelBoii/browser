@@ -101,7 +101,6 @@ pub enum CalcExpression {
     Size(StyleSize),
     Operator(StyleCalcOperator),
     Nesting(Vec<CalcExpression>),
-    Solved(f32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,7 +310,6 @@ fn calc_expression_to_css(expression: &[CalcExpression]) -> String {
             CalcExpression::Nesting(expression) => {
                 format!("({})", calc_expression_to_css(expression))
             }
-            CalcExpression::Solved(value) => format_css_number(*value),
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -1234,7 +1232,7 @@ fn flush_calc_value(
 ) -> Result<()> {
     if buffer.len() > 0 {
         let size = if let Ok(parsed) = buffer.parse::<f32>() {
-            CalcExpression::Solved(parsed)
+            CalcExpression::Size(StyleSize::Unitless(parsed))
         } else {
             CalcExpression::Size(parse_style_size(buffer.clone())?)
         };
