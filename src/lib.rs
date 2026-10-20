@@ -3009,7 +3009,7 @@ fn get_specified_size(
         auto_size,
         window_size,
     )? {
-        StyleSize::Px(value) | StyleSize::Unitless(value) => Some(value as i32),
+        StyleSize::Px(value) => Some(value as i32),
         _ => None,
     }
 }

@@ -800,7 +800,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         width: match node {
             HtmlNode::Element(element) => {
                 if let Some(width) = element.attributes.get_str(&"width".to_string()) {
-                    parse_style_size(width.as_ref()).unwrap()
+                    parse_attribute_size(width.as_ref()).unwrap()
                 } else {
                     match element.tag.as_str() {
                         "br" => StyleSize::Px(0.),
@@ -818,7 +818,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         height: match node {
             HtmlNode::Element(element) => {
                 if let Some(height) = element.attributes.get_str(&"height".to_string()) {
-                    parse_style_size(height.as_ref()).unwrap()
+                    parse_attribute_size(height.as_ref()).unwrap()
                 } else {
                     match element.tag.as_str() {
                         "br" => StyleSize::Px(10.),
@@ -957,7 +957,7 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
                 element
                     .attributes
                     .get_str("font-size")
-                    .and_then(|value| parse_style_size(value.as_ref()).ok())
+                    .and_then(|value| parse_attribute_size(value.as_ref()).ok())
             }
             _ => None,
         }
@@ -1043,7 +1043,7 @@ fn parse_poiner_events(value: String) -> Result<StylePointerEvents> {
 fn parse_two_axis_size(value: String) -> Result<(StyleSize, StyleSize)> {
     let values: Vec<StyleSize> = split_ignoring_parentheses(value.clone(), ' ', &[])
         .into_iter()
-        .map(|s| parse_style_size(s.to_string()))
+        .map(|s| parse_style_length(s.to_string()))
         .collect::<Result<Vec<StyleSize>>>()?;
 
     match values.len() {
@@ -1078,10 +1078,10 @@ fn parse_transform_operation(name: &str, args: &str) -> Result<Option<StyleTrans
                 return Ok(None);
             }
             Ok(Some(StyleTransformOperation::Translate {
-                x: parse_style_size(&parts[0])?,
+                x: parse_style_length(&parts[0])?,
                 y: parts
                     .get(1)
-                    .map(|part| parse_style_size(part))
+                    .map(|part| parse_style_length(part))
                     .transpose()?
                     .unwrap_or(StyleSize::Px(0.)),
             }))
@@ -1091,7 +1091,7 @@ fn parse_transform_operation(name: &str, args: &str) -> Result<Option<StyleTrans
                 return Ok(None);
             }
             Ok(Some(StyleTransformOperation::Translate {
-                x: parse_style_size(&parts[0])?,
+                x: parse_style_length(&parts[0])?,
                 y: StyleSize::Px(0.),
             }))
         }
@@ -1101,7 +1101,7 @@ fn parse_transform_operation(name: &str, args: &str) -> Result<Option<StyleTrans
             }
             Ok(Some(StyleTransformOperation::Translate {
                 x: StyleSize::Px(0.),
-                y: parse_style_size(&parts[0])?,
+                y: parse_style_length(&parts[0])?,
             }))
         }
         "translate3d" => {
@@ -1109,8 +1109,8 @@ fn parse_transform_operation(name: &str, args: &str) -> Result<Option<StyleTrans
                 return Ok(None);
             }
             Ok(Some(StyleTransformOperation::Translate {
-                x: parse_style_size(&parts[0])?,
-                y: parse_style_size(&parts[1])?,
+                x: parse_style_length(&parts[0])?,
+                y: parse_style_length(&parts[1])?,
             }))
         }
         _ => Ok(None),
@@ -1231,11 +1231,7 @@ fn flush_calc_value(
     nesting: i32,
 ) -> Result<()> {
     if buffer.len() > 0 {
-        let size = if let Ok(parsed) = buffer.parse::<f32>() {
-            CalcExpression::Size(StyleSize::Unitless(parsed))
-        } else {
-            CalcExpression::Size(parse_style_size(buffer.clone())?)
-        };
+        let size = CalcExpression::Size(parse_style_size(buffer.as_str())?);
         buffer.clear();
         add_part_to_calc(parts, size, nesting);
     }
@@ -1289,7 +1285,7 @@ fn parse_size_number(value: &str) -> Result<f32> {
 
 fn parse_clamp_size_part(value: &str) -> Result<StyleSize> {
     let value = value.trim();
-    if value.contains(' ') || value.contains('+') || value.contains('*') || value.contains('/') {
+    if value.contains(' ') || value.contains('*') || value.contains('/') {
         parse_calc(value)
     } else {
         parse_style_size(value.to_string())
@@ -1297,7 +1293,7 @@ fn parse_clamp_size_part(value: &str) -> Result<StyleSize> {
 }
 
 fn parse_style_size(value: impl AsRef<str>) -> Result<StyleSize> {
-    let value = value.as_ref();
+    let value = value.as_ref().trim();
     if value == "auto" {
         return Ok(StyleSize::Auto);
     }
@@ -1398,34 +1394,35 @@ fn parse_style_size(value: impl AsRef<str>) -> Result<StyleSize> {
         let parsed = parse_size_number(em)?;
         return Ok(StyleSize::Em(parsed));
     }
-    let adjusted = if value.starts_with('.') {
-        format!("0{}", value)
-    } else {
-        value.to_string()
-    };
-    if let Ok(parsed) = adjusted.parse::<f32>() {
-        return Ok(StyleSize::Px(parsed));
+    if let Ok(parsed) = value.parse::<f32>() {
+        return Ok(StyleSize::Unitless(parsed));
     }
     println!("Failed to parse style size \"{}\"", value);
     Ok(StyleSize::Auto)
 }
 
+fn parse_style_length(value: impl AsRef<str>) -> Result<StyleSize> {
+    let value = value.as_ref();
+    match parse_style_size(value)? {
+        StyleSize::Unitless(0.) => Ok(StyleSize::Px(0.)),
+        StyleSize::Unitless(_) => Err(anyhow!("Expected a length, got {}", value)),
+        size => Ok(size),
+    }
+}
+
+fn parse_attribute_size(value: impl AsRef<str>) -> Result<StyleSize> {
+    match parse_style_size(value)? {
+        StyleSize::Unitless(value) => Ok(StyleSize::Px(value)),
+        size => Ok(size),
+    }
+}
+
 fn parse_line_height(value: String) -> Result<StyleSize> {
-    let value = value.trim();
-    if value == "normal" {
-        return Ok(StyleSize::Auto);
-    }
-
-    let adjusted = if value.starts_with('.') {
-        format!("0{}", value)
+    if value.trim() == "normal" {
+        Ok(StyleSize::Auto)
     } else {
-        value.to_string()
-    };
-    if let Ok(parsed) = adjusted.parse::<f32>() {
-        return Ok(StyleSize::Unitless(parsed));
+        parse_style_size(value)
     }
-
-    parse_style_size(value)
 }
 
 fn parse_grid_size(value: String) -> Result<GridColumnSize> {
@@ -2187,17 +2184,17 @@ fn parse_border_side_value(value: String) -> Result<BorderSideValue> {
     let parts: Vec<&str> = value.split(" ").collect();
     match parts.len() {
         1 => Ok(BorderSideValue {
-            size: Some(parse_style_size(parts[0].to_string())?),
+            size: Some(parse_style_length(parts[0].to_string())?),
             color: None,
             style: None,
         }),
         2 => Ok(BorderSideValue {
-            size: Some(parse_style_size(parts[0].to_string())?),
+            size: Some(parse_style_length(parts[0].to_string())?),
             style: Some(parse_border_style(parts[1].to_string())?),
             color: None,
         }),
         3 => Ok(BorderSideValue {
-            size: Some(parse_style_size(parts[0].to_string())?),
+            size: Some(parse_style_length(parts[0].to_string())?),
             style: Some(parse_border_style(parts[1].to_string())?),
             color: Some(parse_color(parts[2].to_string())?),
         }),
@@ -2419,10 +2416,10 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             | "padding-block-start"
             | "padding-block-end"
             | "padding-inline-start"
-            | "padding-inline-end" => PropertyValue::Size(parse_style_size(value)?),
+            | "padding-inline-end" => PropertyValue::Size(parse_style_length(value)?),
             "line-height" => PropertyValue::Size(parse_line_height(value)?),
             "margin" | "padding" | "inset" | "border-radius" => {
-                PropertyValue::CombinedSize(parse_combined_style(value, parse_style_size)?)
+                PropertyValue::CombinedSize(parse_combined_style(value, parse_style_length)?)
             }
             "margin-inline" => PropertyValue::HorizontalCombinedSize(parse_two_axis_size(value)?),
             "padding-block" => PropertyValue::VerticalCombinedSize(parse_two_axis_size(value)?),
@@ -2490,7 +2487,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             ),
             "flex-shrink" | "flex-grow" => PropertyValue::Int(value.parse::<u32>()?),
             "order" => PropertyValue::SignedInt(value.parse::<i32>()?),
-            "flex-basis" => PropertyValue::Size(parse_style_size(value)?),
+            "flex-basis" => PropertyValue::Size(parse_style_length(value)?),
             "flex" => {
                 let parts: Vec<&str> = value.split(" ").collect();
                 let mut grow = None;
@@ -2516,7 +2513,7 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                                 shrink = Some(1);
                                 basis = Some(StyleSize::Percent(0.));
                             } else {
-                                basis = Some(parse_style_size(parts[0].to_string())?);
+                                basis = Some(parse_style_length(parts[0].to_string())?);
                             }
                         }
                         2 => {
@@ -2526,13 +2523,13 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                                 basis = Some(StyleSize::Percent(0.));
                             } else {
                                 shrink = Some(1);
-                                basis = Some(parse_style_size(parts[1].to_string())?);
+                                basis = Some(parse_style_length(parts[1].to_string())?);
                             }
                         }
                         3 => {
                             grow = Some(parts[0].parse::<u32>()?);
                             shrink = Some(parts[1].parse::<u32>()?);
-                            basis = Some(parse_style_size(parts[2].to_string())?);
+                            basis = Some(parse_style_length(parts[2].to_string())?);
                         }
                         _ => {}
                     }
