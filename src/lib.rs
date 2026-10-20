@@ -7229,9 +7229,9 @@ fn rule_block_css(prelude: &str, declarations: &str) -> String {
     }
 }
 
-fn grouping_rule_css(prelude: &str, rules: &[String]) -> String {
+fn grouping_rule_css<'a>(prelude: &str, rules: impl IntoIterator<Item = &'a str>) -> String {
     let rules = rules
-        .iter()
+        .into_iter()
         .map(|rule| format!("  {rule}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -7304,10 +7304,7 @@ fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
                 .collect();
             let css_text = grouping_rule_css(
                 &format!("@keyframes {}", escape_css_identifier(&name)),
-                &rules
-                    .iter()
-                    .map(|rule| rule.css_text.clone())
-                    .collect::<Vec<_>>(),
+                rules.iter().map(|rule| rule.css_text.as_str()),
             );
             Some(CssRuleData::Keyframes {
                 name,
@@ -7333,10 +7330,7 @@ fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
                 .collect();
             let css_text = grouping_rule_css(
                 &format!("@media {condition_text}"),
-                &rules
-                    .iter()
-                    .filter_map(|rule| rule.css_text().map(str::to_string))
-                    .collect::<Vec<_>>(),
+                rules.iter().filter_map(|rule| rule.css_text()),
             );
             Some(CssRuleData::Media {
                 condition_text,

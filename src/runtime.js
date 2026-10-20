@@ -2944,10 +2944,13 @@ const styleSheets = new WeakMap()
 
 // Basic CSSOM subset, backed by the same parser used for rendering.
 class CSSRule {
-    constructor(parentStyleSheet) {
+    constructor(parentStyleSheet, cssText = "") {
         this.parentStyleSheet = parentStyleSheet
         this.parentRule = null
+        this.__cssText = cssText
     }
+
+    get cssText() { return this.__cssText }
 }
 
 CSSRule.STYLE_RULE = 1
@@ -2961,34 +2964,29 @@ CSSRule.prototype.KEYFRAME_RULE = 8
 
 class CSSStyleRule extends CSSRule {
     constructor(parentStyleSheet, selectorText, cssText) {
-        super(parentStyleSheet)
+        super(parentStyleSheet, cssText)
         this.__selectorText = selectorText
-        this.__cssText = cssText
     }
 
     get type() { return CSSRule.STYLE_RULE }
     get selectorText() { return this.__selectorText }
-    get cssText() { return this.__cssText }
 }
 
 class CSSKeyframeRule extends CSSRule {
     constructor(parentStyleSheet, parentRule, keyText, cssText) {
-        super(parentStyleSheet)
+        super(parentStyleSheet, cssText)
         this.parentRule = parentRule
         this.__keyText = keyText
-        this.__cssText = cssText
     }
 
     get type() { return CSSRule.KEYFRAME_RULE }
     get keyText() { return this.__keyText }
-    get cssText() { return this.__cssText }
 }
 
 class CSSKeyframesRule extends CSSRule {
     constructor(parentStyleSheet, name, rules, cssText) {
-        super(parentStyleSheet)
+        super(parentStyleSheet, cssText)
         this.__name = name
-        this.__cssText = cssText
         this.__rules = rules.map(rule => new CSSKeyframeRule(parentStyleSheet, this, rule.key_text, rule.css_text))
         this.__rules.item = index => this.__rules[index] ?? null
         for (let index = 0; index < this.__rules.length; index++) {
@@ -3000,7 +2998,6 @@ class CSSKeyframesRule extends CSSRule {
     get name() { return this.__name }
     get cssRules() { return this.__rules }
     get length() { return this.__rules.length }
-    get cssText() { return this.__cssText }
 }
 
 function cssRuleFromData(parentStyleSheet, rule, parentRule = null) {
@@ -3020,9 +3017,8 @@ function cssRuleFromData(parentStyleSheet, rule, parentRule = null) {
 
 class CSSMediaRule extends CSSRule {
     constructor(parentStyleSheet, conditionText, rules, cssText, parentRule = null) {
-        super(parentStyleSheet)
+        super(parentStyleSheet, cssText)
         this.parentRule = parentRule
-        this.__cssText = cssText
         this.__conditionText = conditionText
         this.__rules = rules.map(rule => cssRuleFromData(parentStyleSheet, rule, this))
         this.__rules.item = index => this.__rules[index] ?? null
@@ -3045,7 +3041,6 @@ class CSSMediaRule extends CSSRule {
     get media() { return this.__media }
     get cssRules() { return this.__rules }
     get length() { return this.__rules.length }
-    get cssText() { return this.__cssText }
 }
 
 class CSSStyleSheet {
