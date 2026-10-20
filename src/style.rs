@@ -191,6 +191,8 @@ pub enum StyleAlign {
     Left,
     Center,
     Right,
+    Start,
+    End,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -433,6 +435,8 @@ impl_css_keyword!(
     StyleAlign::Left => "left",
     StyleAlign::Center => "center",
     StyleAlign::Right => "right",
+    StyleAlign::Start => "start",
+    StyleAlign::End => "end",
 );
 impl_css_keyword!(
     StyleWhiteSpace,
@@ -2463,9 +2467,11 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             ),
             "text-align" => PropertyValue::Align(
                 match value.as_str().trim() {
-                    "left" | "start" => Some(StyleAlign::Left),
+                    "left" => Some(StyleAlign::Left),
+                    "start" => Some(StyleAlign::Start),
                     "center" => Some(StyleAlign::Center),
-                    "right" | "end" => Some(StyleAlign::Right),
+                    "right" => Some(StyleAlign::Right),
+                    "end" => Some(StyleAlign::End),
                     _ => None,
                 }
                 .with_context(|| "Failed to parse text-align")?,

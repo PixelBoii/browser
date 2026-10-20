@@ -13199,7 +13199,7 @@ impl Renderer {
             // Text alignment belongs to the containing block's inline content.
             // It must not move block children or re-align flex items.
             if let Some(text_align) = text_align
-                && text_align != StyleAlign::Left
+                && !matches!(text_align, StyleAlign::Left | StyleAlign::Start)
                 && row.iter().all(|c| {
                     self.node_styles
                         .get(&self.layout_to_node_idx(c))
@@ -13209,9 +13209,9 @@ impl Renderer {
                 })
             {
                 (first_margin, last_margin) = match text_align {
-                    StyleAlign::Left => panic!(),
+                    StyleAlign::Left | StyleAlign::Start => panic!(),
                     StyleAlign::Center => (StyleSize::Auto, StyleSize::Auto),
-                    StyleAlign::Right => (StyleSize::Auto, StyleSize::Px(0.)),
+                    StyleAlign::Right | StyleAlign::End => (StyleSize::Auto, StyleSize::Px(0.)),
                 };
             }
 
@@ -19560,9 +19560,9 @@ fn text_to_buffer_with_line_height(
     for (start, end, line_width) in lines {
         let free_space = (width - line_width).max(0.);
         let offset = match text_align {
-            StyleAlign::Left => 0.,
+            StyleAlign::Left | StyleAlign::Start => 0.,
             StyleAlign::Center => free_space / 2.,
-            StyleAlign::Right => free_space,
+            StyleAlign::Right | StyleAlign::End => free_space,
         };
         for glyph in &mut glyph_positions[start..end] {
             glyph.x += offset;
