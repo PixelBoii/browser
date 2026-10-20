@@ -2960,44 +2960,36 @@ CSSRule.KEYFRAME_RULE = 8
 CSSRule.prototype.KEYFRAME_RULE = 8
 
 class CSSStyleRule extends CSSRule {
-    constructor(parentStyleSheet, selectorText, declarations) {
+    constructor(parentStyleSheet, selectorText, cssText) {
         super(parentStyleSheet)
         this.__selectorText = selectorText
-        this.__declarations = declarations
+        this.__cssText = cssText
     }
 
     get type() { return CSSRule.STYLE_RULE }
     get selectorText() { return this.__selectorText }
-    get cssText() {
-        return `${this.selectorText} { ${this.__declarations}${this.__declarations ? " " : ""}}`
-    }
+    get cssText() { return this.__cssText }
 }
 
 class CSSKeyframeRule extends CSSRule {
-    constructor(parentStyleSheet, parentRule, keyText, declarations) {
+    constructor(parentStyleSheet, parentRule, keyText, cssText) {
         super(parentStyleSheet)
         this.parentRule = parentRule
-        this.__keyText = keyText.split(",").map(key => {
-            key = key.trim()
-            if (key.toLowerCase() === "from") return "0%"
-            if (key.toLowerCase() === "to") return "100%"
-            return key
-        }).join(", ")
-        this.__declarations = declarations
+        this.__keyText = keyText
+        this.__cssText = cssText
     }
 
     get type() { return CSSRule.KEYFRAME_RULE }
     get keyText() { return this.__keyText }
-    get cssText() {
-        return `${this.keyText} { ${this.__declarations}${this.__declarations ? " " : ""}}`
-    }
+    get cssText() { return this.__cssText }
 }
 
 class CSSKeyframesRule extends CSSRule {
-    constructor(parentStyleSheet, name, rules) {
+    constructor(parentStyleSheet, name, rules, cssText) {
         super(parentStyleSheet)
         this.__name = name
-        this.__rules = rules.map(rule => new CSSKeyframeRule(parentStyleSheet, this, rule.key_text, rule.declarations))
+        this.__cssText = cssText
+        this.__rules = rules.map(rule => new CSSKeyframeRule(parentStyleSheet, this, rule.key_text, rule.css_text))
         this.__rules.item = index => this.__rules[index] ?? null
         for (let index = 0; index < this.__rules.length; index++) {
             this[index] = this.__rules[index]
@@ -3008,20 +3000,17 @@ class CSSKeyframesRule extends CSSRule {
     get name() { return this.__name }
     get cssRules() { return this.__rules }
     get length() { return this.__rules.length }
-    get cssText() {
-        const rules = this.__rules.map(rule => `  ${rule.cssText}`).join("\n")
-        return `@keyframes ${CSS.escape(this.name)} {\n${rules}${rules ? "\n" : ""}}`
-    }
+    get cssText() { return this.__cssText }
 }
 
 function cssRuleFromData(parentStyleSheet, rule, parentRule = null) {
     let result
     if (rule.type === "style") {
-        result = new CSSStyleRule(parentStyleSheet, rule.selector_text, rule.declarations)
+        result = new CSSStyleRule(parentStyleSheet, rule.selector_text, rule.css_text)
     } else if (rule.type === "keyframes") {
-        result = new CSSKeyframesRule(parentStyleSheet, rule.name, rule.rules)
+        result = new CSSKeyframesRule(parentStyleSheet, rule.name, rule.rules, rule.css_text)
     } else if (rule.type === "media") {
-        result = new CSSMediaRule(parentStyleSheet, rule.condition_text, rule.rules, parentRule)
+        result = new CSSMediaRule(parentStyleSheet, rule.condition_text, rule.rules, rule.css_text, parentRule)
     } else {
         result = new CSSRule(parentStyleSheet)
     }
@@ -3030,9 +3019,10 @@ function cssRuleFromData(parentStyleSheet, rule, parentRule = null) {
 }
 
 class CSSMediaRule extends CSSRule {
-    constructor(parentStyleSheet, conditionText, rules, parentRule = null) {
+    constructor(parentStyleSheet, conditionText, rules, cssText, parentRule = null) {
         super(parentStyleSheet)
         this.parentRule = parentRule
+        this.__cssText = cssText
         this.__conditionText = conditionText
         this.__rules = rules.map(rule => cssRuleFromData(parentStyleSheet, rule, this))
         this.__rules.item = index => this.__rules[index] ?? null
@@ -3055,10 +3045,7 @@ class CSSMediaRule extends CSSRule {
     get media() { return this.__media }
     get cssRules() { return this.__rules }
     get length() { return this.__rules.length }
-    get cssText() {
-        const rules = this.__rules.map(rule => `  ${rule.cssText}`).join("\n")
-        return `@media ${this.conditionText} {\n${rules}${rules ? "\n" : ""}}`
-    }
+    get cssText() { return this.__cssText }
 }
 
 class CSSStyleSheet {

@@ -7193,77 +7193,215 @@ struct StyleSheetData {
     rules: Vec<CssRuleData>,
 }
 
+struct StyleDeclarationData {
+    name: String,
+    value: String,
+    important: bool,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum CssRuleData {
     Style {
         selector_text: String,
-        declarations: String,
+        css_text: String,
     },
     Keyframes {
         name: String,
         rules: Vec<KeyframeRuleData>,
+        css_text: String,
     },
     Media {
         condition_text: String,
         rules: Vec<CssRuleData>,
+        css_text: String,
     },
     Other,
+}
+
+impl CssRuleData {
+    fn css_text(&self) -> Option<&str> {
+        match self {
+            CssRuleData::Style { css_text, .. }
+            | CssRuleData::Keyframes { css_text, .. }
+            | CssRuleData::Media { css_text, .. } => Some(css_text),
+            CssRuleData::Other => None,
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct KeyframeRuleData {
     key_text: String,
-    declarations: String,
+    css_text: String,
+}
+
+fn declarations_to_css(declarations: &[StyleDeclarationData]) -> String {
+    declarations
+        .iter()
+        .map(|declaration| {
+            format!(
+                "{}: {}{};",
+                declaration.name,
+                declaration.value,
+                if declaration.important {
+                    " !important"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn rule_block_css(prelude: &str, declarations: &str) -> String {
+    if declarations.is_empty() {
+        format!("{prelude} {{ }}")
+    } else {
+        format!("{prelude} {{ {declarations} }}")
+    }
+}
+
+fn grouping_rule_css(prelude: &str, rules: &[String]) -> String {
+    let rules = rules
+        .iter()
+        .map(|rule| format!("  {rule}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{prelude} {{\n{rules}{}}}",
+        if rules.is_empty() { "" } else { "\n" }
+    )
+}
+
+fn serialize_key_text(key_text: &str) -> String {
+    key_text
+        .split(',')
+        .map(|key| {
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("from") {
+                "0%".to_string()
+            } else if key.eq_ignore_ascii_case("to") {
+                "100%".to_string()
+            } else if let Some(number) = key.strip_suffix('%')
+                && let Ok(number) = number.parse::<f32>()
+            {
+                format!("{}%", format_css_number(number))
+            } else {
+                key.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn escape_css_identifier(value: &str) -> String {
+    let mut out = String::new();
+    for char in value.chars() {
+        if char.is_ascii_alphanumeric() || char == '_' || char == '-' {
+            out.push(char);
+        } else {
+            out.push('\\');
+            out.push(char);
+        }
+    }
+    out
 }
 
 fn css_rule_data(nodes: &[CssNode], idx: usize) -> Option<CssRuleData> {
     match nodes.get(idx)? {
-        CssNode::ClassName(rule) => Some(CssRuleData::Style {
-            selector_text: rule.name.join(", "),
-            declarations: css_rule_declarations(nodes, idx),
-        }),
-        CssNode::Keyframes(rule) => Some(CssRuleData::Keyframes {
-            name: crate::css::unquote(&rule.name).to_string(),
-            rules: nodes
+        CssNode::ClassName(rule) => {
+            let selector_text = rule.name.join(", ");
+            let declarations = declarations_to_css(&css_rule_declarations(nodes, idx));
+            Some(CssRuleData::Style {
+                css_text: rule_block_css(&selector_text, &declarations),
+                selector_text,
+            })
+        }
+        CssNode::Keyframes(rule) => {
+            let name = crate::css::unquote(&rule.name).to_string();
+            let rules: Vec<KeyframeRuleData> = nodes
                 .iter()
                 .enumerate()
                 .filter_map(|(frame_idx, node)| match node {
                     CssNode::Keyframe(frame) if frame.parent == Some(idx) => {
+                        let key_text = serialize_key_text(&frame.key_text);
+                        let declarations =
+                            declarations_to_css(&css_rule_declarations(nodes, frame_idx));
                         Some(KeyframeRuleData {
-                            key_text: frame.key_text.clone(),
-                            declarations: css_rule_declarations(nodes, frame_idx),
+                            css_text: rule_block_css(&key_text, &declarations),
+                            key_text,
                         })
                     }
                     _ => None,
                 })
-                .collect(),
-        }),
-        CssNode::MediaQuery(query) if !query.text.is_empty() => Some(CssRuleData::Media {
-            condition_text: query.text.clone(),
-            rules: nodes
+                .collect();
+            let css_text = grouping_rule_css(
+                &format!("@keyframes {}", escape_css_identifier(&name)),
+                &rules
+                    .iter()
+                    .map(|rule| rule.css_text.clone())
+                    .collect::<Vec<_>>(),
+            );
+            Some(CssRuleData::Keyframes {
+                name,
+                rules,
+                css_text,
+            })
+        }
+        CssNode::MediaQuery(query) if !query.text.is_empty() => {
+            // A comma would be lost by joining the parsed criterias with
+            // "and", and unsupported criterias have no serialized form here.
+            let condition_text = if query.text.contains(',') {
+                query.text.clone()
+            } else {
+                crate::css::media_query_to_css(&query.criterias)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| query.text.clone())
+            };
+            let rules: Vec<CssRuleData> = nodes
                 .iter()
                 .enumerate()
                 .filter(|(_, node)| node.get_parent() == Some(idx))
                 .filter_map(|(child_idx, _)| css_rule_data(nodes, child_idx))
-                .collect(),
-        }),
+                .collect();
+            let css_text = grouping_rule_css(
+                &format!("@media {condition_text}"),
+                &rules
+                    .iter()
+                    .filter_map(|rule| rule.css_text().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            );
+            Some(CssRuleData::Media {
+                condition_text,
+                rules,
+                css_text,
+            })
+        }
         CssNode::Property(_) | CssNode::Variable(_) | CssNode::Keyframe(_) => None,
         _ => Some(CssRuleData::Other),
     }
 }
 
-fn css_rule_declarations(nodes: &[CssNode], rule_idx: usize) -> String {
+fn css_rule_declarations(nodes: &[CssNode], rule_idx: usize) -> Vec<StyleDeclarationData> {
     nodes
         .iter()
         .filter(|node| node.get_parent() == Some(rule_idx))
         .filter_map(|node| match node {
-            CssNode::Property(property) => Some(property.css_text.as_str()),
-            CssNode::Variable(variable) => Some(variable.css_text.as_str()),
+            CssNode::Property(property) => Some(StyleDeclarationData {
+                name: property.property.clone(),
+                value: property.value.to_string(),
+                important: property.important,
+            }),
+            CssNode::Variable(variable) => Some(StyleDeclarationData {
+                name: variable.variable.clone(),
+                value: variable.value.to_string(),
+                important: variable.important,
+            }),
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 #[op2]

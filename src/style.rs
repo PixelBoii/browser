@@ -498,6 +498,170 @@ impl Display for StyleTransform {
     }
 }
 
+impl Display for GridColumnSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GridColumnSize::Auto => formatter.write_str("auto"),
+            GridColumnSize::Px(value) => write!(formatter, "{value}px"),
+            GridColumnSize::Rem(value) => {
+                write!(formatter, "{}rem", format_css_number(*value))
+            }
+            GridColumnSize::Percent(value) => {
+                write!(formatter, "{}%", format_css_number(*value))
+            }
+            GridColumnSize::Fraction(value) => write!(formatter, "{value}fr"),
+        }
+    }
+}
+
+impl Display for GridTemplateColumnsValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GridTemplateColumnsValue::AutoFit(values) => write!(
+                formatter,
+                "repeat(auto-fit, {})",
+                values
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            GridTemplateColumnsValue::MinMax((min, max)) => {
+                write!(formatter, "minmax({min}, {max})")
+            }
+            GridTemplateColumnsValue::Size(value) => value.fmt(formatter),
+        }
+    }
+}
+
+impl Display for GridTemplateColumns {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GridTemplateColumns::Values(values) => formatter.write_str(
+                &values
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            GridTemplateColumns::None => formatter.write_str("none"),
+        }
+    }
+}
+
+fn shorthand_to_css<T: Display + PartialEq>(values: [&T; 4]) -> String {
+    let [top, right, bottom, left] = values;
+    if top == right && right == bottom && bottom == left {
+        top.to_string()
+    } else if top == bottom && right == left {
+        format!("{top} {right}")
+    } else if right == left {
+        format!("{top} {right} {bottom}")
+    } else {
+        format!("{top} {right} {bottom} {left}")
+    }
+}
+
+fn variable_template_to_css(template: &[VariableTemplatePart]) -> String {
+    let mut out = String::new();
+    for part in template {
+        match part {
+            VariableTemplatePart::Text(text) => out += text,
+            VariableTemplatePart::Var((name, fallback)) => {
+                out += &format!("var({name}");
+                if let Some(fallback) = fallback {
+                    out += &format!(", {}", variable_template_to_css(fallback));
+                }
+                out.push(')');
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+impl Display for PropertyValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PropertyValue::Raw(value) => formatter.write_str(value.trim()),
+            PropertyValue::Size(value) => value.fmt(formatter),
+            PropertyValue::Color(value) => value.fmt(formatter),
+            PropertyValue::Display(value) => value.fmt(formatter),
+            PropertyValue::Position(value) => value.fmt(formatter),
+            PropertyValue::Align(value) => value.fmt(formatter),
+            PropertyValue::TextAnchor(value) => value.fmt(formatter),
+            PropertyValue::WhiteSpace(value) => value.fmt(formatter),
+            PropertyValue::Int(value) => value.fmt(formatter),
+            PropertyValue::SignedInt(value) => value.fmt(formatter),
+            PropertyValue::JustifyContent(value) => value.fmt(formatter),
+            PropertyValue::FlexDirection(value) => value.fmt(formatter),
+            PropertyValue::Flex {
+                grow,
+                shrink,
+                basis,
+            } => formatter.write_str(
+                &[
+                    grow.map(|value| value.to_string()),
+                    shrink.map(|value| value.to_string()),
+                    basis.as_ref().map(|value| value.to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" "),
+            ),
+            PropertyValue::BorderStyle(value) => value.fmt(formatter),
+            PropertyValue::BorderSide(value) => formatter.write_str(
+                &[
+                    value.size.as_ref().map(|value| value.to_string()),
+                    value.style.as_ref().map(|value| value.to_string()),
+                    value.color.as_ref().map(|value| value.to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" "),
+            ),
+            PropertyValue::CombinedSize((top, right, bottom, left)) => {
+                formatter.write_str(&shorthand_to_css([top, right, bottom, left]))
+            }
+            PropertyValue::CombinedColor((top, right, bottom, left)) => {
+                formatter.write_str(&shorthand_to_css([top, right, bottom, left]))
+            }
+            PropertyValue::VerticalCombinedSize((top, bottom)) => {
+                if top == bottom {
+                    top.fmt(formatter)
+                } else {
+                    write!(formatter, "{top} {bottom}")
+                }
+            }
+            PropertyValue::HorizontalCombinedSize((left, right)) => {
+                if left == right {
+                    left.fmt(formatter)
+                } else {
+                    write!(formatter, "{left} {right}")
+                }
+            }
+            PropertyValue::GridTemplateColumns(value) => value.fmt(formatter),
+            PropertyValue::ComplexBackground(value) => value.background.fmt(formatter),
+            PropertyValue::Overflow(value) => value.fmt(formatter),
+            PropertyValue::OverflowXY((x, y)) => {
+                if x == y {
+                    x.fmt(formatter)
+                } else {
+                    write!(formatter, "{x} {y}")
+                }
+            }
+            PropertyValue::VariableTemplate(template) => {
+                formatter.write_str(&variable_template_to_css(template))
+            }
+            PropertyValue::ZIndex(value) => value.fmt(formatter),
+            PropertyValue::PointerEvents(value) => value.fmt(formatter),
+            PropertyValue::Transform(value) => value.fmt(formatter),
+            PropertyValue::Visibility(value) => value.fmt(formatter),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     pub width: StyleSize,

@@ -6,7 +6,7 @@ use crate::style::{
     GridTemplateColumns, StyleAlign, StyleBackground, StyleBorderStyle, StyleDisplay,
     StyleFlexDirection, StyleJustifyContent, StylePointerEvents, StylePosition, StyleSize,
     StyleTextAnchor, StyleTransform, StyleVisibility, StyleWhiteSpace, StyleZIndex,
-    parse_property_value, split_ignoring_parentheses,
+    format_css_number, parse_property_value, split_ignoring_parentheses,
 };
 
 const IGNORED_CHARS: [char; 2] = ['\n', '\r'];
@@ -216,7 +216,6 @@ pub enum PropertyValue {
 pub struct Property {
     pub property: String,
     pub value: PropertyValue,
-    pub css_text: String,
     pub parent: Option<usize>,
     pub important: bool,
 }
@@ -225,8 +224,8 @@ pub struct Property {
 pub struct Variable {
     pub variable: String,
     pub value: PropertyValue,
-    pub css_text: String,
     pub parent: Option<usize>,
+    pub important: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -617,6 +616,44 @@ const MEDIA_QUERY_SEPARATORS: [(MediaQueryCriteriaComparison, &str); 3] = [
     (MediaQueryCriteriaComparison::LessOrEqual, "<="),
 ];
 
+pub fn media_query_to_css(criterias: &[MediaQueryCriteria]) -> Option<String> {
+    let parts: Vec<String> = criterias
+        .iter()
+        .map(|criteria| match criteria {
+            MediaQueryCriteria::Screen => Some("screen".to_string()),
+            MediaQueryCriteria::Print => Some("print".to_string()),
+            MediaQueryCriteria::All => Some("all".to_string()),
+            MediaQueryCriteria::Feature(feature) => {
+                let value = match &feature.value {
+                    MediaQueryCriteriaValue::Px(value) => {
+                        format!("{}px", format_css_number(*value))
+                    }
+                    MediaQueryCriteriaValue::Rem(value) => {
+                        format!("{}rem", format_css_number(*value))
+                    }
+                    MediaQueryCriteriaValue::String(value) => value.clone(),
+                };
+                Some(match feature.comparison {
+                    MediaQueryCriteriaComparison::Is => {
+                        format!("({}: {})", feature.property, value)
+                    }
+                    MediaQueryCriteriaComparison::MoreOrEqual => {
+                        format!("({} >= {})", feature.property, value)
+                    }
+                    MediaQueryCriteriaComparison::LessOrEqual => {
+                        format!("({} <= {})", feature.property, value)
+                    }
+                })
+            }
+            MediaQueryCriteria::NotAllAnd(inner) => {
+                media_query_to_css(inner).map(|inner| format!("not all and {inner}"))
+            }
+            MediaQueryCriteria::Unsupported => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(parts.join(" and "))
+}
+
 pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
     let name = name.trim().strip_prefix("only ").unwrap_or(name.trim());
     if let Some(rest) = name.strip_prefix("not all and ") {
@@ -634,8 +671,9 @@ pub fn parse_media_query_parts(name: &str) -> Vec<MediaQueryCriteria> {
             if l.trim() == "print" {
                 return Some(MediaQueryCriteria::Print);
             }
-            l = l.strip_prefix("(").unwrap_or(&l);
-            l = l.strip_suffix(")").unwrap_or(&l);
+            l = l.trim();
+            l = l.strip_prefix("(").unwrap_or(l);
+            l = l.strip_suffix(")").unwrap_or(l);
             let trimmed = l.trim().to_string();
             for (comparison, separator) in MEDIA_QUERY_SEPARATORS {
                 let parts: Vec<&str> = trimmed.split(separator).collect();
@@ -785,25 +823,28 @@ impl CssParser {
         value = value.strip_prefix("'").unwrap_or(value);
         value = value.strip_suffix("'").unwrap_or(value);
 
-        let name = parts.0.trim().to_string();
+        let name = parts.0.trim();
+        let name = if name.starts_with("--") {
+            name.to_string()
+        } else {
+            name.to_ascii_lowercase()
+        };
 
         let parse_result = parse_property_value(name.clone(), value.to_string());
 
         match parse_result {
             Ok((parsed, important)) => {
-                let css_text = format!("{}: {};", name, parts.1.trim());
                 if name.starts_with("--") {
                     self.nodes.push(Node::Variable(Variable {
                         variable: name,
                         value: parsed,
-                        css_text,
                         parent: self.node,
+                        important,
                     }));
                 } else {
                     self.nodes.push(Node::Property(Property {
                         property: name,
                         value: parsed,
-                        css_text,
                         parent: self.node,
                         important,
                     }));
