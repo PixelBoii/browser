@@ -108,6 +108,7 @@ pub enum CalcExpression {
 pub enum StyleSize {
     Auto,
     Px(f32),
+    Unitless(f32),
     Em(f32),
     Rem(f32),
     Percent(f32),
@@ -321,6 +322,7 @@ impl Display for StyleSize {
         match self {
             StyleSize::Auto => write!(formatter, "auto"),
             StyleSize::Px(value) => write!(formatter, "{}px", format_css_number(*value)),
+            StyleSize::Unitless(value) => write!(formatter, "{}", format_css_number(*value)),
             StyleSize::Em(value) => write!(formatter, "{}em", format_css_number(*value)),
             StyleSize::Rem(value) => write!(formatter, "{}rem", format_css_number(*value)),
             StyleSize::Percent(value) => write!(formatter, "{}%", format_css_number(*value)),
@@ -1422,7 +1424,7 @@ fn parse_line_height(value: String) -> Result<StyleSize> {
         value.to_string()
     };
     if let Ok(parsed) = adjusted.parse::<f32>() {
-        return Ok(StyleSize::Em(parsed));
+        return Ok(StyleSize::Unitless(parsed));
     }
 
     parse_style_size(value)

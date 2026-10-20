@@ -3026,6 +3026,7 @@ fn get_specified_size(
             }
         }
         StyleSize::Px(px) => Some(*px as i32),
+        StyleSize::Unitless(value) => Some(unit_to_px(*value, default_unit, font_size) as i32),
         StyleSize::Vh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Svh(vh) => Some((window_size.height as i32 * vh / 100) as i32),
         StyleSize::Vw(vw) => Some((window_size.width as i32 * vw / 100) as i32),
