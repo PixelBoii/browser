@@ -1,4 +1,5 @@
 mod css;
+mod csp;
 mod custom_elements;
 mod document;
 mod frame_context;
@@ -11,6 +12,7 @@ mod ui;
 mod window_messaging;
 
 use deno_core::serde::Deserialize;
+use csp::ContentSecurityPolicy;
 use document::{document_state, op_parse_html_document};
 use deno_error::JsErrorBox;
 use custom_elements::{
@@ -2550,6 +2552,7 @@ struct DocumentStream {
 struct Renderer {
     url: String,
     origin: url::Origin,
+    content_security_policy: ContentSecurityPolicy,
     pub nodes_idxs: Vec<usize>,
     pub nodes: NodesTable,
     template_contents: HashMap<usize, usize>,
@@ -2670,6 +2673,7 @@ struct WorkerHostState {
     rx: Rc<RefCell<tokio::sync::mpsc::UnboundedReceiver<WorkerMessage>>>,
     url: ReqwestUrl,
     client: reqwest::Client,
+    content_security_policy: ContentSecurityPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -6002,6 +6006,28 @@ struct JsHostState {
     renderer: Rc<RefCell<Renderer>>,
     proxy: RendererProxy,
     executed_scripts: Rc<RefCell<ExecutedScripts>>,
+}
+
+#[op2(fast)]
+fn op_csp_allows_connect(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    #[string] url: String,
+    redirect_count: u32,
+) -> bool {
+    let Ok(url) = ReqwestUrl::parse(&url) else {
+        return false;
+    };
+    if let Some(host) = state.try_borrow::<WorkerHostState>() {
+        host.content_security_policy
+            .allows_connect(url, redirect_count)
+    } else {
+        frame_host(scope)
+            .renderer
+            .borrow()
+            .content_security_policy
+            .allows_connect(url, redirect_count)
+    }
 }
 
 fn is_trustworthy_http_url(url: &ReqwestUrl) -> bool {
@@ -9921,6 +9947,7 @@ extension!(
   browser_worker,
   ops = [
     op_realm_is_active,
+    op_csp_allows_connect,
     op_fetch_site,
     op_tls_peer_certificate,
     op_sync_blob_location,
@@ -9950,6 +9977,7 @@ extension!(
 extension!(
   browser,
   ops = [
+    op_csp_allows_connect,
     op_fetch_site,
     op_sync_blob_location,
     op_is_secure_context,
@@ -10606,6 +10634,7 @@ impl Renderer {
 
         Self {
             origin: ReqwestUrl::parse(&url).unwrap().origin(),
+            content_security_policy: ContentSecurityPolicy::default(),
             url,
             nodes_idxs,
             nodes: nodes_table,
@@ -12017,6 +12046,11 @@ impl Renderer {
             .clone()
             .context("Renderer event loop proxy is not configured")?;
         let network = NetworkFetch::new();
+        let content_security_policy = if url.scheme() == "blob" {
+            self.content_security_policy.clone()
+        } else {
+            ContentSecurityPolicy::default()
+        };
         std::thread::spawn(move || {
             if *terminated.borrow() {
                 return;
@@ -12028,6 +12062,7 @@ impl Renderer {
                 rx: Rc::new(RefCell::new(rx)),
                 url: url.clone(),
                 client: network.client.clone(),
+                content_security_policy,
             };
             let tokio = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -12065,7 +12100,17 @@ impl Renderer {
                 } else if let Some(stripped) = url.as_str().strip_prefix("file://") {
                     fs::read_to_string(stripped)?
                 } else {
-                    network.client.get(url.clone()).send().await?.text().await?
+                    let response = network.client.get(url.clone()).send().await?;
+                    let policy = ContentSecurityPolicy::from_headers(
+                        response.headers(),
+                        response.url().origin(),
+                    );
+                    runtime
+                        .op_state()
+                        .borrow_mut()
+                        .borrow_mut::<WorkerHostState>()
+                        .content_security_policy = policy;
+                    response.text().await?
                 };
                 runtime.execute_script(url, code)?;
                 runtime.execute_script("<worker-messaging>", "__startWorkerMessageLoop()")?;
@@ -16560,8 +16605,10 @@ impl FrameJs {
 /// A document frame. [`Frame::open_headless`] initializes one on the calling thread.
 pub struct Frame {
     url: String,
+    content_security_policy: ContentSecurityPolicy,
     document_generation: u64,
-    document_fetch: Option<tokio::task::JoinHandle<Result<(String, String)>>>,
+    document_fetch:
+        Option<tokio::task::JoinHandle<Result<(String, String, ContentSecurityPolicy)>>>,
     renderer: Option<Rc<RefCell<Renderer>>>,
     window: Option<Arc<Window>>,
     js_runtime: Option<FrameJs>,
@@ -16674,6 +16721,7 @@ impl Frame {
             url,
             document_generation: 0,
             document_fetch: None,
+            content_security_policy: ContentSecurityPolicy::default(),
             renderer: None,
             window: None,
             js_runtime: None,
@@ -16711,17 +16759,22 @@ impl Frame {
     async fn get_html_for_navigation(
         client: reqwest::Client,
         request: FormNavigation,
-    ) -> Result<(String, String)> {
+        inherited_policy: ContentSecurityPolicy,
+    ) -> Result<(String, String, ContentSecurityPolicy)> {
         let url = request.url;
         if url.as_str() == "about:blank" {
-            return Ok((BLANK_DOCUMENT.to_string(), url.to_string()));
+            return Ok((
+                BLANK_DOCUMENT.to_string(),
+                url.to_string(),
+                inherited_policy,
+            ));
         }
 
         if request.method == FormMethod::Get
             && let Some(stripped) = url.as_str().strip_prefix("file://")
         {
             let contents = tokio::fs::read_to_string(stripped).await?;
-            Ok((contents, url.to_string()))
+            Ok((contents, url.to_string(), ContentSecurityPolicy::default()))
         } else {
             println!("Fetching HTML for {:?}", url);
             let request = match request.method {
@@ -16732,9 +16785,10 @@ impl Frame {
                     .body(request.body.unwrap_or_default()),
             };
             let resp = request.header("Sec-Fetch-Mode", "navigate").send().await?;
+            let policy = ContentSecurityPolicy::from_headers(resp.headers(), resp.url().origin());
             let url = resp.url().to_string();
             let text = resp.text().await?;
-            Ok((text, url))
+            Ok((text, url, policy))
         }
     }
 
@@ -17600,25 +17654,25 @@ impl Frame {
 
     fn navigate_with_request(&mut self, request: FormNavigation) -> Result<()> {
         let client = self.network_fetch.borrow().client.clone();
+        let fetch = Self::get_html_for_navigation(
+            client,
+            request,
+            self.content_security_policy.clone(),
+        );
         if matches!(self.js_runtime, Some(FrameJs::Shared(_))) {
             if let Some(fetch) = self.document_fetch.take() {
                 fetch.abort();
             }
-            self.document_fetch = Some(
-                self.tokio
-                    .as_ref()
-                    .unwrap()
-                    .borrow()
-                    .spawn(Self::get_html_for_navigation(client, request)),
-            );
+            self.document_fetch = Some(self.tokio.as_ref().unwrap().borrow().spawn(fetch));
             return Ok(());
         }
-        let (input, final_url) = self
+        let (input, final_url, policy) = self
             .tokio
             .as_ref()
             .unwrap()
             .borrow_mut()
-            .block_on(Self::get_html_for_navigation(client, request))?;
+            .block_on(fetch)?;
+        self.content_security_policy = policy;
         self.install_navigation_document(input, final_url)
     }
 
@@ -17635,12 +17689,13 @@ impl Frame {
             return Ok(false);
         }
         let fetch = self.document_fetch.take().unwrap();
-        let (input, final_url) = self
+        let (input, final_url, policy) = self
             .tokio
             .as_ref()
             .unwrap()
             .borrow_mut()
             .block_on(fetch)??;
+        self.content_security_policy = policy;
         self.install_navigation_document(input, final_url)?;
         if self.document_fetch.is_none() {
             self.paint_iframe(parent_proxy, surface);
@@ -17694,6 +17749,8 @@ impl Frame {
                     nodes_idxs,
                     self.html_parser.as_ref().unwrap().template_contents.clone(),
                 );
+                renderer.borrow_mut().content_security_policy =
+                    self.content_security_policy.clone();
             }
             self.executed_scripts = Rc::new(RefCell::new(ExecutedScripts::new()));
             self.dom_content_loaded_dispatched = false;
@@ -17846,6 +17903,7 @@ impl Frame {
             let renderer = host.renderer.borrow();
             self.tokio = Some(renderer.tokio.clone());
             self.blob_store = Arc::clone(&renderer.blob_store);
+            self.content_security_policy = renderer.content_security_policy.clone();
         }
         self.install_navigation_document(BLANK_DOCUMENT.to_string(), "about:blank".to_string())?;
         let nodes_table =
@@ -18155,6 +18213,11 @@ impl Frame {
             Arc::clone(&self.blob_store),
             false,
         ))));
+        self.renderer
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .content_security_policy = self.content_security_policy.clone();
         self.last_pointer_move = None;
     }
 

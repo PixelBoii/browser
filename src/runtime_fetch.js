@@ -5,6 +5,7 @@
 import { core, primordials } from "ext:core/mod.js";
 import {
   op_fetch,
+  op_csp_allows_connect,
   op_fetch_site,
   op_fetch_send,
   op_wasm_streaming_feed,
@@ -99,6 +100,10 @@ function createResponseBodyStream(responseBodyRid, terminator) {
  * @returns {Promise<InnerResponse>}
  */
 async function mainFetch(req, recursive, terminator, initiator = null) {
+  if (!op_csp_allows_connect(req.currentUrl(), req.urlList.length - 1)) {
+    return networkError("Blocked by Content Security Policy");
+  }
+
   if (req.blobUrlEntry !== null) {
     if (req.method !== "GET") {
       throw new TypeError("Blob URL fetch only supports GET method");
