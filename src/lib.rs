@@ -7173,6 +7173,20 @@ fn op_get_inner_text(
     let host = document_state(scope, document);
     let mut renderer = host.renderer.borrow_mut();
     renderer.ensure_styles(StylesheetLoad::AvailableOnly);
+    if host.detached || !renderer.node_is_connected(node_idx) {
+        return renderer.get_text_content(node_idx);
+    }
+    let mut current = Some(node_idx);
+    while let Some(idx) = current {
+        if renderer
+            .node_styles
+            .get(&idx)
+            .is_some_and(|style| style.display == StyleDisplay::None)
+        {
+            return renderer.get_text_content(node_idx);
+        }
+        current = renderer.layout_parent(idx);
+    }
     renderer.get_inner_text(node_idx)
 }
 
