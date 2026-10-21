@@ -26,7 +26,7 @@ use fixedbitset::FixedBitSet;
 use image::{DynamicImage, ImageReader};
 use parser::{HTML_NAMESPACE, HtmlParser};
 pub use parser::{Attributes, CommentElement, Element, Node, ShadowRootMode, TextElement};
-use reqwest::cookie::{CookieStore, Jar};
+use reqwest::cookie::CookieStore;
 use resvg::tiny_skia::IntSize;
 pub use resvg::tiny_skia::Pixmap;
 use resvg::usvg::Tree;
@@ -6112,7 +6112,7 @@ fn op_set_cookie(
     let renderer = host.renderer.borrow();
     let network_fetch = renderer.network_fetch.borrow();
     let jar = &network_fetch.cookie_jar;
-    jar.add_cookie_str(&cookie, &url);
+    jar.set_document_cookie(&cookie, &url);
     Ok(())
 }
 
@@ -6126,11 +6126,7 @@ fn op_get_cookie(scope: &mut v8::PinScope, #[string] url: String) -> Result<Stri
     let host = frame_host(scope);
     let renderer = host.renderer.borrow();
     let network_fetch = renderer.network_fetch.borrow();
-    let cookie = network_fetch
-        .cookie_jar
-        .cookies(&url)
-        .and_then(|value| value.to_str().ok().map(String::from))
-        .unwrap_or_default();
+    let cookie = network_fetch.cookie_jar.document_cookie(&url);
 
     Ok(cookie)
 }
@@ -16403,16 +16399,81 @@ impl FontHandler {
     }
 }
 
+#[derive(Debug, Default)]
+struct CookieJar(Mutex<cookie_store::CookieStore>);
+
+impl CookieJar {
+    fn set_document_cookie(&self, cookie: &str, url: &ReqwestUrl) {
+        let Ok(cookie) = cookie_store::Cookie::parse(cookie, url) else {
+            return;
+        };
+        if cookie.http_only() == Some(true) {
+            return;
+        }
+
+        let mut store = self.0.lock().unwrap();
+        if store
+            .get(&String::from(&cookie.domain), &cookie.path, cookie.name())
+            .is_some_and(|old_cookie| old_cookie.http_only() == Some(true))
+        {
+            return;
+        }
+        let _ = store.insert(cookie.into_owned(), url);
+    }
+
+    fn document_cookie(&self, url: &ReqwestUrl) -> String {
+        self.0
+            .lock()
+            .unwrap()
+            .matches(url)
+            .into_iter()
+            .filter(|cookie| cookie.http_only() != Some(true))
+            .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+impl CookieStore for CookieJar {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &reqwest::header::HeaderValue>,
+        url: &ReqwestUrl,
+    ) {
+        let mut store = self.0.lock().unwrap();
+        for header in cookie_headers {
+            if let Ok(cookie) = std::str::from_utf8(header.as_bytes()) {
+                let _ = store.parse(cookie, url);
+            }
+        }
+    }
+
+    fn cookies(&self, url: &ReqwestUrl) -> Option<reqwest::header::HeaderValue> {
+        let cookies = self
+            .0
+            .lock()
+            .unwrap()
+            .get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if cookies.is_empty() {
+            return None;
+        }
+        reqwest::header::HeaderValue::from_maybe_shared(Bytes::from(cookies)).ok()
+    }
+}
+
 #[derive(Debug)]
 struct NetworkFetch {
     request_cache: HashMap<ReqwestUrl, RequestCacheEntry>,
     client: reqwest::Client,
-    cookie_jar: Arc<Jar>,
+    cookie_jar: Arc<CookieJar>,
 }
 
 impl NetworkFetch {
     pub fn new() -> Self {
-        let cookie_jar = Arc::new(Jar::default());
+        let cookie_jar = Arc::new(CookieJar::default());
         Self {
             request_cache: HashMap::new(),
             client: reqwest::Client::builder()

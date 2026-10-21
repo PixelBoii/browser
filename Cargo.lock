@@ -622,6 +622,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "bytes",
+ "cookie_store",
  "deno_core",
  "deno_crypto",
  "deno_error",
