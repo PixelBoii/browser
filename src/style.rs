@@ -651,6 +651,16 @@ impl Display for PropertyValue {
                 (Some(start), span) => write!(formatter, "{start} / span {span}"),
                 (None, span) => write!(formatter, "span {span}"),
             },
+            PropertyValue::GridArea {
+                row_start,
+                column_start,
+                ..
+            } => match (row_start, column_start) {
+                (Some(row), Some(column)) => write!(formatter, "{row} / {column}"),
+                (Some(row), None) => write!(formatter, "{row}"),
+                (None, Some(column)) => write!(formatter, "auto / {column}"),
+                (None, None) => write!(formatter, "auto"),
+            },
             PropertyValue::ComplexBackground(value) => value.background.fmt(formatter),
             PropertyValue::Overflow(value) => value.fmt(formatter),
             PropertyValue::OverflowXY((x, y)) => {
@@ -720,6 +730,8 @@ pub struct Style {
     pub grid_template_rows: GridTemplateColumns,
     pub grid_column_span: u32,
     pub grid_column_start: Option<u32>,
+    pub grid_row_span: u32,
+    pub grid_row_start: Option<u32>,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub z_index: StyleZIndex,
@@ -783,6 +795,8 @@ impl Style {
             grid_template_rows: self.grid_template_rows.clone(),
             grid_column_span: self.grid_column_span,
             grid_column_start: self.grid_column_start,
+            grid_row_span: self.grid_row_span,
+            grid_row_start: self.grid_row_start,
             overflow_x: self.overflow_x.clone(),
             overflow_y: self.overflow_y.clone(),
             z_index: self.z_index.clone(),
@@ -1010,6 +1024,8 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         grid_template_rows: GridTemplateColumns::None,
         grid_column_span: 1,
         grid_column_start: None,
+        grid_row_span: 1,
+        grid_row_start: None,
         overflow_x: Overflow::Visible,
         overflow_y: Overflow::Visible,
         z_index: StyleZIndex::Auto,
@@ -2186,6 +2202,50 @@ mod tests {
             parse_property_value("grid-column".to_string(), "1 / 2 / 3".to_string()).unwrap();
         assert_eq!(value, PropertyValue::Raw("1 / 2 / 3".to_string()));
     }
+
+    #[test]
+    fn parses_grid_area_start() {
+        for (input, expected) in [
+            (
+                "1/1",
+                PropertyValue::GridArea {
+                    row_start: Some(1),
+                    row_span: 1,
+                    column_start: Some(1),
+                    column_span: 1,
+                },
+            ),
+            (
+                "1 / 2 / 3 / 4",
+                PropertyValue::GridArea {
+                    row_start: Some(1),
+                    row_span: 2,
+                    column_start: Some(2),
+                    column_span: 2,
+                },
+            ),
+            (
+                "span 2 / 3",
+                PropertyValue::GridArea {
+                    row_start: None,
+                    row_span: 2,
+                    column_start: Some(3),
+                    column_span: 1,
+                },
+            ),
+        ] {
+            let (value, important) =
+                parse_property_value("grid-area".to_string(), input.to_string()).unwrap();
+
+            assert_eq!(value, expected);
+            assert!(!important);
+        }
+
+        let (value, _) =
+            parse_property_value("grid-area".to_string(), "1 / 1 / 1 / 1 / 1".to_string())
+                .unwrap();
+        assert_eq!(value, PropertyValue::Raw("1 / 1 / 1 / 1 / 1".to_string()));
+    }
 }
 
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
@@ -2386,6 +2446,56 @@ fn parse_grid_column(value: &str) -> Option<(Option<u32>, u32)> {
         return None;
     }
     Some((start, span.unwrap_or(1).max(1)))
+}
+
+fn parse_grid_line(part: &str) -> (Option<u32>, u32) {
+    let part = part.trim();
+    if let Some(span) = part.strip_prefix("span") {
+        return (None, span.trim().parse().unwrap_or(1));
+    }
+    (part.parse::<u32>().ok().filter(|line| *line > 0), 1)
+}
+
+// Parses `grid-area` into its row and column starts and spans, such as
+// `1 / 1` -> ((Some(1), 1), (Some(1), 1)).
+fn parse_grid_area(value: &str) -> Option<((Option<u32>, u32), (Option<u32>, u32))> {
+    // `grid-area` has between one and four parts:
+    // row-start / column-start / row-end / column-end.
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts.len() > 4 || parts.iter().any(|part| part.trim().is_empty()) {
+        return None;
+    }
+    let (row_start, mut row_span) = parse_grid_line(parts[0]);
+    let (column_start, mut column_span) =
+        parts.get(1).map_or((None, 1), |part| parse_grid_line(part));
+    if let Some(end) = parts.get(2) {
+        let (end_start, end_span) = parse_grid_line(end);
+        if end.trim().starts_with("span") {
+            row_span = end_span;
+        } else if let (Some(start), Some(end)) = (row_start, end_start) {
+            row_span = end.saturating_sub(start);
+        }
+    }
+    if let Some(end) = parts.get(3) {
+        let (end_start, end_span) = parse_grid_line(end);
+        if end.trim().starts_with("span") {
+            column_span = end_span;
+        } else if let (Some(start), Some(end)) = (column_start, end_start) {
+            column_span = end.saturating_sub(start);
+        }
+    }
+    if row_start.is_none()
+        && column_start.is_none()
+        && row_span == 1
+        && column_span == 1
+        && !value.contains("span")
+    {
+        return None;
+    }
+    Some((
+        (row_start, row_span.max(1)),
+        (column_start, column_span.max(1)),
+    ))
 }
 
 fn parse_background(value: String) -> Result<PropertyValue> {
@@ -2629,6 +2739,16 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
             "grid-template-rows" => parse_grid_template_columns_value(value)?,
             "grid-column" => parse_grid_column(&value)
                 .map(PropertyValue::GridColumn)
+                .unwrap_or(PropertyValue::Raw(value)),
+            "grid-area" => parse_grid_area(&value)
+                .map(|((row_start, row_span), (column_start, column_span))| {
+                    PropertyValue::GridArea {
+                        row_start,
+                        row_span,
+                        column_start,
+                        column_span,
+                    }
+                })
                 .unwrap_or(PropertyValue::Raw(value)),
             "overflow" | "overflow-y" | "overflow-x" => parse_overflow(value)?,
             "z-index" => PropertyValue::ZIndex(parse_z_index(value)?),
@@ -2966,6 +3086,20 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         ("grid-column", PropertyValue::GridColumn((start, span))) => {
             style.grid_column_start = start;
             style.grid_column_span = span.max(1);
+        }
+        (
+            "grid-area",
+            PropertyValue::GridArea {
+                row_start,
+                row_span,
+                column_start,
+                column_span,
+            },
+        ) => {
+            style.grid_row_start = row_start;
+            style.grid_row_span = row_span.max(1);
+            style.grid_column_start = column_start;
+            style.grid_column_span = column_span.max(1);
         }
         ("overflow", PropertyValue::Overflow(overflow)) => {
             style.overflow_x = overflow.clone();

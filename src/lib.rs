@@ -10497,6 +10497,7 @@ struct GridBaseItem {
     column: i32,
     column_span: i32,
     row: i32,
+    row_span: i32,
 }
 
 fn resolve_auto_fit(
@@ -13809,7 +13810,7 @@ impl Renderer {
         }
         let mut dynamic_width_to_give =
             width_to_distribute.saturating_sub(column_gap_total + definitely_used_width as u32);
-        let mut dynamic_height_to_give = height_to_distribute - definitely_used_height as u32;
+        let mut dynamic_height_to_give = height_to_distribute.saturating_sub(definitely_used_height as u32);
         let justify_items = style.justify_items;
         let align_items = style.align_items;
         let child_allow_fill = if justify_items != StyleJustifyContent::Stretch {
@@ -13825,8 +13826,13 @@ impl Renderer {
         for child_idx in immediate_children.iter() {
             let child_style = self.node_styles.get(child_idx);
             let column_span = child_style.map_or(1, |style| style.grid_column_span.max(1)) as i32;
+            let row_span = child_style.map_or(1, |style| style.grid_row_span.max(1)) as i32;
             let explicit_column_start = child_style.map(|s| s.grid_column_start.map(|s| s as i32 - 1)).flatten();
-            let wrap = if let Some(explicit_column_start) = explicit_column_start {
+            let explicit_row_start = child_style.map(|s| s.grid_row_start.map(|s| s as i32 - 1)).flatten();
+            let fully_explicit = explicit_column_start.is_some() && explicit_row_start.is_some();
+            let wrap = if fully_explicit {
+                false
+            } else if let Some(explicit_column_start) = explicit_column_start {
                 explicit_column_start < current_column
             } else {
                 match grid_template_columns {
@@ -13843,6 +13849,8 @@ impl Renderer {
                 row_count = row_count.max(current_row + 1);
             }
             let child_column = explicit_column_start.unwrap_or(current_column);
+            let child_row = explicit_row_start.unwrap_or(current_row as i32);
+            row_count = row_count.max((child_row + row_span) as usize);
             let layout_checkpoint = self.layout_table.len();
             let child_size = self
                 .layout_node(
@@ -13875,9 +13883,12 @@ impl Renderer {
                     target_height: base_height,
                     column: child_column,
                     column_span,
-                    row: current_row as i32,
+                    row: child_row,
+                    row_span,
                 });
-                current_column = child_column + column_span;
+                if !fully_explicit {
+                    current_column = child_column + column_span;
+                }
                 column_count = column_count.max((child_column + column_span) as usize);
             }
         }
@@ -13935,19 +13946,14 @@ impl Renderer {
             column_starts[column] = width_allocated;
             width_allocated += width + grid_gap as i32;
         }
-        for base_item in base_items.iter_mut() {
-            let specified_column_size =
-                if let GridTemplateColumns::Values(_) = &grid_template_columns {
-                    (base_item.column..base_item.column + base_item.column_span)
-                        .map(|column| column_widths[column as usize])
-                        .sum()
-                } else {
-                    container_sizes.inner_width as i32
-                };
-            let specified_height = if let GridTemplateColumns::Values(rows) = &grid_template_rows {
+        let mut row_heights = vec![0; row_count];
+        let mut row_starts = vec![0; row_count];
+        let mut height_allocated = 0;
+        for row in 0..row_count {
+            let height = if let GridTemplateColumns::Values(rows) = &grid_template_rows {
                 self.calculate_grid_item_size(
                     rows,
-                    base_item.row as usize,
+                    row,
                     height_to_distribute,
                     dynamic_height_to_give,
                     max_row_fractions,
@@ -13955,20 +13961,32 @@ impl Renderer {
                     &column_max_heights,
                 )
             } else {
-                base_item.base_height as i32
+                column_max_heights[row] as i32
             };
+            row_heights[row] = height;
+            row_starts[row] = height_allocated;
+            height_allocated += height + grid_gap as i32;
+        }
+        for base_item in base_items.iter_mut() {
+            let specified_column_size = (base_item.column..base_item.column + base_item.column_span)
+                .map(|column| column_widths[column as usize])
+                .sum::<i32>()
+                + grid_gap as i32 * (base_item.column_span - 1);
+            let specified_height = (base_item.row..base_item.row + base_item.row_span)
+                .map(|row| row_heights[row as usize])
+                .sum::<i32>()
+                + grid_gap as i32 * (base_item.row_span - 1);
             base_item.target_width = specified_column_size as u32;
             base_item.target_height = specified_height as u32;
         }
         let mut last_row = 0;
         for base_item in base_items {
-            let wrap = base_item.row > last_row;
-            last_row = base_item.row;
             content_position.x = original_content_position.x + column_starts[base_item.column as usize];
-            if wrap {
-                content_position.y += max_child_height + grid_gap as i32;
+            content_position.y = original_content_position.y + row_starts[base_item.row as usize];
+            if base_item.row != last_row {
                 max_child_height = 0;
             }
+            last_row = base_item.row;
             let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
             let forced_width = match child_style.width {
                 // Percentages on a grid item resolve against its grid area.
@@ -13996,13 +14014,9 @@ impl Renderer {
                 x: content_position.x + offset_x,
                 y: content_position.y + offset_y,
             };
-            let forced_height = match (&grid_template_rows, &child_style.height) {
-                (GridTemplateColumns::Values(_), StyleSize::Auto)
-                    if align_items == StyleJustifyContent::Stretch =>
-                {
-                    Some(base_item.target_height)
-                }
-                (_, StyleSize::Auto) => None,
+            let forced_height = match &child_style.height {
+                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => Some(base_item.target_height),
+                StyleSize::Auto => None,
                 _ => Some(base_item.base_height),
             };
             if let Some(child) = self.layout_node(

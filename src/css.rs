@@ -203,6 +203,12 @@ pub enum PropertyValue {
     HorizontalCombinedSize((StyleSize, StyleSize)),
     GridTemplateColumns(GridTemplateColumns),
     GridColumn((Option<u32>, u32)),
+    GridArea {
+        row_start: Option<u32>,
+        row_span: u32,
+        column_start: Option<u32>,
+        column_span: u32,
+    },
     ComplexBackground(StyleComplexBackground),
     Overflow(Overflow),
     OverflowXY((Overflow, Overflow)),
