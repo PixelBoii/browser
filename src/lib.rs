@@ -2605,7 +2605,12 @@ struct Renderer {
         (Rc<Pixmap>, u32, u32),
     >,
     css_parse_cache: HashMap<ExpandableCssNode, Vec<CssNode>>,
-    flattened_css_cache: Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
+    flattened_css_cache: Option<(
+        String,
+        Vec<(Option<usize>, ExpandableCssNode)>,
+        Vec<CssNode>,
+        Vec<Option<usize>>,
+    )>,
     variable_definitions: VariableDefinitions,
     event_loop_proxy: Option<RendererProxy>,
     hovering_impact: HashSet<usize>,
@@ -3841,10 +3846,11 @@ enum ExpandableCssNode {
 }
 
 fn get_expandable_css_nodes_walk(
-    expandable: &mut Vec<ExpandableCssNode>,
+    expandable: &mut Vec<(Option<usize>, ExpandableCssNode)>,
     nodes: &NodesTable,
     children_index: &NodeMap<Vec<usize>>,
     idx: usize,
+    tree: Option<usize>,
 ) {
     let Some(Node::Element(element)) = nodes.get(idx) else {
         return;
@@ -3867,7 +3873,7 @@ fn get_expandable_css_nodes_walk(
             }
             Node::Text(text) => text,
         };
-        expandable.push(ExpandableCssNode::Inline(text.text.clone()));
+        expandable.push((tree, ExpandableCssNode::Inline(text.text.clone())));
     } else if element.tag == "link"
         && let Some(href) = element.attributes.get_str("href")
         && element.attributes.get_str("rel").is_some_and(|v| {
@@ -3875,11 +3881,11 @@ fn get_expandable_css_nodes_walk(
             rels.contains(&"stylesheet")
         })
     {
-        expandable.push(ExpandableCssNode::Link(href.into_owned()));
+        expandable.push((tree, ExpandableCssNode::Link(href.into_owned())));
     } else if element.tag != "noscript" {
         let children = &children_index.get(&idx).unwrap();
         for child in children.iter() {
-            get_expandable_css_nodes_walk(expandable, nodes, children_index, *child);
+            get_expandable_css_nodes_walk(expandable, nodes, children_index, *child, tree);
         }
     }
 }
@@ -3888,10 +3894,26 @@ fn get_expandable_css_nodes(
     nodes: &NodesTable,
     root_indice: usize,
     children_index: &NodeMap<Vec<usize>>,
-) -> Vec<ExpandableCssNode> {
+    shadow_roots: &HashMap<usize, usize>,
+) -> Vec<(Option<usize>, ExpandableCssNode)> {
     let mut expandable = vec![];
 
-    get_expandable_css_nodes_walk(&mut expandable, nodes, children_index, root_indice);
+    get_expandable_css_nodes_walk(&mut expandable, nodes, children_index, root_indice, None);
+    let mut shadow_roots: Vec<usize> = shadow_roots.values().copied().collect();
+    shadow_roots.sort_unstable();
+    for root in shadow_roots {
+        if let Some(children) = children_index.get(&root) {
+            for child in children.iter() {
+                get_expandable_css_nodes_walk(
+                    &mut expandable,
+                    nodes,
+                    children_index,
+                    *child,
+                    Some(root),
+                );
+            }
+        }
+    }
 
     expandable
 }
@@ -4021,8 +4043,8 @@ fn compute_node_style(
     let style = &node_styles[&node_idx];
     let resolved_variables = Rc::clone(&style.variables);
 
-    // Until scoped stylesheets and slots are supported, render the shadow children
-    // with host inheritance and their inline styles. Document rules stay outside.
+    // Shadow children inherit from the host; their matched rules are already
+    // filtered to their own tree. Slots are not supported yet.
     let children_root = shadow_roots.get(&node_idx).copied().unwrap_or(node_idx);
     for child_idx in children_index.get(&children_root).unwrap().iter() {
         compute_node_style(
@@ -4056,19 +4078,24 @@ fn parse_css_nodes(parser: &mut CssParser, css_nodes: &Vec<String>) -> Result<()
     Ok(())
 }
 
-fn flatten_css_chunks(mut parsed_css_chunks: Vec<(usize, Vec<CssNode>)>) -> Vec<CssNode> {
+fn flatten_css_chunks(
+    mut parsed_css_chunks: Vec<(usize, Vec<CssNode>)>,
+    expandable: &[(Option<usize>, ExpandableCssNode)],
+) -> (Vec<CssNode>, Vec<Option<usize>>) {
     parsed_css_chunks.sort_by_key(|(idx, _)| *idx);
 
     let mut parsed_css_nodes = vec![];
-    for (_, nodes) in parsed_css_chunks {
+    let mut rule_trees = vec![];
+    for (idx, nodes) in parsed_css_chunks {
         let offset = parsed_css_nodes.len();
         for mut node in nodes {
             node.offset_parent(offset);
             parsed_css_nodes.push(node);
+            rule_trees.push(expandable[idx].0);
         }
     }
 
-    parsed_css_nodes
+    (parsed_css_nodes, rule_trees)
 }
 
 fn move_up_ancestor_chain(
@@ -5469,21 +5496,33 @@ fn get_css_nodes(
     nodes: &NodesTable,
     root_indice: usize,
     dom_indexes: &DomIndexes,
+    shadow_roots: &HashMap<usize, usize>,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
-    flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
+    flattened_css_cache: &mut Option<(
+        String,
+        Vec<(Option<usize>, ExpandableCssNode)>,
+        Vec<CssNode>,
+        Vec<Option<usize>>,
+    )>,
     css_parser: &mut CssParser,
     load: StylesheetLoad,
-) -> (Vec<CssNode>, bool, bool) {
-    let expandable = get_expandable_css_nodes(nodes, root_indice, &dom_indexes.children_index);
-    if let Some((cached_base_url, cached_expandable, cached_nodes)) = flattened_css_cache
+) -> (Vec<CssNode>, Vec<Option<usize>>, bool, bool) {
+    let expandable = get_expandable_css_nodes(
+        nodes,
+        root_indice,
+        &dom_indexes.children_index,
+        shadow_roots,
+    );
+    if let Some((cached_base_url, cached_expandable, cached_nodes, cached_rule_trees)) =
+        flattened_css_cache
         && cached_base_url == base_url
         && cached_expandable == &expandable
     {
-        return (cached_nodes.clone(), true, false);
+        return (cached_nodes.clone(), cached_rule_trees.clone(), true, false);
     }
     let mut parsed_css_chunks = vec![];
     let mut needs_fetching = vec![];
-    for (idx, exp) in expandable.iter().enumerate() {
+    for (idx, (_, exp)) in expandable.iter().enumerate() {
         if let Some(cached_nodes) = css_parse_cache.get(&exp) {
             parsed_css_chunks.push((idx, cached_nodes.clone()));
         } else {
@@ -5509,15 +5548,20 @@ fn get_css_nodes(
             parsed_css_chunks.push((idx, nodes));
         }
     }
-    let parsed_css_nodes = flatten_css_chunks(parsed_css_chunks);
+    let (parsed_css_nodes, rule_trees) = flatten_css_chunks(parsed_css_chunks, &expandable);
     // An incomplete collection must be revisited when normal DOM processing
     // can fetch the missing sheets, including rematching their selectors.
     *flattened_css_cache = if pending_fetches {
         None
     } else {
-        Some((base_url.clone(), expandable, parsed_css_nodes.clone()))
+        Some((
+            base_url.clone(),
+            expandable,
+            parsed_css_nodes.clone(),
+            rule_trees.clone(),
+        ))
     };
-    (parsed_css_nodes, false, pending_fetches)
+    (parsed_css_nodes, rule_trees, false, pending_fetches)
 }
 
 #[derive(Debug)]
@@ -5627,6 +5671,7 @@ fn collect_connected_elements(
     nodes: &NodesTable,
     root_idx: usize,
     children_index: &NodeMap<Vec<usize>>,
+    shadow_roots: &HashMap<usize, usize>,
 ) -> FixedBitSet {
     let mut connected = FixedBitSet::with_capacity(nodes.data.len());
     let mut visited = FixedBitSet::with_capacity(nodes.data.len());
@@ -5642,8 +5687,22 @@ fn collect_connected_elements(
         if let Some(children) = children_index.get(&node_idx) {
             pending.extend(children);
         }
+        if let Some(root) = shadow_roots.get(&node_idx) {
+            pending.push(*root);
+        }
     }
     connected
+}
+
+fn element_tree(nodes: &NodesTable, element_idx: usize) -> Option<usize> {
+    let mut current = nodes.get(element_idx).and_then(|node| node.get_parent());
+    while let Some(idx) = current {
+        if matches!(nodes.get(idx), Some(Node::ShadowRoot { .. })) {
+            return Some(idx);
+        }
+        current = nodes.get(idx).and_then(|node| node.get_parent());
+    }
+    None
 }
 
 fn add_connected_subtree_elements(
@@ -5750,7 +5809,12 @@ fn compute_node_styles(
     window_size: &PhysicalSize<u32>,
     dom_indexes: &mut DomIndexes,
     css_parse_cache: &mut HashMap<ExpandableCssNode, Vec<CssNode>>,
-    flattened_css_cache: &mut Option<(String, Vec<ExpandableCssNode>, Vec<CssNode>)>,
+    flattened_css_cache: &mut Option<(
+        String,
+        Vec<(Option<usize>, ExpandableCssNode)>,
+        Vec<CssNode>,
+        Vec<Option<usize>>,
+    )>,
     hovering_chain: &Vec<usize>,
     css_parser: &mut CssParser,
     mut node_styles: NodeMap<Style>,
@@ -5772,13 +5836,14 @@ fn compute_node_styles(
         .local_revisions
         .retain(|idx, _| nodes.contains_key(*idx));
     let start = Instant::now();
-    let (mut parsed_css_nodes, stylesheet_unchanged, pending_fetches) = get_css_nodes(
+    let (mut parsed_css_nodes, rule_trees, stylesheet_unchanged, pending_fetches) = get_css_nodes(
         base_url,
         tokio,
         network_fetch,
         nodes,
         root_indice,
         dom_indexes,
+        shadow_roots,
         css_parse_cache,
         flattened_css_cache,
         css_parser,
@@ -5802,8 +5867,12 @@ fn compute_node_styles(
         style_cache.selector_invalidation =
             Some(SelectorInvalidationIndex::compile(&parsed_css_nodes));
     }
-    let connected_elements =
-        collect_connected_elements(nodes, dom_indexes.root_indice, &dom_indexes.children_index);
+    let connected_elements = collect_connected_elements(
+        nodes,
+        dom_indexes.root_indice,
+        &dom_indexes.children_index,
+        shadow_roots,
+    );
     let rematch_plan =
         if !stylesheet_unchanged || window_changed || style_cache.selector_matches.is_empty() {
             SelectorRematchPlan::Full
@@ -5881,6 +5950,14 @@ fn compute_node_styles(
             // Keeping a stale positive only causes an unnecessary hover rematch; dropping one can
             // miss a style change. A later full rematch replaces the set exactly.
             style_cache.selector_hovering_impact.extend(hovering_impact);
+        }
+    }
+    // Stylesheets are collected together so selector indexes stay shared, but a rule
+    // only applies to elements in the tree that owns its stylesheet.
+    for (idx, matches) in collected_class_nodes.iter_mut().enumerate() {
+        if !matches.is_empty() {
+            let tree = element_tree(nodes, idx);
+            matches.retain(|matched| rule_trees.get(matched.node_idx) == Some(&tree));
         }
     }
     style_cache
