@@ -3849,6 +3849,7 @@ fn get_expandable_css_nodes_walk(
     expandable: &mut Vec<(Option<usize>, ExpandableCssNode)>,
     nodes: &NodesTable,
     children_index: &NodeMap<Vec<usize>>,
+    shadow_roots: &HashMap<usize, usize>,
     idx: usize,
     tree: Option<usize>,
 ) {
@@ -3885,7 +3886,29 @@ fn get_expandable_css_nodes_walk(
     } else if element.tag != "noscript" {
         let children = &children_index.get(&idx).unwrap();
         for child in children.iter() {
-            get_expandable_css_nodes_walk(expandable, nodes, children_index, *child, tree);
+            get_expandable_css_nodes_walk(
+                expandable,
+                nodes,
+                children_index,
+                shadow_roots,
+                *child,
+                tree,
+            );
+        }
+    }
+
+    if let Some(root) = shadow_roots.get(&idx)
+        && let Some(children) = children_index.get(root)
+    {
+        for child in children {
+            get_expandable_css_nodes_walk(
+                expandable,
+                nodes,
+                children_index,
+                shadow_roots,
+                *child,
+                Some(*root),
+            );
         }
     }
 }
@@ -3898,22 +3921,14 @@ fn get_expandable_css_nodes(
 ) -> Vec<(Option<usize>, ExpandableCssNode)> {
     let mut expandable = vec![];
 
-    get_expandable_css_nodes_walk(&mut expandable, nodes, children_index, root_indice, None);
-    let mut shadow_roots: Vec<usize> = shadow_roots.values().copied().collect();
-    shadow_roots.sort_unstable();
-    for root in shadow_roots {
-        if let Some(children) = children_index.get(&root) {
-            for child in children.iter() {
-                get_expandable_css_nodes_walk(
-                    &mut expandable,
-                    nodes,
-                    children_index,
-                    *child,
-                    Some(root),
-                );
-            }
-        }
-    }
+    get_expandable_css_nodes_walk(
+        &mut expandable,
+        nodes,
+        children_index,
+        shadow_roots,
+        root_indice,
+        None,
+    );
 
     expandable
 }
@@ -5709,22 +5724,26 @@ fn add_connected_subtree_elements(
     root_idx: usize,
     nodes: &NodesTable,
     children_index: &NodeMap<Vec<usize>>,
+    shadow_roots: &HashMap<usize, usize>,
     connected: &FixedBitSet,
     elements: &mut FixedBitSet,
 ) {
-    if !connected.contains(root_idx) {
-        return;
-    }
     let mut pending = vec![root_idx];
     while let Some(node_idx) = pending.pop() {
-        if !connected.contains(node_idx) || elements.contains(node_idx) {
-            continue;
-        }
-        if matches!(nodes.get(node_idx), Some(Node::Element(_))) {
-            elements.insert(node_idx);
+        match nodes.get(node_idx) {
+            Some(Node::Element(_))
+                if connected.contains(node_idx) && !elements.contains(node_idx) =>
+            {
+                elements.insert(node_idx);
+            }
+            Some(Node::ShadowRoot { host, .. }) if connected.contains(*host) => {}
+            _ => continue,
         }
         if let Some(children) = children_index.get(&node_idx) {
             pending.extend(children);
+        }
+        if let Some(root) = shadow_roots.get(&node_idx) {
+            pending.push(*root);
         }
     }
 }
@@ -5735,6 +5754,7 @@ fn plan_selector_rematch(
     class_definitions: &ClassIndexes,
     nodes: &NodesTable,
     children_index: &NodeMap<Vec<usize>>,
+    shadow_roots: &HashMap<usize, usize>,
     connected: &FixedBitSet,
 ) -> SelectorRematchPlan {
     if changes.force_full {
@@ -5750,6 +5770,7 @@ fn plan_selector_rematch(
             *root_idx,
             nodes,
             children_index,
+            shadow_roots,
             connected,
             &mut dirty_elements,
         );
@@ -5883,6 +5904,7 @@ fn compute_node_styles(
                 &css_parser.class_definitions,
                 nodes,
                 &dom_indexes.children_index,
+                shadow_roots,
                 &connected_elements,
             )
         };
