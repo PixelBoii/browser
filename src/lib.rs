@@ -11577,7 +11577,11 @@ impl Renderer {
         scripts
     }
 
-    pub fn prepare_frame_creation(&self, url: Option<String>, node_idx: usize) -> Result<PreparedFrame> {
+    pub fn prepare_frame_creation(
+        &mut self,
+        url: Option<String>,
+        node_idx: usize,
+    ) -> Result<PreparedFrame> {
         let frame_url = match url.as_deref().filter(|url| !url.is_empty()) {
             Some(url) => ReqwestUrl::parse(&self.url)?.join(url)?,
             None => ReqwestUrl::parse("about:blank")?,
@@ -11591,12 +11595,21 @@ impl Renderer {
             })
             .map(Cow::into_owned)
             .unwrap_or_default();
+        self.ensure_layout();
+        let size = self
+            .node_layout_mapping
+            .get(&node_idx)
+            .map(|idx| {
+                let rect = &self.layout_table[*idx].rect;
+                PhysicalSize::new(rect.width, rect.height)
+            })
+            .unwrap_or(PhysicalSize::new(300, 150));
         let parent_proxy = self.event_loop_proxy.as_ref().unwrap().clone();
         Ok(PreparedFrame {
             url: frame_url,
             window_name,
             parent_proxy,
-            size: PhysicalSize::new(300, 150),
+            size,
             node_idx,
         })
     }
@@ -12992,21 +13005,20 @@ impl Renderer {
                     if style.display == StyleDisplay::None {
                         return None;
                     }
-                    let (height, width) = match self.nodes.get(node_idx).unwrap() {
-                        Node::Element(element) => (
-                            element
-                                .attributes
-                                .get_str("height")
-                                .and_then(|v| v.parse::<f32>().ok())
-                                .unwrap_or(150.) as u32,
-                            element
-                                .attributes
-                                .get_str("width")
-                                .and_then(|v| v.parse::<f32>().ok())
-                                .unwrap_or(300.) as u32,
-                        ),
-                        _ => unreachable!(),
-                    };
+                    let container_size = self.get_container_sizes(
+                        node_idx,
+                        &forced_size,
+                        style,
+                        &available_size,
+                        containing_node_idx,
+                    );
+                    let width = container_size
+                        .clamp_width(container_size.container_width_non_filling.unwrap_or(300));
+                    let height = container_size
+                        .container_height_non_filling
+                        .unwrap_or(150)
+                        .min(container_size.max_height.unwrap_or(u32::MAX))
+                        .max(container_size.min_height.unwrap_or(u32::MIN));
                     let z_index = match style.z_index {
                         StyleZIndex::Auto => 0,
                         StyleZIndex::Number(value) => value,
