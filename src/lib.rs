@@ -13896,8 +13896,19 @@ impl Renderer {
         let mut column_max_widths = vec![0; column_count];
         let mut column_max_heights = vec![0; row_count];
         for base_item in base_items.iter() {
+            let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
+            let (margin_left, margin_right, _, _) = self.get_margins(
+                base_item.node_idx,
+                child_style,
+                Size {
+                    width: container_sizes.inner_width,
+                    height: container_sizes.inner_height,
+                },
+            );
+            let outer_width =
+                (base_item.base_width as i32 + margin_left + margin_right).max(0) as u32;
             column_max_widths[base_item.column as usize] =
-                column_max_widths[base_item.column as usize].max(base_item.base_width);
+                column_max_widths[base_item.column as usize].max(outer_width);
             column_max_heights[base_item.row as usize] =
                 column_max_heights[base_item.row as usize].max(base_item.base_height);
         }
@@ -13927,24 +13938,49 @@ impl Renderer {
         // Lay out base items and convert build real layout children
         let mut column_widths = vec![0; column_count];
         let mut column_starts = vec![0; column_count];
-        let mut width_allocated = 0;
+        let mut implicit_columns = vec![];
         for column in 0..column_count {
-            let width = if let GridTemplateColumns::Values(columns) = &grid_template_columns {
-                self.calculate_grid_item_size(
-                    columns,
-                    column as usize,
-                    width_to_distribute,
-                    dynamic_width_to_give,
-                    max_column_fractions,
-                    total_auto_columns,
-                    &column_max_widths,
-                )
-            } else {
-                container_sizes.inner_width as i32
+            let width = match &grid_template_columns {
+                GridTemplateColumns::Values(columns) if column < columns.len() => {
+                    self.calculate_grid_item_size(
+                        columns,
+                        column,
+                        width_to_distribute,
+                        dynamic_width_to_give,
+                        max_column_fractions,
+                        total_auto_columns,
+                        &column_max_widths,
+                    )
+                }
+                _ => {
+                    implicit_columns.push(column);
+                    column_max_widths[column] as i32
+                }
             };
             column_widths[column] = width;
+        }
+        // Implicit tracks are sized from their contents, then stretched to
+        // fill the grid when it has a definite width to fill.
+        if (allow_fill || specified_width.is_some()) && !implicit_columns.is_empty() {
+            let used_width = column_widths.iter().sum::<i32>()
+                + grid_gap as i32 * (column_count.saturating_sub(1) as i32);
+            let remaining = width_to_distribute as i32 - used_width;
+            if remaining > 0 {
+                let share = remaining / implicit_columns.len() as i32;
+                let mut extra = remaining % implicit_columns.len() as i32;
+                for column in &implicit_columns {
+                    column_widths[*column] += share;
+                    if extra > 0 {
+                        column_widths[*column] += 1;
+                        extra -= 1;
+                    }
+                }
+            }
+        }
+        let mut width_allocated = 0;
+        for column in 0..column_count {
             column_starts[column] = width_allocated;
-            width_allocated += width + grid_gap as i32;
+            width_allocated += column_widths[column] + grid_gap as i32;
         }
         let mut row_heights = vec![0; row_count];
         let mut row_starts = vec![0; row_count];
