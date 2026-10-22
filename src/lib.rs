@@ -13740,7 +13740,7 @@ impl Renderer {
             immediate_children.len(),
             self.get_root_font_size(),
         );
-        let mut current_column = 0;
+        let mut current_column: i32 = 0;
         let mut definitely_used_width = 0;
         let mut definitely_used_height = 0;
         let mut max_column_fractions = 0;
@@ -13823,15 +13823,18 @@ impl Renderer {
         let mut current_row: usize = 0;
         // Compute base items and their ideal sizes
         for child_idx in immediate_children.iter() {
-            let column_span =
-                self.node_styles
-                    .get(child_idx)
-                    .map_or(1, |style| style.grid_column_span.max(1)) as i32;
-            let wrap = match grid_template_columns {
-                GridTemplateColumns::Values(ref template_columns) => {
-                    self.get_grid_column(current_column, column_span, &template_columns)
+            let child_style = self.node_styles.get(child_idx);
+            let column_span = child_style.map_or(1, |style| style.grid_column_span.max(1)) as i32;
+            let explicit_column_start = child_style.map(|s| s.grid_column_start.map(|s| s as i32 - 1)).flatten();
+            let wrap = if let Some(explicit_column_start) = explicit_column_start {
+                explicit_column_start < current_column
+            } else {
+                match grid_template_columns {
+                    GridTemplateColumns::Values(ref template_columns) => {
+                        self.get_grid_column(current_column, column_span, &template_columns)
+                    }
+                    GridTemplateColumns::None => current_column >= 1,
                 }
-                GridTemplateColumns::None => current_column >= 1,
             };
             if wrap {
                 max_child_height = 0;
@@ -13839,6 +13842,7 @@ impl Renderer {
                 current_row += 1;
                 row_count = row_count.max(current_row + 1);
             }
+            let child_column = explicit_column_start.unwrap_or(current_column);
             let layout_checkpoint = self.layout_table.len();
             let child_size = self
                 .layout_node(
@@ -13869,12 +13873,12 @@ impl Renderer {
                     target_width: base_width,
                     base_height,
                     target_height: base_height,
-                    column: current_column,
+                    column: child_column,
                     column_span,
                     row: current_row as i32,
                 });
-                current_column += column_span;
-                column_count = column_count.max(current_column as usize);
+                current_column = child_column + column_span;
+                column_count = column_count.max((child_column + column_span) as usize);
             }
         }
         // Compute max sizes per column (used for auto calculation)
@@ -13910,21 +13914,32 @@ impl Renderer {
             }
         }
         // Lay out base items and convert build real layout children
+        let mut column_widths = vec![0; column_count];
+        let mut column_starts = vec![0; column_count];
+        let mut width_allocated = 0;
+        for column in 0..column_count {
+            let width = if let GridTemplateColumns::Values(columns) = &grid_template_columns {
+                self.calculate_grid_item_size(
+                    columns,
+                    column as usize,
+                    width_to_distribute,
+                    dynamic_width_to_give,
+                    max_column_fractions,
+                    total_auto_columns,
+                    &column_max_widths,
+                )
+            } else {
+                container_sizes.inner_width as i32
+            };
+            column_widths[column] = width;
+            column_starts[column] = width_allocated;
+            width_allocated += width + grid_gap as i32;
+        }
         for base_item in base_items.iter_mut() {
             let specified_column_size =
-                if let GridTemplateColumns::Values(columns) = &grid_template_columns {
+                if let GridTemplateColumns::Values(_) = &grid_template_columns {
                     (base_item.column..base_item.column + base_item.column_span)
-                        .map(|column| {
-                            self.calculate_grid_item_size(
-                                columns,
-                                column as usize,
-                                width_to_distribute,
-                                dynamic_width_to_give,
-                                max_column_fractions,
-                                total_auto_columns,
-                                &column_max_widths,
-                            )
-                        })
+                        .map(|column| column_widths[column as usize])
                         .sum()
                 } else {
                     container_sizes.inner_width as i32
@@ -13945,12 +13960,12 @@ impl Renderer {
             base_item.target_width = specified_column_size as u32;
             base_item.target_height = specified_height as u32;
         }
-        let mut last_column = 0;
+        let mut last_row = 0;
         for base_item in base_items {
-            let wrap = base_item.column <= last_column;
-            last_column = base_item.column;
+            let wrap = base_item.row > last_row;
+            last_row = base_item.row;
+            content_position.x = original_content_position.x + column_starts[base_item.column as usize];
             if wrap {
-                content_position.x = original_content_position.x;
                 content_position.y += max_child_height + grid_gap as i32;
                 max_child_height = 0;
             }
@@ -19576,7 +19591,7 @@ pub fn run() -> Result<()> {
     let hover_debugging = args.iter().any(|arg| arg == "--hover-debugging");
     let show_fps_counter = args.iter().any(|arg| arg == "--fps-counter");
     Browser::open(
-        "file:///home/pixel/browser/pages/dom-parser.html".to_string(),
+        "file:///home/pixel/browser/pages/test.html".to_string(),
         hover_debugging,
         show_fps_counter,
     )?;
