@@ -13965,7 +13965,7 @@ impl Renderer {
         let mut column_max_heights = vec![0; row_count];
         for base_item in base_items.iter() {
             let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
-            let (margin_left, margin_right, _, _) = self.get_margins(
+            let (margin_left, margin_right, margin_top, margin_bottom) = self.get_margins(
                 base_item.node_idx,
                 child_style,
                 Size {
@@ -13975,10 +13975,12 @@ impl Renderer {
             );
             let outer_width =
                 (base_item.base_width as i32 + margin_left + margin_right).max(0) as u32;
+            let outer_height =
+                (base_item.base_height as i32 + margin_top + margin_bottom).max(0) as u32;
             column_max_widths[base_item.column as usize] =
                 column_max_widths[base_item.column as usize].max(outer_width);
             column_max_heights[base_item.row as usize] =
-                column_max_heights[base_item.row as usize].max(base_item.base_height);
+                column_max_heights[base_item.row as usize].max(outer_height);
         }
         // Deduct max sizes per {} from dynamic_{}_to_give as it will be used by auto calculation
         if let GridTemplateColumns::Values(ref template_columns) = grid_template_columns {
@@ -14092,18 +14094,30 @@ impl Renderer {
             }
             last_row = base_item.row;
             let child_style = self.node_styles.get(&base_item.node_idx).unwrap();
+            let (margin_left, margin_right, margin_top, margin_bottom) = self.get_margins(
+                base_item.node_idx,
+                child_style,
+                Size {
+                    width: base_item.target_width,
+                    height: base_item.target_height,
+                },
+            );
+            let available_width =
+                (base_item.target_width as i32 - margin_left - margin_right).max(0) as u32;
+            let available_height =
+                (base_item.target_height as i32 - margin_top - margin_bottom).max(0) as u32;
             let forced_width = match child_style.width {
                 // Percentages on a grid item resolve against its grid area.
                 StyleSize::Percent(percent) => {
                     (base_item.target_width as f32 * percent / 100.).max(0.) as u32
                 }
                 StyleSize::Auto if justify_items == StyleJustifyContent::Stretch => {
-                    base_item.target_width
+                    available_width
                 }
                 _ => base_item.base_width,
             };
-            let free_x = (base_item.target_width as i32 - forced_width as i32).max(0);
-            let free_y = (base_item.target_height as i32 - base_item.base_height as i32).max(0);
+            let free_x = (available_width as i32 - forced_width as i32).max(0);
+            let free_y = (available_height as i32 - base_item.base_height as i32).max(0);
             let offset_x = match justify_items {
                 StyleJustifyContent::Center => free_x / 2,
                 StyleJustifyContent::FlexEnd => free_x,
@@ -14115,11 +14129,11 @@ impl Renderer {
                 _ => 0,
             };
             let child_position = Position {
-                x: content_position.x + offset_x,
-                y: content_position.y + offset_y,
+                x: content_position.x + margin_left + offset_x,
+                y: content_position.y + margin_top + offset_y,
             };
             let forced_height = match &child_style.height {
-                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => Some(base_item.target_height),
+                StyleSize::Auto if align_items == StyleJustifyContent::Stretch => Some(available_height),
                 StyleSize::Auto => None,
                 _ => Some(base_item.base_height),
             };
@@ -14143,8 +14157,10 @@ impl Renderer {
                 longest_row_width =
                     longest_row_width.max(content_position.x - original_content_position.x);
                 content_position.x += grid_gap as i32;
-                max_child_height =
-                    max_child_height.max(self.layout_table.get(child).unwrap().rect.height as i32);
+                max_child_height = max_child_height.max(
+                    self.layout_table.get(child).unwrap().rect.height as i32
+                        + margin_top + margin_bottom,
+                );
                 children.push(child);
             }
         }
@@ -16191,7 +16207,7 @@ impl Renderer {
             font_size,
             self.get_root_font_size(),
             &style.margin_top,
-            Some(available_size.height),
+            Some(available_size.width),
             None,
             &self.window_size,
         )
@@ -16200,7 +16216,7 @@ impl Renderer {
             font_size,
             self.get_root_font_size(),
             &style.margin_bottom,
-            Some(available_size.height),
+            Some(available_size.width),
             None,
             &self.window_size,
         )
