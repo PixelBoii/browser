@@ -1618,6 +1618,17 @@ class CanvasRenderingContext2D {
         this.__stateStack = []
     }
 
+    get font() {
+        return this.__font
+    }
+
+    set font(value) {
+        const font = String(value)
+        if (core.ops.op_canvas_font_is_valid(font)) {
+            this.__font = font
+        }
+    }
+
     get globalCompositeOperation() {
         return this.__compositeOperation
     }
@@ -3201,7 +3212,7 @@ class SVGTextContentElement extends SVGGraphicsElement {
         if (style.display === "none") return 0
         const text = this.textContent.replace(/[ \t\r\n]+/g, " ").replace(/^ | $/g, "")
         return core.ops.op_canvas_measure_text(
-            this.ownerDocument, text, `${parseFloat(style.fontSize)}px`, "left", "alphabetic",
+            this.ownerDocument, text, `${parseFloat(style.fontSize)}px sans-serif`, "left", "alphabetic",
         ).width
     }
 }

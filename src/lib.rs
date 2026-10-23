@@ -7857,21 +7857,21 @@ impl CanvasFilter {
 
 // Parses the parts of a canvas font shorthand this engine uses: the
 // pixel size and the family list that follows it. Style and weight words
-// before the size are skipped, as is a line-height after the size. An
-// unparseable font falls back to the initial 10px sans-serif.
-fn parse_canvas_font(font: &str) -> (f64, Vec<String>) {
-    let fallback = || (10.0, vec!["sans-serif".to_string()]);
+// before the size are skipped, as is a line-height after the size.
+fn parse_canvas_font(font: &str) -> Option<(f64, Vec<String>)> {
     let lower = font.to_ascii_lowercase();
-    let Some(px) = lower.find("px") else {
-        return fallback();
-    };
+    let px = lower.find("px")?;
     let number_start = lower[..px]
-        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .rfind(char::is_whitespace)
         .map_or(0, |index| index + 1);
-    let Ok(size) = lower[number_start..px].parse::<f64>() else {
-        return fallback();
-    };
+    let size = lower[number_start..px].parse::<f64>().ok()?;
+    if !size.is_finite() || size < 0.0 {
+        return None;
+    }
     let size_end = px + 2;
+    if !font[size_end..].starts_with(char::is_whitespace) && !font[size_end..].starts_with('/') {
+        return None;
+    }
     let mut families_text = font[size_end..].trim_start();
     // Skip an optional "/line-height" between the size and the families.
     if let Some(after_slash) = families_text.strip_prefix('/') {
@@ -7892,9 +7892,14 @@ fn parse_canvas_font(font: &str) -> (f64, Vec<String>) {
         .filter(|family| !family.is_empty())
         .collect();
     if families.is_empty() {
-        return (size, vec!["sans-serif".to_string()]);
+        return None;
     }
-    (size, families)
+    Some((size, families))
+}
+
+#[op2(fast)]
+fn op_canvas_font_is_valid(#[string] font: String) -> bool {
+    parse_canvas_font(&font).is_some()
 }
 
 fn parse_canvas_filter(filter: &str) -> CanvasFilter {
@@ -9258,7 +9263,9 @@ fn op_canvas_measure_text(
     #[string] text_align: String,
     #[string] text_baseline: String,
 ) -> CanvasTextMetrics {
-    let (font_size, families) = parse_canvas_font(&font);
+    let Some((font_size, families)) = parse_canvas_font(&font) else {
+        return CanvasTextMetrics::default();
+    };
     if !font_size.is_finite() || font_size <= 0.0 {
         return CanvasTextMetrics::default();
     }
@@ -9494,7 +9501,9 @@ fn op_canvas_fill_text(
     #[serde] shadow: CanvasShadowStyle,
     #[string] filter: String,
 ) -> Result<bool, JsErrorBox> {
-    let (font_size, families) = parse_canvas_font(&font);
+    let Some((font_size, families)) = parse_canvas_font(&font) else {
+        return Ok(false);
+    };
     if !x.is_finite() || !y.is_finite() || !font_size.is_finite() || font_size <= 0.0 {
         return Ok(false);
     }
@@ -9570,7 +9579,9 @@ fn op_canvas_stroke_text(
     #[serde] shadow: CanvasShadowStyle,
     #[string] filter: String,
 ) -> Result<bool, JsErrorBox> {
-    let (font_size, families) = parse_canvas_font(&font);
+    let Some((font_size, families)) = parse_canvas_font(&font) else {
+        return Ok(false);
+    };
     if !x.is_finite()
         || !y.is_finite()
         || !font_size.is_finite()
@@ -10167,6 +10178,7 @@ extension!(
     op_canvas_fill_text,
     op_canvas_stroke_text,
     op_canvas_measure_text,
+    op_canvas_font_is_valid,
     op_svg_get_extent_of_char,
     op_set_cookie,
     op_get_cookie,
