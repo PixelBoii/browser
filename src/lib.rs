@@ -13766,7 +13766,9 @@ impl Renderer {
             .copied()
             .filter(|c| {
                 let style = &self.node_styles.get(c);
-                style.is_some_and(|style| !style.position.is_free())
+                style.is_some_and(|style| {
+                    !style.position.is_free() && style.display != StyleDisplay::None
+                })
             })
             .collect();
         immediate_children.sort_by(|a, b| {
@@ -13881,6 +13883,13 @@ impl Renderer {
             }
             GridTemplateColumns::None => 1,
         };
+        // Establish implicit columns before searching for available cells.
+        for child_idx in &immediate_children {
+            let child_style = self.node_styles.get(child_idx).unwrap();
+            let column_start = child_style.grid_column_start.map_or(0, |start| start as usize - 1);
+            let column_span = child_style.grid_column_span.max(1) as usize;
+            column_count = column_count.max(column_start + column_span);
+        }
         let mut row_count = 1usize;
         let mut cursor = GridCursor::new(column_count);
         // Compute base items and their ideal sizes
@@ -13949,7 +13958,6 @@ impl Renderer {
                         cursor.mark_occupied(row as usize, col as usize);
                     }
                 }
-                column_count = column_count.max((child_column + column_span) as usize);
             }
         }
         // Compute max sizes per column (used for auto calculation)
