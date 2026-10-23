@@ -1914,7 +1914,13 @@ pub(crate) fn parse_color(value: String) -> Result<StyleBackground> {
             "highlight" | "selecteditem" => Ok(StyleBackground::Hex(0x33_99_FF_FF)),
             "transparent" | "none" => Ok(StyleBackground::Transparent),
             "currentcolor" => Ok(StyleBackground::CurrentColor),
-            _ => Err(anyhow!("Failed to parse color \"{}\"", value)),
+            name => {
+                let color = palette::named::from_str(name)
+                    .with_context(|| format!("Failed to parse color \"{}\"", value))?;
+                Ok(StyleBackground::Hex(rgba_to_hex((
+                    color.red, color.green, color.blue, 255,
+                ))))
+            }
         }
     }
 }
