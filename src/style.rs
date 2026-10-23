@@ -156,6 +156,8 @@ impl StyleDisplay {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StyleJustifyContent {
     Auto,
+    Start,
+    End,
     FlexStart,
     FlexEnd,
     Center,
@@ -409,6 +411,8 @@ impl_css_keyword!(
 impl_css_keyword!(
     StyleJustifyContent,
     StyleJustifyContent::Auto => "auto",
+    StyleJustifyContent::Start => "start",
+    StyleJustifyContent::End => "end",
     StyleJustifyContent::FlexStart => "flex-start",
     StyleJustifyContent::FlexEnd => "flex-end",
     StyleJustifyContent::Center => "center",
@@ -597,6 +601,13 @@ impl Display for PropertyValue {
             PropertyValue::Int(value) => value.fmt(formatter),
             PropertyValue::SignedInt(value) => value.fmt(formatter),
             PropertyValue::JustifyContent(value) => value.fmt(formatter),
+            PropertyValue::PlaceContent { align, justify } => {
+                if align == justify {
+                    align.fmt(formatter)
+                } else {
+                    write!(formatter, "{align} {justify}")
+                }
+            }
             PropertyValue::FlexDirection(value) => value.fmt(formatter),
             PropertyValue::Flex {
                 grow,
@@ -2272,8 +2283,10 @@ mod tests {
 fn parse_justify_content(value: &str) -> StyleJustifyContent {
     match value {
         "auto" => StyleJustifyContent::Auto,
-        "normal" | "start" | "left" | "self-start" | "flex-start" => StyleJustifyContent::FlexStart,
-        "end" | "right" | "self-end" | "flex-end" => StyleJustifyContent::FlexEnd,
+        "start" => StyleJustifyContent::Start,
+        "end" => StyleJustifyContent::End,
+        "normal" | "left" | "self-start" | "flex-start" => StyleJustifyContent::FlexStart,
+        "right" | "self-end" | "flex-end" => StyleJustifyContent::FlexEnd,
         "center" => StyleJustifyContent::Center,
         "space-between" => StyleJustifyContent::SpaceBetween,
         "space-around" => StyleJustifyContent::SpaceAround,
@@ -2723,11 +2736,12 @@ pub fn parse_property_value(property: String, value: String) -> Result<(Property
                 PropertyValue::JustifyContent(parse_justify_content(value.as_str()))
             }
             "place-content" => {
-                let parts: Vec<&str> = value.split(" ").collect();
-                // align-content ignored for now
+                let parts: Vec<&str> = value.split_whitespace().collect();
                 match parts.len() {
-                    1 => PropertyValue::JustifyContent(parse_justify_content(parts[0].trim())),
-                    2 => PropertyValue::JustifyContent(parse_justify_content(parts[1].trim())),
+                    1 | 2 => PropertyValue::PlaceContent {
+                        align: parse_justify_content(parts[0]),
+                        justify: parse_justify_content(parts.get(1).unwrap_or(&parts[0])),
+                    },
                     _ => PropertyValue::Raw(value),
                 }
             }
@@ -3017,8 +3031,8 @@ pub fn apply_style_property(style: &mut Style, property: &Property) -> Result<()
         ("align-self", PropertyValue::JustifyContent(value)) => {
             style.align_self = value;
         }
-        ("place-content", PropertyValue::JustifyContent(value)) => {
-            style.justify_content = value;
+        ("place-content", PropertyValue::PlaceContent { justify, .. }) => {
+            style.justify_content = justify;
         }
         ("place-items", PropertyValue::JustifyContent(value)) => {
             style.align_items = value;

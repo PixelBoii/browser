@@ -14120,12 +14120,12 @@ impl Renderer {
             let free_y = (available_height as i32 - base_item.base_height as i32).max(0);
             let offset_x = match justify_items {
                 StyleJustifyContent::Center => free_x / 2,
-                StyleJustifyContent::FlexEnd => free_x,
+                StyleJustifyContent::End | StyleJustifyContent::FlexEnd => free_x,
                 _ => 0,
             };
             let offset_y = match align_items {
                 StyleJustifyContent::Center => free_y / 2,
-                StyleJustifyContent::FlexEnd => free_y,
+                StyleJustifyContent::End | StyleJustifyContent::FlexEnd => free_y,
                 _ => 0,
             };
             let child_position = Position {
@@ -14655,8 +14655,10 @@ impl Renderer {
             StyleFlexDirection::Row => 0,
         };
         let cross_offset = match align {
-            StyleJustifyContent::Auto | StyleJustifyContent::FlexStart => 0,
-            StyleJustifyContent::FlexEnd => cross_free_space,
+            StyleJustifyContent::Auto
+            | StyleJustifyContent::Start
+            | StyleJustifyContent::FlexStart => 0,
+            StyleJustifyContent::End | StyleJustifyContent::FlexEnd => cross_free_space,
             StyleJustifyContent::Center => cross_free_space / 2,
             StyleJustifyContent::SpaceBetween => 0,
             StyleJustifyContent::SpaceAround => 0,
@@ -15104,9 +15106,10 @@ impl Renderer {
 
         let (main_start_offset, main_distributed_gap) = match style.justify_content {
             StyleJustifyContent::Auto
+            | StyleJustifyContent::Start
             | StyleJustifyContent::FlexStart
             | StyleJustifyContent::Stretch => (0, 0),
-            StyleJustifyContent::FlexEnd => (main_free_space, 0),
+            StyleJustifyContent::End | StyleJustifyContent::FlexEnd => (main_free_space, 0),
             StyleJustifyContent::Center => (main_free_space / 2, 0),
             StyleJustifyContent::SpaceBetween if base_items.len() > 1 => {
                 (0, main_free_space / (base_items.len() as u32 - 1))
@@ -15344,7 +15347,7 @@ impl Renderer {
                                         static_position_available_height,
                                     ))
                                 }
-                                StyleJustifyContent::FlexEnd => {
+                                StyleJustifyContent::End | StyleJustifyContent::FlexEnd => {
                                     Some(SizeDependentStaticOffset::EndY(
                                         static_position_available_height,
                                     ))

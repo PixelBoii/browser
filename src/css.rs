@@ -182,6 +182,10 @@ pub enum PropertyValue {
     Int(u32),
     SignedInt(i32),
     JustifyContent(StyleJustifyContent),
+    PlaceContent {
+        align: StyleJustifyContent,
+        justify: StyleJustifyContent,
+    },
     FlexDirection(StyleFlexDirection),
     Flex {
         grow: Option<u32>,
