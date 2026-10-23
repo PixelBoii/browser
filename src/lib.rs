@@ -10686,6 +10686,66 @@ pub struct PreparedFrame {
     node_idx: usize,
 }
 
+struct GridCursor {
+    columns: usize,
+    column: usize,
+    row: usize,
+    occupied: Vec<Vec<usize>>
+}
+impl GridCursor {
+    pub fn new(columns: usize) -> Self {
+        Self {
+            columns,
+            column: 0,
+            row: 0,
+            occupied: vec![],
+        }
+    }
+
+    pub fn mark_occupied(&mut self, row: usize, col: usize) {
+        self.ensure_rows(row + 1);
+        self.occupied[row].push(col);
+    }
+
+    pub fn ensure_rows(&mut self, rows: usize) {
+        if rows > self.occupied.len() {
+            self.occupied.resize(rows, vec![]);
+        }
+    }
+
+    pub fn box_free(&self, col: usize, col_span: usize, row: usize, row_span: usize) -> bool {
+        for candidate_row in row..row + row_span {
+            for candidate_col in col..col + col_span {
+                if candidate_row < self.occupied.len() && self.occupied[candidate_row].contains(&candidate_col) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn until_available(&mut self, col_span: usize, row_span: usize) {
+        self.ensure_rows(self.row + 1);
+
+        if self.column + col_span - 1 < self.columns {
+            for candidate in self.column..self.columns.saturating_sub(col_span - 1) {
+                if self.box_free(candidate, col_span, self.row, row_span) {
+                    self.column = candidate;
+                    return;
+                }
+            }
+        }
+
+        self.wrap(col_span, row_span);
+    }
+
+    pub fn wrap(&mut self, col_span: usize, row_span: usize) {
+        self.row += 1;
+        self.column = 0;
+        self.until_available(col_span, row_span);
+    }
+}
+
 impl Renderer {
     fn new(
         url: String,
@@ -13553,16 +13613,6 @@ impl Renderer {
         Ok(layout_box)
     }
 
-    fn get_grid_column(
-        &self,
-        current_column: i32,
-        column_span: i32,
-        template_columns: &Vec<GridTemplateColumnsValue>,
-    ) -> bool {
-        // Are we out of columns?
-        current_column + column_span > template_columns.len() as i32
-    }
-
     fn calculate_grid_item_size(
         &self,
         template: &Vec<GridTemplateColumnsValue>,
@@ -13711,7 +13761,7 @@ impl Renderer {
         let width_to_distribute = container_sizes.inner_width;
         let height_to_distribute = container_sizes.inner_height;
         let children_idxs = self.layout_children(node_idx);
-        let immediate_children: Vec<usize> = children_idxs
+        let mut immediate_children: Vec<usize> = children_idxs
             .iter()
             .copied()
             .filter(|c| {
@@ -13719,6 +13769,13 @@ impl Renderer {
                 style.is_some_and(|style| !style.position.is_free())
             })
             .collect();
+        immediate_children.sort_by(|a, b| {
+            let a_style = &self.node_styles.get(a);
+            let a_explicit = a_style.is_some_and(|s| s.grid_column_start.is_some() && s.grid_row_start.is_some());
+            let b_style = &self.node_styles.get(b);
+            let b_explicit = b_style.is_some_and(|s| s.grid_column_start.is_some() && s.grid_row_start.is_some());
+            b_explicit.cmp(&a_explicit)
+        });
         let free_children: Vec<usize> = children_idxs
             .iter()
             .copied()
@@ -13741,7 +13798,6 @@ impl Renderer {
             immediate_children.len(),
             self.get_root_font_size(),
         );
-        let mut current_column: i32 = 0;
         let mut definitely_used_width = 0;
         let mut definitely_used_height = 0;
         let mut max_column_fractions = 0;
@@ -13819,9 +13875,14 @@ impl Renderer {
             allow_fill
         };
         let mut base_items = vec![];
-        let mut column_count = 1usize;
+        let mut column_count = match grid_template_columns {
+            GridTemplateColumns::Values(ref template_columns) => {
+                template_columns.len()
+            }
+            GridTemplateColumns::None => 1,
+        };
         let mut row_count = 1usize;
-        let mut current_row: usize = 0;
+        let mut cursor = GridCursor::new(column_count);
         // Compute base items and their ideal sizes
         for child_idx in immediate_children.iter() {
             let child_style = self.node_styles.get(child_idx);
@@ -13830,26 +13891,23 @@ impl Renderer {
             let explicit_column_start = child_style.map(|s| s.grid_column_start.map(|s| s as i32 - 1)).flatten();
             let explicit_row_start = child_style.map(|s| s.grid_row_start.map(|s| s as i32 - 1)).flatten();
             let fully_explicit = explicit_column_start.is_some() && explicit_row_start.is_some();
+            if !fully_explicit {
+                cursor.until_available(column_span as usize, row_span as usize);
+            }
             let wrap = if fully_explicit {
                 false
             } else if let Some(explicit_column_start) = explicit_column_start {
-                explicit_column_start < current_column
+                explicit_column_start < cursor.column as i32
             } else {
-                match grid_template_columns {
-                    GridTemplateColumns::Values(ref template_columns) => {
-                        self.get_grid_column(current_column, column_span, &template_columns)
-                    }
-                    GridTemplateColumns::None => current_column >= 1,
-                }
+                cursor.column + column_span as usize > column_count
             };
             if wrap {
                 max_child_height = 0;
-                current_column = 0;
-                current_row += 1;
-                row_count = row_count.max(current_row + 1);
+                cursor.wrap(column_span as usize, row_span as usize);
+                row_count = row_count.max(cursor.row + 1);
             }
-            let child_column = explicit_column_start.unwrap_or(current_column);
-            let child_row = explicit_row_start.unwrap_or(current_row as i32);
+            let child_column = explicit_column_start.unwrap_or(cursor.column as i32);
+            let child_row = explicit_row_start.unwrap_or(cursor.row as i32);
             row_count = row_count.max((child_row + row_span) as usize);
             let layout_checkpoint = self.layout_table.len();
             let child_size = self
@@ -13886,8 +13944,10 @@ impl Renderer {
                     row: child_row,
                     row_span,
                 });
-                if !fully_explicit {
-                    current_column = child_column + column_span;
+                for row in child_row..child_row + row_span {
+                    for col in child_column..child_column + column_span {
+                        cursor.mark_occupied(row as usize, col as usize);
+                    }
                 }
                 column_count = column_count.max((child_column + column_span) as usize);
             }
