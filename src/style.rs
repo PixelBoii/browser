@@ -820,7 +820,17 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
     Style {
         width: match node {
             HtmlNode::Element(element) => {
-                if let Some(width) = element.attributes.get_str(&"width".to_string()) {
+                if let Some(width) = element.attributes.get_str(&"width".to_string())
+                    && (element.namespace.as_deref() == Some(crate::parser::SVG_NAMESPACE)
+                        || matches!(
+                            element.tag.as_str(),
+                            "canvas" | "embed" | "iframe" | "img" | "object" | "video"
+                                | "table" | "col" | "colgroup" | "td" | "th" | "hr" | "marquee"
+                        )
+                        || (element.tag == "input"
+                            && element.attributes.get_str("type")
+                                .is_some_and(|value| value.eq_ignore_ascii_case("image"))))
+                {
                     parse_attribute_size(width.as_ref()).unwrap()
                 } else {
                     match element.tag.as_str() {
@@ -838,7 +848,18 @@ pub fn get_base_style(node: &HtmlNode, parent_style: Option<&Style>) -> Style {
         },
         height: match node {
             HtmlNode::Element(element) => {
-                if let Some(height) = element.attributes.get_str(&"height".to_string()) {
+                if let Some(height) = element.attributes.get_str(&"height".to_string())
+                    && (element.namespace.as_deref() == Some(crate::parser::SVG_NAMESPACE)
+                        || matches!(
+                            element.tag.as_str(),
+                            "canvas" | "embed" | "iframe" | "img" | "object" | "video"
+                                | "table" | "col" | "colgroup" | "thead" | "tbody" | "tfoot"
+                                | "tr" | "td" | "th" | "marquee"
+                        )
+                        || (element.tag == "input"
+                            && element.attributes.get_str("type")
+                                .is_some_and(|value| value.eq_ignore_ascii_case("image"))))
+                {
                     parse_attribute_size(height.as_ref()).unwrap()
                 } else {
                     match element.tag.as_str() {
